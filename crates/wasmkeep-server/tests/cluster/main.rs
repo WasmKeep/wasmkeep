@@ -342,6 +342,9 @@ struct PeerProxy {
     next: Arc<AtomicU8>,
     /// Bumped to close every connection open now.
     close: tokio::sync::watch::Sender<u64>,
+    /// How many connections it carries now (one it is still closing
+    /// counts).
+    open: Arc<AtomicUsize>,
     /// Where it listens.
     addr: SocketAddr,
     /// Set to stop listening: connections to it are refused from then on.
@@ -350,7 +353,9 @@ struct PeerProxy {
 
 impl PeerProxy {
     /// Closes every connection open now, both sides, as the node behind
-    /// does to one it kept idle too long.
+    /// does to one it kept idle too long. Nothing a peer sends from then on
+    /// is passed on; the proxy then waits (a bounded time) for the peer to
+    /// close its side too.
     fn close_connections(&self) {
         self.close.send_modify(|n| *n += 1);
     }
@@ -358,6 +363,17 @@ impl PeerProxy {
     /// Stops listening and closes every connection: from now on a peer's
     /// connection to the node behind is refused, as by a firewall or a
     /// listener that is gone, while the node itself runs on.
+    ///
+    /// It returns once every peer closed its side of the connections it
+    /// had, so a peer's pool no longer holds one: its next request needs a
+    /// new connection, and that is refused at connect, before any of the
+    /// request is written. Without that wait a request sent at once could
+    /// still go out on a pooled connection the peer had not yet seen
+    /// closed, which it rightly cannot tell from one the owner read (an
+    /// answer of unknown outcome, not the refusal the tests mean). The
+    /// peer's pool drops the entry when its connection's task ends, which
+    /// is when that task closes the socket, so the window left between the
+    /// two is the end of one task, not a timing guess.
     async fn refuse_connections(&self) {
         self.refuse.send_replace(true);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -370,6 +386,14 @@ impl PeerProxy {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         self.close_connections();
+        while self.open.load(Ordering::SeqCst) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a peer of the proxy at {} kept a connection open",
+                self.addr
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The next bytes a peer sends are dropped and their connection closed.
@@ -389,10 +413,11 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(AtomicUsize::new(0));
     let next = Arc::new(AtomicU8::new(PROXY_PASS));
     let (close, closed) = tokio::sync::watch::channel(0u64);
     let (refuse, mut refused) = tokio::sync::watch::channel(false);
-    let (count, mode) = (Arc::clone(&accepted), Arc::clone(&next));
+    let (count, mode, live) = (Arc::clone(&accepted), Arc::clone(&next), Arc::clone(&open));
     tokio::spawn(async move {
         loop {
             let inbound = tokio::select! {
@@ -404,17 +429,31 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
                 Ok(()) = refused.changed() => break,
             };
             count.fetch_add(1, Ordering::SeqCst);
+            let open = OpenConnection::new(&live);
             let (mode, mut closed) = (Arc::clone(&mode), closed.clone());
             closed.mark_unchanged();
             tokio::spawn(async move {
+                let _open = open;
+                let mut inbound = inbound;
                 let Ok(outbound) = TcpStream::connect(target).await else {
                     return;
                 };
                 tokio::select! {
-                    () = proxy_pipe(inbound, outbound, &mode) => {}
-                    // A proxy nobody controls any more keeps carrying.
+                    // A close asked for wins over bytes that arrive with
+                    // it: those are never passed on.
+                    biased;
                     Ok(()) = closed.changed() => {}
+                    () = proxy_pipe(&mut inbound, outbound, &mode) => return,
                 }
+                // Closed: the node's side at once, then the peer's, and
+                // wait for the peer to close its own (it does as soon as
+                // it sees the end), dropping whatever it still sends.
+                let _ = inbound.shutdown().await;
+                let mut sink = vec![0u8; 16 << 10];
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while matches!(inbound.read(&mut sink).await, Ok(1..)) {}
+                })
+                .await;
             });
         }
     });
@@ -424,15 +463,32 @@ async fn peer_proxy(target: SocketAddr) -> (SocketAddr, PeerProxy) {
             accepted,
             next,
             close,
+            open,
             addr,
             refuse,
         },
     )
 }
 
+/// Counts one connection of a [`PeerProxy`] as open while it lives.
+struct OpenConnection(Arc<AtomicUsize>);
+
+impl OpenConnection {
+    fn new(open: &Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(open))
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Carries bytes both ways until either side closes, or `mode` says to
 /// drop the peer's next bytes or the answer to them.
-async fn proxy_pipe(mut inbound: TcpStream, mut outbound: TcpStream, mode: &AtomicU8) {
+async fn proxy_pipe(inbound: &mut TcpStream, mut outbound: TcpStream, mode: &AtomicU8) {
     let (mut from_peer, mut from_node) = (vec![0u8; 16 << 10], vec![0u8; 16 << 10]);
     // Set by `PROXY_CUT_ANSWER`: nothing more goes back to the peer.
     let mut cut_answer = false;
@@ -465,7 +521,7 @@ async fn proxy_pipe(mut inbound: TcpStream, mut outbound: TcpStream, mode: &Atom
     if cut_answer {
         // The node behind read its request whole and answers; the peer's
         // side closes, and nobody hears the rest of the answer.
-        drop(inbound);
+        let _ = inbound.shutdown().await;
         while matches!(outbound.read(&mut from_node).await, Ok(1..)) {}
     }
 }
