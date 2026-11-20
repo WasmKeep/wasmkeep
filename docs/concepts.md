@@ -306,6 +306,10 @@ due, `on-alarm` runs as an event.
   after 1 s, doubling up to 5 minutes, so make handlers idempotent (record
   what you did in the database, in the same event). While it is being
   retried, `get-alarm` returns the next attempt's time.
+- Inside `on-alarm` the delivered alarm is consumed: `get-alarm` returns
+  none until the handler sets or clears the alarm, then what it set. What
+  it sets stands, even the delivered time again (it runs again at once);
+  an alarm it leaves alone is cleared once it succeeds.
 - For several timers, keep them in a table and set the alarm to the
   earliest; reschedule from `on-alarm`.
 

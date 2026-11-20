@@ -28,7 +28,9 @@ func SetAlarm(at uint64) {
 
 // GetAlarm represents the imported function "get-alarm".
 //
-// The pending alarm time, if any.
+// The pending alarm time, if any. Inside `on-alarm` the alarm being
+// delivered is consumed: none until the handler calls `set-alarm` or
+// `clear-alarm`, then what it set (none after a clear).
 //
 //	get-alarm: func() -> option<u64>
 //

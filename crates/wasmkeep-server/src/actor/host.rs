@@ -472,6 +472,7 @@ impl ActorHost {
             deleted: None,
             delete_retry: false,
             deleter: None,
+            delivering_alarm: false,
             call: None,
             sockets,
             replica: None,
@@ -856,8 +857,12 @@ impl alarms::Host for ActorHost {
         if self.deleted.is_some() || self.delete_retry {
             return Ok(()); // the actor was deleted in this event
         }
+        let delivering = self.delivering_alarm;
         self.with_db(move |db| {
             db.set_alarm(at)?;
+            if delivering {
+                db.set_meta(ALARM_TOUCHED_KEY, "1")?;
+            }
             db.set_meta(ALARM_FAILURES_KEY, "0")
         })
         .await?
@@ -869,9 +874,18 @@ impl alarms::Host for ActorHost {
         if self.deleted.is_some() || self.delete_retry {
             return Ok(None);
         }
-        self.with_db(|db| db.alarm())
-            .await?
-            .map_err(|e| wasmtime::format_err!("get-alarm: {e}"))
+        // Inside `on-alarm`, the alarm being delivered is consumed: none
+        // until the handler sets or clears one, then its own setting (ADR
+        // 0009, amendment of 2026-11-20).
+        let delivering = self.delivering_alarm;
+        self.with_db(move |db| {
+            if delivering && db.meta(ALARM_TOUCHED_KEY)?.is_none() {
+                return Ok(None);
+            }
+            db.alarm()
+        })
+        .await?
+        .map_err(|e| wasmtime::format_err!("get-alarm: {e}"))
     }
 
     async fn clear_alarm(&mut self) -> wasmtime::Result<()> {
@@ -879,8 +893,12 @@ impl alarms::Host for ActorHost {
         if self.deleted.is_some() || self.delete_retry {
             return Ok(());
         }
-        self.with_db(|db| {
+        let delivering = self.delivering_alarm;
+        self.with_db(move |db| {
             db.clear_alarm()?;
+            if delivering {
+                db.set_meta(ALARM_TOUCHED_KEY, "1")?;
+            }
             db.set_meta(ALARM_FAILURES_KEY, "0")
         })
         .await?

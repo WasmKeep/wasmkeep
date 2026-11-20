@@ -42,6 +42,10 @@ on-alarm: func() -> result<_, string>;
 ```
 
 Runs when the pending alarm is due. An error or trap schedules a retry.
+The delivered alarm is consumed: once `on-alarm` succeeds it is
+cleared, unless the handler set or cleared the alarm itself. What the
+handler set stands, even the delivered time again (it runs again at
+once); a `set-alarm` rolled back with its transaction does not count.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
@@ -238,7 +242,9 @@ possible.
 get-alarm: func() -> option<u64>;
 ```
 
-The pending alarm time, if any.
+The pending alarm time, if any. Inside `on-alarm` the alarm being
+delivered is consumed: none until the handler calls `set-alarm` or
+`clear-alarm`, then what it set (none after a clear).
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |

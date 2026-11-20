@@ -88,6 +88,9 @@ export class ScaleHost {
     private advance(state: ScaleState, now: number): boolean {
         // A step that fails (or the edge ceiling) leaves its operation for
         // the alarm 2 s later; with nothing to do the round's alarm stands.
+        // Right on either host: before 0.7.0 `before` may be the delivered
+        // time, which that host clears after on-alarm; since, it is none
+        // or the round's own alarm.
         const before = alarms.getAlarm();
         alarms.setAlarm(BigInt(now + 2000));
         if (!this.scaling.begin(state, now)) {
@@ -142,7 +145,9 @@ export class ScaleHost {
             stepped = step();
         // The alarm the round set stands unless scaling has more to do.
         if (stepped) {
-            // now + 1, not now: an alarm left at the delivered time is cleared after on-alarm.
+            // now + 1, not now: a host before 0.7.0 clears an alarm left at
+            // the delivered time after on-alarm (ADR 0009, amendment of
+            // 2026-11-20). Kept while the SDK supports such hosts.
             const at = state.op ? now + 1 : now + 20;
             alarms.setAlarm(BigInt(at));
             return { ...result, next: at };
@@ -152,7 +157,8 @@ export class ScaleHost {
             alarms.setAlarm(BigInt(at));
             return { ...result, next: at };
         }
-        // Not getAlarm(): inside on-alarm it answers the alarm being delivered.
+        // Not getAlarm(): inside on-alarm a host before 0.7.0 answers the
+        // alarm being delivered (none since, until the handler sets one).
         return result;
     }
     /** Section 13: a 0.6.0 room's scale rows move to this pusher, one step

@@ -9,6 +9,20 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **`on-alarm` keeps the alarm it sets, even for the delivered time.**
+  After a successful `on-alarm` the host cleared an alarm still at the
+  time it had delivered, so a handler that re-armed for exactly that time
+  (a punctual "continue now") lost its alarm and stalled. Now whatever the
+  handler sets or clears is its new alarm; only an alarm it left alone is
+  cleared. Inside `on-alarm`, `get-alarm` now returns none until the
+  handler sets or clears the alarm, then what it set; it used to return
+  the alarm being delivered. A guest that saved `get-alarm` there and put
+  it back now restores "no alarm" instead of the delivered time. A
+  `set-alarm` rolled back with its transaction still counts for nothing.
+  The broadcast SDKs keep their 1 ms re-arm and do not read `get-alarm`
+  in `on-alarm`, since a component may still run on an older host. See
+  ADR 0009, amendment of 2026-11-20, and the `alarms` and `on-alarm` docs
+  in the WIT.
 - **Periodic snapshots of batched classes leave the mailbox.** A batched
   hold took its periodic snapshot inside the mailbox gap after an event:
   a flush to the barrier, the copy, then the upload, with every event

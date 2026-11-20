@@ -1130,6 +1130,17 @@ fn forgetting_a_covered_delivery_is_caught() {
     );
 }
 
+/// ADR 0009, amendment of 2026-11-20: a round that sets the delivered time
+/// again is covered by its own delivery; forgetting that delivery on its
+/// completion would leave the re-armed alarm unarmed.
+#[test]
+fn forgetting_a_delivery_that_rearmed_its_own_time_is_caught() {
+    batched::deliveries_caught(
+        batched::DeliveryRule::CompleteForgetsRearm,
+        batched::Violation::AlarmUnarmed,
+    );
+}
+
 #[test]
 fn forgetting_a_dropped_delivery_is_caught() {
     batched::deliveries_caught(

@@ -691,11 +691,17 @@ over: its edges' rows name the room, and are recreated.
 (an empty body for a join, `u64` 1 for a publish). `adopt` takes a kind
 (0 read, 1 hand over: the directory's address or empty, then up to 16
 edges, 2 retire). A step that continues at once sets the alarm 1 ms
-after its event's time, not at it: the host clears, after `on-alarm`, an
-alarm still at the delivered time, so a punctual delivery would stall
-the operation (this was already so for the room's scale steps). Inside
-`on-alarm`, `get-alarm` answers the alarm being delivered: the pusher's
-idle decision reads the round's own next alarm instead.
+after its event's time, not at it: a host before 0.7.0 clears, after
+`on-alarm`, an alarm still at the delivered time, so a punctual delivery
+would stall the operation (this was already so for the room's scale
+steps). On such a host `get-alarm` inside `on-alarm` also answers the
+alarm being delivered: the pusher's idle decision reads the round's own
+next alarm instead. Since 0.7.0 the host keeps what the handler set, the
+delivered time included, and `get-alarm` there answers none until the
+handler touches the alarm ([ADR 0009](0009-alarms-in-a-cluster.md),
+amendment of 2026-11-20); the SDKs keep both precautions, which are right
+on either host, as long as they support hosts before it (a component
+cannot tell which host it runs on).
 
 **What a pusher cold start rebuilds.** Its scale state is durable, so a
 pusher that wakes, moves or loses its node keeps its children, relays

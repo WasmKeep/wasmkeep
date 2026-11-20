@@ -59,8 +59,9 @@ class World {
     }
     /** The pusher's alarm, fired. */
     alarm(address: string) {
-        // As the host does: during on-alarm get-alarm still answers the alarm
-        // being delivered, which is cleared after unless the handler moved it.
+        // As a host before 0.7.0 does (the harder case the SDK still
+        // supports): during on-alarm get-alarm still answers the alarm being
+        // delivered, which is cleared after unless the handler moved it.
         // A delivered alarm is due: its time is now (a punctual delivery).
         const at = BigInt(Date.now());
         alarms.setAlarm(at);

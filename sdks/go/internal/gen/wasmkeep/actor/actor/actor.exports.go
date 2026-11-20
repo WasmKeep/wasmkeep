@@ -22,6 +22,10 @@ var Exports struct {
 	// OnAlarm represents the caller-defined, exported function "on-alarm".
 	//
 	// Runs when the pending alarm is due. An error or trap schedules a retry.
+	// The delivered alarm is consumed: once `on-alarm` succeeds it is
+	// cleared, unless the handler set or cleared the alarm itself. What the
+	// handler set stands, even the delivered time again (it runs again at
+	// once); a `set-alarm` rolled back with its transaction does not count.
 	//
 	//	on-alarm: func() -> result<_, string>
 	OnAlarm func() (result cm.Result[string, struct{}, string])
