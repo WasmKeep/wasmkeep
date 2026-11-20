@@ -82,7 +82,7 @@ step 'toolchain image pins'
 python3 -I scripts/check-toolchain.py
 
 rust=false; everything=false; simulation=false; scripts=false; preflight=false
-workflows=false
+workflows=false; room_harness=false
 packages=(); sdk_ts=false; sdk_py=false; sdk_go=false; sdk_c=false
 for path in "${changed[@]}"; do
   case "$path" in
@@ -109,6 +109,7 @@ for path in "${changed[@]}"; do
     sdks/c/*) sdk_c=true ;;
   esac
   case "$path" in bench/*.sh) preflight=true ;; esac
+  case "$path" in bench/*.mjs|bench/test/*|sdks/typescript/src/room-*) room_harness=true ;; esac
   if [[ "$path" == *.sh && -f "$path" ]]; then bash -n "$path"; fi
 done
 
@@ -130,6 +131,13 @@ fi
 if $full || $scripts; then
   step 'script tests'
   for test in scripts/test_*.py; do python3 -I "$test"; done
+fi
+# The room harness's own tests (bench/test) run against a mocked transport,
+# with the TypeScript SDK's esbuild; the real-node smoke stays
+# scripts/check-room-bench.py.
+if $full || $room_harness; then
+  if [ -d sdks/typescript/node_modules ]; then step 'room harness tests'; node --test bench/test/*.test.mjs
+  else skip 'the room harness tests (run npm ci in sdks/typescript)'; fi
 fi
 if $full || $sdk_ts || $sdk_py || $sdk_go || $sdk_c; then
   step 'SDK unit tests'

@@ -57,6 +57,12 @@ def main():
                 assert len(result['acknowledged_positions']) == counters['publish_ok']
                 assert result['ready_at_start'] == 16
                 assert counters['deliveries'] >= 24
+                # The application is handed each number once, HTTP recovery
+                # included; the SDK's discards of what a history page also
+                # carried are counted apart (discarded_catchup). A stalled
+                # reader catching up over HTTP is bench/test/room-catchup.
+                assert counters['repeats'] == 0, counters
+                assert counters['discarded_live'] == 0, counters
                 assert counters['reconnect_attempts'] > 0
                 assert counters['smoke_dropped_frames'] == 1
                 assert counters['gaps_recovered'] > 0
