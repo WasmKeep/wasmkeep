@@ -237,22 +237,67 @@ wait ended ([monitoring](monitoring.md)).
 
 ### What an idle cluster asks of the bucket
 
-With nothing to do, each node of a three-node cluster with one app sends
-the bucket, per heartbeat period (3 s by default), since 0.4.2
-([ADR 0009, 0011, 0014 and 0020](adr/0020-one-lease-per-node.md), amendments of 2026-11-14):
+With nothing to do, each process of a three-process cluster with one deployed
+app sends the following requests. This is the current code's model at the
+default heartbeat and deploy/secrets check periods (3 s), with no actors,
+alarms, operator intents, secrets, restore/recreate markers or optional idle
+expiry. Startup, retries, changed deploys and lease lapses are excluded.
 
-| What | Requests | Per node, at 3 s |
+| What | Requests | Per process, one app |
 | --- | --- | --- |
-| Its node lease | 1 PUT a period | 0.33 PUT/s |
-| The other nodes' heartbeats | 1 GET per node a period; a LIST of `nodes/` every ten periods (30 s), and at once when a node that just started says hello | 1.0 GET/s, 0.033 LIST/s |
-| The operator's intents (drains, moves, actor deletes) | 1 GET of `control/changed` a period; the three LISTs of the intents when it changed, or every minute | 0.33 GET/s, 0.05 LIST/s |
-| The alarm index | 1 LIST when an entry is due for the sweep, at most every 10 s and at least every minute | 0.017 LIST/s with no alarms |
-| The deployed version, its tombstone, and the secrets (`--app`) | 1 GET each a period | 1.0 GET/s |
+| Its node lease | 1 PUT a heartbeat period; no steady-state GET on a successful renewal | 0.333 PUT/s |
+| All node heartbeats, including its own | 1 GET per logical node a heartbeat period, including periods that LIST `nodes/`; 1 LIST every ten periods (30 s) | 1.000 GET/s, 0.033 LIST/s |
+| The operator's intents (drains, moves, actor deletes and restores) | 1 GET of `control/changed` a heartbeat period; four intent LISTs when it changes, or every minute | 0.333 GET/s, 0.067 LIST/s |
+| The alarm index | 1 LIST when an entry is due for the sweep, at most every 10 s and at least every minute; no GET with an empty index | 0.017 LIST/s with no alarms |
+| Deployed version pointer (`apps/<tenant>/<app>/current`) | 1 GET every deploy check; no manifest/component GET when unchanged | 0.333 GET/s |
+| App deletion tombstone (`deleted`) | 1 GET every deploy check | 0.333 GET/s |
+| App restore fence (`restoring`) | 1 GET every deploy check | 0.333 GET/s |
+| App recreation marker (`recreated`) | 1 GET every deploy check | 0.333 GET/s |
+| App restoration marker (`restored`) | 1 GET every deploy check | 0.333 GET/s |
+| Secrets pointer (`secrets/current`, unless `--no-secrets`) | 1 GET every secrets check | 0.333 GET/s |
+| File usage (`state/<tenant>/<app>/blob-usage`) | 1 GET per minute on every node, even without files | 0.017 GET/s |
+| File sweep records (`blob-sweeps/`), on the collecting node only | 1 LIST per minute, even with no records | +0.017 LIST/s on that node |
+| Hourly file epoch cleanup and usage count, on the collecting node only | With no files: 4 GETs (two fresh reads each of `recreated` and `restored`), 2 LISTs and 1 PUT | +0.0011 GET/s, +0.0006 LIST/s, +0.0003 PUT/s on that node; code-derived, outside the short measurement |
+| Readiness and the node file | Readiness uses local state; the node file is read locally at start | 0 bucket GET/s |
 | Idle expiry, on one node, for an app whose classes expire | 2 LISTs (`owners/`, `alarms/`) every 10 minutes | 0.003 LIST/s on that node |
 
-About 0.1 LIST/s per node, down from 1.43 (1.1 in 0.4.1, before the
-app's delete requests were listed too), so about 780,000 LISTs a month
-for the three nodes instead of 11 million. What got
+**Between hourly passes: 3.350 GET/s, 0.333 PUT/s and 0.117 LIST/s
+per process, plus 0.017 LIST/s on the collecting node.**
+The earlier 2.333 GET/s model omitted `restoring`, `recreated` and
+`restored`: together 1 GET/s. The intent table also omitted the fourth
+LIST, for actor restores, and file maintenance. The deletion, restore and
+recreation reads are safety checks (`AppRef::still_ours`), not redundant probes: they stop an
+old runtime from serving a deleted or replaced app. `app_check` repeats
+them at startup and after a lease lapse; that is outside steady state.
+The node's own heartbeat GET detects twins and supplies the live set;
+it must not be subtracted from the membership reads.
+
+With **A apps per process and N processes**, every app's membership loop
+reads all **N × A logical node objects**, including other apps, each
+heartbeat period. Thus at default periods the GET rate per process is
+**A × (N × A + 7) / 3 + A / 60**: heartbeats plus control, five deploy/safety reads,
+and secrets, plus the minute file-usage reads. For three processes and
+two apps this is **8.700 GET/s**, about a 2.6× increase, with 0.667 PUT/s
+and about 0.233 LIST/s, plus 0.017 LIST/s per app collected there. Hourly
+passes add the small collector-only costs above. The transport is
+shared but the membership observations belong to each app's independent
+lease/twin/fence checks. Caching these between loops would need a separate
+freshness proof; this accounting change does not alter those semantics.
+Old node objects left under `nodes/` also cost reads until forgotten.
+
+GET totals sum **all** `status` labels of
+`wasmkeep_bucket_requests_total{operation="get"}`. `status="not_found"`
+is a subset, not an additional operation. In this fixture it accounts for
+2.017 GET/s per app: control, four safety markers, the secrets pointer,
+and the minute file-usage read (until the hourly pass publishes usage).
+These are bucket-client calls; retries and paginated LISTs can produce more
+wire requests. The [loopback measurement](benchmarks.md#bucket-requests-at-rest)
+counts both and checks every GET key against this model.
+
+About 0.117 LIST/s per process, down from 1.43 (1.1 in 0.4.1, before the
+app's delete requests were listed too), so about 907,000 LISTs a month
+for the three processes, plus 43,200 on the collector and 1,440 hourly
+maintenance LISTs: about 952,000 in total instead of 11 million. What got
 slower: a drain, an undrain or a move requested by a CLI of 0.4.1 or
 before is read within a minute instead of 3 s (one from the 0.4.2 CLI
 still within 3 s); a node of 0.4.1 that starts is seen by 0.4.2 peers

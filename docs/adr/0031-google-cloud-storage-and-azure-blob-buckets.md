@@ -281,23 +281,22 @@ GCS and Azure, each blank until the real test fills it.
 
 ## Cost
 
-Rates at rest, per node at the default 3 s heartbeat, since 0.4.2
-(`docs/cluster.md`, "What an idle cluster asks of the bucket"): 0.33 PUT,
-about 0.1 LIST and 2.33 GET per second (1.0 heartbeats, 0.33
-`control/changed`, 1.0 deploy, tombstone and secrets). For three nodes and
-30 days that is about **2.59 million PUTs, 0.78 million LISTs and
-18.1 million GETs**. `docs/benchmarks.md`, "Bucket requests at rest",
-measured the 0.4.1 code at 0.334 PUT, 1.10 LIST and 1.33 GET per node
-(2.6 million, 8.6 million and 13 million a month). It is shown for
-comparison only; 0.4.2 is current.
+The corrected current model at rest, per process with one app and three
+processes at the default 3 s periods (`docs/cluster.md`, "What an idle
+cluster asks of the bucket"), is 0.333 PUT, 0.117 LIST and **3.350 GET/s**,
+plus 0.017 LIST/s on the collecting node and small hourly file-maintenance costs.
+The old 2.333 GET/s model omitted the `restoring`, `recreated` and `restored`
+safety reads (1 GET/s together); it also omitted the actor-restore intent
+LIST (one a minute), the minute file-usage GETs and collector maintenance.
+Including the empty hourly file passes, over 30 days the corrected totals
+are about **2.593 million PUTs, 0.952 million LISTs and 26.052 million GETs**.
 
-Measured since (2026-11-18, 0.6.0 build `14f7ea2`, three nodes, one app,
-ten minutes at rest; `docs/benchmarks.md`, "Bucket requests at rest",
-[`bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv`](../../bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv)):
-0.333 PUT, 0.12 to 0.13 LIST and **3.1 to 3.3 GET** per node and second.
-GETs run above the 2.33 modeled here, so the GET figures below are a
-floor: at the measured rate, about 25 million GETs a month for three
-nodes, not 18.1 million. The table below is not recomputed.
+The 0.6.0 ten-minute loopback measurement on `14f7ea2` reported
+3.1–3.3 GET/s. The source-attributed repeat and its raw key/status counts
+are in [Bucket requests at rest](../benchmarks.md#bucket-requests-at-rest).
+Not-found GETs are included when summing all status labels; do not add
+them again. The table below recomputes the request arithmetic using this
+corrected model and the original quoted prices, not a new price survey.
 
 | Monthly, three idle nodes | GCS Standard, single region [G13] | Azure Hot LRS, East US [A13] |
 | --- | --- | --- |
@@ -305,13 +304,13 @@ nodes, not 18.1 million. The table below is not recomputed.
 | How a LIST is billed | Class A (XML "GET Bucket when listing objects") | "List and Create Container", $0.05 per 10,000 [A14] |
 | How a GET is billed | Class B, $0.0004 per 1,000 | Read, $0.004 per 10,000 (a HEAD is "Other", same price [A14]) |
 | How a DELETE is billed | Free | Free on GPv2 [A14] |
-| **0.4.2 at rest** | 3.37 M × Class A = $16.84, 18.1 M × Class B = $7.25: **about $24** | PUT $12.95, LIST $3.89, GET $7.25: **about $24** |
+| **Corrected model, one app per process** | 3.545 M × Class A = $17.72, 26.052 M × Class B = $10.42: **about $28** | PUT $12.96, LIST $4.76, GET $10.42: **about $28** |
 | 0.4.1 at rest, for comparison | 11.2 M × Class A = $56, 13 M × Class B = $5.2: about $61 | PUT $13, LIST $43, GET $5.2: about $61 |
 
 - On both providers a LIST is billed like a PUT, so the 0.4.2 listing
   cadence matters as much there as on S3.
 - On GCS, dual-region and multi-region buckets bill Class A at $0.01 per
-  1,000 [G13], about $41 a month at rest.
+  1,000 [G13], about $46 a month at rest under the corrected model.
 - Azure prices come from Microsoft's Retail Prices API
   (`https://prices.azure.com/api/retail/prices`, filtered to service
   Storage, region `eastus`, SKU "Hot LRS", product "General Block Blob
