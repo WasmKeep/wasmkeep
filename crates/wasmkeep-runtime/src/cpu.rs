@@ -26,7 +26,9 @@ pub fn cpu_budget_exceeded_total() -> u64 {
 }
 
 /// CPU time the calling thread has used, from an arbitrary origin. Only
-/// readings taken on one thread are compared.
+/// readings taken on one thread are compared. On Linux in a VM, time the
+/// hypervisor steals may count as the thread's: the kernel leaves it out
+/// only when built with `CONFIG_PARAVIRT_TIME_ACCOUNTING`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn thread_cpu() -> Duration {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
@@ -52,23 +54,38 @@ fn thread_cpu() -> Duration {
 ///
 /// The budget is meant as CPU time, not wall time: on a loaded node the OS
 /// runs other threads in the middle of a guest's work, and that is not the
-/// guest's time. Reading the thread's CPU clock at every hook costs a
-/// syscall per host call (about +10% CPU on a small request), so:
+/// guest's time. Reading the thread's CPU clock is a syscall, and reading it
+/// at every hook makes a small request markedly slower, so the meter reads
+/// it only where the wall clock can be wrong:
 ///
 /// - A segment that follows an epoch check (the guest has been running for
 ///   a tick or more) is measured with the thread CPU clock: one reading per
 ///   tick, exact.
-/// - Any other segment is measured with the (cheap) wall clock, capped at
-///   two ticks. Without an epoch check in between, a guest cannot really
-///   run longer than about one tick, so the cap only removes preemption.
+/// - Until then, segments are measured with the (cheap) wall clock, capped
+///   at two ticks. Without an epoch check in between, a guest cannot really
+///   run longer than about one tick, so the cap bounds what preemption adds
+///   to one segment.
+/// - Once a wall-clock segment lasts longer than a quarter of a tick, the
+///   thread was likely preempted (or the guest computes in long stretches,
+///   where a reading is cheap next to the work): every later segment of the
+///   event reads the thread CPU clock at both ends. That segment often ends
+///   at an epoch check, since the epoch advanced while the thread was off its
+///   core. An event that makes many host calls on an oversubscribed core is
+///   then charged at most one capped segment beyond its CPU time, instead of
+///   up to two ticks per segment.
 #[derive(Debug)]
 struct Meter {
     used: Duration,
     running: Option<Segment>,
     /// The next segment follows an epoch check.
     precise_next: bool,
+    /// A wall-clock segment of this event ran long: measure every later one
+    /// with the thread CPU clock.
+    precise_rest: bool,
     /// Most a wall-clock segment is charged.
     cap: Duration,
+    /// A wall-clock segment longer than this sets `precise_rest`.
+    long: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +101,9 @@ impl Meter {
             used: Duration::ZERO,
             running: None,
             precise_next: false,
+            precise_rest: false,
             cap: tick.saturating_mul(2),
+            long: tick / 4,
         }
     }
 
@@ -93,12 +112,16 @@ impl Meter {
     }
 
     fn enter_guest(&mut self, wall: Instant, cpu: impl FnOnce() -> Duration) {
-        let cpu = std::mem::take(&mut self.precise_next).then(cpu);
+        let precise = std::mem::take(&mut self.precise_next) || self.precise_rest;
+        let cpu = precise.then(cpu);
         self.running = Some(Segment { wall, cpu });
     }
 
     fn leave_guest(&mut self, wall: Instant, cpu: impl FnOnce() -> Duration) {
         if let Some(segment) = self.running.take() {
+            if segment.cpu.is_none() && wall.saturating_duration_since(segment.wall) > self.long {
+                self.precise_rest = true;
+            }
             self.used += self.charge(segment, wall, cpu);
         }
     }
@@ -299,16 +322,52 @@ mod tests {
     fn a_segment_after_an_epoch_check_is_charged_its_cpu_time() {
         let t0 = Instant::now();
         let mut m = Meter::new(TICK);
+        let first = Duration::from_micros(200);
         m.enter_guest(t0, || unreachable!());
-        m.leave_guest(t0 + ms(1), || unreachable!()); // reached a check
+        m.leave_guest(t0 + first, || unreachable!()); // reached a check
         m.checked();
         // 40 ms of wall time, of which the thread ran 7 ms.
         m.enter_guest(t0 + ms(2), || ms(100));
         m.leave_guest(t0 + ms(42), || ms(107));
-        assert_eq!(m.total(t0 + ms(42), || unreachable!()), ms(8));
+        assert_eq!(m.total(t0 + ms(42), || unreachable!()), first + ms(7));
         // Back to the wall clock for the segment after a plain host call.
         m.enter_guest(t0 + ms(50), || unreachable!());
-        assert_eq!(m.total(t0 + ms(51), || unreachable!()), ms(9));
+        let short = Duration::from_micros(200);
+        assert_eq!(
+            m.total(t0 + ms(50) + short, || unreachable!()),
+            first + ms(7) + short
+        );
+    }
+
+    #[test]
+    fn short_segments_never_read_the_cpu_clock() {
+        // An unloaded event: many host calls, a little guest code each.
+        let t0 = Instant::now();
+        let mut m = Meter::new(TICK);
+        let step = Duration::from_micros(100);
+        for i in 0..1_000 {
+            let at = t0 + step * (2 * i);
+            m.enter_guest(at, || unreachable!("short segments use the wall clock"));
+            m.leave_guest(at + step, || {
+                unreachable!("short segments use the wall clock")
+            });
+        }
+        assert_eq!(m.total(t0, || unreachable!()), ms(100));
+    }
+
+    #[test]
+    fn a_long_segment_switches_the_rest_of_the_event_to_the_cpu_clock() {
+        let t0 = Instant::now();
+        let mut m = Meter::new(TICK);
+        m.enter_guest(t0, || unreachable!());
+        m.leave_guest(t0 + ms(30), || unreachable!()); // preempted: capped
+        // Every later segment, short or not, is read with the CPU clock.
+        m.enter_guest(t0 + ms(31), || ms(100));
+        m.leave_guest(t0 + ms(32), || ms(100) + Duration::from_micros(300));
+        assert_eq!(
+            m.total(t0 + ms(32), || unreachable!()),
+            ms(2) + Duration::from_micros(300)
+        );
     }
 
     #[test]
@@ -316,10 +375,113 @@ mod tests {
         let t0 = Instant::now();
         let mut m = Meter::new(TICK);
         m.checked();
+        m.enter_guest(t0, || ms(1));
+        m.leave_guest(t0 + ms(60), || ms(2)); // ran long
         m.reset();
         m.enter_guest(t0, || unreachable!("reset forgets the pending check"));
         m.leave_guest(t0 + ms(60), || unreachable!());
         assert_eq!(m.total(t0, || unreachable!()), ms(2));
+        // ... and, from here, that a segment ran long.
+        m.reset();
+        m.enter_guest(t0, || unreachable!("reset forgets the long segment"));
+        m.leave_guest(t0 + Duration::from_micros(100), || unreachable!());
+    }
+
+    /// One thread as the meter sees it: a wall clock and its CPU clock.
+    struct Thread {
+        wall: Instant,
+        cpu: Duration,
+    }
+
+    impl Thread {
+        fn new() -> Self {
+            Self {
+                wall: Instant::now(),
+                cpu: ms(1_000),
+            }
+        }
+
+        /// One stretch of guest code between two host calls: `wall` passes,
+        /// of which the thread is on a core for `cpu`.
+        fn segment(&mut self, m: &mut Meter, wall: Duration, cpu: Duration) {
+            let at = self.cpu;
+            m.enter_guest(self.wall, || at);
+            self.wall += wall;
+            self.cpu += cpu;
+            let at = self.cpu;
+            m.leave_guest(self.wall, || at);
+        }
+
+        /// A host call: time passes and the host thread does some work.
+        fn host(&mut self, wall: Duration, cpu: Duration) {
+            self.wall += wall;
+            self.cpu += cpu;
+        }
+    }
+
+    #[test]
+    fn preempted_short_segments_are_charged_their_cpu_time() {
+        // An event that makes many host calls with a little guest work in
+        // between, on an oversubscribed core: each stretch of guest code is
+        // preempted for 30 ms. The guest really runs 50 us per stretch.
+        let mut t = Thread::new();
+        let mut m = Meter::new(TICK);
+        for _ in 0..100 {
+            t.segment(&mut m, ms(30), Duration::from_micros(50));
+            t.host(Duration::from_micros(20), Duration::from_micros(20));
+        }
+        let used = m.total(t.wall, || unreachable!("no segment running"));
+        // 5 ms of guest CPU, plus at most one capped segment.
+        assert!(used <= ms(5) + 2 * TICK, "charged {used:?} for 5 ms");
+    }
+
+    #[test]
+    fn preempted_segments_that_end_at_an_epoch_check_are_charged_their_cpu_time() {
+        // The usual shape of preemption: the epoch advanced while the thread
+        // was off its core, so the guest's next check point fires the
+        // callback as soon as it runs again. The segment ends at an epoch
+        // check, the next one is measured precisely, then a host call.
+        let mut t = Thread::new();
+        let mut m = Meter::new(TICK);
+        for _ in 0..100 {
+            t.segment(&mut m, ms(30), Duration::from_micros(30));
+            m.checked();
+            t.segment(&mut m, Duration::from_micros(20), Duration::from_micros(20));
+            t.host(Duration::from_micros(20), Duration::from_micros(20));
+        }
+        let used = m.total(t.wall, || unreachable!("no segment running"));
+        // 5 ms of guest CPU, plus at most one capped segment.
+        assert!(used <= ms(5) + 2 * TICK, "charged {used:?} for 5 ms");
+    }
+
+    #[test]
+    fn many_short_busy_segments_add_up() {
+        // A guest that burns its budget in short stretches between host
+        // calls, without reaching an epoch check, is still charged in full,
+        // loaded or not.
+        for preempted in [Duration::ZERO, ms(5)] {
+            let mut t = Thread::new();
+            let mut m = Meter::new(TICK);
+            for i in 0..100 {
+                let wall = Duration::from_micros(900)
+                    + if i % 2 == 0 {
+                        preempted
+                    } else {
+                        Duration::ZERO
+                    };
+                t.segment(&mut m, wall, Duration::from_micros(900));
+                t.host(Duration::from_micros(10), Duration::from_micros(10));
+            }
+            let used = m.total(t.wall, || unreachable!("no segment running"));
+            assert!(
+                used >= ms(90),
+                "charged {used:?} for 90 ms (preempted {preempted:?})"
+            );
+            assert!(
+                used <= ms(92),
+                "charged {used:?} for 90 ms (preempted {preempted:?})"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,19 @@ The text under a version's heading is its GitHub release text
 - **Wasmtime 50.0.3**, which fixes RUSTSEC-2026-0587: a WASI filesystem
   sandbox escape on Windows through a drive-prefixed path. WasmKeep ships
   no Windows build; the patch release of the pinned version is taken anyway.
+- **The CPU budget no longer charges a guest for other threads' time.**
+  A short stretch of guest code between two host calls was timed with the
+  wall clock, capped at two epoch ticks (2 ms). An event that makes many
+  host calls, such as a batch of fetches, runs as many such stretches, and
+  on an oversubscribed core each one the OS preempted was charged up to
+  2 ms of other threads' time: an event that used a few milliseconds of
+  CPU could be charged past its budget and answer 500 as a CPU-budget
+  trap. Once one of an event's wall-clock stretches runs longer than a
+  quarter of a tick, the rest of the event is now measured with the
+  thread CPU clock, so it is charged at most one capped stretch beyond
+  its CPU time. An unloaded event with short stretches still reads only
+  the wall clock. A guest that burns CPU still traps at its budget, and a
+  tight loop is still interrupted at the next epoch tick.
 
 - **The room renders the browser's history page.** A front answering
   `GET /history` decoded the room's binary page into objects and encoded
