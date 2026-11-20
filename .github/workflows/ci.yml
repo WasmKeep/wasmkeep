@@ -468,6 +468,27 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The tests build their Rust guests with cargo at run time, each
+          # guest a Cargo workspace of its own with its own target directory.
+          # Listing only the root cached none of them, so every run rebuilt
+          # their dependencies cold (a Rust room took 50-60 s on the runner,
+          # against a few seconds with a warm directory), and tests sharing
+          # a guest waited on cargo's lock for it. The root stays first.
+          workspaces: |
+            .
+            examples/counter
+            examples/chat-room
+            examples/jobs/kv
+            examples/jobs/queue
+            examples/jobs/app
+            examples/workflows/orders
+            examples/workflows/ledger
+            examples/workflows/app
+            examples/db/database
+            examples/db/app
+            examples/todo-front/todos
+            examples/todo-front/front
+            crates/wasmkeep-server/tests/guests/test-actor
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
