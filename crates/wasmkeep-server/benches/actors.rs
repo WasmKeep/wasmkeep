@@ -62,12 +62,17 @@ impl Client {
 
 fn benches(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     let _entered = rt.enter();
     let wasm = guests::build_guest("../../examples/counter", "counter");
-    let runtime = Runtime::new(&RuntimeConfig::default()).unwrap();
+    let runtime = Runtime::new(&RuntimeConfig {
+        measure_fuel: std::env::var_os("WASMKEEP_BENCH_FUEL").is_some(),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
     let component = runtime.compile(&wasm).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut config = ActorConfig::new(data.path());
@@ -136,6 +141,15 @@ fn benches(c: &mut Criterion) {
     });
 
     group.finish();
+    if std::env::var_os("WASMKEEP_BENCH_REPORT_EVENT_TIME").is_some() {
+        for line in wasmkeep_server::metrics::render(Default::default()).lines() {
+            if line.starts_with("wasmkeep_event_duration_seconds_sum{")
+                || line.starts_with("wasmkeep_event_duration_seconds_count{")
+            {
+                eprintln!("{line}");
+            }
+        }
+    }
 }
 
 criterion_group!(actors, benches);

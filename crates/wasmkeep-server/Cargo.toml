@@ -38,7 +38,7 @@ rcgen.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 # block_in_place for a batched capture off an instance (ADR 0034); no new crate.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing.workspace = true
 thiserror.workspace = true
 # The index of an actor's files on a node without a bucket (ADR 0030, section 2); already in the tree through wasmkeep-storage.

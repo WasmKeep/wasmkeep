@@ -10,6 +10,8 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService};
+#[path = "support/fuel.rs"]
+mod fuel;
 #[path = "support/guests.rs"]
 mod guests;
 async fn request(addr: SocketAddr, path: &str) -> String {
@@ -307,7 +309,10 @@ async fn fanout_budget(engine: &str) {
         );
         std::fs::read(output).unwrap()
     };
-    let runtime_config = RuntimeConfig::default();
+    let runtime_config = RuntimeConfig {
+        measure_fuel: true,
+        ..RuntimeConfig::default()
+    };
     assert_eq!(runtime_config.cpu_budget, Duration::from_millis(50));
     let runtime = Runtime::new(&runtime_config).unwrap();
     let component = guests::compile(&runtime, &wasm);
@@ -353,6 +358,11 @@ async fn fanout_budget(engine: &str) {
     drop(sockets);
     let _ = stop.send(());
     server.await.unwrap().unwrap();
+    fuel::assert_ceiling(match engine {
+        "rust" => 10_000_000,
+        "quickjs" => 250_000_000,
+        _ => 500_000_000,
+    });
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]

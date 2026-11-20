@@ -112,14 +112,67 @@ impl Counts {
     }
 
     fn render(&self, out: &mut String, name: &str) {
+        self.render_labels(out, name, "");
+    }
+
+    fn render_labels(&self, out: &mut String, name: &str, labels: &str) {
+        let sep = if labels.is_empty() { "" } else { "," };
         for (bound, bucket) in self.bounds.iter().zip(&self.buckets) {
             let n = bucket.load(Ordering::Relaxed);
-            let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {n}");
+            let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{bound}\"}} {n}");
         }
         let count = self.count.load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
-        let _ = writeln!(out, "{name}_sum {}", self.sum.load(Ordering::Relaxed));
-        let _ = writeln!(out, "{name}_count {count}");
+        let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"+Inf\"}} {count}");
+        let labels = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("{{{labels}}}")
+        };
+        let _ = writeln!(
+            out,
+            "{name}_sum{labels} {}",
+            self.sum.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "{name}_count{labels} {count}");
+    }
+}
+
+/// Fuel units per guest event.
+#[derive(Debug)]
+pub(crate) struct EventFuel(Counts);
+impl Default for EventFuel {
+    fn default() -> Self {
+        Self(Counts::new(&[
+            10_000,
+            100_000,
+            1_000_000,
+            5_000_000,
+            10_000_000,
+            25_000_000,
+            50_000_000,
+            100_000_000,
+            250_000_000,
+            500_000_000,
+            1_000_000_000,
+            10_000_000_000,
+        ]))
+    }
+}
+
+pub(crate) fn record_event_fuel(app: &str, class: &str, kind: &str, fuel: u64) {
+    METRICS
+        .event_fuel
+        .get_in(app, &[("class", class), ("kind", event_kind(kind))])
+        .0
+        .observe(fuel);
+}
+
+fn event_kind(kind: &str) -> &str {
+    match kind {
+        "request" => "fetch",
+        "alarm" => "alarm",
+        "websocket" => "websocket",
+        _ => "other",
     }
 }
 
@@ -292,6 +345,7 @@ pub(crate) struct Metrics {
     /// How long guest events ran, by class and duration kind (fetch,
     /// alarm, websocket, other), with tenant and app.
     pub(crate) event_seconds: Family<Histogram>,
+    pub(crate) event_fuel: Family<EventFuel>,
     /// Accepted guest-event jobs waiting for their mailbox turn, by class.
     pub(crate) mailbox_wait_seconds: Family<Histogram>,
     pub(crate) mailbox_host_work_seconds: Family<Histogram>,
@@ -675,12 +729,7 @@ pub(crate) fn record_event(
         app,
         &[("class", class), ("kind", kind), ("outcome", outcome)],
     ));
-    let duration_kind = match kind {
-        "request" => "fetch",
-        "alarm" => "alarm",
-        "websocket" => "websocket",
-        _ => "other",
-    };
+    let duration_kind = event_kind(kind);
     METRICS
         .event_seconds
         .get_in(app, &[("class", class), ("kind", duration_kind)])
@@ -1136,6 +1185,14 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "histogram",
         "How long guest events ran, by tenant, app, class and kind (fetch, alarm, websocket, other).",
     );
+    head(
+        &mut out,
+        "wasmkeep_event_fuel",
+        "histogram",
+        "Wasmtime fuel units consumed per guest event; excludes host work.",
+    );
+    m.event_fuel
+        .each(|labels, h| h.0.render_labels(&mut out, "wasmkeep_event_fuel", labels));
     m.event_seconds.each(|labels, h| {
         h.render(&mut out, "wasmkeep_event_duration_seconds", labels);
     });
@@ -2537,5 +2594,27 @@ mod tests {
                 "NOT_READY_REASONS lists {reason:?}, which no code gives"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fuel_tests {
+    use super::*;
+
+    #[test]
+    fn fuel_histograms_preserve_app_class_and_kind() {
+        let m = Metrics::default();
+        for (app, kind, value) in [("one", "request", 100_000), ("two", "alarm", 2_000_000)] {
+            let labels = app_labels("tenant", app);
+            m.event_fuel
+                .get_in(&labels, &[("class", "room"), ("kind", event_kind(kind))])
+                .0
+                .observe(value);
+        }
+        let page = render_with(&m, Gauges::default(), &[]);
+        assert!(page.contains("# TYPE wasmkeep_event_fuel histogram"));
+        assert!(page.contains("wasmkeep_event_fuel_bucket{tenant=\"tenant\",app=\"one\",class=\"room\",kind=\"fetch\",le=\"100000\"} 1"));
+        assert!(page.contains("wasmkeep_event_fuel_sum{tenant=\"tenant\",app=\"two\",class=\"room\",kind=\"alarm\"} 2000000"));
+        assert!(page.contains("wasmkeep_event_fuel_count{tenant=\"tenant\",app=\"two\",class=\"room\",kind=\"alarm\"} 1"));
     }
 }

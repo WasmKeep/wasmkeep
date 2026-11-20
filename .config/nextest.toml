@@ -17,10 +17,9 @@ path = "junit.xml"
 # timings; run too many at once on a loaded machine, they miss those timings
 # (the flaky multi-node tests seen so far all come from them).
 cluster = { max-threads = 8 }
-# The big-room tests at the default CPU budget push a whole room window
-# through a TypeScript front and room at 50 ms per event. Four at once on a
-# four-core runner starve each other's events past that budget (the front
-# traps and answers 500) and past the two-minute limit: one at a time.
+# The default-budget room/window and fanout tests retain the real 50 ms
+# CPU budget alongside their fuel ceilings. Serialize them to avoid
+# competing with one another; fuel does not remove CPU-budget sensitivity.
 big-room = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -28,7 +27,7 @@ filter = 'binary(cluster) | binary(cluster_over_tls) | binary(revocation) | bina
 test-group = 'cluster'
 
 [[profile.default.overrides]]
-filter = 'binary(big_room) & test(/_at_default_budget/)'
+filter = '(binary(big_room) | binary(room_edge)) & test(/default_budget/)'
 test-group = 'big-room'
 slow-timeout = { period = "60s", terminate-after = 4 }
 

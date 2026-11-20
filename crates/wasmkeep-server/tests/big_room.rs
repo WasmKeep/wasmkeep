@@ -8,6 +8,8 @@ use tokio::{
 };
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService, App, HttpComponent};
+#[path = "support/fuel.rs"]
+mod fuel;
 #[path = "support/guests.rs"]
 #[allow(dead_code)]
 mod guests;
@@ -190,6 +192,7 @@ async fn node_with(
     }
     let config = RuntimeConfig {
         max_instances: 512,
+        measure_fuel: true,
         ..RuntimeConfig::default()
     };
     assert_eq!(config.cpu_budget, Duration::from_millis(50));
@@ -455,6 +458,7 @@ async fn heavy(suffix: &str) {
     );
     let _ = stop.send(());
     server.await.unwrap().unwrap();
+    fuel::assert_ceiling(500_000_000);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]
@@ -506,6 +510,7 @@ async fn distinct_positions(suffix: &str) {
     assert_eq!(publish(addr, "after", "x").await.unwrap(), (2, 2002));
     let _ = stop.send(());
     server.await.unwrap().unwrap();
+    fuel::assert_ceiling(500_000_000);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "speed-sensitive: the default 50 ms budget per event on a slow CI runner measures the runner; scripts/check.sh --full runs it"]

@@ -411,3 +411,47 @@ fn block_on_slowly<F: std::future::Future>(
         }
     }
 }
+
+#[tokio::test]
+async fn fuel_is_repeatable_resets_and_preserves_cpu_traps() {
+    for enabled in [false, true] {
+        let runtime = Runtime::new(&RuntimeConfig {
+            measure_fuel: enabled,
+            max_instances: 8,
+            cpu_budget: Duration::from_millis(20),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let component = runtime.compile(&wat::parse_str(WORK_WAT).unwrap()).unwrap();
+        let linker = Linker::<()>::new(runtime.engine());
+        let pre = runtime.instantiate_pre(&linker, &component).unwrap();
+        let (mut store, meter) = runtime.new_metered_async_store(());
+        let instance = pre.instantiate_async(&mut store).await.unwrap();
+        let work = instance
+            .get_typed_func::<(i64,), ()>(&mut store, "work")
+            .unwrap();
+        let mut observations = Vec::new();
+        for _ in 0..3 {
+            meter.reset_event(&mut store);
+            work.call_async(&mut store, (1000,)).await.unwrap();
+            observations.push(meter.fuel_used(&store));
+        }
+        assert!(observations.windows(2).all(|w| w[0] == w[1]));
+        if enabled {
+            assert!(observations[0].unwrap() > 1000);
+        } else {
+            assert_eq!(observations[0], None);
+        }
+        meter.reset_event(&mut store);
+        let error = work.call_async(&mut store, (i64::MAX,)).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<CpuBudgetExceeded>().is_some(),
+            "{error:?}"
+        );
+        if enabled {
+            // Wasmtime may keep fuel in a register until a normal return.
+            // A trapped call reports only the fuel flushed before the trap.
+            assert!(meter.fuel_used(&store).is_some());
+        }
+    }
+}

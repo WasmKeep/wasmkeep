@@ -136,3 +136,23 @@ fn pool_limit_caps_live_instances() {
     stores.pop();
     pre.instantiate(&mut third).unwrap();
 }
+
+#[test]
+fn fuel_instrumentation_has_a_distinct_component_cache_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let wasm = answer_wasm();
+    let mut keys = Vec::new();
+    for measure_fuel in [false, true] {
+        let runtime = Runtime::new(&RuntimeConfig {
+            max_instances: 2,
+            measure_fuel,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let cache = ComponentCache::new(runtime.clone(), dir.path()).unwrap();
+        keys.push(cache.key(&wasm));
+        let component = cache.get_or_compile(&wasm).unwrap();
+        assert_eq!(call_run(&runtime, &component), 42);
+    }
+    assert_ne!(keys[0], keys[1]);
+}
