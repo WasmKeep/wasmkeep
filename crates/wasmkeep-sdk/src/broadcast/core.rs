@@ -1,11 +1,11 @@
 use super::*;
 use crate::{Value, storage};
 /// Storage seam used by the host adapter and crash tests. Durable execution
-/// must not return success until uploaded. An alarm is an absolute millisecond.
+/// must not return success until uploaded. The room sets no alarm (ADR 0040,
+/// section 13): its pusher clocks the rounds.
 pub trait Store {
     fn exec(&mut self, sql: &str, params: &[Value], durable: bool) -> Result<(), String>;
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String>;
-    fn alarm(&mut self, at: u64) -> Result<(), String>;
     fn flush(&mut self) -> Result<(), String>;
 }
 #[derive(Debug)]
@@ -25,21 +25,41 @@ impl Store for Host {
             .map(|r| r.values)
             .map_err(|e| e.to_string())
     }
-    fn alarm(&mut self, at: u64) -> Result<(), String> {
-        crate::alarms::set_alarm(at);
-        Ok(())
-    }
     fn flush(&mut self) -> Result<(), String> {
         storage::flush().map_err(|e| e.to_string())
     }
 }
-/// R2 sequencer. `before_push` is the confirmation barrier for R3's round;
-/// publishing never calls a child. Join/poke and scale operations belong to R4.
+/// What a pull carries (ADR 0040, section 13): the push header a child at
+/// the pulled position needs, then the messages after it, each with the
+/// base of its own epoch.
+#[derive(Clone, Debug)]
+pub struct Pull {
+    pub e: u64,
+    pub base: u64,
+    pub first: u64,
+    pub head: u64,
+    pub recover: bool,
+    pub messages: Vec<(Message, u64)>,
+}
+/// Rows one pull carries at most, and the bodies and ids they total at most
+/// (the old round's slice: one push takes 512 messages and 512 KiB).
+const PULL_ROWS: usize = 513;
+const PULL_BYTES: usize = 512 * 1024;
+/// What reading one row costs a pull's budget besides its bytes.
+pub(super) const ROW_COST: usize = 1024;
+/// A busy flag older than this without a pull counts as idle: longer than
+/// an event's wall (30 s by default), so a round held by a slow edge keeps
+/// its pusher busy, and a pusher that lost its alarm is woken again.
+pub const IDLE_EXPIRY: u64 = 60_000;
+/// The sequencer: numbers, epochs, the window, history and the pusher's pull.
+/// Publishing never calls anyone and sets no alarm.
 #[derive(Debug)]
 pub struct Core<S: Store = Host> {
     db: S,
     epoch: Option<Epoch>,
-    pending: bool,
+    /// The pusher said it went idle at the head; a cold room assumes so.
+    idle: bool,
+    pulled: Option<u64>,
     pub(super) confirm: bool,
 }
 impl<S: Store> Core<S> {
@@ -47,7 +67,8 @@ impl<S: Store> Core<S> {
         Self {
             db,
             epoch: None,
-            pending: false,
+            idle: true,
+            pulled: None,
             confirm,
         }
     }
@@ -86,34 +107,6 @@ impl<S: Store> Core<S> {
     /// The highest number in the window, if any.
     pub(super) fn last(&self) -> Result<Option<u64>, String> {
         Ok(self.end(true)?.map(|p| p.n))
-    }
-    /// Up to `count` rows from number `from` on, at most one page past
-    /// `bytes` of bodies: what one push needs, never the whole window.
-    pub(super) fn rows(
-        &self,
-        mut from: u64,
-        count: usize,
-        bytes: usize,
-    ) -> Result<Vec<Message>, String> {
-        let mut out = Vec::new();
-        let mut seen = 0;
-        while out.len() < count && seen <= bytes {
-            let page = PAGE.min(count - out.len());
-            let rows = self.db.query(
-                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
-                &[int(from)?, int(page as u64)?],
-            )?;
-            for r in &rows {
-                let m = row(r)?;
-                seen += m.body.len();
-                from = m.position.n.saturating_add(1);
-                out.push(m);
-            }
-            if rows.len() < page {
-                break;
-            }
-        }
-        Ok(out)
     }
     pub(super) fn epochs(&self) -> Result<Vec<Epoch>, String> {
         self.db
@@ -215,28 +208,97 @@ impl<S: Store> Core<S> {
             let _ = self.db.exec("ROLLBACK", &[], false);
         }
         result?;
-        if !self.pending {
-            self.db.alarm(now.saturating_add(20))?;
-            self.pending = true;
-        }
         Ok(positions)
     }
-    /// Flush before every push, even a header-only round. False means no push
-    /// is permitted; the retry alarm has been set for 50ms later.
-    pub fn before_push(&mut self, now: u64) -> Result<bool, String> {
-        self.wake()?;
-        if self.confirm
-            && let Err(e) = self.db.flush()
-        {
-            if e.contains("not durable: still uploading") {
-                self.db.alarm(now.saturating_add(50))?;
-                self.pending = true;
-                return Ok(false);
-            }
-            return Err(e);
+    /// Whether a publish should ask its front to poke the pusher.
+    pub fn poke(&self, now: u64) -> bool {
+        self.idle
+            || self
+                .pulled
+                .is_none_or(|at| now.saturating_sub(at) > IDLE_EXPIRY)
+    }
+    /// The pusher's read (section 13): the header a child at `after` needs
+    /// and the messages after it, at most `budget` bytes charged one
+    /// `ROW_COST` per row (at least one row unless `budget` is 0), 513 rows
+    /// and 512 KiB of bodies and ids. With `confirm`, it flushes first and
+    /// fails with `not durable: still uploading` until the upload is in.
+    /// `idle` with `budget` 0 and no position, or the head, records that the
+    /// pusher stopped clocking itself; any other pull clears it.
+    pub fn pull(
+        &mut self,
+        after: Option<Position>,
+        budget: usize,
+        idle: bool,
+        now: u64,
+    ) -> Result<Pull, String> {
+        if budget > 1024 * 1024 {
+            return Err("invalid pull budget".into());
         }
-        self.pending = false;
-        Ok(true)
+        let epoch = self.wake()?;
+        if self.confirm {
+            self.db.flush()?;
+        }
+        let epochs = self.epochs()?;
+        let head = self.last()?.unwrap_or(epoch.base);
+        if let Some(p) = after
+            && (p.e == 0 || p.e > epoch.e || (p.e == epoch.e && p.n > head))
+        {
+            return Err("invalid position".into());
+        }
+        self.pulled = Some(now);
+        self.idle = idle && budget == 0 && after.is_none_or(|p| p.e == epoch.e && p.n == head);
+        let later = || {
+            epochs
+                .iter()
+                .filter(move |e| after.is_some_and(|p| e.e > p.e))
+        };
+        let base = later().fold(epoch.base, |b, e| b.min(e.base));
+        let mut pull = Pull {
+            e: epoch.e,
+            base,
+            first: head.saturating_add(1),
+            head,
+            recover: false,
+            messages: vec![],
+        };
+        // A position above a later epoch's base starts at that base: the numbers above it are void.
+        let from = after.map_or(head, |p| later().fold(p.n, |n, e| n.min(e.base)));
+        if budget == 0 || from >= head {
+            return Ok(pull);
+        }
+        let rows = (budget / ROW_COST).clamp(1, PULL_ROWS);
+        let (mut next, mut bytes) = (from.saturating_add(1), 0);
+        while pull.messages.len() < rows {
+            let want = PAGE.min(rows - pull.messages.len());
+            let page = self.db.query(
+                "SELECT n,e,at,id,body FROM wasmkeep_room_history WHERE n >= ?1 ORDER BY n LIMIT ?2",
+                &[int(next)?, int(want as u64)?],
+            )?;
+            for r in &page {
+                let m = row(r)?;
+                let size = m.body.len() + m.id.as_ref().map_or(0, String::len);
+                if !pull.messages.is_empty() && bytes + size > PULL_BYTES {
+                    return Ok(pull);
+                }
+                let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
+                    // Its epoch's base left the 64 kept: HTTP history answers it.
+                    pull.recover = true;
+                    pull.first = head.saturating_add(1);
+                    pull.messages.clear();
+                    return Ok(pull);
+                };
+                if pull.messages.is_empty() {
+                    pull.first = m.position.n;
+                }
+                bytes += size;
+                next = m.position.n.saturating_add(1);
+                pull.messages.push((m, boundary.base));
+            }
+            if page.len() < want {
+                break;
+            }
+        }
+        Ok(pull)
     }
     pub fn history(
         &mut self,

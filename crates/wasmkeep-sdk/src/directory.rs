@@ -414,6 +414,13 @@ impl Client {
         let (op, body) = encode_change(change);
         decode_map(&self.call(op, body)?).ok_or_else(invalid)
     }
+    /// The owner hands the map to `owner`; repeated, it changes nothing.
+    pub fn transfer(&self, owner: &str) -> Result<(), Error> {
+        let mut w = Writer::default();
+        w.bytes(owner.as_bytes());
+        self.call("transfer", w.finish())?;
+        Ok(())
+    }
     pub fn delete(&self, expect: u64) -> Result<(), Error> {
         let mut w = Writer::default();
         w.u64(expect);
@@ -614,6 +621,27 @@ pub mod handler {
                         save(Some(&before), &after)?;
                     }
                     after.last_result.ok_or_else(invalid)
+                })
+            }
+            "transfer" => {
+                // The owner names its successor (ADR 0040, section 13); the
+                // map's version is unchanged. Repeated: already done.
+                let owner = text(&mut r)?;
+                if !r.is_empty() {
+                    return Err(invalid());
+                }
+                transaction(|| {
+                    let state = load()?;
+                    if state.owner != owner {
+                        if state.owner != caller {
+                            return Err(Error::Forbidden);
+                        }
+                        storage::exec(
+                            "UPDATE wasmkeep_directory_map SET owner=?1 WHERE id=1",
+                            &params![owner.clone()],
+                        )?;
+                    }
+                    Ok(vec![])
                 })
             }
             "entries" => {

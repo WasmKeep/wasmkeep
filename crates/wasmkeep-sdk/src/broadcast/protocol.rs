@@ -1,6 +1,7 @@
 use super::*;
 use crate::wire::{self, Reader, Writer};
 const PREFIX: &str = "/wasmkeep-room/v1/";
+const POKE: &str = "/wasmkeep-pusher/v1/poke";
 fn bad() -> String {
     "invalid room protocol".into()
 }
@@ -36,16 +37,143 @@ fn optional(r: &mut Reader<'_>) -> Result<bool, String> {
         _ => Err(bad()),
     }
 }
+/// `adopt` (section 13): a 0.6.0 room's scale rows, read, handed over and
+/// retired at its pusher's request. The only time a room calls anyone.
+#[cfg(feature = "actor")]
+fn adopt(r: &mut Reader<'_>, w: &mut Writer, pusher: &str) -> Result<(), String> {
+    let legacy = |sql: &str| -> Option<Vec<u8>> {
+        let rows = crate::storage::query(sql, &[]).ok()?;
+        match rows.values.first()?.first()? {
+            crate::Value::Blob(b) => Some(b.clone()),
+            crate::Value::Text(s) => Some(s.clone().into_bytes()),
+            _ => None,
+        }
+    };
+    match count(r, 2)? {
+        0 => {
+            end(r)?;
+            let data = legacy("SELECT data FROM wasmkeep_room_scale LIMIT 1");
+            let op = data
+                .as_ref()
+                .and_then(|_| legacy("SELECT args FROM wasmkeep_room_ops LIMIT 1"));
+            for v in [data, op] {
+                w.u64(u64::from(v.is_some()));
+                if let Some(v) = v {
+                    w.bytes(&v);
+                }
+            }
+            Ok(())
+        }
+        2 => {
+            end(r)?;
+            let sql = |s: &str, durable: bool| {
+                if durable {
+                    crate::storage::exec_durable(s, &[])
+                } else {
+                    crate::storage::exec(s, &[])
+                }
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            };
+            sql("BEGIN", false)?;
+            let result = sql("DROP TABLE IF EXISTS wasmkeep_room_ops", false)
+                .and_then(|_| sql("DROP TABLE IF EXISTS wasmkeep_room_scale", false))
+                .and_then(|_| sql("COMMIT", true));
+            if result.is_err() {
+                let _ = sql("ROLLBACK", false);
+            }
+            result
+        }
+        _ => {
+            let directory = text(r)?;
+            let n = count(r, 16)?;
+            let edges = (0..n).map(|_| text(r)).collect::<Result<Vec<_>, _>>()?;
+            end(r)?;
+            // This room is the controller the map and the edges still accept.
+            if !directory.is_empty() {
+                let mut t = Writer::default();
+                t.bytes(pusher.as_bytes());
+                let reply = wire::call(
+                    &directory,
+                    "POST",
+                    "/wasmkeep-directory/v1/transfer".into(),
+                    vec![],
+                    t.finish(),
+                )?;
+                if reply.status != 200 && reply.status != 404 {
+                    return Err(format!("directory transfer answered {}", reply.status));
+                }
+            }
+            let mut body = "{\"room\":".to_owned();
+            crate::json::write_str(&mut body, pusher);
+            body.push('}');
+            let requests: Vec<_> = edges
+                .into_iter()
+                .map(|e| {
+                    (
+                        e,
+                        crate::actors::Request {
+                            method: "POST".into(),
+                            path: "/wasmkeep-edge/v1/handover".into(),
+                            headers: vec![],
+                            body: body.clone().into_bytes(),
+                        },
+                    )
+                })
+                .collect();
+            if crate::calls::call_many(&requests)
+                .into_iter()
+                .any(|r| r.map_or(true, |r| r.status != 200))
+            {
+                return Err("edge handover failed".into());
+            }
+            Ok(())
+        }
+    }
+}
+/// The room's operations, as its handler serves them. `pull` and `adopt`
+/// answer the room's pusher only.
 #[cfg(feature = "actor")]
 pub(super) fn serve<S: Store>(
     core: &mut Core<S>,
     op: &str,
     body: &[u8],
     now: u64,
+    caller: &str,
+    pusher: &str,
 ) -> Result<Vec<u8>, String> {
     let mut r = Reader::new(body);
     let mut w = Writer::default();
+    if matches!(op, "pull" | "adopt") && caller != pusher {
+        return Err("forbidden: the room's pusher only".into());
+    }
     match op {
+        "pull" => {
+            let after = if optional(&mut r)? {
+                Some(position(&mut r)?)
+            } else {
+                None
+            };
+            let budget = count(&mut r, 1024 * 1024)?;
+            let idle = optional(&mut r)?;
+            end(&r)?;
+            let p = core.pull(after, budget, idle, now)?;
+            w.u64(p.e)
+                .u64(p.base)
+                .u64(p.first)
+                .u64(p.head)
+                .u64(u64::from(p.recover))
+                .u64(p.messages.len() as u64);
+            for (m, base) in p.messages {
+                put(&mut w, m.position);
+                w.u64(base).u64(m.at).u64(u64::from(m.id.is_some()));
+                if let Some(id) = m.id {
+                    w.bytes(id.as_bytes());
+                }
+                w.bytes(m.body.as_bytes());
+            }
+        }
+        "adopt" => adopt(&mut r, &mut w, pusher)?,
         "publish" => {
             let len = count(&mut r, 64)?;
             let mut messages = Vec::new();
@@ -66,6 +194,8 @@ pub(super) fn serve<S: Store>(
             for p in result {
                 put(&mut w, p);
             }
+            // Section 13: ask the front to poke the pusher only when it went idle.
+            w.u64(u64::from(core.poke(now)));
         }
         "history" => {
             let after = if optional(&mut r)? {
@@ -115,17 +245,33 @@ fn encode_client(s: &str) -> String {
     }
     out
 }
+/// The pusher of a room address: `room/lobby` has `pusher/lobby` (the class
+/// swapped, the name kept). Use [`Client::with_pusher`] for another layout.
+pub fn pusher_of(room: &str) -> String {
+    format!(
+        "pusher/{}",
+        room.split_once('/').map_or(room, |(_, name)| name)
+    )
+}
 /// Front-side helper: publish and gap requests go over HTTP to the front,
 /// which authorizes them and calls this client. Never call it from an edge.
 #[derive(Debug)]
 pub struct Client {
     address: String,
+    pusher: String,
 }
 impl Client {
     pub fn new(address: impl Into<String>) -> Self {
+        let address = address.into();
         Self {
-            address: address.into(),
+            pusher: pusher_of(&address),
+            address,
         }
+    }
+    /// The pusher to poke, when it is not [`pusher_of`] the room.
+    pub fn with_pusher(mut self, pusher: impl Into<String>) -> Self {
+        self.pusher = pusher.into();
+        self
     }
     fn call(&self, op: &str, body: Vec<u8>) -> Result<Vec<u8>, String> {
         let r = wire::call(&self.address, "POST", format!("{PREFIX}{op}"), vec![], body)?;
@@ -134,8 +280,9 @@ impl Client {
         }
         Ok(r.body)
     }
-    /// Authorize the client first. Directory lookup and the alarm-only poke
-    /// share one batch; a cold directory is retried once after that batch.
+    /// Authorize the client first. Directory lookup and the pusher's
+    /// alarm-only poke share one batch; a cold directory is retried once
+    /// after that batch.
     pub fn join(
         &self,
         directory: &str,
@@ -153,13 +300,14 @@ impl Client {
         };
         let poke = crate::actors::Request {
             method: "POST".into(),
-            path: format!("{PREFIX}poke"),
+            path: POKE.into(),
             headers: vec![],
             body: vec![],
         };
+        // The poke goes to the pusher (section 13), which creates the group.
         let results = crate::calls::call_many(&[
             (directory.into(), lookup.clone()),
-            (self.address.clone(), poke),
+            (self.pusher.clone(), poke),
         ]);
         let mut reply = results
             .into_iter()
@@ -208,7 +356,16 @@ impl Client {
         let result = (0..len)
             .map(|_| position(&mut r))
             .collect::<Result<_, _>>()?;
+        // A 0.6.0 room answers no poke field.
+        let poke = !r.is_empty() && optional(&mut r)?;
         end(&r)?;
+        // ADR 0040, section 13: the pusher went idle and asks for a poke. A
+        // failed poke is ignored: the room keeps asking until the pusher pulls.
+        if poke {
+            let mut w = Writer::default();
+            w.u64(1);
+            let _ = wire::call(&self.pusher, "POST", POKE.into(), vec![], w.finish());
+        }
         Ok(result)
     }
     pub fn history(
@@ -270,9 +427,13 @@ impl Client {
 #[cfg(feature = "actor")]
 mod actor {
     use super::*;
-    thread_local! {static LAST_ROUND:std::cell::Cell<Option<u64>>=const {std::cell::Cell::new(None)};static CORE:std::cell::RefCell<Core> = std::cell::RefCell::new(Core::new(Host,false));}
+    thread_local! {
+        static CORE: std::cell::RefCell<Core> = std::cell::RefCell::new(Core::new(Host, false));
+        static PUSHER_CLASS: std::cell::RefCell<String> = std::cell::RefCell::new("pusher".into());
+    }
     /// Default room class (`confirm = false`). For confirmation, delegate your
-    /// lifecycle to `handler::init(true)` and `handler::before_push`.
+    /// lifecycle to `handler::init(true)`. Its pusher is `pusher/<name>`
+    /// unless `handler::pusher_class` names another class.
     #[derive(Debug)]
     pub struct Room;
     impl crate::Actor for Room {
@@ -280,7 +441,8 @@ mod actor {
             handler::init(false)
         }
         fn on_alarm() -> Result<(), String> {
-            handler::before_push().map(|_| ())
+            // A 0.6.0 room's alarm fires once more: rounds are the pusher's now.
+            Ok(())
         }
     }
     impl crate::http::Guest for Room {
@@ -296,37 +458,15 @@ mod actor {
                 c.init()
             })
         }
-        /// R3 must call this immediately before sending its round, and send only
-        /// when true. In R2 there are no children to send to.
-        pub fn before_push() -> Result<bool, String> {
-            CORE.with_borrow_mut(|c| c.before_push(crate::now_ms()))
-        }
-        /// Run a fixed-edge round from the room's alarm.
-        pub fn round(round: &mut Round) -> Result<(), String> {
-            LAST_ROUND.set(Some(crate::now_ms()));
-            CORE.with_borrow_mut(|c| round.run(c, crate::now_ms()))
-        }
-        /// Run the R4 controller and direct-child round from on-alarm.
-        pub fn scaling(scale: &mut Scaling, round: &mut Round) -> Result<(), String> {
-            let now = crate::now_ms();
-            LAST_ROUND.set(Some(now));
-            CORE.with_borrow_mut(|c| scale.run(round, c, now))
-        }
-        pub fn poke() {
-            let now = crate::now_ms();
-            if LAST_ROUND
-                .get()
-                .is_none_or(|last| now.saturating_sub(last) > 1000)
-                && crate::alarms::get_alarm().is_none()
-            {
-                crate::alarms::set_alarm(now);
-            }
+        /// The pusher's class, `pusher` by default (ADR 0040, section 13).
+        pub fn pusher_class(class: &str) {
+            PUSHER_CLASS.set(class.into());
         }
         pub fn handle(req: crate::http::IncomingRequest, out: crate::http::ResponseOutparam) {
-            if wire::caller(&req).is_none() {
+            let Some(caller) = wire::caller(&req) else {
                 crate::http::respond(out, 403, "text/plain", b"inside callers only");
                 return;
-            }
+            };
             if !matches!(req.method(), crate::http::Method::Post) {
                 crate::http::respond(out, 405, "text/plain", b"POST required");
                 return;
@@ -339,20 +479,29 @@ mod actor {
             let result = crate::http::read_body(&req, 270 * 1024)
                 .ok_or_else(bad)
                 .and_then(|b| {
+                    // A 0.6.0 front still pokes the room: the front pokes the pusher now.
                     if op == "poke" {
-                        if !b.is_empty() {
-                            return Err(bad());
-                        }
-                        poke();
-                        Ok(vec![])
-                    } else {
-                        CORE.with_borrow_mut(|c| serve(c, op, &b, crate::now_ms()))
+                        return Ok(vec![]);
                     }
+                    let a = crate::actors::self_address();
+                    let pusher = format!(
+                        "{}/{}/{}",
+                        a.tenant,
+                        PUSHER_CLASS.with_borrow(Clone::clone),
+                        a.name
+                    );
+                    CORE.with_borrow_mut(|c| serve(c, op, &b, crate::now_ms(), &caller, &pusher))
                 });
             match result {
                 Ok(b) => crate::http::respond(out, 200, "application/octet-stream", &b),
                 Err(e) => {
-                    let status = if e.starts_with("invalid") { 400 } else { 503 };
+                    let status = if e.starts_with("invalid") {
+                        400
+                    } else if e.starts_with("forbidden") {
+                        403
+                    } else {
+                        503
+                    };
                     crate::http::respond(out, status, "text/plain", e.as_bytes());
                 }
             }

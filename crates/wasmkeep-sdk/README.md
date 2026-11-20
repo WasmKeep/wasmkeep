@@ -349,9 +349,18 @@ the last returned message's position.
 Deploy the room with batched writes. The first operation after each cold
 start, including history, records one durable epoch boundary so a reconnect
 can learn of a loss before another publish. Publishes use plain writes and
-schedule a 20 ms alarm. The window holds 2,000 messages or 8 MiB of UTF-8
-bodies; history replies include framing within their 256 KiB bound.
-For confirmation, delegate initialization to `broadcast::handler::init(true)`;
-`before_push` flushes and permits a round only on success, scheduling a 50 ms
-retry while uploading. R2 has no delivery children: its alarm only runs this
-barrier. Edge delivery, join/poke, scaling and relays follow in R3–R5.
+set no alarm. The window holds 2,000 messages or 8 MiB of UTF-8 bodies;
+history replies include framing within their 256 KiB bound. For
+confirmation, delegate initialization to `broadcast::handler::init(true)`:
+the room's pull then flushes first, and the pusher retries 50 ms later while
+uploading.
+
+Delivery is a fifth class since 0.7.0 (ADR 0040, section 13), deployed
+internally as `pusher`: delegate its `on_alarm` to
+`broadcast::pusher::handler::scaling(&mut scaling, &mut round)` (or
+`::round` for fixed edges) and its `handle` to
+`broadcast::pusher::handler::handle` (the poke). It pulls from
+`room/<its name>` (`pusher::handler::room_class` changes the class).
+`Client::publish` pokes the pusher only when the room's answer asks for it.
+A room deployed with 0.6.0 moves its group to its pusher by itself (see the
+changelog).

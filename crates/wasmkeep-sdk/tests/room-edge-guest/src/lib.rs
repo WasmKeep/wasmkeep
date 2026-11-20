@@ -1,4 +1,4 @@
-use wasmkeep_sdk::broadcast::{Client, Position, Publish, handler};
+use wasmkeep_sdk::broadcast::{Client, Position, Publish, handler, pusher};
 use wasmkeep_sdk::broadcast::{EdgeActor, Round};
 use wasmkeep_sdk::{Actor, http, storage};
 thread_local! { static ROUND: std::cell::RefCell<Round> = std::cell::RefCell::new(Round::new(&["edge/e"]).unwrap()); }
@@ -8,6 +8,10 @@ fn fanout() -> bool {
 }
 fn edge() -> bool {
     wasmkeep_sdk::actors::self_address().class == "edge"
+}
+/// The room `t/room` has the pusher `pusher/room` (ADR 0040, section 13).
+fn is_pusher() -> bool {
+    wasmkeep_sdk::actors::self_address().class == "pusher"
 }
 struct TestRoom;
 impl Actor for TestRoom {
@@ -36,6 +40,8 @@ impl Actor for TestRoom {
             Ok(())
         } else if edge() {
             EdgeActor::on_init()
+        } else if is_pusher() {
+            Ok(())
         } else {
             handler::init(false)
         }
@@ -63,16 +69,19 @@ impl Actor for TestRoom {
         EdgeActor::on_websocket_close(id, code, reason);
     }
     fn on_alarm() -> Result<(), String> {
-        if edge() {
-            Ok(())
+        if is_pusher() {
+            TestRoom::round().map(|_| ())
         } else {
-            ROUND.with_borrow_mut(handler::round)
+            Ok(())
         }
     }
 }
 impl TestRoom {
     fn round() -> Result<String, String> {
-        ROUND.with_borrow_mut(handler::round).map(|_| "ok".into())
+        pusher::handler::room_class("t");
+        ROUND
+            .with_borrow_mut(pusher::handler::round)
+            .map(|_| "ok".into())
     }
 }
 impl http::Guest for TestRoom {
@@ -104,14 +113,24 @@ impl http::Guest for TestRoom {
             return;
         }
         let path = req.path_with_query().unwrap_or_default();
+        if is_pusher() {
+            if path == "/r3-round" {
+                match Self::round() {
+                    Ok(s) => http::respond(out, 200, "text/plain", s.as_bytes()),
+                    Err(s) => http::respond(out, 500, "text/plain", s.as_bytes()),
+                }
+            } else {
+                pusher::handler::handle(req, out);
+            }
+            return;
+        }
         let client = Client::new("t/room");
         let result: Result<String, String> = match path.as_str() {
-            "/r3-round" => Self::round(),
             "/r3-start" => (|| {
                 client.history(None, 100, None)?;
                 for _ in 0..2 {
                     let r = wasmkeep_sdk::actors::call(
-                        "t/room",
+                        "pusher/room",
                         &wasmkeep_sdk::actors::Request {
                             method: "POST".into(),
                             path: "/r3-round".into(),

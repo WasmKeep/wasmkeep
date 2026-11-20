@@ -103,25 +103,29 @@ impl Round {
                 .collect(),
         })
     }
-    pub fn run<S: Store>(&mut self, core: &mut Core<S>, now: u64) -> Result<(), String> {
+    /// One round over `source` (the room's pull through [`Pulled`], or a
+    /// local [`Core`]). Sets the next alarm when one is due and answers it,
+    /// with the lowest head a pushed child was given, for the pusher's idle
+    /// pull (ADR 0040, section 13).
+    pub fn run(&mut self, source: &mut impl Source, now: u64) -> Result<RoundResult, String> {
         for child in &mut self.children {
             child.sockets = None;
         }
-        if !core.before_push(now)? {
-            return Ok(());
-        }
-        let epoch = core.wake()?;
-        let epochs = core.epochs()?;
-        let head = core.last()?.unwrap_or(epoch.base);
         let mut indices = vec![];
+        let mut heads: Vec<Option<(u64, u64)>> = vec![];
         let mut requests = vec![];
-        // Slices by start: children at one position share one read and one
+        // Pulls by position: children at one position share one pull and one
         // encoding. One round builds at most ROUND_BYTES of messages (one
         // slice at least); the rest keep their positions for 20 ms later.
-        let mut slices: std::collections::BTreeMap<(u64, u64), Slice> = Default::default();
+        let mut slices: std::collections::BTreeMap<Option<(u64, u64)>, Option<Slice>> =
+            Default::default();
         let mut read = 0usize;
         let mut budget = ROUND_BYTES;
         let mut deferred = false;
+        let mut retry = 20;
+        let mut delivered: Option<Position> = None;
+        // The header of a current-epoch position (or none): the epoch's own base.
+        let mut current: Option<(u64, u64, u64)> = None;
         // A continuation starts at the child the last round deferred first,
         // so under sustained publishing every child takes its turn.
         let start = self
@@ -143,77 +147,106 @@ impl Round {
             {
                 continue;
             }
-            let (path, body) = if !child.initialized {
+            let (path, body, header) = if !child.initialized {
                 let mut body = "{\"room\":".to_owned();
                 crate::json::write_str(&mut body, &{
                     let a = crate::actors::self_address();
                     format!("{}/{}/{}", a.tenant, a.class, a.name)
                 });
                 body.push_str(",\"lo\":\"0000000000000000\",\"state\":\"active\"}");
-                ("init", body)
+                ("init", body, None)
             } else {
-                let n = child.position.map(|p| {
-                    epochs
-                        .iter()
-                        .filter(|e| e.e > p.e)
-                        .fold(p.n, |n, e| n.min(e.base))
-                });
+                let key = child.position.map(|p| (p.e, p.n));
+                // Not the entry API: an exhausted budget defers the child before any insert.
+                #[allow(clippy::map_entry)]
+                if !slices.contains_key(&key) {
+                    let shortcut = child
+                        .position
+                        .zip(current)
+                        .filter(|(p, (e, _, head))| p.e == *e && p.n == *head);
+                    let slice = if let Some((_, (e, base, head))) = shortcut {
+                        // A child at a head the round already pulled needs no read.
+                        Some(Slice::header(Pull {
+                            e,
+                            base,
+                            first: head.saturating_add(1),
+                            head,
+                            recover: false,
+                            messages: vec![],
+                        }))
+                    } else if key.is_some() && (read >= ROUND_BYTES || budget == 0) {
+                        // Reads stop with the budget too: a deferred child costs nothing.
+                        deferred = true;
+                        self.resume.get_or_insert_with(|| child.address.clone());
+                        continue;
+                    } else {
+                        let budget = if key.is_some() { ROUND_BYTES - read } else { 0 };
+                        match source.pull(child.position, budget, false, now) {
+                            Ok(pull) => {
+                                if child.position.is_none_or(|p| p.e == pull.e) {
+                                    current = Some((pull.e, pull.base, pull.head));
+                                }
+                                if delivered.is_none_or(|d| (pull.e, pull.head) < (d.e, d.n)) {
+                                    delivered = Some(Position {
+                                        e: pull.e,
+                                        n: pull.head,
+                                    });
+                                }
+                                let slice = Slice::read(pull);
+                                read += slice.read;
+                                Some(slice)
+                            }
+                            Err(e) => {
+                                // Not durable yet (confirm): the upload's retry is 50 ms.
+                                if e.contains("not durable") {
+                                    retry = 50;
+                                }
+                                None
+                            }
+                        }
+                    };
+                    slices.insert(key, slice);
+                }
+                let Some(slice) = &slices[&key] else {
+                    deferred = true;
+                    self.resume.get_or_insert_with(|| child.address.clone());
+                    continue;
+                };
+                let h = &slice.header;
                 let mut push = Push {
-                    recover: false,
-                    e: epoch.e,
-                    base: child.position.map_or(epoch.base, |p| {
-                        epochs
-                            .iter()
-                            .filter(|e| e.e > p.e)
-                            .fold(epoch.base, |b, e| b.min(e.base))
-                    }),
-                    first: head.saturating_add(1).min(9007199254740991),
-                    head,
+                    recover: h.recover,
+                    e: h.e,
+                    base: h.base,
+                    first: h.head.saturating_add(1).min(9007199254740991),
+                    head: h.head,
                     messages: vec![],
                 };
-                if let Some(n) = n.filter(|n| *n < head) {
-                    let key = (n, push.base);
-                    if let std::collections::btree_map::Entry::Vacant(e) = slices.entry(key) {
-                        if read >= ROUND_BYTES || budget == 0 {
-                            deferred = true;
-                            self.resume.get_or_insert_with(|| child.address.clone());
-                            continue;
-                        }
-                        // Never more rows than the budget has left (one at least).
-                        let rows = ((ROUND_BYTES - read) / ROW_COST).clamp(1, 513);
-                        let slice = Slice::read(core, &epochs, n + 1, rows)?;
-                        read += slice.read;
-                        e.insert(slice);
+                if let Some(&first) = slice.first.as_ref().filter(|_| !h.recover) {
+                    // The cut: at most 512 messages and 512 KiB of JSON per request.
+                    push.first = first;
+                    let fixed = push.encode().len();
+                    let (mut k, mut total) = (0, fixed);
+                    while k < slice.items.len()
+                        && k < 512
+                        && total + slice.sizes[k] + usize::from(k > 0) <= 512 * 1024
+                    {
+                        total += slice.sizes[k] + usize::from(k > 0);
+                        k += 1;
                     }
-                    let slice = &slices[&key];
-                    if slice.recover {
-                        push.recover = true;
-                    } else if let Some(&first) = slice.first.as_ref() {
-                        // The cut: at most 512 messages and 512 KiB of JSON per request.
-                        push.first = first;
-                        let fixed = push.encode().len();
-                        let (mut k, mut total) = (0, fixed);
-                        while k < slice.items.len()
-                            && k < 512
-                            && total + slice.sizes[k] + usize::from(k > 0) <= 512 * 1024
-                        {
-                            total += slice.sizes[k] + usize::from(k > 0);
-                            k += 1;
-                        }
-                        if k > 0 && total - fixed > budget && budget < ROUND_BYTES {
-                            deferred = true;
-                            self.resume.get_or_insert_with(|| child.address.clone());
-                            continue;
-                        }
-                        budget = budget.saturating_sub(total - fixed);
-                        push.messages = slice.items[..k].to_vec();
+                    if k > 0 && total - fixed > budget && budget < ROUND_BYTES {
+                        deferred = true;
+                        self.resume.get_or_insert_with(|| child.address.clone());
+                        continue;
                     }
+                    budget = budget.saturating_sub(total - fixed);
+                    push.messages = slice.items[..k].to_vec();
                 }
                 let body = push.encode();
                 Push::decode(&body)?; // Reject numbers JSON cannot represent exactly.
-                ("push", body)
+                ("push", body, Some((h.e, h.head)))
             };
             indices.push(index);
+            heads.push(header);
             requests.push((
                 child.address.clone(),
                 crate::actors::Request {
@@ -224,7 +257,7 @@ impl Round {
                 },
             ));
         }
-        let mut next = deferred.then(|| now.saturating_add(20));
+        let mut next = deferred.then(|| now.saturating_add(retry));
         let mut skip = std::collections::BTreeSet::new();
         let results = if self.relays.is_empty() {
             crate::calls::call_many(&requests)
@@ -293,19 +326,19 @@ impl Round {
                     child.initialized = true;
                     return Some(20);
                 }
-                let (p, more) = acknowledgment(&r.body, epoch.e, head)?;
+                // Each child's answer is checked against its own pull's header.
+                let (epoch, head) = heads[slot]?;
+                let (p, more) = acknowledgment(&r.body, epoch, head)?;
                 child.position = Some(p);
                 child.sockets = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)
                     .and_then(|j| super::edge::number(&j, "sockets").ok());
                 let j = crate::json::parse_unique(std::str::from_utf8(&r.body).ok()?)?;
                 let lagging = super::edge::number(&j, "lagging").ok()?;
                 let stalled = super::edge::number(&j, "stalled").unwrap_or(0);
-                let delay = child.lag_retry.delay(
-                    p,
-                    head,
-                    lagging,
-                    if p.e == epoch.e { stalled } else { 0 },
-                );
+                let delay =
+                    child
+                        .lag_retry
+                        .delay(p, head, lagging, if p.e == epoch { stalled } else { 0 });
                 Some(if more { delay } else { 0 })
             });
             if let Some(delay) = ok {
@@ -331,46 +364,70 @@ impl Round {
         if let Some(at) = next {
             crate::alarms::set_alarm(at);
         }
-        Ok(())
+        Ok(RoundResult { next, delivered })
     }
+}
+
+/// What a round reads from (ADR 0040, section 13): the room's pull, over
+/// calls ([`Pulled`]) in the pusher, or a [`Core`] in this instance.
+pub trait Source {
+    fn pull(
+        &mut self,
+        after: Option<Position>,
+        budget: usize,
+        idle: bool,
+        now: u64,
+    ) -> Result<Pull, String>;
+}
+impl<S: Store> Source for Core<S> {
+    fn pull(
+        &mut self,
+        after: Option<Position>,
+        budget: usize,
+        idle: bool,
+        now: u64,
+    ) -> Result<Pull, String> {
+        Core::pull(self, after, budget, idle, now)
+    }
+}
+/// What a round leaves for the pusher's idle decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoundResult {
+    /// The alarm the round set, if any.
+    pub next: Option<u64>,
+    /// The lowest head a pushed child was given: where an idle pull claims to be.
+    pub delivered: Option<Position>,
 }
 
 /// Message bytes one round builds for its children (ADR 0040, section 4).
 const ROUND_BYTES: usize = 1024 * 1024;
-/// What reading one row costs the round's budget besides its JSON: at
-/// most about 1,000 rows a round.
-const ROW_COST: usize = 1024;
 /// The messages after one position, each with its JSON size.
 struct Slice {
+    header: Pull,
     first: Option<u64>,
     items: Vec<Item>,
     sizes: Vec<usize>,
-    recover: bool,
     read: usize,
 }
 impl Slice {
-    fn read<S: Store>(
-        core: &Core<S>,
-        epochs: &[Epoch],
-        from: u64,
-        rows: usize,
-    ) -> Result<Self, String> {
-        let mut s = Slice {
+    fn header(header: Pull) -> Self {
+        Slice {
+            header,
             first: None,
             items: vec![],
             sizes: vec![],
-            recover: false,
             read: 0,
-        };
-        for m in core.rows(from, rows, 512 * 1024)? {
-            let Some(boundary) = epochs.iter().find(|e| e.e == m.position.e) else {
-                return Ok(Slice { recover: true, ..s });
-            };
+        }
+    }
+    fn read(mut pull: Pull) -> Self {
+        let messages = std::mem::take(&mut pull.messages);
+        let mut s = Slice::header(pull);
+        for (m, base) in messages {
             s.first.get_or_insert(m.position.n);
             let item = Item {
                 epoch: Some(Epoch {
                     e: m.position.e,
-                    base: boundary.base,
+                    base,
                 }),
                 at: m.at,
                 id: m.id,
@@ -378,11 +435,11 @@ impl Slice {
             };
             let size = item.json().len();
             // Every row costs, an empty one too: its read, its item and its JSON.
-            s.read += ROW_COST + size;
+            s.read += super::core::ROW_COST + size;
             s.sizes.push(size);
             s.items.push(item);
         }
-        Ok(s)
+        s
     }
 }
 fn acknowledgment(body: &[u8], epoch: u64, head: u64) -> Option<(Position, bool)> {
