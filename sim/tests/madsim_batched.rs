@@ -16,6 +16,15 @@ fn batched_invariants_and_non_vacuity() {
 }
 
 #[test]
+fn back_to_back_events_stay_within_the_loss_bound() {
+    batched::back_to_back_safe();
+}
+#[test]
+fn back_to_back_age_one_tick_over_is_caught() {
+    batched::back_to_back_caught(Switch::MaxUnsentPlusOne, Violation::LossBound);
+}
+
+#[test]
 fn strict_is_the_same_model_with_batching_off() {
     batched::safe(false);
 }

@@ -508,7 +508,35 @@ impl World {
         });
     }
 
+    /// Applies an outcome waiting in the hold's cell (the PUT returned),
+    /// as the hold itself does: `pump` at every event end, and the waits at
+    /// an event's end and in a flush, which await the upload (`landed`),
+    /// not the completion job. Only the completion job is delayed (by up to
+    /// 41 ticks under `random_faults`, to reach completions across
+    /// ownerships): a hold that asks for its outcome is not kept from it.
+    fn apply_landed(&mut self, actor: usize) {
+        let Some(h) = &self.actors[actor].hold else {
+            return;
+        };
+        let landed: Vec<usize> = h
+            .flights
+            .iter()
+            .copied()
+            .filter(|&i| {
+                self.uploads[i].hold == h.generation
+                    && matches!(self.uploads[i].stage, Stage::Completion)
+            })
+            .collect();
+        for i in landed {
+            if matches!(self.uploads[i].stage, Stage::Completion) {
+                self.network_step(i);
+            }
+        }
+    }
+
     fn can_start(&mut self, actor: usize) -> bool {
+        // The wait at an event's end (`hold_at_event_end`).
+        self.apply_landed(actor);
         let Some(h) = &mut self.actors[actor].hold else {
             return false;
         };
@@ -557,6 +585,8 @@ impl World {
         h.commits.push((self.serial, self.now));
         a.boundaries.insert(self.serial, h.local.clone());
         self.outcome.counts.commits += 1;
+        // The event's end: `mark`, then `pump` applies what landed.
+        self.apply_landed(actor);
     }
 
     async fn event(&mut self, actor: usize, alarm: Option<u64>) {
@@ -734,6 +764,8 @@ impl World {
                 self.check();
                 return true;
             }
+            // `flush_through` awaits `landed` and applies it itself.
+            self.apply_landed(actor);
             self.advance(1).await;
         }
         let Some(h) = self.actors[actor].hold.as_mut() else {
@@ -1058,21 +1090,33 @@ impl World {
                 self.outcome.counts.sparse_loss += 1;
                 return;
             }
-            // The stalled upload's capture anchors the post-stall span. Its
-            // predecessor RTT describes earlier captured work, not extra time
-            // in which admission may keep accepting new work after the stall.
+            // Under a stall, the event-start rule (ADR 0034, section 3, rule
+            // 1) bounds what runs after the oldest uncaptured commit: no
+            // event starts once it is MAX_UNSENT old, and the last one
+            // commits EVENT_MAX later. So the span is anchored there, at
+            // the first lost commit the stalled upload does not carry, not
+            // at that upload's capture: an event may start on the capture
+            // tick and commit EVENT_MAX after it (one completion applied
+            // while the actor was held), which a capture anchor with one
+            // tick of slack wrongly counted against the rule. From the
+            // capture, the span is MAX_UNSENT + 2 * EVENT_MAX - 1 ticks.
+            // Nothing uncaptured lost: nothing for the rule to bound.
             let stalled = self.uploads.iter().find(|u| {
                 u.actor == actor && u.hold == h.generation && u.object.boundaries.contains(&first.0)
             });
+            let unsent = lost
+                .iter()
+                .find(|(id, _)| stalled.is_none_or(|u| !u.object.boundaries.contains(id)));
             let from = if healthy {
                 first.1
             } else {
-                stalled.map_or(first.1, |u| u.captured_at)
+                unsent.map_or(last.1, |c| c.1)
             };
             let bound = if healthy {
                 2 * r + EVENT_MAX
             } else {
-                MAX_UNSENT + EVENT_MAX + 1 // capture tick
+                // Starts while younger than MAX_UNSENT: at MAX_UNSENT - 1.
+                MAX_UNSENT - 1 + EVENT_MAX
             };
             if !healthy && last.1.saturating_sub(from) == bound {
                 self.outcome.counts.stalled_at_bound += 1;
@@ -2693,9 +2737,10 @@ impl World {
 
     async fn delivery_workload(&mut self, d: &mut Deliveries) {
         let actor = 0;
-        // Crashes and cuts are aimed here, also inside a job's waits, rather
-        // than `random_faults`: that also delays upload completions across
-        // ownerships, which the replication workloads above judge.
+        // `random_faults` crashes and cuts nodes and delays completion jobs
+        // (across ownerships too); crashes and cuts are also aimed here,
+        // inside a job's waits.
+        self.random_faults = true;
         for _ in 0..300 {
             if self.interrupt.is_none() && self.rng.chance(3) {
                 let at = self.now + self.rng.below(6);
@@ -2725,16 +2770,20 @@ impl World {
                     d.local.queue.push_back(Job::Move(alarm));
                 }
                 // A failed segment (its retire request dropped, an entry
-                // left), or a failed entry PUT. Not stalled: a long stall
-                // is the replication workloads' (its loss bound is judged
-                // for their event pattern, not this mailbox's).
-                6 => {
-                    if self.rng.below(2) == 0 {
-                        self.actors[actor].next_fail = true;
-                    } else {
-                        self.actors[actor].next_entry_fail = true;
+                // left), a failed entry PUT, or a slow or stalled one, failing
+                // or not: the loss bound is judged for this mailbox too.
+                6 => match self.rng.below(4) {
+                    0 => self.actors[actor].next_fail = true,
+                    1 => self.actors[actor].next_entry_fail = true,
+                    2 => {
+                        let fail = self.rng.below(3) == 0;
+                        self.fault(actor, fail);
                     }
-                }
+                    _ => {
+                        let fail = self.rng.below(2) == 0;
+                        self.stall(actor, fail);
+                    }
+                },
                 _ => {}
             }
             self.timer_tick(actor, d);
@@ -2749,6 +2798,7 @@ impl World {
             }
             self.timer_tick(actor, d);
         }
+        self.random_faults = false;
         self.interrupt = None;
     }
 
@@ -2871,4 +2921,101 @@ pub(crate) fn deliveries_caught(rule: DeliveryRule, expected: Violation) {
         "seed {seed} did not reproduce"
     );
     eprintln!("caught: {rule:?} seed={seed} expected={expected:?}");
+}
+
+/// Back-to-back events on one busy actor (each waits for admission, as a
+/// mailbox job does) under `random_faults`, with seeded slow, failed and
+/// stalled uploads: the loss bound judged on a dense event pattern, with
+/// completion jobs delayed while the hold applies its own outcomes.
+pub(crate) fn simulate_back_to_back(seed: u64, rule: Switch) -> Outcome {
+    Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async {
+        let mut w = World::new(seed ^ 0xB2B_E7E5, rule, true);
+        for a in 0..ACTORS {
+            w.event(a, Some(1000)).await;
+            w.flush(a).await;
+        }
+        w.random_faults = true;
+        let actor = 0;
+        for _ in 0..120 {
+            if w.actors[actor].hold.is_none() {
+                if w.rng.chance(30) {
+                    w.acquire(actor);
+                }
+                w.advance(1).await;
+                continue;
+            }
+            match w.rng.below(10) {
+                0 => {
+                    let fail = w.rng.below(3) == 0;
+                    w.fault(actor, fail);
+                }
+                1 => {
+                    let fail = w.rng.below(2) == 0;
+                    w.stall(actor, fail);
+                }
+                _ => {}
+            }
+            for _ in 0..1 + w.rng.below(4) {
+                if !w.admitted_event(actor, None).await {
+                    break;
+                }
+            }
+        }
+        w.random_faults = false;
+        w.advance(100).await;
+        w.check();
+        w.outcome
+    })
+}
+
+pub(crate) fn back_to_back_safe() {
+    let only = std::env::var("WASMKEEP_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let range = only.map_or(0..seeds(), |seed| seed..seed + 1);
+    let count = range.end - range.start;
+    let mut totals = Counts::default();
+    for seed in range {
+        let out = simulate_back_to_back(seed, Switch::Safe);
+        assert!(
+            out.violations.is_empty(),
+            "seed {seed}: {:?}; {:?}",
+            out.violations,
+            out.counts
+        );
+        totals.add(out.counts);
+    }
+    for (name, value) in [
+        ("healthy loss", totals.healthy_loss),
+        ("unhealthy loss", totals.unhealthy_loss),
+        ("blocked events", totals.blocked_events),
+        ("batched", totals.batched),
+        ("failed hold dropped", totals.failed_hold_dropped),
+    ] {
+        assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
+    }
+    if only.is_none() && count >= 200 {
+        assert!(
+            totals.stalled_at_bound >= 3,
+            "stalled bound never reached: {totals:?}"
+        );
+    }
+    eprintln!("back-to-back: {count} seeds: {totals:?}");
+}
+
+/// The back-to-back workload catches `rule` as `expected` within the seeds.
+pub(crate) fn back_to_back_caught(rule: Switch, expected: Violation) {
+    let seed = (0..seeds())
+        .find(|&seed| {
+            simulate_back_to_back(seed, rule)
+                .violations
+                .contains(&expected)
+        })
+        .unwrap_or_else(|| panic!("{rule:?}: no {expected:?} within {} seeds", seeds()));
+    assert_eq!(
+        simulate_back_to_back(seed, rule).violations,
+        simulate_back_to_back(seed, rule).violations,
+        "seed {seed} did not reproduce"
+    );
+    eprintln!("caught back to back: {rule:?} seed={seed} expected={expected:?}");
 }
