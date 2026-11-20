@@ -9,6 +9,32 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **A pusher round is bounded in work, not only in bytes.** A round over
+  many children lagging at distinct positions read and pushed about 1,000
+  rows (the 1 MiB budget at 1 KiB a row), which took about 455 M fuel on
+  QuickJS and StarlingMonkey, close to the 500 M the 50 ms budget is
+  calibrated for, and could trap at the CPU budget. A round now also
+  counts its work, in counts a guest can keep where it cannot read its
+  fuel: 8 a pull, 3 a request to a child, 1 a row read and 1 a row encoded
+  into a push, at most 640 (`ROUND_WORK`, in both SDKs). Through relays a
+  row counts once per slice, since the relays' packs are the only
+  encoding: the round no longer encodes each child's push there. A pull
+  is sized for the children at its position, so one child reads at most
+  314 rows and 127 relayed edges at one position each get 125 rows a
+  round (before, one or two of them got 314). The children the rest would
+  need keep their positions for the next round 20 ms later, which starts
+  at the first of them, so delivery stays in order and every child takes
+  its turn. Children already at the head the round read are left for the
+  next round without setting an alarm, so a group at its head still goes
+  idle, unless one's last answer asked for a retry (lagging sockets),
+  which it keeps; they keep their last socket count. On QuickJS the
+  pusher's alarms now take at most about 215 M fuel: the
+  distinct-positions test asserts them at 250 M and runs in every run and
+  CI again, with two new tests of one position fanned out to 127 and 256
+  edges. Its StarlingMonkey variant stays ignored: its rounds take about
+  160 M, but the first alarm after the restart still takes about 430 M.
+  At 256 edges the requests alone fill a round: a slice moves one row a
+  round, to 210 of them. See ADR 0040, section 13.
 - **Wasmtime 50.0.3**, which fixes RUSTSEC-2026-0587: a WASI filesystem
   sandbox escape on Windows through a drive-prefixed path. WasmKeep ships
   no Windows build; the patch release of the pinned version is taken anyway.

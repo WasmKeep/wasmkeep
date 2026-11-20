@@ -2,7 +2,8 @@
 // that never moves. Each answers a push with its own fixed position (the
 // number ending its name, times 7, at most the head), so every round of
 // the room finds as many lagging children, at as many distinct positions,
-// as it has.
+// as it has. An edge named `….l<i>` stays 300 behind the head instead, so
+// every child shares one position: one slice, fanned out to all.
 import { actors, defineActor } from "@wasmkeep/sdk";
 
 export default defineActor({
@@ -10,7 +11,10 @@ export default defineActor({
     if (!req.path.startsWith("/wasmkeep-edge/v1/")) return { status: 404 };
     if (!req.path.endsWith("/push")) return '{"sockets":0}';
     const p = JSON.parse(req.text()) as { e: number; head: number };
-    const at = Number(/(\d+)$/.exec(actors.self().name)?.[1] ?? "0") * 7;
+    const name = actors.self().name;
+    const at = /\.l\d+$/.test(name)
+      ? Math.max(0, p.head - 300)
+      : Number(/(\d+)$/.exec(name)?.[1] ?? "0") * 7;
     return JSON.stringify({ e: p.e, n: Math.min(at, p.head), lagging: 0, sockets: 0 });
   },
 });

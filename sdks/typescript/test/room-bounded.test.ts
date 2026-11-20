@@ -4,7 +4,7 @@
 // CPU budget whatever state a heavy run left behind.
 import assert from "node:assert/strict";
 import { Core, type Store } from "../src/broadcast-core";
-import { Round } from "../src/broadcast-round";
+import { Round, ROUND_WORK } from "../src/broadcast-round";
 import { ScaleHost } from "../src/broadcast-scaling";
 import * as db from "./directory-storage-stub";
 import * as alarms from "./room-alarms-stub";
@@ -73,7 +73,7 @@ test("history reads the page it answers, not the window", () => {
     assert(c.seen.rows <= 80, `last=3 read ${c.seen.rows} rows`);
     db.close();
 });
-test("a round with many lagging children builds at most 1 MiB, then continues 20 ms later", () => {
+test("a round with many lagging children builds at most 1 MiB and ROUND_WORK, then continues 20 ms later", () => {
     db.install(":memory:");
     const c = counting(), core = new Core(c.store);
     core.init();
@@ -102,7 +102,8 @@ test("a round with many lagging children builds at most 1 MiB, then continues 20
         if ([...at.values()].some(n => n < 2000))
             assert.equal(alarms.pending, BigInt(now + 20));
         now += 20;
-        assert(++rounds < 64, "lagging children must catch up");
+        // About 20,000 rows, at most ROUND_WORK / 2 read and pushed a round.
+        assert(++rounds < 96, "lagging children must catch up");
     }
     db.close();
 });
@@ -232,6 +233,126 @@ test("a round reads a bounded number of rows whatever the children's positions, 
         round.run(of(core), i * 20);
         assert(c.seen.rows <= 1100, `round ${i} read ${c.seen.rows} rows`);
     }
+    db.close();
+});
+/** `count` children (256) behind relays of 16, each answering the
+ * position `answer` says, or the whole acknowledgment. */
+function relayed(answer: (name: string, push: any) => number | object, count = 256) {
+    const children = Array.from({ length: count }, (_, i) => ({ name: `edge/r.e${i}` }));
+    const relays = Array.from({ length: Math.ceil(count / 16) }, (_, r) => ({ name: `relay/r.r${r}`, edges: children.slice(r * 16, r * 16 + 16).map(c => c.name) }));
+    const seen = { pushes: 0, rows: 0, pushed: new Map<string, number>() };
+    install((_address, r) => {
+        const pack = JSON.parse(new TextDecoder().decode(r.body));
+        seen.pushes += pack.children.length;
+        for (const ch of pack.children) {
+            seen.rows += ch.count;
+            seen.pushed.set(ch.edge, ch.count);
+        }
+        return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(pack.children.map((ch: any) => {
+                const a = answer(ch.edge, ch.push);
+                return typeof a === "number" ? { e: 1, n: a, lagging: 0, sockets: 0 } : { e: 1, lagging: 0, sockets: 0, ...a };
+            }))) };
+    });
+    const round = new Round([]);
+    round.sync(children, relays);
+    return { round, seen };
+}
+test("a round's work is bounded in counts whatever the children lag (ADR 0040, section 13)", () => {
+    db.install(":memory:");
+    const c = counting(), core = new Core(c.store);
+    core.init();
+    core.wake();
+    fill(2000, 1, 1);
+    // Each child stays at its own position: 256 distinct slices every round.
+    const { round, seen } = relayed(name => Number(name.split(".e")[1]) * 7);
+    round.run(of(core), 0); // header only: the positions
+    for (let i = 1; i <= 4; i++) {
+        seen.pushes = 0; seen.rows = 0; c.reset();
+        const result = round.run(of(core), i * 20);
+        // A push costs 3, a pull 8 (one at least), a row read or pushed 1.
+        const read = c.seen.rows - 16; // the pull's own few lookups
+        assert(seen.pushes >= 1 && seen.rows >= 1, `round ${i} made no progress`);
+        assert(3 * seen.pushes + seen.rows + read + 8 <= ROUND_WORK, `round ${i}: ${seen.pushes} pushes, ${seen.rows} rows pushed, ${c.seen.rows} read`);
+        assert.equal(result.next, i * 20 + 20);
+    }
+    db.close();
+});
+test("256 children at the head go idle though one round cannot push them all", () => {
+    db.install(":memory:");
+    const core = new Core(db);
+    core.init();
+    core.wake();
+    fill(10, 1, 1);
+    const { round, seen } = relayed((_name, push) => push.head);
+    let now = 0, result = round.run(of(core), now);
+    for (let i = 0; i < 4 && result.next !== undefined; i++)
+        result = round.run(of(core), now += 20);
+    assert.equal(result.next, undefined, `${seen.pushes} pushes and still due`);
+    // A publish then reaches every child: the skipped ones first.
+    core.publish([{ body: "new" }], BigInt(now));
+    const before = seen.rows;
+    for (let i = 0; i < 4 && seen.rows - before < 256; i++)
+        round.run(of(core), now += 20);
+    assert.equal(seen.rows - before, 256);
+    db.close();
+});
+test("a child left out at the head that last answered lagging sockets keeps its retry", () => {
+    db.install(":memory:");
+    const core = new Core(db);
+    core.init();
+    core.wake();
+    fill(10, 1, 1);
+    // Every child at the head; the last one's sockets stay behind.
+    const last = "edge/r.e255";
+    const { round, seen } = relayed((name, push) => ({ n: push.head, lagging: name === last ? 1 : 0 }));
+    let now = 0;
+    round.run(of(core), now);
+    let left = 0;
+    for (let i = 0; i < 8; i++) {
+        seen.pushed.clear();
+        const result = round.run(of(core), now += 20);
+        if (!seen.pushed.has(last))
+            left++;
+        assert(result.next !== undefined, `round ${i}: the lagging child lost its retry`);
+    }
+    assert(left > 0, "the lagging child was never left out");
+    db.close();
+});
+test("a round pushes a slice's rows to every relayed child at that position", () => {
+    db.install(":memory:");
+    const core = new Core(db);
+    core.init();
+    core.wake();
+    fill(400, 1, 1);
+    // 127 children (8 relays) all 300 behind the head: one slice, fanned out.
+    const { round, seen } = relayed((_name, push) => Math.max(0, push.head - 300), 127);
+    round.run(of(core), 0); // header only: the positions
+    seen.pushed.clear();
+    round.run(of(core), 20);
+    assert.equal(seen.pushed.size, 127);
+    const fewest = Math.min(...seen.pushed.values());
+    assert(fewest >= 100, `the fewest rows a child got: ${fewest}`);
+    db.close();
+});
+test("children left out keep their last socket count, which Scaling reads", () => {
+    db.install(":memory:");
+    const core = new Core(db);
+    core.init();
+    core.wake();
+    fill(10, 1, 1);
+    const { round, seen } = relayed((name, push) => ({ n: push.head, sockets: name.endsWith(".e0") ? 3 : 0 }));
+    let now = 0, result = round.run(of(core), now);
+    for (let i = 0; i < 4 && result.next !== undefined; i++)
+        result = round.run(of(core), now += 20);
+    // A publish: one round cannot push every child, the rest are left out.
+    core.publish([{ body: "new" }], BigInt(now));
+    seen.pushed.clear();
+    result = round.run(of(core), now += 20);
+    assert(seen.pushed.size < 256, `${seen.pushed.size} pushed`);
+    // ScaleHost copies `round.count` into the scale state it decides on.
+    for (let i = 0; i < 256; i++)
+        assert.equal(round.count(`edge/r.e${i}`), i ? 0 : 3, `edge/r.e${i}`);
+    assert.equal(result.occupied, true);
     db.close();
 });
 }

@@ -17,21 +17,40 @@ fn array<'a>(j: &'a Json, key: &str) -> Result<&'a [Json], String> {
         _ => Err("invalid relay array".into()),
     }
 }
+#[cfg(test)]
 pub(super) fn pack(entries: &[(String, actors::Request)]) -> Result<String, String> {
-    if entries.is_empty() || entries.len() > 16 {
-        return Err("relay fan-out: 1..16".into());
-    }
     let pushes: Vec<_> = entries
         .iter()
         .map(|(_, r)| Push::decode(std::str::from_utf8(&r.body).map_err(|_| "invalid UTF-8")?))
         .collect::<Result<_, _>>()?;
-    let shared = pushes
+    let parts: Vec<_> = entries
         .iter()
-        .filter(|p| !p.messages.is_empty())
-        .min_by_key(|p| p.first)
-        .unwrap_or(&pushes[0]);
-    let mut s = format!("{{\"shared\":{},\"children\":[", shared.encode());
-    for (i, ((edge, _), p)) in entries.iter().zip(&pushes).enumerate() {
+        .zip(&pushes)
+        .map(|((edge, _), p)| (edge.as_str(), p, &p.messages[..]))
+        .collect();
+    pack_parts(&parts)
+}
+/// [`pack`] from each edge's push header and messages, as the round has
+/// them: the shared messages are encoded once, and each part checked as
+/// its own push would be (numbers JSON represents exactly).
+pub(super) fn pack_parts(entries: &[(&str, &Push, &[super::Item])]) -> Result<String, String> {
+    if entries.is_empty() || entries.len() > 16 {
+        return Err("relay fan-out: 1..16".into());
+    }
+    let (_, head, items) = entries
+        .iter()
+        .filter(|(_, _, m)| !m.is_empty())
+        .min_by_key(|(_, p, _)| p.first)
+        .unwrap_or(&entries[0]);
+    let shared = Push {
+        messages: items.to_vec(),
+        ..(*head).clone()
+    };
+    let encoded = shared.encode();
+    Push::decode(&encoded)?;
+    let end = shared.first + shared.messages.len() as u64;
+    let mut s = format!("{{\"shared\":{encoded},\"children\":[");
+    for (i, (edge, p, m)) in entries.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
@@ -40,16 +59,13 @@ pub(super) fn pack(entries: &[(String, actors::Request)]) -> Result<String, Stri
         let count = if p.recover {
             0
         } else {
-            p.messages
-                .len()
-                .min((shared.first + shared.messages.len() as u64).saturating_sub(p.first) as usize)
+            m.len().min(end.saturating_sub(p.first) as usize)
         };
-        let mut header = p.clone();
+        let mut header = (*p).clone();
         header.messages.clear();
-        s.push_str(&format!(
-            ",\"push\":{},\"count\":{count}}}",
-            header.encode()
-        ));
+        let header = header.encode();
+        Push::decode(&header)?;
+        s.push_str(&format!(",\"push\":{header},\"count\":{count}}}"));
     }
     s.push_str("]}");
     Ok(s)
