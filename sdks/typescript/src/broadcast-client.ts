@@ -36,9 +36,18 @@ function position(r: Reader): Position {
 function put(w: Writer, p: Position) {
     w.u64(p.e).u64(p.n);
 }
+/** The pusher of a room address: `room/lobby` has `pusher/lobby` (the class
+ * swapped, the name kept). Pass the pusher explicitly for another layout. */
+export function pusherOf(room: string): string {
+    const slash = room.indexOf("/");
+    return `pusher/${slash < 0 ? room : room.slice(slash + 1)}`;
+}
+const POKE = "/wasmkeep-pusher/v1/poke";
 /** Front helper; no calls from an edge or relay. */
 export class Client {
-    constructor(readonly address: string) {
+    readonly pusher: string;
+    constructor(readonly address: string, pusher?: string) {
+        this.pusher = pusher ?? pusherOf(address);
     }
     private call(op: string, body: Uint8Array): Reader {
         const result = call(this.address, "POST", PREFIX + op, [], body);
@@ -59,7 +68,13 @@ export class Client {
         const r = this.call("publish", w.finish()), n = count(r, 64), out: Position[] = [];
         for (let i = 0; i < n; i++)
             out.push(position(r));
+        // A 0.6.0 room answers no poke field.
+        const poke = r.isEmpty() ? false : flag(r);
         end(r);
+        // ADR 0040, section 13: the pusher went idle and asks for a poke. A
+        // failed poke is ignored: the room keeps asking until the pusher pulls.
+        if (poke)
+            call(this.pusher, "POST", POKE, [], new Writer().u64(1).finish());
         return out;
     }
     history(after?: Position, limit = 2000, last?: number): History {
@@ -83,12 +98,13 @@ import { point, readEntry, number as directoryNumber, end as directoryEnd } from
 import { handOff } from './request';
 /** Authorize first. An empty room is created on its alarm, so a first join
  * can be unavailable until that alarm runs; the reconnecting client retries. */
-export function join(room: string, directory: string, client: string, after?: Position) {
+export function join(room: string, directory: string, client: string, after?: Position, pusher = pusherOf(room)) {
     const p = point(client), lookup = { method: 'POST', path: '/wasmkeep-directory/v1/lookup', headers: [] as [
             string,
             string
         ][], body: new Writer().u64(p).finish() };
-    const results = calls.callMany([[directory, lookup], [room, { method: 'POST', path: PREFIX + 'poke', headers: [], body: new Uint8Array() }]]);
+    // The poke goes to the pusher (section 13), which creates the group.
+    const results = calls.callMany([[directory, lookup], [pusher, { method: 'POST', path: POKE, headers: [], body: new Uint8Array() }]]);
     const first = results[0];
     if (first.tag !== 'ok')
         throw Error('join lookup failed');

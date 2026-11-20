@@ -7,7 +7,10 @@ export let commits = 0;
 export let deleted = false;
 let beforeCommit: (() => void) | undefined;
 let failCommit = false;
-export function install(path: string): void { db = new DatabaseSync(path); commits = 0; deleted = false; beforeCommit = undefined; failCommit = false; }
+const named = new Map<string, DatabaseSync>();
+export function install(path: string): void { db = new DatabaseSync(path); named.clear(); commits = 0; deleted = false; beforeCommit = undefined; failCommit = false; }
+/** Tests of several actors: each name its own in-memory database. */
+export function use(name: string): void { let d = named.get(name); if (!d) { d = new DatabaseSync(":memory:"); named.set(name, d); } db = d; }
 export function close(): void { db.close(); }
 export function onCommit(fn: () => void): void { beforeCommit = fn; }
 export function failNextCommit(): void { failCommit = true; }

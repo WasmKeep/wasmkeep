@@ -73,12 +73,37 @@ const bytesOf = (v: Value): Uint8Array => {
  * head and an id are indexed lookups, trimming is one statement SQLite
  * runs, and history and pushes read bounded pages. Sizes come from SQLite
  * (`length(CAST(... AS BLOB))`), not from re-encoding text in the guest. */
+/** What a pull carries (ADR 0040, section 13): the push header a child at
+ * the pulled position needs, then the messages after it, each with its own
+ * epoch and that epoch's base. */
+export interface Pull {
+    e: bigint;
+    b: bigint;
+    first: bigint;
+    head: bigint;
+    recover: boolean;
+    messages: Pulled[];
+}
+export interface Pulled extends Row {
+    /** The base of the message's own epoch. */
+    b: bigint;
+}
+/** Rows one pull carries at most, and the bodies they total at most (the
+ * old round's slice: one push takes 512 messages and 512 KiB). */
+const PULL_ROWS = 513, PULL_BYTES = 512 * 1024;
+/** What reading one row costs a pull's budget besides its bytes. */
+export const ROW_COST = 1024;
+/** A busy flag older than this without a pull counts as idle: longer than
+ * an event's wall (30 s by default), so a round held by a slow edge keeps
+ * its pusher busy, and a pusher that lost its alarm is woken again. */
+export const IDLE_EXPIRY = 60000;
 export class Core {
     private epoch?: Epoch;
-    private pending = false;
-    constructor(private db: Store, private alarms: {
-        setAlarm(n: bigint): void;
-    }, private confirm = false) {
+    /** The pusher said it went idle at the head (section 13); a cold room
+     * assumes so. Memory only. */
+    private idle = true;
+    private pulled?: number;
+    constructor(private db: Store, private confirm = false) {
     }
     init() {
         this.db.exec(`CREATE TABLE IF NOT EXISTS ${H} (n INTEGER PRIMARY KEY,e INTEGER NOT NULL,at INTEGER NOT NULL,id TEXT UNIQUE,body TEXT NOT NULL)`, []);
@@ -97,24 +122,6 @@ export class Core {
     }
     /** The highest number in the window, if any. */
     last(): bigint | undefined { return this.edge(true)?.n; }
-    /** Up to `count` rows from number `from` on, at most one page past
-     * `bytes` of bodies. */
-    rows(from: bigint, count: number, bytes = Infinity): Row[] {
-        const out: Row[] = [];
-        let seen = 0;
-        while (out.length < count && seen <= bytes) {
-            const page = this.db.query(`SELECT n,e,at,id,body,length(CAST(body AS BLOB)),coalesce(length(CAST(id AS BLOB)),0) FROM ${H} WHERE n >= ?1 ORDER BY n LIMIT ?2`, [integer(from), integer(BigInt(Math.min(PAGE, count - out.length)))]).values;
-            for (const r of page) {
-                const row: Row = { position: { n: num(r[0]), e: num(r[1]) }, at: num(r[2]), id: r[3].tag === "null" ? undefined : str(r[3]), body: str(r[4]), bodyBytes: Number(num(r[5])), idBytes: Number(num(r[6])) };
-                out.push(row);
-                seen += row.bodyBytes;
-                from = row.position.n + 1n;
-            }
-            if (page.length < PAGE)
-                break;
-        }
-        return out;
-    }
     private transaction<T>(durable: boolean, f: () => T): T {
         this.db.exec("BEGIN", []);
         try {
@@ -165,28 +172,65 @@ export class Core {
             this.db.exec(`DELETE FROM ${H} WHERE n <= (SELECT n FROM (SELECT n, row_number() OVER w AS k, sum(length(CAST(body AS BLOB))) OVER w AS tail FROM ${H} WINDOW w AS (ORDER BY n DESC ROWS UNBOUNDED PRECEDING)) WHERE k > 2000 OR tail > 8388608 ORDER BY n DESC LIMIT 1)`, []);
             return positions;
         });
-        if (!this.pending) {
-            this.alarms.setAlarm(now + 20n);
-            this.pending = true;
-        }
         return positions;
     }
-    beforePush(now: bigint): boolean {
-        this.wake();
+    /** Whether a publish should ask its front to poke the pusher. */
+    poke(now: number): boolean {
+        return this.idle || this.pulled === undefined || now - this.pulled > IDLE_EXPIRY;
+    }
+    /** The pusher's read (section 13): the header a child at `after` needs
+     * and the messages after it, at most `budget` bytes charged one
+     * `ROW_COST` per row (at least one row unless `budget` is 0), 513 rows
+     * and 512 KiB of bodies and ids. With `confirm`, it flushes first and
+     * throws `not durable: still uploading` until the upload is in. `idle`
+     * with `budget` 0 and no position, or the head, records that the pusher
+     * stopped clocking itself; any other pull clears it. `raw` gives each
+     * message's bytes, its text left empty. */
+    pull(after: Position | undefined, budget: number, idle: boolean, now: number, raw = false): { pull: Pull; raw: Raw[] } {
+        if (!Number.isSafeInteger(budget) || budget < 0 || budget > 1024 * 1024)
+            throw Error("invalid pull budget");
+        const epoch = this.wake();
         if (this.confirm)
-            try {
-                this.db.flush();
-            }
-            catch (e) {
-                if (errorMessage(e).includes("not durable: still uploading")) {
-                    this.alarms.setAlarm(now + 50n);
-                    this.pending = true;
-                    return false;
+            this.db.flush();
+        const epochs = this.epochs(), head = this.last() ?? epoch.base;
+        if (after && (after.e <= 0n || after.n < 0n || after.e > epoch.e || (after.e === epoch.e && after.n > head)))
+            throw Error("invalid position");
+        this.pulled = now;
+        this.idle = idle && budget === 0 && (!after || (after.e === epoch.e && after.n === head));
+        const later = after ? epochs.filter(e => e.e > after.e) : [];
+        const b = later.reduce((b, e) => b < e.base ? b : e.base, epoch.base);
+        const p: Pull = { e: epoch.e, b, first: head + 1n, head, recover: false, messages: [] };
+        const out: Raw[] = [];
+        // A position above a later epoch's base starts at that base: the numbers above it are void.
+        const from = after ? later.reduce((n, e) => n < e.base ? n : e.base, after.n) : head;
+        if (budget === 0 || from >= head)
+            return { pull: p, raw: out };
+        const rows = Math.max(1, Math.min(PULL_ROWS, Math.floor(budget / ROW_COST)));
+        let next = from + 1n, bytes = 0;
+        while (p.messages.length < rows) {
+            const want = Math.min(PAGE, rows - p.messages.length);
+            const page = this.db.query(`SELECT n,e,at,id,${raw ? "CAST(body AS BLOB),CAST(id AS BLOB)" : "body,NULL"},length(CAST(body AS BLOB)),coalesce(length(CAST(id AS BLOB)),0) FROM ${H} WHERE n >= ?1 ORDER BY n LIMIT ?2`, [integer(next), integer(BigInt(want))]).values;
+            for (const r of page) {
+                const n = num(r[0]), e = num(r[1]), bodyBytes = Number(num(r[6])), idBytes = Number(num(r[7]));
+                if (p.messages.length && bytes + bodyBytes + idBytes > PULL_BYTES)
+                    return { pull: p, raw: out };
+                const boundary = epochs.find(x => x.e === e);
+                if (!boundary) {
+                    // Its epoch's base left the 64 kept: HTTP history answers it.
+                    return { pull: { ...p, recover: true, first: head + 1n, messages: [] }, raw: [] };
                 }
-                throw e;
+                if (!p.messages.length)
+                    p.first = n;
+                bytes += bodyBytes + idBytes;
+                p.messages.push({ position: { n, e }, b: boundary.base, at: num(r[2]), id: r[3].tag === "null" ? undefined : str(r[3]), body: raw ? "" : str(r[4]), bodyBytes, idBytes });
+                if (raw)
+                    out.push({ body: bytesOf(r[4]), id: r[3].tag === "null" ? undefined : bytesOf(r[5]) });
+                next = n + 1n;
             }
-        this.pending = false;
-        return true;
+            if (page.length < want)
+                break;
+        }
+        return { pull: p, raw: out };
     }
     history(after?: Position, limit = 2000, last?: number): History {
         return this.page(after, limit, last).history;

@@ -1,0 +1,67 @@
+# Shared Rust/TypeScript vectors for the room's pull (ADR 0040, section 13).
+# Scenarios are separated by blank lines; each starts on an empty room.
+#   publish K [SIZE]  K publishes of one message, SIZE bytes of "x" (default 1)
+#   lose N            delete rows above N (writes a crash lost)
+#   trim N            delete rows up to N (the window moved on)
+#   restart           a new Core over the same database (a cold start)
+#   epochdrop E       delete epoch E's row (it left the 64 kept)
+#   clock T           the time of the following pulls and pokes (ms)
+#   poke P            a publish now would answer poke = P
+#   pull E N BUDGET IDLE -> e b first head recover count lastE lastB
+#                     E N "- -" for no position; lastE lastB of the last
+#                     message carried, 0 0 for none
+
+# Budgets: 1 KiB per row, 513 rows, 512 KiB of bodies, at least one row.
+publish 20 60000
+pull 1 0 1048576 0 -> 1 0 1 20 0 8 1 0
+pull 1 0 4096 0 -> 1 0 1 20 0 4 1 0
+pull 1 0 1 0 -> 1 0 1 20 0 1 1 0
+pull 1 0 0 0 -> 1 0 21 20 0 0 0 0
+pull - - 1048576 0 -> 1 0 21 20 0 0 0 0
+pull 1 20 1048576 0 -> 1 0 21 20 0 0 0 0
+publish 600
+pull 1 20 1048576 0 -> 1 0 21 620 0 513 1 0
+pull 1 20 102400 0 -> 1 0 21 620 0 100 1 0
+
+# A position below the window starts at the window: the edge's behind.
+publish 10
+trim 5
+pull 1 2 1048576 0 -> 1 0 6 10 0 5 1 0
+
+# An epoch bump between pulls: numbers above the new base are void, an old
+# acknowledgment above the head is valid, new messages carry their epoch.
+publish 5
+pull 1 3 1048576 0 -> 1 0 4 5 0 2 1 0
+lose 4
+restart
+pull 1 3 1048576 0 -> 2 4 4 4 0 1 1 0
+pull 1 5 1048576 0 -> 2 4 5 4 0 0 0 0
+publish 1
+pull 1 5 1048576 0 -> 2 4 5 5 0 1 2 4
+pull 2 5 1048576 0 -> 2 4 6 5 0 0 0 0
+
+# A row whose epoch left the 64 kept: recover, no messages.
+publish 3
+restart
+publish 1
+epochdrop 1
+pull 1 0 1048576 0 -> 2 3 5 4 1 0 0 0
+
+# The idle flag: a cold room asks for pokes; an idle pull at the head (or
+# with no position) records it; any other pull clears it; it expires.
+poke 1
+publish 2
+pull 1 0 1048576 0 -> 1 0 1 2 0 2 1 0
+poke 0
+pull 1 2 0 1 -> 1 0 3 2 0 0 0 0
+poke 1
+pull 1 1 0 1 -> 1 0 3 2 0 0 0 0
+poke 0
+pull - - 0 1 -> 1 0 3 2 0 0 0 0
+poke 1
+pull 1 2 1048576 1 -> 1 0 3 2 0 0 0 0
+poke 0
+clock 60000
+poke 0
+clock 60001
+poke 1

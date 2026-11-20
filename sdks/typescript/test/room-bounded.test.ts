@@ -2,15 +2,17 @@
 // a full window, many lagging children and a scale
 // operation each stay bounded per event, so no event exceeds the default
 // CPU budget whatever state a heavy run left behind.
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Core, type Store } from "../src/broadcast-core";
 import { Round } from "../src/broadcast-round";
 import { ScaleHost } from "../src/broadcast-scaling";
 import * as db from "./directory-storage-stub";
 import * as alarms from "./room-alarms-stub";
-import { install } from "./host-stub";
+import { useSqlite, encode, decode, byteLength, fits } from "../src/room-utf8";
+import { modes, sources } from "./room-source";
 import type { Value } from "wasmkeep:actor/types@0.2.0";
+for (const mode of modes) {
+const { test, install, of } = sources(mode);
 
 /** The stub store, counting the rows and text bytes each query hands back. */
 function counting() {
@@ -35,7 +37,7 @@ function fill(count: number, size: number, from = 1) {
 const one = (sql: string) => Number((db.query(sql, []).values[0][0] as { val: bigint }).val);
 test("a publish on a full window reads a bounded number of rows and keeps the window", () => {
     db.install(":memory:");
-    const c = counting(), core = new Core(c.store, alarms);
+    const c = counting(), core = new Core(c.store);
     core.init();
     core.wake();
     fill(2000, 256);
@@ -58,7 +60,7 @@ test("a publish on a full window reads a bounded number of rows and keeps the wi
 });
 test("history reads the page it answers, not the window", () => {
     db.install(":memory:");
-    const c = counting(), core = new Core(c.store, alarms);
+    const c = counting(), core = new Core(c.store);
     core.init();
     core.wake();
     fill(2000, 1024);
@@ -73,7 +75,7 @@ test("history reads the page it answers, not the window", () => {
 });
 test("a round with many lagging children builds at most 1 MiB, then continues 20 ms later", () => {
     db.install(":memory:");
-    const c = counting(), core = new Core(c.store, alarms);
+    const c = counting(), core = new Core(c.store);
     core.init();
     core.wake();
     fill(2000, 2048);
@@ -89,12 +91,12 @@ test("a round with many lagging children builds at most 1 MiB, then continues 20
         return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify({ e: 1, n: at.get(address), lagging: 0 })) };
     });
     const round = new Round(edges);
-    round.run(core, 0); // init
-    round.run(core, 20); // header only: the positions
+    round.run(of(core), 0); // init
+    round.run(of(core), 20); // header only: the positions
     let now = 40, rounds = 0;
     while ([...at.values()].some(n => n < 2000)) {
         bytes = 0; calls = 0; c.reset();
-        round.run(core, now);
+        round.run(of(core), now);
         assert(bytes <= 1024 * 1024 + 16 * 128, `round ${rounds} built ${bytes} bytes in ${calls} calls`);
         assert(c.seen.bytes <= 2 * 1024 * 1024, `round ${rounds} read ${c.seen.bytes} bytes`);
         if ([...at.values()].some(n => n < 2000))
@@ -108,7 +110,7 @@ test("a scale pass runs one durable step per event and continues on the alarm", 
     db.install(":memory:");
     const host = new ScaleHost({ directory: "directory/bg:r", edgeClass: "edge", capacity: 10 });
     host.init();
-    const core = new Core(db, alarms);
+    const core = new Core(db);
     core.init();
     const effects: string[] = [];
     install((address, r) => {
@@ -117,13 +119,13 @@ test("a scale pass runs one durable step per event and continues on the alarm", 
         return { status: r.path.endsWith("/create") ? 503 : 200, headers: [], body: new TextEncoder().encode(r.path.endsWith("/push") ? '{"e":1,"n":0,"sockets":0,"lagging":0}' : '{"sockets":0}') };
     });
     // The first event boots the group by one step; the directory's step is the next event's.
-    host.run(new Round([]), core, 0);
+    host.run(new Round([]), of(core), 0);
     assert.deepEqual(effects, ["edge/r.e1 /wasmkeep-edge/v1/init"]);
     assert.equal(host.load()!.op!.step, 1);
-    assert.equal(alarms.pending, 0n);
+    // The next step 1 ms on: an alarm left at the delivered time would be cleared.
+    assert.equal(alarms.pending, 1n);
     db.close();
 });
-import { useSqlite, encode, decode, byteLength, fits } from "../src/room-utf8";
 test("the SQLite UTF-8 path answers exactly what TextEncoder and TextDecoder do", () => {
     db.install(":memory:");
     useSqlite(true);
@@ -164,7 +166,7 @@ function edges(_names: string[], at: Map<string, number>, pushed: Map<string, nu
 }
 test("sustained 256 KiB batches never starve a child: every child advances, one that falls out of the window is told", () => {
     db.install(":memory:");
-    const core = new Core(db, alarms);
+    const core = new Core(db);
     core.init();
     core.wake();
     const names = ["edge/a", "edge/b", "edge/c", "edge/d"];
@@ -172,12 +174,12 @@ test("sustained 256 KiB batches never starve a child: every child advances, one 
     const answer = edges(names, at, pushed, holes);
     install((address, r) => ({ status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(answer(address, JSON.parse(new TextDecoder().decode(r.body))))) }));
     const round = new Round(names);
-    round.run(core, 0);
-    round.run(core, 20);
+    round.run(of(core), 0);
+    round.run(of(core), 20);
     let now = 40;
     for (let i = 0; i < 60; i++) {
         core.publish(Array.from({ length: 4 }, () => ({ body: "z".repeat(65536) })), BigInt(now));
-        round.run(core, now);
+        round.run(of(core), now);
         now += 20;
     }
     const head = Number(core.last());
@@ -190,7 +192,7 @@ test("sustained 256 KiB batches never starve a child: every child advances, one 
 });
 test("a child left behind the window gets a push past its position (the edge's behind)", () => {
     db.install(":memory:");
-    const core = new Core(db, alarms);
+    const core = new Core(db);
     core.init();
     core.wake();
     fill(100, 10, 1000);
@@ -198,16 +200,16 @@ test("a child left behind the window gets a push past its position (the edge's b
     const answer = edges(["edge/old"], at, pushed, holes);
     install((address, r) => ({ status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify(answer(address, JSON.parse(new TextDecoder().decode(r.body))))) }));
     const round = new Round(["edge/old"]);
-    round.run(core, 0);
-    round.run(core, 20);
-    round.run(core, 40);
+    round.run(of(core), 0);
+    round.run(of(core), 20);
+    round.run(of(core), 40);
     assert(holes.has("edge/old"));
     assert.equal(at.get("edge/old"), 1099);
     db.close();
 });
 test("a round reads a bounded number of rows whatever the children's positions, empty bodies included", () => {
     db.install(":memory:");
-    const c = counting(), core = new Core(c.store, alarms);
+    const c = counting(), core = new Core(c.store);
     core.init();
     core.wake();
     db.exec("BEGIN", []);
@@ -224,11 +226,12 @@ test("a round reads a bounded number of rows whatever the children's positions, 
     });
     const round = new Round([]);
     round.sync(children, relays);
-    round.run(core, 0); // header only: the positions
+    round.run(of(core), 0); // header only: the positions
     for (let i = 1; i <= 3; i++) {
         c.reset();
-        round.run(core, i * 20);
+        round.run(of(core), i * 20);
         assert(c.seen.rows <= 1100, `round ${i} read ${c.seen.rows} rows`);
     }
     db.close();
 });
+}
