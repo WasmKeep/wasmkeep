@@ -297,7 +297,7 @@ pub(crate) struct Metrics {
     pub(crate) mailbox_host_work_seconds: Family<Histogram>,
     pub(crate) alarm_stale_hints: Family<AtomicU64>,
     /// Alarm deliveries an actor's mailbox ran, by class and outcome
-    /// (`ran`, `stale`, `deferred`), with tenant and app.
+    /// (`ran`, `stale`, `duplicate`, `deferred`), with tenant and app.
     pub(crate) alarm_deliveries: Family<AtomicU64>,
     /// Batched event boundaries gating the next guest event, by class.
     pub(crate) event_start_rule_wait_seconds: Family<Histogram>,
@@ -1148,7 +1148,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
     family(
         &mut out,
         "wasmkeep_alarm_deliveries_total",
-        "Alarm deliveries run in actor mailboxes, by tenant, app, class and outcome (ran, stale, deferred).",
+        "Alarm deliveries run in actor mailboxes, by tenant, app, class and outcome (ran, stale, duplicate, deferred).",
         &m.alarm_deliveries,
     );
     for (name, help, durations) in [

@@ -9,6 +9,24 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **One delivery per alarm round.** An event that ended while its actor's
+  alarm delivery waited in the mailbox queued another delivery of the same
+  round; every one after the first found the alarm moved and cleared it as
+  a stale hint, in a cluster with a flush, a fence, a LIST and DELETEs
+  inside the mailbox. A busy room spent most of its mailbox time there and
+  its publishes waited behind it. Now an event's end leaves a delivery for
+  the same time alone, a delivery the mailbox dropped (the actor failed to
+  start, or the event stopped) is delivered again with backoff instead of
+  waiting for the next event or a sweep, a local redelivery of a time the
+  actor's hold already ran skips the stale-hint clear, and that clear's
+  DELETEs run off the mailbox.
+  `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` (`ran`,
+  `stale`, `duplicate`, `deferred`) and
+  `wasmkeep_alarm_dropped_deliveries_total` show it: stale over ran should
+  be near zero ([monitoring](docs/monitoring.md#alarm-deliveries),
+  [ADR 0009](docs/adr/0009-alarms-in-a-cluster.md), amendment of
+  2026-11-19).
+
 - **Where an actor's time goes.** Three histograms per app and class:
   `wasmkeep_mailbox_wait_seconds` (queued to started),
   `wasmkeep_event_start_rule_wait_seconds` (a batched actor's event

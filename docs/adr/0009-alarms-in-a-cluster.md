@@ -1,10 +1,11 @@
 # 0009. Alarms in a cluster: an index in the bucket and a sweep
 
-- Status: accepted (implemented 2026-11-03, revised after three rounds of adversarial review the same day; index keys tagged with the owner's generation and a nonce on 2026-11-05, closing a race with deletes that land late; R4, an alarm from before joining listed before the first upload, the same day). Mutation-checked tests cover the sweep delivering an orphaned alarm, sweeps getting past stuck entries, the cursor under an escaped prefix, committed retries, backoff for handlers that reschedule and fail, a fresh backoff per alarm, recording the listed entry, stale-entry cleanup, late deletes after a takeover and after an owner's own reschedule (the alarm still delivered by a node that never ran the actor), the owner's generation in new keys, and legacy entries next to tagged ones. Not covered by tests: listing from `exec-durable`, giving the actor up after a failed listing, the timer's backoff horizon, resuming after the delivery cap, and sharding when nodes disagree; R1 to R4 and the fence are also checked under deterministic simulation (`sim/tests/madsim_alarm_index.rs`): three owners in turns on node leases (`wasmkeep_sim::node`, ADR 0020: holds, fences, releases), state uploads following replication's late-commit rule, requests applied late, deletes timing out and landing later, crashes, with the invariant that a committed alarm's named entry exists checked every 50 ms. Some nodes join with an alarm in their own data. 200 seeds per push; untagged keys, no generation check, no fence, a first upload before its entry, and clearing while the bucket has nothing for the actor are each caught by some seed (the last two with a budget of 2,000 seeds; the empty-bucket case is reached by a fault aimed at a joining node's first upload, and a separate test shows the rules keep every entry under that fault). Cluster tests cover R4 (`an_alarm_from_single_node_data_is_indexed_before_its_first_upload`) and the entry left while the bucket has nothing (`an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it`). Not modelled there: `exec-durable`'s mid-event index update, deleting an actor, the PUT retry, legacy migration and timer delivery (cluster tests cover those). One known exception to the invariant as the simulation states it: if recording the new entry in the database fails after its PUT, the event is still replicated naming the previous entry (at another time), while the new, unnamed entry lists the alarm; nothing is lost (that entry is delivered, then removed as unnamed).
+- Status: accepted (implemented 2026-11-03, revised after three rounds of adversarial review the same day; index keys tagged with the owner's generation and a nonce on 2026-11-05, closing a race with deletes that land late; R4, an alarm from before joining listed before the first upload, the same day). Mutation-checked tests cover the sweep delivering an orphaned alarm, sweeps getting past stuck entries, the cursor under an escaped prefix, committed retries, backoff for handlers that reschedule and fail, a fresh backoff per alarm, recording the listed entry, stale-entry cleanup, late deletes after a takeover and after an owner's own reschedule (the alarm still delivered by a node that never ran the actor), the owner's generation in new keys, and legacy entries next to tagged ones. Not covered by tests: listing from `exec-durable`, giving the actor up after a failed listing, the timer's backoff horizon, resuming after the delivery cap, and sharding when nodes disagree; R1 to R4 and the fence are also checked under deterministic simulation (`sim/tests/madsim_alarm_index.rs`): three owners in turns on node leases (`wasmkeep_sim::node`, ADR 0020: holds, fences, releases), state uploads following replication's late-commit rule, requests applied late, deletes timing out and landing later, crashes, with the invariant that a committed alarm's named entry exists checked every 50 ms. Some nodes join with an alarm in their own data. 200 seeds per push; untagged keys, no generation check, no fence, a first upload before its entry, and clearing while the bucket has nothing for the actor are each caught by some seed (the last two with a budget of 2,000 seeds; the empty-bucket case is reached by a fault aimed at a joining node's first upload, and a separate test shows the rules keep every entry under that fault). Cluster tests cover R4 (`an_alarm_from_single_node_data_is_indexed_before_its_first_upload`) and the entry left while the bucket has nothing (`an_entry_for_an_actor_the_bucket_never_had_stays_without_creating_it`). Not modelled there: `exec-durable`'s mid-event index update, deleting an actor, the PUT retry and legacy migration (cluster tests cover those); the node's timer and mailbox deliveries are modelled on the batched hold since 2026-11-19 (see that amendment). One known exception to the invariant as the simulation states it: if recording the new entry in the database fails after its PUT, the event is still replicated naming the previous entry (at another time), while the new, unnamed entry lists the alarm; nothing is lost (that entry is delivered, then removed as unnamed).
 - Amended by [ADR 0020](0020-one-lease-per-node.md) (2026-11-07): ownership is a node lease plus an ownership record per actor; where this record says lease, read the actor's hold (`LeaseView`: the hold exists and the node lease is valid). `sim/tests/madsim_alarm_index.rs` runs on node leases since 2026-11-07 (`wasmkeep_sim::node`, holds acting by the server's own rule): over 200 seeds, 1,511 takeovers, 3,993 alarms and the invariant held throughout (2,000 seeds: 15,086 takeovers); every unsafe variant is caught, within 20 seeds. On node leases a takeover during a joining node's first upload needs that node cut off and fenced (its lease keeps renewing while the upload is only slow), so "clearing while the bucket has nothing" is reached by a fault aimed at that upload (delayed at the bucket, the node cut off), under which the rules also hold.
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md) (planned, 0.4.0): the alarm index moves under the app's root, `state/<tenant>/<app>/`.
 - Amended 2026-11-14 (0.4.2): a sweep with nothing due waits until the earliest entry it listed is the sweep's, at most six sweep periods (60 s), and a change in the view of the nodes wakes it. See "Amendment of 2026-11-14" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): in a batched class an entry is named at each event but PUT once per segment, before its upload; entries are retired only after that segment's acknowledgement; the fence is judged on the acknowledged head.
+- Amended 2026-11-19 (0.7.0): an event's end leaves a delivery in flight for the same time alone, a covered or dropped delivery is delivered again, a local redelivery of a time the hold already ran skips the stale-hint clear, and that clear's DELETEs run off the mailbox. See "Amendment of 2026-11-19" below.
 - Date: 2026-11-03
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -295,3 +296,116 @@ versions share the index as they did, by the same hash.
 - `alarm_index::tests::an_idle_sweep_waits_for_the_earliest_entry_within_bounds`.
 - The cluster tests of orphaned alarms (`tests/cluster/alarms.rs`) pass
   unchanged.
+
+## Amendment of 2026-11-19: one delivery per alarm round
+
+On a busy actor every round of its alarm was delivered several times. A
+large room, its mailbox always busy, ran several stale-hint clears for each
+alarm round, each a large share of a second inside the mailbox: most of
+the mailbox's time went to them, and its publishes waited behind. The timer re-registered the
+committed alarm at the end of every event, even when the delivery it had
+already handed to the mailbox was for that time; each event that ended
+while the round's delivery waited in the queue queued another. The first
+ran the round and moved the alarm on; each of the others found its time no
+longer committed and cleared it as a stale hint (section 4: on a batched
+hold a flush to the barrier, the fence, a LIST and DELETEs).
+
+### The rule
+
+Pure decisions in `alarm_index`, used by the timer (`alarm.rs`) and by
+`sim/tests/support/batched.rs`:
+
+- **An event's end leaves a delivery in flight for the same time alone**
+  (`delivery_covers`; the timer's `sync`). The mailbox runs events in
+  order, so that delivery runs after the event and reads the alarm it
+  committed. A different time (a move while the delivery waits, or a
+  clear and a new time) registers as before, and the old delivery's late
+  completion or retry changes nothing (its identity no longer matches).
+  During an admission backoff nothing is in flight, so a sync registers
+  anew as before. Other registrations (the startup scan, restores, the
+  backoff after a failure, an alarm moved later by its own delivery) keep
+  replacing whatever is there, as `a_new_committed_time_supersedes_pending_and_inflight_retries`
+  tests.
+- **A covered delivery whose run registered nothing is delivered again**
+  (`deliver_again`). Its result and the event's sync reach the timer from
+  different tasks, so the run may have ended before the commit, or without
+  running `on-alarm` (another owner, a failure); nothing else would arm the
+  committed alarm, and a single node has no sweep. A run that ran the
+  round moves or clears the alarm itself, which replaces the registration,
+  so its completion changes nothing.
+- **A delivery the mailbox dropped is delivered again**, with the
+  admission backoff (100 ms doubling to 5 s): the actor failed to start, or
+  the event stopped before answering. Before, it was forgotten until the
+  actor's next event (which, for the same time, it now covers) or a sweep.
+  A delivery that ran, or any delivery while the node shuts down,
+  completes as before. Counted in
+  `wasmkeep_alarm_dropped_deliveries_total`.
+- **A local delivery of a time this hold already ran `on-alarm` for skips
+  the stale-hint clear** (`stale_clear_skippable`, the latest such time
+  and the hold's lease generation). The entry its state named then is
+  retired by its exact key once the move is replicated (R2; ADR 0034,
+  section 9, on a batched hold), so the LIST would find nothing of this
+  hold's. Such a delivery still happens after a legitimate move (the alarm
+  cleared and set again while a delivery waits, or a stale delivery that
+  ran the committed round while that round's own registration was
+  queued). A delivery from the index (the sweep) always clears: the
+  entries it lists at that time are named by no state (an earlier owner's,
+  or one whose exact-key DELETE failed or was dropped with a failed
+  segment), and only it removes them.
+- **The stale-hint clear's DELETEs run off the mailbox**, as ADR 0034,
+  section 9 allows: the LIST and the choice of entries stay serialized with
+  the hold's next event; a DELETE landing late cannot remove a newer entry
+  (R1).
+
+### What still holds
+
+- R1 to R4 and the fence are unchanged; clearing fewer stale hints never
+  removes an entry a state names. A restorable committed alarm still has
+  its entry: nothing here writes or deletes an entry the rules did not
+  already choose.
+- A batched hold judges R2 only on its acknowledged head: the belt skips a
+  clear, it never judges one.
+- An entry no state names at a time the actor keeps re-arming is cleared
+  as before only by a delivery from the index, which the owner's own sweep
+  defers while a registration of the actor is due within the longest
+  backoff (section 4). That is unchanged: before, such entries were often
+  cleared by the duplicate deliveries this amendment removes. They cost a
+  line in each sweep's listing until the actor goes quiet.
+
+### Measuring it
+
+`wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` counts the
+deliveries a mailbox ran: `ran`, `stale`, `duplicate` (a stale hint the
+belt skipped) and `deferred`. Stale per ran was well above one on such a
+room before; it should be near zero after ([monitoring](../monitoring.md#alarm-deliveries)).
+
+### Tests
+
+- `tests/alarms.rs`,
+  `events_that_end_while_a_delivery_is_queued_do_not_queue_more`: an
+  alarm comes due behind a busy mailbox and six fetch events; one
+  delivery, no stale hint. Before the change it saw stale hints.
+- `alarm.rs`: events ending with the in-flight time queue no second
+  delivery; a move while a delivery is in flight registers the new time;
+  a covered delivery that registered nothing is delivered again, in
+  either order of its result and the sync; a dropped delivery is delivered
+  again with backoff, not counted as an admission retry; only the sweep
+  marks deliveries as from the index. The existing tests keep their
+  assertions (`Retry` gained its drop flag).
+- `sim/tests/madsim_alarm_index.rs`,
+  `batched_deliveries_keep_one_per_round_and_the_index_invariants`: the
+  timer and mailbox on ADR 0034's batched hold, with refused, dropped and
+  deferred deliveries, results racing the next events' syncs, moves while
+  a delivery waits, failed segments and entry PUTs, crashes and cuts, and
+  at the end a delivery from the index for every entry left at a time no
+  state names. At 200 seeds no second delivery of a round, no committed
+  alarm left unarmed once every result is in, no orphan left after the
+  final deliveries, and the model's index and replication invariants hold
+  throughout. Its uploads fail (segments and entry PUTs) but are not
+  stalled, and completions are not delayed across ownerships: the other
+  workloads of the model judge those, and their loss bound is stated for
+  their event pattern, not this mailbox's. Each rule removed is caught within 200 seeds:
+  re-registering the in-flight time (a second delivery runs stale),
+  forgetting a covered delivery, forgetting a dropped one (the committed
+  alarm unarmed), and the belt skipping deliveries from the index (an
+  orphan left).

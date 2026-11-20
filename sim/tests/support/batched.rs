@@ -13,8 +13,10 @@
 //! from local commit. Seeded delays and event lengths reorder actors and jobs.
 //! Directed workloads make rare races reachable, as in madsim_alarm_index's
 //! cut_at_first_upload; the same workloads run with every rule switch, including
-//! strict. Oracles never consult the switch. No mailbox, bytes, sidecar file I/O,
-//! checksum computation, effects, or real lease network is claimed here. Byte
+//! strict. Oracles never consult the switch. No mailbox (except the alarm
+//! delivery model at the end of this file, ADR 0009's amendment of 2026-11-19),
+//! bytes, sidecar file I/O, checksum computation, effects, or real lease network
+//! is claimed here. Byte
 //! caps and the node upload budget are out of scope. Cache contents/positions
 //! model local_is_at, not filesystem atomicity. SidecarBeforeAck is explicitly
 //! structural only (SidecarAhead), not evidence of a restore failure. This is
@@ -92,6 +94,16 @@ pub(crate) enum Violation {
     SidecarAhead,
     StrictAhead,
     EntryFailureUploaded,
+    /// The delivery model ([`simulate_deliveries`]): a delivery an event's
+    /// end registered while one for the same time was in flight, run after
+    /// that round (a second delivery of it, which finds its hint stale).
+    LocalDuplicate,
+    /// A committed alarm an event synced, with no registration or delivery
+    /// on the timer once every delivery's result came back.
+    AlarmUnarmed,
+    /// An index entry at a time named by no state, left after a delivery
+    /// from the index (a sweep) of that time.
+    OrphanLeft,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -334,6 +346,9 @@ struct World {
     interrupt: Option<(u64, usize, bool)>,
     healthy_delay: u64,
     waiting: Option<(usize, usize)>,
+    // The delivery model clears one stale hint at a time; `None` (the
+    // other workloads) clears every time, as before.
+    clear_only: Option<u64>,
 
     // Intervals include deliberately slow/failed object requests. Lease-only
     // cuts are independent: those can happen while the bucket accepts PUTs.
@@ -358,6 +373,7 @@ impl World {
             interrupt: None,
             healthy_delay: 0,
             waiting: None,
+            clear_only: None,
 
             unhealthy: Vec::new(),
             outcome: Outcome::default(),
@@ -1393,6 +1409,9 @@ impl World {
         let a = &mut self.actors[actor];
         let listed: Vec<_> = a.entries.iter().cloned().collect();
         for hint in [1000, 2000, 3000] {
+            if self.clear_only.is_some_and(|only| only != hint) {
+                continue;
+            }
             if indexed.is_some_and(|e| e.at == hint) {
                 continue;
             }
@@ -2251,4 +2270,591 @@ pub(crate) fn caught_in_scenario(rule: Switch, expected: Violation, scenario: us
         "{rule:?}: insufficient {expected:?} witnesses in scenario {scenario}: {witnesses:?}"
     );
     eprintln!("caught: {rule:?} expected={expected:?} scenario={scenario} seeds={witnesses:?}");
+}
+
+// The node's alarm timer and mailbox deliveries (ADR 0009, amendment of
+// 2026-11-19), on the batched hold above. The timer mirrors the server's
+// (`alarm.rs`): one registration per actor, waiting or handed to the
+// mailbox; the decisions are the production ones in
+// `wasmkeep_cluster::alarm_index` (`delivery_covers`, `deliver_again`,
+// `stale_clear_skippable`). Alarm times are abstract: every committed
+// alarm is due. The mailbox runs jobs in order: fetch events that keep the
+// alarm, events that move it, and deliveries. A delivery is refused at
+// admission, dropped before it answers, or deferred (it runs and registers
+// nothing, as for another owner) at random; results reach the timer up to
+// three ticks late, racing the next events' syncs. A delivery whose time
+// is committed runs the round (moves the alarm on); one whose time is not
+// clears the stale hint at the barrier (`cleanup`, that one time), unless
+// the belt skips it. Holds end at random (crashes, cuts); a new hold
+// registers its restored alarm, as a restore does. At the end, with
+// faults off, every entry left at a time no state names is delivered from
+// the index (a sweep reaching a quiet actor), and none may remain.
+
+/// One rule of the timer and delivery changed at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryRule {
+    Safe,
+    /// An event's end re-registers even when the delivery in flight is for
+    /// the same time (the timer before 0.7.0).
+    ResyncReplaces,
+    /// A completion forgets a delivery an event's sync was left to.
+    CompleteForgets,
+    /// A dropped delivery is completed (forgotten), not delivered again.
+    DropForgotten,
+    /// The belt also skips stale hints a sweep delivers.
+    BeltOnSweep,
+}
+
+#[derive(Clone, Copy)]
+struct Reg {
+    waiting: bool,
+    ready_at: u64,
+    hint: u64,
+    id: u64,
+    swept: bool,
+    covered: bool,
+    refusals: u32,
+    /// Made by an event's end while a delivery of the same time was in
+    /// flight: a second delivery of one round.
+    second: bool,
+}
+
+enum Job {
+    /// An event that leaves the alarm as it is.
+    Fetch,
+    /// An event that sets the alarm (or clears it).
+    Move(Option<u64>),
+    Deliver {
+        hint: u64,
+        id: u64,
+        swept: bool,
+        second: bool,
+    },
+}
+
+enum Answer {
+    Complete(u64),
+    /// Refused at admission (`false`) or dropped by the mailbox (`true`).
+    Retry(u64, bool),
+}
+
+#[derive(Default)]
+struct Local {
+    hold: u64,
+    reg: Option<Reg>,
+    ids: u64,
+    queue: std::collections::VecDeque<Job>,
+    answers: Vec<(u64, Answer)>,
+    /// The latest time this hold ran the round for.
+    delivered: Option<u64>,
+    /// The last job to sync the timer was an event that committed an alarm.
+    synced_by_event: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryCounts {
+    pub(crate) rounds: u64,
+    pub(crate) covered: u64,
+    pub(crate) delivered_again: u64,
+    pub(crate) dropped: u64,
+    pub(crate) refused: u64,
+    pub(crate) deferred: u64,
+    pub(crate) moves_in_flight: u64,
+    pub(crate) stale_clears: u64,
+    pub(crate) belt_skips: u64,
+    pub(crate) swept_clears: u64,
+    pub(crate) orphans_cleared: u64,
+    pub(crate) holds: u64,
+}
+
+impl DeliveryCounts {
+    fn add(&mut self, o: &Self) {
+        self.rounds += o.rounds;
+        self.covered += o.covered;
+        self.delivered_again += o.delivered_again;
+        self.dropped += o.dropped;
+        self.refused += o.refused;
+        self.deferred += o.deferred;
+        self.moves_in_flight += o.moves_in_flight;
+        self.stale_clears += o.stale_clears;
+        self.belt_skips += o.belt_skips;
+        self.swept_clears += o.swept_clears;
+        self.orphans_cleared += o.orphans_cleared;
+        self.holds += o.holds;
+    }
+}
+
+struct Deliveries {
+    rule: DeliveryRule,
+    local: Local,
+    counts: DeliveryCounts,
+}
+
+const TIMES: [u64; 3] = [1000, 2000, 3000];
+
+impl Deliveries {
+    fn set(&mut self, now: u64, at: u64, swept: bool) {
+        let l = &mut self.local;
+        l.ids += 1;
+        l.reg = Some(Reg {
+            waiting: true,
+            ready_at: now,
+            hint: at,
+            id: l.ids,
+            swept,
+            covered: false,
+            refusals: 0,
+            second: false,
+        });
+    }
+
+    /// An event's end: `AlarmHandle::sync`, or `clear` for none.
+    fn sync(&mut self, now: u64, committed: Option<u64>) {
+        let Some(at) = committed else {
+            self.local.reg = None;
+            return;
+        };
+        let in_flight = self.local.reg.and_then(|r| (!r.waiting).then_some(r.hint));
+        if in_flight.is_some_and(|hint| hint != at) {
+            self.counts.moves_in_flight += 1;
+        }
+        if self.rule != DeliveryRule::ResyncReplaces && alarm_index::delivery_covers(in_flight, at)
+        {
+            self.counts.covered += 1;
+            if let Some(r) = self.local.reg.as_mut() {
+                r.covered = true;
+            }
+        } else {
+            self.set(now, at, false);
+            if let Some(r) = self.local.reg.as_mut() {
+                r.second = in_flight == Some(at);
+            }
+        }
+    }
+
+    /// A delivery's result reaching the timer.
+    fn answer(&mut self, now: u64, answer: Answer) {
+        let (id, retry) = match answer {
+            Answer::Complete(id) => (id, None),
+            Answer::Retry(id, dropped) => (id, Some(dropped)),
+        };
+        let Some(r) = self.local.reg else { return };
+        if r.id != id || r.waiting {
+            return;
+        }
+        match retry {
+            Some(true) if self.rule == DeliveryRule::DropForgotten => self.complete(now, r),
+            Some(_) => {
+                self.local.ids += 1;
+                self.local.reg = Some(Reg {
+                    waiting: true,
+                    ready_at: now + 1 + u64::from(r.refusals.min(3)),
+                    id: self.local.ids,
+                    covered: false,
+                    refusals: r.refusals + 1,
+                    ..r
+                });
+            }
+            None => self.complete(now, r),
+        }
+    }
+
+    fn complete(&mut self, now: u64, r: Reg) {
+        let covered = r.covered && self.rule != DeliveryRule::CompleteForgets;
+        if alarm_index::deliver_again(covered) {
+            self.counts.delivered_again += 1;
+            self.set(now, r.hint, false);
+        } else {
+            self.local.reg = None;
+        }
+    }
+}
+
+impl World {
+    fn committed(&self, actor: usize) -> Option<u64> {
+        self.actors[actor]
+            .hold
+            .as_ref()
+            .and_then(|h| h.local.alarm.as_ref().map(|e| e.at))
+    }
+
+    fn named(&self, actor: usize) -> Option<u64> {
+        self.actors[actor]
+            .hold
+            .as_ref()
+            .and_then(|h| h.acknowledged.alarm.as_ref().map(|e| e.at))
+    }
+
+    fn hold_generation(&self, actor: usize) -> Option<u64> {
+        self.actors[actor].hold.as_ref().map(|h| h.generation)
+    }
+
+    /// Runs an event to its commit, waiting for admission like a mailbox
+    /// job does; `false` if the hold ended first.
+    async fn admitted_event(&mut self, actor: usize, alarm: Option<u64>) -> bool {
+        let Some(generation) = self.hold_generation(actor) else {
+            return false;
+        };
+        for _ in 0..200 {
+            if self.hold_generation(actor) != Some(generation) {
+                return false;
+            }
+            if self.can_start(actor) {
+                let duration = 1 + self.rng.below(EVENT_MAX);
+                self.advance(duration).await;
+                if self.hold_generation(actor) != Some(generation) {
+                    return false;
+                }
+                self.commit(actor, alarm);
+                self.check();
+                return true;
+            }
+            self.advance(1).await;
+        }
+        false
+    }
+
+    /// Clears the stale hint `hint` as `clear_stale_hint` does: at a
+    /// `Flushed` barrier, on the acknowledged entry (ADR 0034, section 9).
+    async fn clear_hint(&mut self, actor: usize, hint: u64) -> u64 {
+        let before = self.actors[actor].entries.len();
+        self.clear_only = Some(hint);
+        self.cleanup(actor, false).await;
+        self.clear_only = None;
+        before.saturating_sub(self.actors[actor].entries.len()) as u64
+    }
+
+    /// One mailbox job of the delivery model.
+    async fn run_job(&mut self, actor: usize, d: &mut Deliveries, job: Job) {
+        match job {
+            Job::Fetch => {
+                let keep = self.committed(actor);
+                self.synced_event(actor, d, keep).await;
+            }
+            Job::Move(alarm) => self.synced_event(actor, d, alarm).await,
+            Job::Deliver {
+                hint,
+                id,
+                swept,
+                second,
+            } => {
+                if self.rng.chance(8) {
+                    d.counts.dropped += 1;
+                    let due = self.now + self.rng.below(4);
+                    d.local.answers.push((due, Answer::Retry(id, true)));
+                    return;
+                }
+                if self.rng.chance(8) {
+                    // Ran and registered nothing (another owner, say): a
+                    // committed alarm left unarmed then is not this node's.
+                    d.counts.deferred += 1;
+                    d.local.synced_by_event = false;
+                    let due = self.now + self.rng.below(4);
+                    d.local.answers.push((due, Answer::Complete(id)));
+                    return;
+                }
+                let generation = d.local.hold;
+                if second && self.committed(actor) != Some(hint) {
+                    // It runs after the round it repeats: a stale hint
+                    // cleared for nothing (before 0.7.0, in the mailbox).
+                    self.outcome.violations.insert(Violation::LocalDuplicate);
+                }
+                self.deliver(actor, d, hint, swept).await;
+                if self.hold_generation(actor) == Some(generation) {
+                    let due = self.now + self.rng.below(4);
+                    d.local.answers.push((due, Answer::Complete(id)));
+                }
+            }
+        }
+    }
+
+    async fn synced_event(&mut self, actor: usize, d: &mut Deliveries, alarm: Option<u64>) {
+        if self.admitted_event(actor, alarm).await {
+            let committed = self.committed(actor);
+            d.sync(self.now, committed);
+            d.local.synced_by_event = committed.is_some();
+        }
+    }
+
+    /// `ActorState::alarm`, abstracted: the committed alarm, if any, is due
+    /// and runs its round (moving the alarm on); a hint that is not
+    /// committed is cleared as stale, or skipped by the belt.
+    async fn deliver(&mut self, actor: usize, d: &mut Deliveries, hint: u64, swept: bool) {
+        let committed = self.committed(actor);
+        let delivered = d.local.delivered;
+        let stale = committed != Some(hint);
+        d.local.synced_by_event = false;
+        let generation = d.local.hold;
+        if let Some(at) = committed {
+            d.local.delivered = Some(at);
+            d.counts.rounds += 1;
+            let next = if self.rng.below(4) == 0 {
+                None
+            } else {
+                let others: Vec<_> = TIMES.iter().copied().filter(|t| *t != at).collect();
+                Some(others[self.rng.below(others.len() as u64) as usize])
+            };
+            if !self.admitted_event(actor, next).await {
+                return;
+            }
+            d.sync(self.now, self.committed(actor));
+        } else {
+            d.local.reg = None;
+        }
+        if !stale || self.hold_generation(actor) != Some(generation) {
+            return;
+        }
+        let as_swept = swept && d.rule != DeliveryRule::BeltOnSweep;
+        if alarm_index::stale_clear_skippable(hint, as_swept, delivered) {
+            d.counts.belt_skips += 1;
+            return;
+        }
+        d.counts.stale_clears += 1;
+        let cleared = self.clear_hint(actor, hint).await;
+        if swept {
+            d.counts.swept_clears += 1;
+            d.counts.orphans_cleared += cleared;
+        }
+    }
+
+    /// The timer's own steps for one tick: answers that came back, and a
+    /// waiting registration handed to the mailbox (or refused).
+    fn timer_tick(&mut self, actor: usize, d: &mut Deliveries) {
+        let now = self.now;
+        let answers = std::mem::take(&mut d.local.answers);
+        for (due, answer) in answers {
+            if due <= now {
+                d.answer(now, answer);
+            } else {
+                d.local.answers.push((due, answer));
+            }
+        }
+        if let Some(r) = d.local.reg.as_mut()
+            && r.waiting
+            && r.ready_at <= now
+        {
+            r.waiting = false;
+            let (hint, id, swept, second) = (r.hint, r.id, r.swept, r.second);
+            if self.rng.chance(10) {
+                d.counts.refused += 1;
+                d.local.answers.push((now, Answer::Retry(id, false)));
+            } else {
+                d.local.queue.push_back(Job::Deliver {
+                    hint,
+                    id,
+                    swept,
+                    second,
+                });
+            }
+        }
+        // Once every result is in, an alarm an event committed is armed.
+        if d.local.answers.is_empty()
+            && d.local.synced_by_event
+            && self.committed(actor).is_some()
+            && d.local.reg.is_none()
+        {
+            self.outcome.violations.insert(Violation::AlarmUnarmed);
+        }
+    }
+
+    /// A new hold: its mailbox and timer state start over, and the restored
+    /// alarm is registered (a restore's `Set`).
+    fn new_local(&mut self, actor: usize, d: &mut Deliveries) {
+        let Some(generation) = self.hold_generation(actor) else {
+            return;
+        };
+        if d.local.hold == generation {
+            return;
+        }
+        d.counts.holds += 1;
+        d.local = Local {
+            hold: generation,
+            ids: d.local.ids,
+            ..Local::default()
+        };
+        if let Some(at) = self.committed(actor) {
+            d.set(self.now, at, false);
+        }
+    }
+
+    async fn delivery_workload(&mut self, d: &mut Deliveries) {
+        let actor = 0;
+        // Crashes and cuts are aimed here, also inside a job's waits, rather
+        // than `random_faults`: that also delays upload completions across
+        // ownerships, which the replication workloads above judge.
+        for _ in 0..300 {
+            if self.interrupt.is_none() && self.rng.chance(3) {
+                let at = self.now + self.rng.below(6);
+                let crash = self.rng.below(2) == 0;
+                self.interrupt = Some((at, actor, crash));
+            }
+            if self.actors[actor].hold.is_none() && self.rng.chance(30) {
+                self.acquire(actor);
+            }
+            self.new_local(actor, d);
+            if self.actors[actor].hold.is_none() {
+                self.advance(1).await;
+                continue;
+            }
+            // Arrivals: bursts of fetches (a busy room), and some moves.
+            match self.rng.below(10) {
+                0..=4 => {
+                    for _ in 0..1 + self.rng.below(4) {
+                        d.local.queue.push_back(Job::Fetch);
+                    }
+                }
+                5 => {
+                    let alarm = match self.rng.below(4) {
+                        0 => None,
+                        n => Some(n * 1000),
+                    };
+                    d.local.queue.push_back(Job::Move(alarm));
+                }
+                // A failed segment (its retire request dropped, an entry
+                // left), or a failed entry PUT. Not stalled: a long stall
+                // is the replication workloads' (its loss bound is judged
+                // for their event pattern, not this mailbox's).
+                6 => {
+                    if self.rng.below(2) == 0 {
+                        self.actors[actor].next_fail = true;
+                    } else {
+                        self.actors[actor].next_entry_fail = true;
+                    }
+                }
+                _ => {}
+            }
+            self.timer_tick(actor, d);
+            if let Some(job) = d.local.queue.pop_front() {
+                let generation = d.local.hold;
+                self.run_job(actor, d, job).await;
+                if self.hold_generation(actor) != Some(generation) {
+                    continue;
+                }
+            } else {
+                self.advance(1).await;
+            }
+            self.timer_tick(actor, d);
+        }
+        self.interrupt = None;
+    }
+
+    /// Faults off, everything settled: each entry at a time no state names
+    /// is delivered from the index, and none may be left after.
+    async fn final_sweep(&mut self, d: &mut Deliveries) {
+        let actor = 0;
+        if self.actors[actor].hold.is_none() {
+            self.acquire(actor);
+        }
+        self.new_local(actor, d);
+        self.flush(actor).await;
+        self.advance(100).await;
+        if self.hold_generation(actor) != Some(d.local.hold) || !self.idle(actor) {
+            return;
+        }
+        let named = self.named(actor);
+        let times: BTreeSet<u64> = self.actors[actor]
+            .entries
+            .iter()
+            .map(|e| e.at)
+            .filter(|at| Some(*at) != named)
+            .collect();
+        for hint in times {
+            if self.committed(actor) == Some(hint) {
+                continue;
+            }
+            // The sweep reaches a quiet actor: no registration of its own
+            // holds the entry back, and the round is not due.
+            let as_swept = d.rule != DeliveryRule::BeltOnSweep;
+            if alarm_index::stale_clear_skippable(hint, as_swept, d.local.delivered) {
+                d.counts.belt_skips += 1;
+                continue;
+            }
+            let cleared = self.clear_hint(actor, hint).await;
+            d.counts.swept_clears += 1;
+            d.counts.orphans_cleared += cleared;
+        }
+        self.flush(actor).await;
+        self.advance(100).await;
+        let named = self.named(actor);
+        if self.hold_generation(actor) == Some(d.local.hold)
+            && self.actors[actor]
+                .entries
+                .iter()
+                .any(|e| Some(e.at) != named)
+        {
+            self.outcome.violations.insert(Violation::OrphanLeft);
+        }
+    }
+}
+
+/// The delivery model under `rule`, seeded.
+pub(crate) fn simulate_deliveries(
+    seed: u64,
+    rule: DeliveryRule,
+) -> (BTreeSet<Violation>, DeliveryCounts) {
+    Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async {
+        let mut w = World::new(seed ^ 0xDE11_7E2E, Switch::Safe, true);
+        for a in 0..ACTORS {
+            w.event(a, Some(1000)).await;
+            w.flush(a).await;
+        }
+        let mut d = Deliveries {
+            rule,
+            local: Local::default(),
+            counts: DeliveryCounts::default(),
+        };
+        w.delivery_workload(&mut d).await;
+        w.final_sweep(&mut d).await;
+        for a in 0..ACTORS {
+            w.drop_hold(a, false);
+        }
+        w.advance(100).await;
+        w.check();
+        (w.outcome.violations, d.counts)
+    })
+}
+
+pub(crate) fn deliveries_safe() {
+    let mut totals = DeliveryCounts::default();
+    let only = std::env::var("WASMKEEP_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let range = only.map_or(0..seeds(), |seed| seed..seed + 1);
+    let count = range.end - range.start;
+    for seed in range {
+        let (violations, counts) = simulate_deliveries(seed, DeliveryRule::Safe);
+        assert!(
+            violations.is_empty(),
+            "seed {seed}: {violations:?}; {counts:?}"
+        );
+        totals.add(&counts);
+    }
+    for (name, value) in [
+        ("rounds", totals.rounds),
+        ("covered syncs", totals.covered),
+        ("delivered again", totals.delivered_again),
+        ("dropped", totals.dropped),
+        ("refused", totals.refused),
+        ("deferred", totals.deferred),
+        ("moves in flight", totals.moves_in_flight),
+        ("stale clears", totals.stale_clears),
+        ("swept clears", totals.swept_clears),
+        ("holds", totals.holds),
+    ] {
+        assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
+    }
+    assert!(totals.orphans_cleared > 0, "{totals:?}");
+    eprintln!("delivery model: {count} seeds: {totals:?}");
+}
+
+pub(crate) fn deliveries_caught(rule: DeliveryRule, expected: Violation) {
+    let seed = (0..seeds())
+        .find(|&seed| simulate_deliveries(seed, rule).0.contains(&expected))
+        .unwrap_or_else(|| panic!("{rule:?}: no {expected:?} within {} seeds", seeds()));
+    assert_eq!(
+        simulate_deliveries(seed, rule).0,
+        simulate_deliveries(seed, rule).0,
+        "seed {seed} did not reproduce"
+    );
+    eprintln!("caught: {rule:?} seed={seed} expected={expected:?}");
 }

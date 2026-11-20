@@ -393,3 +393,26 @@ fn an_idle_sweep_waits_for_the_earliest_entry_within_bounds() {
         60_000
     );
 }
+
+#[test]
+fn a_delivery_covers_only_a_commit_of_its_own_time() {
+    assert!(delivery_covers(Some(17), 17));
+    // A move while it is queued registers the new time.
+    assert!(!delivery_covers(Some(17), 18));
+    // Nothing in flight (waiting, backing off, none): register.
+    assert!(!delivery_covers(None, 17));
+}
+
+#[test]
+fn only_a_covered_delivery_is_delivered_again_when_it_ran() {
+    assert!(!deliver_again(false));
+    assert!(deliver_again(true));
+}
+
+#[test]
+fn only_a_local_redelivery_of_a_delivered_time_skips_the_stale_clear() {
+    assert!(stale_clear_skippable(17, false, Some(17)));
+    assert!(!stale_clear_skippable(17, true, Some(17)), "from the index");
+    assert!(!stale_clear_skippable(17, false, Some(18)));
+    assert!(!stale_clear_skippable(17, false, None));
+}

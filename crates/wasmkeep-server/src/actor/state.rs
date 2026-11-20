@@ -82,6 +82,11 @@ pub(super) struct ActorState {
     pub(super) alarms: AlarmHandle,
     /// Consecutive failed `on-alarm` runs, for backoff.
     pub(super) alarm_failures: u32,
+    /// The latest alarm time this actor ran `on-alarm` for, with the lease
+    /// generation of the hold that ran it (`None` on a single node): a
+    /// local delivery of that time again, once the alarm moved, need not
+    /// clear it as a stale hint (`alarm_index::stale_clear_skippable`).
+    pub(super) delivered_alarm: Option<(Option<u64>, u64)>,
     /// The service, for `actors.call` (set right after construction).
     pub(super) service: ServiceSlot,
     /// The node's WebSocket connections.
@@ -1648,7 +1653,9 @@ impl ActorState {
             }
         } else if sync_alarm {
             match committed {
-                Ok(Ok(Some(at))) => self.alarms.set(self.address.clone(), at),
+                // Left to a delivery in flight for the same time (ADR 0009,
+                // amendment of 2026-11-19).
+                Ok(Ok(Some(at))) => self.alarms.sync(self.address.clone(), at),
                 Ok(Ok(None)) => self.alarms.clear(self.address.clone()),
                 _ => {
                     tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "could not read the alarm")

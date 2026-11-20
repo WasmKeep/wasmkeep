@@ -740,7 +740,8 @@ carries several events and only its end can be restored:
   flush records a boundary, the entry named there is PUT when its
   segment is prepared.
 - **The local timer** is armed from the committed local alarm at each
-  event's end, as today. So an alarm set by an event whose segment never
+  event's end, as today (unless a delivery for that time is already in
+  the mailbox: ADR 0009, amendment of 2026-11-19). So an alarm set by an event whose segment never
   lands may fire on this node, and its `on-alarm` run, before its node
   dies and the setting is lost with it. This is listed in section 12.
 

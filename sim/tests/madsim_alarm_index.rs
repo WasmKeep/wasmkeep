@@ -1098,3 +1098,52 @@ fn actor_restore_entry_after_upload_is_caught() {
         ..SAFE
     });
 }
+
+/// ADR 0009, amendment of 2026-11-19: the node's timer and mailbox
+/// deliveries on a batched hold, with duplicate, refused, dropped and
+/// deferred deliveries, results racing the next events, crashes and cuts.
+/// No round is delivered twice, no committed alarm is left unarmed, no
+/// orphan survives a delivery from the index, and the index invariants of
+/// the model above hold throughout.
+#[test]
+fn batched_deliveries_keep_one_per_round_and_the_index_invariants() {
+    batched::deliveries_safe();
+}
+
+/// Without the guard (an event's end re-registering the time of the
+/// delivery in flight, as before 0.7.0), a round is delivered again.
+#[test]
+fn resyncing_the_in_flight_time_is_caught() {
+    batched::deliveries_caught(
+        batched::DeliveryRule::ResyncReplaces,
+        batched::Violation::LocalDuplicate,
+    );
+}
+
+/// With the guard, a completion that forgot a covered delivery would leave
+/// the committed alarm unarmed.
+#[test]
+fn forgetting_a_covered_delivery_is_caught() {
+    batched::deliveries_caught(
+        batched::DeliveryRule::CompleteForgets,
+        batched::Violation::AlarmUnarmed,
+    );
+}
+
+#[test]
+fn forgetting_a_dropped_delivery_is_caught() {
+    batched::deliveries_caught(
+        batched::DeliveryRule::DropForgotten,
+        batched::Violation::AlarmUnarmed,
+    );
+}
+
+/// The belt must not skip what a sweep delivers: only that removes an
+/// entry no state names.
+#[test]
+fn skipping_swept_stale_hints_is_caught() {
+    batched::deliveries_caught(
+        batched::DeliveryRule::BeltOnSweep,
+        batched::Violation::OrphanLeft,
+    );
+}

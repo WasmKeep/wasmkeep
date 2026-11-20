@@ -217,6 +217,7 @@ impl ActorService {
                         limits,
                         alarms,
                         alarm_failures: 0,
+                        delivered_alarm: None,
                         service,
                         sockets,
                         chain: Arc::from(Vec::new()),
@@ -490,7 +491,7 @@ impl ActorService {
                 move |state: &mut ActorState, waited| {
                     state.record_mailbox_wait(waited);
                     Box::pin(async move {
-                        state.alarm(delivery.hint).await;
+                        state.alarm(delivery.hint, delivery.swept).await;
                         // Set when another node turned out to own it.
                         state.owner_hint.as_ref().map(|(owner, _)| owner.clone())
                     })
@@ -509,7 +510,20 @@ impl ActorService {
                     inner.recheck_if_handing_over(&address, &owner);
                     inner.alarms.complete(address, delivery);
                 }
-                _ => {
+                // Dropped before it answered: the actor failed to start, or
+                // the event stopped (a host panic). An event that ended with
+                // this time left the alarm to this delivery, so it is
+                // delivered again, with backoff, rather than forgotten;
+                // unless the node is shutting down (`Gone` then too).
+                Err(MailboxError::Init { .. } | MailboxError::Gone(_))
+                    if !inner.mailboxes.is_closed() =>
+                {
+                    inner.alarms.redeliver(address, delivery);
+                }
+                // Ran (whatever it found), or the node is shutting down
+                // (`Closed`):
+                // other nodes take over, or the startup scan re-arms it.
+                Ok(None) | Err(_) => {
                     // A draining node handed the alarm off: nothing of the
                     // actor stays here (ADR 0014).
                     if inner.cluster.as_ref().is_some_and(|c| c.draining()) {

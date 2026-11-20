@@ -37,16 +37,19 @@ pub(super) enum Delivered {
     Ran,
     /// Its hint no longer matched the committed alarm: a stale hint.
     Stale,
+    /// A stale hint this hold had already delivered, met again from this
+    /// node's timer: not cleared (the move retired its entry).
+    Duplicate,
     /// Not run now: another owner, a hand-off, the bucket, a missing
     /// value, an actor not ready, no state, a class no longer served.
     Deferred,
 }
-const DELIVERED: [&str; 3] = ["ran", "stale", "deferred"];
+const DELIVERED: [&str; 4] = ["ran", "stale", "duplicate", "deferred"];
 
 pub(super) struct Timing {
     histograms: [Arc<Histogram>; 7],
     stale_hints: Arc<AtomicU64>,
-    deliveries: [Arc<AtomicU64>; 3],
+    deliveries: [Arc<AtomicU64>; 4],
     guest: AtomicU64,
     host: AtomicU64,
     depth: AtomicUsize,

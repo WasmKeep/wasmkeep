@@ -170,7 +170,7 @@ its first request.
 | `wasmkeep_mailbox_wait_seconds{tenant,app,class}` | histogram | Time from the accepted enqueue attempt to the start of a guest-event mailbox job; excludes capacity-admission retries. |
 | `wasmkeep_mailbox_host_work_seconds{tenant,app,class,work}` | histogram | Exclusive host work inside the mailbox, including jobs with no guest event; fixed `work` categories below. |
 | `wasmkeep_alarm_stale_hints_total{tenant,app,class}` | counter | Stale alarm hint clear attempts (including failures or deferred clears), not the number of index objects deleted. |
-| `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` | counter | Alarm deliveries an actor's mailbox ran, by how they ended: `ran` (`on-alarm` ran for the committed alarm), `stale` (the delivery's time no longer matched the committed alarm: cleared or moved since), `deferred` (not run now: another node owns the actor, a draining node handed it off, the bucket was unavailable, a required value is missing, the actor was not ready or its class is no longer served). `stale` over `ran` is how many extra deliveries each alarm round costs; see [alarm deliveries](#alarm-deliveries). |
+| `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` | counter | Alarm deliveries an actor's mailbox ran, by how they ended: `ran` (`on-alarm` ran for the committed alarm), `stale` (the delivery's time no longer matched the committed alarm: cleared or moved since), `duplicate` (a stale time this actor's hold had already run, met again from the node's timer after a move: not cleared, its entry was retired when the alarm moved), `deferred` (not run now: another node owns the actor, a draining node handed it off, the bucket was unavailable, a required value is missing, the actor was not ready or its class is no longer served). `stale` over `ran` is how many extra deliveries each alarm round costs; see [alarm deliveries](#alarm-deliveries). |
 | `wasmkeep_alarm_dropped_deliveries_total` | counter | Alarm deliveries the mailbox dropped before they answered (the actor failed to start, or the event stopped), rescheduled with the admission backoff. |
 | `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
 | `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
@@ -365,7 +365,9 @@ A ratio near zero is expected: stale deliveries come from index entries
 left by an earlier owner or a failed DELETE, and from alarms moved or
 cleared while their delivery was due. A ratio of one or more on a busy
 actor (before 0.7.0, a room whose mailbox was always busy) means the same
-round is being delivered several times.
+round is being delivered several times. `duplicate` deliveries cost a
+mailbox turn but no clear; `wasmkeep_alarm_dropped_deliveries_total`
+counts deliveries redelivered after the mailbox dropped them.
 
 ### Bucket requests
 

@@ -4,6 +4,10 @@
 //! cache of "who is due when", updated from the committed row at the end of
 //! every event, filled by a scan of the data directory at startup, and drained
 //! by delivering due alarms as mailbox events.
+//!
+//! An event that ends with the time a delivery already handed to the
+//! mailbox is for leaves that delivery as it is (ADR 0009, amendment of
+//! 2026-11-19): it runs after the event and reads the same alarm.
 
 use std::collections::{BTreeSet, HashMap, hash_map::RandomState};
 use std::hash::BuildHasher;
@@ -14,6 +18,9 @@ use wasmkeep_runtime::ActorAddress;
 
 enum Cmd {
     Set(ActorAddress, u64),
+    /// From an event's end: like `Set`, unless the delivery in flight is
+    /// for the same time (`alarm_index::delivery_covers`).
+    Sync(ActorAddress, u64),
     /// Like `Set`, unless `address` is already registered for an earlier
     /// time.
     SetIfEarlier(ActorAddress, u64),
@@ -23,9 +30,10 @@ enum Cmd {
     /// For each (address, at): whether a `Sweep` of it would change
     /// nothing (horizon in ms).
     Pending(Vec<(ActorAddress, u64)>, u64, oneshot::Sender<Vec<bool>>),
-    /// Retry a mailbox admission failure, retaining its original due-time
-    /// hint and leaving any newer registration alone.
-    Retry(ActorAddress, Delivery),
+    /// Retry a mailbox admission failure (`false`) or a delivery the mailbox
+    /// dropped (`true`), retaining its original due-time hint and leaving
+    /// any newer registration alone.
+    Retry(ActorAddress, Delivery, bool),
     Complete(ActorAddress, Delivery),
     Clear(ActorAddress),
     /// Like `Clear`, only if `address` is registered to wake at this time.
@@ -48,6 +56,16 @@ impl AlarmHandle {
     /// already registered for it.
     pub(crate) fn set(&self, address: ActorAddress, at: u64) {
         let _ = self.tx.send(Cmd::Set(address, at));
+    }
+
+    /// The committed alarm `at` an event of `address` ended with: like
+    /// [`set`](Self::set), unless the delivery this timer handed to the
+    /// mailbox and has not heard back from is for `at`. That delivery runs
+    /// after the event and reads the same alarm; registering again would
+    /// deliver the round twice. If its result comes back with nothing
+    /// registered since, it is delivered again ([`complete`](Self::complete)).
+    pub(crate) fn sync(&self, address: ActorAddress, at: u64) {
+        let _ = self.tx.send(Cmd::Sync(address, at));
     }
 
     /// Fire `address` at `at`, unless an earlier time is registered for it.
@@ -86,11 +104,21 @@ impl AlarmHandle {
     /// delay ceiling starts at 100 ms and doubles up to 5 s; each delay is
     /// sampled from the upper half of that range. Newer Set/Clear wins.
     pub(crate) fn retry(&self, address: ActorAddress, delivery: Delivery) {
-        let _ = self.tx.send(Cmd::Retry(address, delivery));
+        let _ = self.tx.send(Cmd::Retry(address, delivery, false));
     }
 
-    /// Release delivery state after any result other than an admission
-    /// refusal. This cannot clear a registration made by the actor event.
+    /// Deliver again, with the same backoff as [`retry`](Self::retry), a
+    /// delivery the mailbox dropped before it answered (the actor failed to
+    /// start, or the event stopped): nothing else would arm its alarm
+    /// until the actor's next event or a sweep. Newer Set/Clear wins.
+    pub(crate) fn redeliver(&self, address: ActorAddress, delivery: Delivery) {
+        let _ = self.tx.send(Cmd::Retry(address, delivery, true));
+    }
+
+    /// Release delivery state after the event ran. This cannot clear a
+    /// registration made by the actor event; if an event's [`sync`](Self::sync)
+    /// was left to this delivery and nothing registered since, the alarm is
+    /// delivered again instead.
     pub(crate) fn complete(&self, address: ActorAddress, delivery: Delivery) {
         let _ = self.tx.send(Cmd::Complete(address, delivery));
     }
@@ -143,6 +171,9 @@ pub(crate) fn now_ms_i64() -> i64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Delivery {
     pub(crate) hint: u64,
+    /// Registered by the sweep, from the bucket's index: the hint is an
+    /// index entry's time, which may be named by no state.
+    pub(crate) swept: bool,
     generation: u64,
 }
 
@@ -152,6 +183,8 @@ struct Registration {
     wake: Option<u64>,
     delivery: Delivery,
     refusals: u32,
+    /// An event's `Sync` was left to this delivery while it was in flight.
+    covered: bool,
 }
 
 #[derive(Default)]
@@ -179,6 +212,10 @@ impl Timer {
     }
 
     fn set(&mut self, address: ActorAddress, at: u64) {
+        self.register(address, at, false);
+    }
+
+    fn register(&mut self, address: ActorAddress, at: u64, swept: bool) {
         self.clear(&address);
         let generation = self.next_generation();
         self.by_address.insert(
@@ -187,9 +224,11 @@ impl Timer {
                 wake: Some(at),
                 delivery: Delivery {
                     hint: at,
+                    swept,
                     generation,
                 },
                 refusals: 0,
+                covered: false,
             },
         );
         self.due.insert((at, address));
@@ -212,6 +251,19 @@ impl Timer {
     fn apply(&mut self, cmd: Cmd, now: u64) {
         match cmd {
             Cmd::Set(address, at) => self.set(address, at),
+            Cmd::Sync(address, at) => {
+                let in_flight = self
+                    .by_address
+                    .get(&address)
+                    .and_then(|r| r.wake.is_none().then_some(r.delivery.hint));
+                if wasmkeep_cluster::alarm_index::delivery_covers(in_flight, at) {
+                    if let Some(r) = self.by_address.get_mut(&address) {
+                        r.covered = true;
+                    }
+                } else {
+                    self.set(address, at);
+                }
+            }
             Cmd::SetIfEarlier(address, at) => {
                 if !self
                     .by_address
@@ -223,7 +275,7 @@ impl Timer {
             }
             Cmd::Sweep(address, at, horizon) => {
                 if !self.sweep_keeps(&address, at, now, horizon) {
-                    self.set(address, at);
+                    self.register(address, at, true);
                 }
             }
             Cmd::Pending(entries, horizon, reply) => {
@@ -233,7 +285,7 @@ impl Timer {
                     .collect();
                 let _ = reply.send(kept);
             }
-            Cmd::Retry(address, delivery) => {
+            Cmd::Retry(address, delivery, dropped) => {
                 let Some(old) = self.by_address.get(&address).copied() else {
                     return;
                 };
@@ -246,29 +298,44 @@ impl Timer {
                 let delay = floor + random % (ceiling - floor + 1);
                 let wake = now.saturating_add(delay);
                 let generation = self.next_generation();
+                // The retried delivery is handed over after any event that
+                // was left to this one: it reads that event's alarm.
                 self.by_address.insert(
                     address.clone(),
                     Registration {
                         wake: Some(wake),
                         delivery: Delivery {
-                            hint: delivery.hint,
                             generation,
+                            ..delivery
                         },
                         refusals: old.refusals.saturating_add(1),
+                        covered: false,
                     },
                 );
                 self.due.insert((wake, address));
-                crate::metrics::inc(&crate::metrics::METRICS.alarm_admission_retries);
-                #[cfg(test)]
-                self.admission_retries
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if dropped {
+                    crate::metrics::inc(&crate::metrics::METRICS.alarm_dropped_deliveries);
+                } else {
+                    crate::metrics::inc(&crate::metrics::METRICS.alarm_admission_retries);
+                    #[cfg(test)]
+                    self.admission_retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Cmd::Complete(address, delivery) => {
-                if self
-                    .by_address
-                    .get(&address)
-                    .is_some_and(|old| old.delivery == delivery && old.wake.is_none())
-                {
+                let Some(old) = self.by_address.get(&address).copied() else {
+                    return;
+                };
+                if old.delivery != delivery || old.wake.is_some() {
+                    return;
+                }
+                if wasmkeep_cluster::alarm_index::deliver_again(old.covered) {
+                    // An event committed this time while the delivery was
+                    // out, and its run registered nothing since: the alarm
+                    // may still be due (the run ended first, or did not
+                    // run `on-alarm`). The new delivery reads it.
+                    self.set(address, delivery.hint);
+                } else {
                     self.clear(&address);
                 }
             }
@@ -319,7 +386,8 @@ impl Timer {
 
 /// Starts the timer task; `fire` is called for each due actor with its
 /// original due-time hint (once per registration: the actor's next event
-/// re-registers it if still pending).
+/// re-registers it if still pending, unless this delivery is for the same
+/// time; then its completion does).
 pub(crate) fn spawn(fire: impl Fn(ActorAddress, Delivery) + Send + 'static) -> AlarmHandle {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut timer = Timer::default();
@@ -397,7 +465,7 @@ mod tests {
         let mut delivery = start_delivery(&mut timer, 17);
         let mut now = 1000;
         for attempt in 0..100_u32 {
-            timer.apply(Cmd::Retry(addr(), delivery), now);
+            timer.apply(Cmd::Retry(addr(), delivery, false), now);
             let delay = u64::try_from(timer.wait(now).as_millis()).unwrap();
             let ceiling = (100_u64 << attempt.min(6)).min(5000);
             assert!(
@@ -422,7 +490,7 @@ mod tests {
             let address = ActorAddress::new("t", "c", format!("a{i}")).unwrap();
             timer.apply(Cmd::Set(address.clone(), 17), 0);
             let delivery = timer.pop_due(17).unwrap().1;
-            timer.apply(Cmd::Retry(address, delivery), 1000);
+            timer.apply(Cmd::Retry(address, delivery, false), 1000);
         }
         let wakes: BTreeSet<_> = timer.due.iter().map(|(wake, _)| *wake).collect();
         assert!(
@@ -435,18 +503,18 @@ mod tests {
     fn duplicate_and_stale_retries_do_not_multiply_or_postpone_delivery() {
         let mut timer = Timer::default();
         let first = start_delivery(&mut timer, 17);
-        timer.apply(Cmd::Retry(addr(), first), 1000);
+        timer.apply(Cmd::Retry(addr(), first, false), 1000);
         let wake = timer.by_address[&addr()].wake.unwrap();
         for now in 1001..1100 {
-            timer.apply(Cmd::Retry(addr(), first), now);
+            timer.apply(Cmd::Retry(addr(), first, false), now);
         }
         assert_eq!(timer.by_address[&addr()].wake, Some(wake));
         let next = timer.pop_due(wake).unwrap().1;
-        timer.apply(Cmd::Retry(addr(), first), wake);
+        timer.apply(Cmd::Retry(addr(), first, false), wake);
         timer.apply(Cmd::Complete(addr(), first), wake);
         assert!(timer.due.is_empty());
         assert_eq!(timer.by_address[&addr()].delivery, next);
-        timer.apply(Cmd::Retry(addr(), next), wake);
+        timer.apply(Cmd::Retry(addr(), next, false), wake);
         assert_eq!(timer.due.len(), 1);
     }
 
@@ -456,11 +524,11 @@ mod tests {
             let mut timer = Timer::default();
             let delivery = start_delivery(&mut timer, 17);
             if pending_retry {
-                timer.apply(Cmd::Retry(addr(), delivery), 1000);
+                timer.apply(Cmd::Retry(addr(), delivery, false), 1000);
             }
             // Even the same due-time represents a new registration.
             timer.apply(Cmd::Set(addr(), 17), 1001);
-            timer.apply(Cmd::Retry(addr(), delivery), 1002);
+            timer.apply(Cmd::Retry(addr(), delivery, false), 1002);
             timer.apply(Cmd::Complete(addr(), delivery), 1002);
             let replacement = timer.pop_due(1002).unwrap().1;
             assert_eq!(replacement.hint, 17);
@@ -469,16 +537,121 @@ mod tests {
         }
     }
 
+    /// `Sync` is what an event's end sends (`Set` keeps the semantics
+    /// above). Events that end with the time of the delivery in flight
+    /// leave it alone: before 0.7.0 each queued another delivery of the
+    /// same round, and each found the alarm moved by the first.
+    #[test]
+    fn events_ending_with_the_in_flight_time_queue_no_second_delivery() {
+        let mut timer = Timer::default();
+        let delivery = start_delivery(&mut timer, 17);
+        for now in 1000..1010 {
+            timer.apply(Cmd::Sync(addr(), 17), now);
+            assert!(timer.pop_due(u64::MAX).is_none(), "a second delivery");
+        }
+        // The delivery's run moves the alarm: registered anew, and its
+        // late completion leaves that registration alone.
+        timer.apply(Cmd::Sync(addr(), 5000), 1010);
+        timer.apply(Cmd::Complete(addr(), delivery), 1011);
+        assert!(timer.pop_due(4999).is_none());
+        let next = timer.pop_due(5000).unwrap().1;
+        assert_eq!(next.hint, 5000);
+        assert!(timer.pop_due(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn a_move_while_a_delivery_is_in_flight_registers_the_new_time() {
+        for at in [16, 18, 1_000_000] {
+            let mut timer = Timer::default();
+            let delivery = start_delivery(&mut timer, 17);
+            timer.apply(Cmd::Sync(addr(), at), 1000);
+            // Late callbacks of the old delivery change nothing.
+            timer.apply(Cmd::Retry(addr(), delivery, false), 1001);
+            timer.apply(Cmd::Retry(addr(), delivery, true), 1001);
+            timer.apply(Cmd::Complete(addr(), delivery), 1001);
+            assert_eq!(timer.by_address[&addr()].wake, Some(at));
+            assert_eq!(timer.pop_due(u64::MAX).unwrap().1.hint, at);
+        }
+    }
+
+    /// The event's sync and the delivery's completion come from different
+    /// tasks: in either order, a committed alarm that nothing else
+    /// registered is delivered again.
+    #[test]
+    fn a_covered_delivery_that_registered_nothing_is_delivered_again_in_either_order() {
+        for sync_first in [true, false] {
+            let mut timer = Timer::default();
+            let delivery = start_delivery(&mut timer, 17);
+            if sync_first {
+                timer.apply(Cmd::Sync(addr(), 17), 1000);
+                timer.apply(Cmd::Complete(addr(), delivery), 1001);
+            } else {
+                timer.apply(Cmd::Complete(addr(), delivery), 1000);
+                assert!(timer.by_address.is_empty());
+                timer.apply(Cmd::Sync(addr(), 17), 1001);
+            }
+            let again = timer.pop_due(1001).unwrap().1;
+            assert_eq!(again.hint, 17);
+            assert_ne!(again, delivery);
+            // That one completes with nothing left to do: forgotten.
+            timer.apply(Cmd::Complete(addr(), again), 1002);
+            assert!(timer.by_address.is_empty(), "sync_first: {sync_first}");
+        }
+    }
+
+    /// A delivery the mailbox dropped (the actor failed to start, or the
+    /// event stopped) is delivered again with backoff, not left to the
+    /// next event's sync (which, for the same time, it covers) or to a
+    /// sweep.
+    #[test]
+    fn a_dropped_delivery_is_delivered_again_without_waiting_for_a_sweep() {
+        for covered in [false, true] {
+            let mut timer = Timer::default();
+            let delivery = start_delivery(&mut timer, 17);
+            if covered {
+                timer.apply(Cmd::Sync(addr(), 17), 1000);
+            }
+            timer.apply(Cmd::Retry(addr(), delivery, true), 1000);
+            let delay = u64::try_from(timer.wait(1000).as_millis()).unwrap();
+            assert!((50..=100).contains(&delay), "{delay}");
+            let again = timer.pop_due(1000 + delay).unwrap().1;
+            assert_eq!(again.hint, 17);
+            assert_ne!(again, delivery);
+            assert_eq!(
+                timer
+                    .admission_retries
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "not an admission refusal"
+            );
+            // A second drop backs off further.
+            timer.apply(Cmd::Retry(addr(), again, true), 2000);
+            assert!(timer.wait(2000) >= Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn only_the_sweep_registers_swept_deliveries_and_a_retry_keeps_the_origin() {
+        let mut timer = Timer::default();
+        timer.apply(Cmd::Sweep(addr(), 17, 0), 1000);
+        let swept = timer.pop_due(1000).unwrap().1;
+        assert!(swept.swept);
+        timer.apply(Cmd::Retry(addr(), swept, false), 1000);
+        assert!(timer.pop_due(u64::MAX).unwrap().1.swept);
+        let local = start_delivery(&mut timer, 17);
+        assert!(!local.swept);
+    }
+
     #[test]
     fn clearing_cancels_pending_retries_and_rejects_late_callbacks() {
         for pending_retry in [false, true] {
             let mut timer = Timer::default();
             let delivery = start_delivery(&mut timer, 17);
             if pending_retry {
-                timer.apply(Cmd::Retry(addr(), delivery), 1000);
+                timer.apply(Cmd::Retry(addr(), delivery, false), 1000);
             }
             timer.apply(Cmd::Clear(addr()), 1001);
-            timer.apply(Cmd::Retry(addr(), delivery), 1002);
+            timer.apply(Cmd::Retry(addr(), delivery, false), 1002);
             timer.apply(Cmd::Complete(addr(), delivery), 1002);
             assert!(timer.pop_due(u64::MAX).is_none());
             assert!(timer.by_address.is_empty());
@@ -490,14 +663,14 @@ mod tests {
         let mut timer = Timer::default();
         let mut delivery = start_delivery(&mut timer, 17);
         for _ in 0..8 {
-            timer.apply(Cmd::Retry(addr(), delivery), 1000);
+            timer.apply(Cmd::Retry(addr(), delivery, false), 1000);
             delivery = timer.pop_due(6000).unwrap().1;
         }
         timer.apply(Cmd::Complete(addr(), delivery), 6000);
         assert!(timer.by_address.is_empty());
         assert!(timer.due.is_empty());
         let delivery = start_delivery(&mut timer, 17);
-        timer.apply(Cmd::Retry(addr(), delivery), 1000);
+        timer.apply(Cmd::Retry(addr(), delivery, false), 1000);
         assert!(
             (Duration::from_millis(50)..=Duration::from_millis(100)).contains(&timer.wait(1000))
         );
@@ -509,7 +682,7 @@ mod tests {
         let delivery = start_delivery(&mut timer, 17);
         timer.apply(Cmd::Sweep(addr(), 17, 0), 1000);
         assert!(timer.pop_due(1000).is_none());
-        timer.apply(Cmd::Retry(addr(), delivery), 1000);
+        timer.apply(Cmd::Retry(addr(), delivery, false), 1000);
         let wake = timer.by_address[&addr()].wake.unwrap();
         // Even a sweep horizon shorter than our delay cannot bypass backoff.
         timer.apply(Cmd::Sweep(addr(), 17, 0), 1001);

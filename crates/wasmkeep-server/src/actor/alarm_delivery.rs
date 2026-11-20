@@ -14,9 +14,9 @@ impl ActorState {
     /// retry with exponential backoff, so delivery is at least once.
     ///
     /// `hint` is the time the alarm was registered for on this node (from an
-    /// event, the startup scan, a retry or the bucket's index); the
+    /// event, the startup scan, a retry or the bucket's index: `swept`); the
     /// committed alarm in the database decides what runs.
-    pub(super) async fn alarm(&mut self, hint: u64) {
+    pub(super) async fn alarm(&mut self, hint: u64, swept: bool) {
         self.chain = Arc::from(Vec::new());
         // The event runs on the class it takes now (ADR 0013).
         if let Err(e) = self.refresh_class() {
@@ -165,19 +165,39 @@ impl ActorState {
         // An index entry that no longer matches the committed alarm (it was
         // cleared or moved since) is stale: removed below, once the
         // committed alarm is indexed.
-        let stale_hint = (at != Some(hint)).then_some(hint);
+        let mut stale_hint = (at != Some(hint)).then_some(hint);
+        // A local delivery of a time this hold already ran `on-alarm` for
+        // (ADR 0009, amendment of 2026-11-19): the entry it named then is
+        // retired by its exact key once the move is replicated, so nothing
+        // of this hold's is left at that time. A delivery from the index
+        // still clears what it lists there.
+        let generation = self.hold_generation();
+        let delivered = self
+            .delivered_alarm
+            .and_then(|(held, at)| (held == generation).then_some(at));
+        let duplicate =
+            stale_hint.is_some_and(|h| alarm_index::stale_clear_skippable(h, swept, delivered));
+        if duplicate {
+            tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), hint, "alarm: a time this hold already delivered; not clearing it");
+            stale_hint = None;
+        }
+        let stale = if duplicate {
+            Delivered::Duplicate
+        } else {
+            Delivered::Stale
+        };
         match at {
             // Nothing to run, but `ensure_ready` may have run `on-init`,
             // whose writes must be replicated like any event's.
             None => {
-                self.timing.delivered(Delivered::Stale);
+                self.timing.delivered(stale);
                 self.alarms.clear(self.address.clone());
                 let named = self.index_and_replicate(None).await;
                 self.clear_stale_hint(stale_hint, named).await;
                 return;
             }
             Some(at) if at > now_ms() => {
-                self.timing.delivered(Delivered::Stale);
+                self.timing.delivered(stale);
                 self.alarms.set(self.address.clone(), at);
                 let named = self.index_and_replicate(Some(at)).await;
                 self.clear_stale_hint(stale_hint, named).await;
@@ -203,6 +223,7 @@ impl ActorState {
             .unwrap_or(0);
 
         self.timing.delivered(Delivered::Ran);
+        self.delivered_alarm = Some((generation, at));
         live.start_event("alarm");
         let run = limit(
             self.limits.wall,
@@ -276,6 +297,12 @@ impl ActorState {
                 self.clear_stale_hint(stale_hint, named).await;
             }
         }
+    }
+
+    /// The lease generation of this actor's hold, `None` without one (a
+    /// single node).
+    fn hold_generation(&self) -> Option<u64> {
+        self.held.as_ref().and_then(|h| h.lease().generation())
     }
 
     /// Whether this node may write the actor's alarm index entries: it
@@ -648,10 +675,19 @@ impl ActorState {
                 return true;
             }
         };
-        for stale in alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation) {
-            if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
-                tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "removing a stale alarm entry failed");
-            }
+        // Selected here, serialized with the hold's next event; the exact-key
+        // DELETEs finish off the actor's path (ADR 0034, section 9): a late
+        // one cannot remove a newer entry, keys are never reused (R1).
+        let stale = alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation);
+        if !stale.is_empty() {
+            let (address, app) = (self.address.clone(), self.app_name.clone());
+            tokio::spawn(async move {
+                for stale in stale {
+                    if let Err(e) = cluster.delete_alarm_entry(&address, &stale).await {
+                        tracing::debug!(app = %crate::logging::named(&app), actor = %crate::logging::actor(&address), error = %e, "removing a stale alarm entry failed");
+                    }
+                }
+            });
         }
         true
     }
