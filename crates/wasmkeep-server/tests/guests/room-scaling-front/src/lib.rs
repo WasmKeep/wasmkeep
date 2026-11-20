@@ -40,7 +40,7 @@ impl http::Guest for Front {
         }
         if path == "/state" {
             let r = wasmkeep_sdk::actors::call(
-                if relays { "room/relays" } else { "room/r" },
+                if relays { "pusher/relays" } else { "pusher/r" },
                 &wasmkeep_sdk::actors::Request {
                     method: "POST".into(),
                     path: if relays {
@@ -96,7 +96,7 @@ wasmkeep_sdk::export_front!(Front);
 // R6-only test routes: production clients use the TypeScript example's front.
 fn r6(path: &str, out: http::ResponseOutparam) {
     let name = query(path, "room").unwrap_or("big");
-    assert!(matches!(name, "big" | "small"));
+    assert!(matches!(name, "big" | "small" | "legacy"));
     let room = Client::new(format!("room/{name}"));
     let directory = format!("directory/bg:{name}");
     let endpoint = path.split('?').next().unwrap();
@@ -111,7 +111,39 @@ fn r6(path: &str, out: http::ResponseOutparam) {
         }
         return;
     }
+    // The pusher tests: wake the pusher where this front runs, trap the
+    // room, slow an edge down, list the pusher's children.
+    let call = |to: String, path: String| {
+        wasmkeep_sdk::actors::call(
+            &to,
+            &wasmkeep_sdk::actors::Request {
+                method: "POST".into(),
+                path,
+                headers: vec![],
+                body: vec![],
+            },
+        )
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|r| {
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            if r.status == 200 {
+                Ok(body)
+            } else {
+                Err(format!("{}: {body}", r.status))
+            }
+        })
+    };
     let result: Result<String, String> = match endpoint {
+        "/r6/warm-pusher" => call(format!("pusher/{name}"), "/wasmkeep-pusher/v1/poke".into()),
+        "/r6/trap" => call(format!("room/{name}"), "/test-trap".into()),
+        "/r6/slow" => call(
+            format!("edge/{name}.e{}", query(path, "edge").unwrap()),
+            format!("/test-slow?ms={}", query(path, "ms").unwrap()),
+        ),
+        "/r6/children" => call(format!("pusher/{name}"), "/test-children".into()),
+        "/r6/legacy-boot" => call(format!("room/{name}"), "/test-legacy-boot".into()),
+        "/r6/legacy-rows" => call(format!("room/{name}"), "/test-legacy-rows".into()),
+        "/r6/owner" => call(format!("directory/bg:{name}"), "/test-owner".into()),
         "/r6/warm" => wasmkeep_sdk::actors::call(
             &format!("edge/{name}.e{}", query(path, "edge").unwrap()),
             &wasmkeep_sdk::actors::Request {

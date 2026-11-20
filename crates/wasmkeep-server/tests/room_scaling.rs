@@ -110,13 +110,13 @@ async fn room_scaling_split_reconnect_and_merge() {
     let mut cfg = ActorConfig::new(data.path());
     // Keep the epoch stable while testing scaling; crash/hibernate is covered separately.
     cfg.mailbox.idle_timeout = Duration::from_secs(120);
-    for c in ["room", "edge", "directory", "relay"] {
+    for c in ["room", "pusher", "edge", "directory", "relay"] {
         cfg.access.set(c, wasmkeep_server::Access::Internal);
     }
     let svc = ActorService::new(
         rt,
         cfg,
-        ["room", "edge", "directory", "relay"]
+        ["room", "pusher", "edge", "directory", "relay"]
             .into_iter()
             .map(|c| (c.into(), component.clone(), wasm.clone()))
             .collect(),
@@ -367,13 +367,13 @@ async fn room_relays_grow_deliver_and_retire() {
     let mut cfg = ActorConfig::new(data.path());
     // Keep the epoch stable while testing scaling; crash/hibernate is covered separately.
     cfg.mailbox.idle_timeout = Duration::from_secs(120);
-    for c in ["room", "edge", "directory", "relay"] {
+    for c in ["room", "pusher", "edge", "directory", "relay"] {
         cfg.access.set(c, wasmkeep_server::Access::Internal);
     }
     let svc = ActorService::new(
         rt,
         cfg,
-        ["room", "edge", "directory", "relay"]
+        ["room", "pusher", "edge", "directory", "relay"]
             .into_iter()
             .map(|c| (c.into(), component.clone(), wasm.clone()))
             .collect(),
@@ -490,6 +490,99 @@ async fn room_relays_grow_deliver_and_retire() {
     let (_, done, task) = clients.pop().unwrap();
     let _ = done.send(());
     task.await.unwrap();
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}
+/// ADR 0040, section 13: a group as a 0.6.0 room left it (the room the
+/// controller: its scale rows, the map's owner and the edges' room) moves
+/// to its pusher, and its sockets receive the next publish from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_scaling_a_0_6_0_room_moves_to_its_pusher() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front_wasm = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let rt = Runtime::new(&RuntimeConfig {
+        max_instances: 16,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let component = guests::compile(&rt, &wasm);
+    let front = HttpComponent::new(rt.clone(), &guests::compile(&rt, &front_wasm)).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = ActorConfig::new(data.path());
+    cfg.mailbox.idle_timeout = Duration::from_secs(120);
+    for c in ["room", "pusher", "edge", "directory", "relay"] {
+        cfg.access.set(c, wasmkeep_server::Access::Internal);
+    }
+    let svc = ActorService::new(
+        rt,
+        cfg,
+        ["room", "pusher", "edge", "directory", "relay"]
+            .into_iter()
+            .map(|c| (c.into(), component.clone(), wasm.clone()))
+            .collect(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(wasmkeep_server::serve_with(
+        listener,
+        App {
+            front: Some(front),
+            actors: Some(svc),
+        },
+        async {
+            let _ = stopped.await;
+        },
+        ServeLimits::default(),
+    ));
+    let (status, body) = get(addr, "/r6/legacy-boot?room=legacy").await;
+    assert_eq!(status, 200, "{body}");
+    let (_, owner) = get(addr, "/r6/owner?room=legacy").await;
+    assert!(
+        owner.ends_with("/room/legacy"),
+        "the 0.6.0 room owns the map: {owner}"
+    );
+    let (_, rows) = get(addr, "/r6/legacy-rows?room=legacy").await;
+    assert!(rows.contains("wasmkeep_room_scale"), "{rows}");
+    // A client joins through the old map; its poke wakes the pusher.
+    let mut ws = None;
+    for _ in 0..50 {
+        if let Ok((mut s, _)) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/r6/join?room=legacy&c=old&n=0"))
+                .await
+        {
+            assert!(frame(&mut s).await.to_text().unwrap().contains("ready"));
+            ws = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let mut ws = ws.expect("join");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (_, owner) = get(addr, "/r6/owner?room=legacy").await;
+        let (_, rows) = get(addr, "/r6/legacy-rows?room=legacy").await;
+        if owner.ends_with("/pusher/legacy") && rows.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the move: owner {owner}, rows {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The edge now takes the pusher's pushes (its rewritten configuration parses).
+    let (status, n) = get(addr, "/r6/publish?room=legacy&id=after-move").await;
+    assert_eq!(status, 200, "{n}");
+    let n: u64 = n.parse().unwrap();
+    let mut last = n - 1;
+    while last < n {
+        assert!(!consume(frame(&mut ws).await, &mut last));
+    }
+    let (_, children) = get(addr, "/r6/children?room=legacy").await;
+    let (_, map) = get(addr, "/r6/map?room=legacy").await;
+    assert_eq!(children, map, "the adopted children are the map's");
     let _ = stop.send(());
     server.await.unwrap().unwrap();
 }

@@ -19,7 +19,7 @@ async fn example(suffix: &str) {
         .with_test_writer()
         .try_init();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ts-big-room");
-    let paths: Vec<_> = ["front", "room", "edge", "relay", "directory"]
+    let paths: Vec<_> = ["front", "room", "pusher", "edge", "relay", "directory"]
         .iter()
         .map(|c| root.join(format!("{c}{suffix}.wasm")))
         .collect();
@@ -44,7 +44,7 @@ async fn example(suffix: &str) {
     let data = tempfile::tempdir().unwrap();
     let mut cfg = ActorConfig::new(data.path());
     let mut classes = vec![];
-    for (class, path) in ["room", "edge", "relay", "directory"]
+    for (class, path) in ["room", "pusher", "edge", "relay", "directory"]
         .iter()
         .zip(&paths[1..])
     {
@@ -175,12 +175,12 @@ async fn node_with(
     tokio::task::JoinHandle<Result<(), wasmkeep_server::Error>>,
 )> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/ts-big-room");
-    let mut paths: Vec<_> = ["front", "room", "edge", "relay", "directory"]
+    let mut paths: Vec<_> = ["front", "room", "pusher", "edge", "relay", "directory"]
         .iter()
         .map(|c| root.join(format!("{c}{suffix}.wasm")))
         .collect();
     if let Some(edge) = edge {
-        paths[2] = edge;
+        paths[3] = edge;
     }
     if paths.iter().any(|p| !p.exists()) {
         assert!(
@@ -204,7 +204,7 @@ async fn node_with(
     .unwrap();
     let mut cfg = ActorConfig::new(data);
     let mut classes = vec![];
-    for (class, path) in ["room", "edge", "relay", "directory"]
+    for (class, path) in ["room", "pusher", "edge", "relay", "directory"]
         .iter()
         .zip(&paths[1..])
     {

@@ -10,7 +10,7 @@ const handle = api({
   // the client asks again while `more`.
   history: after => broadcast.historyJSON(room.history(after, 256)),
   stats: () => ({ head: broadcast.historyJSON(room.history()).head,
-    ...JSON.parse(actors.call('room/lobby', {path:'/stats'}).text()) }),
+    ...JSON.parse(actors.call('pusher/lobby', {path:'/stats'}).text()) }),
 });
 export default defineFront({ fetch(req) {
   if (req.method === 'GET' && req.path === '/') return {headers:{'content-type':'text/html; charset=utf-8'},body:page};

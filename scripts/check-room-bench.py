@@ -22,7 +22,7 @@ def main():
             command = [os.environ.get('WASMKEEP_BIN', str(ROOT / 'target/debug/wasmkeep')),
                        'serve', 'examples/ts-big-room/front.wasm', '--listen', f'127.0.0.1:{port}',
                        '--data-dir', str(Path(scratch) / 'data')]
-            for actor in ('room', 'edge', 'relay', 'directory'):
+            for actor in ('room', 'pusher', 'edge', 'relay', 'directory'):
                 command += ['--actor', f'{actor}=examples/ts-big-room/{actor}.wasm',
                             '--access', f'{actor}=internal']
             node = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=log)
