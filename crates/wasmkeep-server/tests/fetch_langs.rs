@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService, EgressPolicy};
 
@@ -298,23 +298,42 @@ async fn fetch_from_guest(addr: SocketAddr, url: &str, send: usize) -> String {
     body.strip_suffix('\n').unwrap_or(body).to_owned()
 }
 
+/// An address where connections are refused, and the socket that keeps it
+/// so: bound, so no other server can take the port, but never listening, so
+/// a connection is refused rather than queued. (Binding a listener and
+/// dropping it frees the port for the next server that asks for one.)
+fn refusing() -> (TcpSocket, SocketAddr) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
+#[tokio::test]
+async fn a_refusing_address_stays_refused_while_other_servers_start() {
+    let (_keep, addr) = refusing();
+    // Another test's server, in this or another process, may be handed any
+    // free port; tokio binds with SO_REUSEADDR.
+    if let Ok(other) = TcpListener::bind(addr).await {
+        tokio::spawn(async move { while other.accept().await.is_ok() {} });
+    }
+    let err = TcpStream::connect(addr).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+}
+
 /// The answers to the same requests, as one guest gives them.
 async fn answers(wasm: &[u8]) -> Vec<String> {
     let server = server().await;
     let dir = tempfile::tempdir().unwrap();
     let local = EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]);
     let addr = start(dir.path(), wasm, local).await;
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let (_closed, closed) = refusing();
     let mut out = vec![
         fetch_from_guest(addr, &format!("http://{server}/ok"), 0).await,
         fetch_from_guest(addr, &format!("http://{server}/echo"), 5000).await,
         fetch_from_guest(addr, &format!("http://{server}/big"), 0).await,
         fetch_from_guest(addr, &format!("http://{server}/short"), 0).await,
-        // Nothing listens there any more.
+        // Nothing listens there.
         fetch_from_guest(addr, &format!("http://{closed}/ok"), 0).await,
         fetch_from_guest(addr, "ftp://example.com/", 0).await,
     ];
@@ -364,11 +383,7 @@ async fn check_batches(lang: &str, wasm: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let local = EgressPolicy::allowing(vec!["127.0.0.1".parse().unwrap()]);
     let addr = start(dir.path(), wasm, local).await;
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let (_closed, closed) = refusing();
     let batch = vec![
         (0, format!("http://{server}/ok")),
         (5000, format!("http://{server}/echo")),
