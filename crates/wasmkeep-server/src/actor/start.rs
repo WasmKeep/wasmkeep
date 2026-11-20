@@ -207,6 +207,7 @@ impl ActorService {
                         return Err(format!("{address} is not of this node's tenant").into());
                     }
                     Ok(ActorState {
+                        timing: super::timing::Timing::new(&factory_app_labels, address.class()),
                         address,
                         app_labels: Arc::clone(&factory_app_labels),
                         app_name: Arc::clone(&factory_app_name),
@@ -238,6 +239,20 @@ impl ActorService {
             },
             ActorState::before_drop,
         );
+        let timing_labels = Arc::clone(&app_labels);
+        mailboxes.observe_jobs(move |address, state, timing| {
+            if let Some(state) = state {
+                state.timing.job(timing);
+            } else if let wasmkeep_runtime::JobTiming::Finished { elapsed } = timing {
+                crate::metrics::METRICS
+                    .mailbox_host_work_seconds
+                    .get_in(
+                        &timing_labels,
+                        &[("class", address.class()), ("work", "restore")],
+                    )
+                    .observe(elapsed);
+            }
+        });
         // Several apps in one process draw residents from one pool, each
         // with its floor (ADR 0038, section 8).
         if let Some(pool) = &config.resident_pool {

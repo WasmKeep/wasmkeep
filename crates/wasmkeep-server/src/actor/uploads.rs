@@ -534,6 +534,7 @@ impl ActorState {
     /// to the owner record, which is what idle expiry reads, ADR 0028).
     pub(super) fn complete_uploads(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            let _timed = self.timing.work(super::timing::Work::CompleteUploads);
             self.stepped = false;
             let Some(slot) = self.batched_replica() else {
                 return;
@@ -592,6 +593,7 @@ impl ActorState {
 
     /// The periodic snapshot of a batched hold, at a `Flushed` barrier.
     async fn snapshot_in_gap(&mut self, slot: SharedReplica) {
+        let _timed = self.timing.work(super::timing::Work::SnapshotInGap);
         let deadline = self.upload_deadline().await;
         match self.flush_to_barrier(Some(deadline)).await {
             Some(Barrier::Flushed) => {}
@@ -649,6 +651,7 @@ impl ActorState {
         &mut self,
         deadline: Option<tokio::time::Instant>,
     ) -> Option<Barrier> {
+        let _timed = self.timing.work(super::timing::Work::FlushToBarrier);
         let hold = self.held.as_ref()?;
         let Some(slot) = self.batched_replica() else {
             return Some(hold.barrier());

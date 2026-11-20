@@ -1039,3 +1039,101 @@ async fn timing_mailbox_wait_excludes_capacity_admission() {
     mailboxes.close();
     assert!(mailboxes.drained(Duration::from_secs(5)).await);
 }
+
+fn host_work_sum(work: &str) -> f64 {
+    let page = crate::metrics::render(Default::default());
+    let prefix = format!(
+        "wasmkeep_mailbox_host_work_seconds_sum{{tenant=\"default\",app=\"default\",class=\"test\",work=\"{work}\"}} "
+    );
+    page.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or("0")
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn timing_host_work_without_guest() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 16, &[]);
+    let a = ActorAddress::new("default", "test", "host-only").unwrap();
+    service
+        .inner
+        .mailboxes
+        .submit(&a, |_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            })
+        })
+        .await
+        .unwrap();
+    // A following job starts only after the observer finished the previous one.
+    service
+        .inner
+        .mailboxes
+        .submit(&a, |_| Box::pin(async {}))
+        .await
+        .unwrap();
+    assert!(host_work_sum("other") >= 0.025);
+}
+
+#[tokio::test]
+async fn timing_host_work_fetch_sums_to_job() {
+    let data = tempfile::tempdir().unwrap();
+    let service = call_service(data.path(), 16, &[]);
+    let a = ActorAddress::new("default", "test", "fetch-timing").unwrap();
+    let (tx, rx) = oneshot::channel();
+    let measured = service.inner.mailboxes.submit(&a, |state| {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let req = hyper::Request::builder()
+                .uri("/fired")
+                .header(hyper::header::HOST, "actor.wasmkeep.internal")
+                .body(http_body_util::Full::new(bytes::Bytes::new()))
+                .unwrap();
+            state
+                .owned_request(req, tx, Arc::from(Vec::new()), false)
+                .await;
+            started.elapsed().as_secs_f64()
+        })
+    });
+    let super::Outcome::Served(response) = rx.await.unwrap() else {
+        panic!("fetch was not served");
+    };
+    let response =
+        super::routing::collect_response(response, &super::routing::BodyBudget::one(), false)
+            .await
+            .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"0\n");
+    let elapsed = measured.await.unwrap();
+    service
+        .inner
+        .mailboxes
+        .submit(&a, |_| Box::pin(async {}))
+        .await
+        .unwrap();
+    let host: f64 = [
+        "stale_alarm_hint",
+        "complete_uploads",
+        "snapshot_in_gap",
+        "flush_to_barrier",
+        "hibernate",
+        "restore",
+        "other",
+    ]
+    .iter()
+    .map(|w| host_work_sum(w))
+    .sum();
+    assert!(host > 0.0, "host time must not disappear");
+    let page = crate::metrics::render(Default::default());
+    let guest: f64 = page
+        .lines()
+        .filter(|l| l.starts_with("wasmkeep_event_duration_seconds_sum{"))
+        .map(|l| l.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+        .sum();
+    assert!(
+        (guest + host - elapsed).abs() < 0.005,
+        "guest={guest} host={host} job={elapsed}"
+    );
+}

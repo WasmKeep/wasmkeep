@@ -56,6 +56,10 @@ fn state(
         writes: crate::apps::Writes::Batched,
     });
     ActorState {
+        timing: super::timing::Timing::new(
+            &crate::metrics::app_labels("t", "default"),
+            address.class(),
+        ),
         app_labels: crate::metrics::app_labels("t", "default"),
         app_name: Arc::from("t/default"),
         moves: Arc::default(),

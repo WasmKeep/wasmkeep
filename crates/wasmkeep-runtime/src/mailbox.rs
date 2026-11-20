@@ -22,6 +22,18 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Error type a factory may return.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Timing notifications for an executed mailbox job. Queue/admission wait is excluded.
+#[derive(Debug, Clone, Copy)]
+pub enum JobTiming {
+    /// The state exists and the job is about to run. Initialization is part
+    /// of this job's elapsed time (zero for an already resident state).
+    Started { initialization: Duration },
+    /// The job returned or panicked, before a panicking state is dropped.
+    Finished { elapsed: Duration },
+}
+
+type Observer<S> = dyn Fn(&ActorAddress, Option<&S>, JobTiming) + Send + Sync;
+
 type Factory<S> =
     dyn Fn(ActorAddress, Residency) -> BoxFuture<'static, Result<S, BoxError>> + Send + Sync;
 /// A queued event. It receives the actor state, or the error that kept the
@@ -173,6 +185,7 @@ impl<S> std::fmt::Debug for Mailboxes<S> {
 struct Inner<S> {
     config: MailboxConfig,
     factory: Box<Factory<S>>,
+    observer: std::sync::OnceLock<Box<Observer<S>>>,
     /// Run before a state is dropped; none: dropped at once.
     step: Option<Box<Step<S>>>,
     actors: Mutex<Registry<S>>,
@@ -262,6 +275,7 @@ impl<S: Send + 'static> Mailboxes<S> {
             inner: Arc::new(Inner {
                 config,
                 factory: Box::new(move |address, residency| Box::pin(factory(address, residency))),
+                observer: std::sync::OnceLock::new(),
                 step,
                 actors: Mutex::new(HashMap::new()),
                 closed: tokio::sync::watch::Sender::new(false),
@@ -275,6 +289,17 @@ impl<S: Send + 'static> Mailboxes<S> {
                 tries: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Installs a synchronous job observer once, before submitting work.
+    /// Covers all submission APIs, including resident-only maintenance jobs.
+    /// Failed state creation reports Finished with no state. Observers must not panic.
+    /// Adds no allocation per job; disabled mailboxes read no timing clock.
+    pub fn observe_jobs(
+        &self,
+        observer: impl Fn(&ActorAddress, Option<&S>, JobTiming) + Send + Sync + 'static,
+    ) {
+        let _ = self.inner.observer.set(Box::new(observer));
     }
 
     /// Queues `job` for `address` and returns a future for its result.
@@ -990,6 +1015,9 @@ async fn run_actor<S: Send + 'static>(
             .last
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
 
+        let observer = inner.observer.get();
+        let started = observer.map(|_| std::time::Instant::now());
+        let initializing = state.is_none();
         if state.is_none() {
             // A panicking event may have left work holding the old state's
             // resources. Never build a second state under that same slot:
@@ -1007,6 +1035,15 @@ async fn run_actor<S: Send + 'static>(
             }
             if !task_residency.is_exclusive() {
                 job(Err(MailboxError::Capacity(address.clone()))).await;
+                if let (Some(observer), Some(started)) = (observer, started) {
+                    observer(
+                        &address,
+                        None,
+                        JobTiming::Finished {
+                            elapsed: started.elapsed(),
+                        },
+                    );
+                }
                 own.activity
                     .last
                     .store(clock_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -1022,6 +1059,15 @@ async fn run_actor<S: Send + 'static>(
                         source,
                     }))
                     .await;
+                    if let (Some(observer), Some(started)) = (observer, started) {
+                        observer(
+                            &address,
+                            None,
+                            JobTiming::Finished {
+                                elapsed: started.elapsed(),
+                            },
+                        );
+                    }
                     // A failed factory is idle too: another name may need
                     // to evict it rather than wait for the idle timeout.
                     own.activity
@@ -1037,7 +1083,30 @@ async fn run_actor<S: Send + 'static>(
             // events already queued behind it would be lost. Contain it, drop
             // the possibly inconsistent state, and keep serving. The caller
             // of the panicking event sees `Gone` (its reply was dropped).
-            if CatchUnwind(job(Ok(s))).await.is_err() {
+            if let (Some(observer), Some(started)) = (observer, started) {
+                observer(
+                    &address,
+                    Some(s),
+                    JobTiming::Started {
+                        initialization: if initializing {
+                            started.elapsed()
+                        } else {
+                            Duration::ZERO
+                        },
+                    },
+                );
+            }
+            let panicked = CatchUnwind(job(Ok(s))).await.is_err();
+            if let (Some(observer), Some(started)) = (observer, started) {
+                observer(
+                    &address,
+                    Some(s),
+                    JobTiming::Finished {
+                        elapsed: started.elapsed(),
+                    },
+                );
+            }
+            if panicked {
                 state = None;
             }
         }

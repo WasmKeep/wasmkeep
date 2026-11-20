@@ -590,6 +590,8 @@ impl ActorState {
         let Some(hint) = hint else {
             return true;
         };
+        let _timed = self.timing.work(super::timing::Work::StaleAlarmHint);
+        self.timing.stale_hint();
         // A batched hold clears only at a `Flushed` barrier, and judges R2
         // on the entry its acknowledged head names, never the local
         // database's (ADR 0034, section 9): it flushes first, with one

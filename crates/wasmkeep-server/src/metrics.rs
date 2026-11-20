@@ -294,6 +294,8 @@ pub(crate) struct Metrics {
     pub(crate) event_seconds: Family<Histogram>,
     /// Accepted guest-event jobs waiting for their mailbox turn, by class.
     pub(crate) mailbox_wait_seconds: Family<Histogram>,
+    pub(crate) mailbox_host_work_seconds: Family<Histogram>,
+    pub(crate) alarm_stale_hints: Family<AtomicU64>,
     /// Batched event boundaries gating the next guest event, by class.
     pub(crate) event_start_rule_wait_seconds: Family<Histogram>,
     /// Events stopped by the host, by reason (`wall`, `lease`, `replica`).
@@ -1131,7 +1133,18 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
     m.event_seconds.each(|labels, h| {
         h.render(&mut out, "wasmkeep_event_duration_seconds", labels);
     });
+    family(
+        &mut out,
+        "wasmkeep_alarm_stale_hints_total",
+        "Stale alarm hint clear attempts, by tenant, app and class.",
+        &m.alarm_stale_hints,
+    );
     for (name, help, durations) in [
+        (
+            "wasmkeep_mailbox_host_work_seconds",
+            "Exclusive mailbox host work time, by tenant, app, class and work.",
+            &m.mailbox_host_work_seconds,
+        ),
         (
             "wasmkeep_mailbox_wait_seconds",
             "Time from accepted enqueue attempt to mailbox job start, by tenant, app and class.",
