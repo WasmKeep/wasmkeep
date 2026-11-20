@@ -1116,20 +1116,16 @@ floor under the bill before
 any traffic in that version and scenario; a bucket that does not bill
 requests charges nothing for it.
 
-**Modeled since 0.4.2.** The
+**The old model and the 0.6.0 measurement.** The earlier
 [documented cadence](cluster.md#what-an-idle-cluster-asks-of-the-bucket)
-for an idle three-node, one-app cluster implies approximately 0.333 PUT,
-0.1 LIST and 2.333 GET per node-second, excluding the optional idle-expiry
-scan. These are derived rates, not observations.
-
-**Measured on 0.6.0: GETs run above the model.** Three nodes on `14f7ea2`
-with a bucket on loopback, ten minutes (600 s) at rest, once with one app
-per process and once with two, read from `wasmkeep_bucket_requests_total`
-on each node
+predicted 0.333 PUT, about 0.1 LIST and 2.333 GET per node-second.
+Three nodes on `14f7ea2`, with a bucket on loopback, were measured for ten
+minutes (600 s) at rest, once with one app per process and once with two,
+using `wasmkeep_bucket_requests_total`
 ([`…-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv`](../bench/results/2026-11-18-14f7ea2-idle-bucket-requests-loopback-3nodes-10min.csv)).
-Per node and second, nodes a / b / c:
+Per process and second, nodes a / b / c:
 
-| | One app | Two apps | Model, one app |
+| | One app | Two apps | Old model, one app |
 | --- | --- | --- | --- |
 | PUT | 0.333 / 0.333 / 0.333 | 0.667 / 0.667 / 0.667 | 0.333 |
 | LIST | 0.133 / 0.117 / 0.117 | 0.250 / 0.233 / 0.233 | about 0.1 |
@@ -1137,21 +1133,101 @@ Per node and second, nodes a / b / c:
 | GET answered not found | 1.978 / 1.805 / 1.982 | 3.903 / 3.665 / 3.773 | |
 | DELETE | 0 | 0 | 0 |
 
-- **PUTs match the model**: the node lease, one per heartbeat period,
-  one per app.
-- **LISTs are close**: 0.12 to 0.13 against about 0.1.
-- **GETs are above it**: 3.1 to 3.3 per node and second against 2.333,
-  about 40 % more. The file has a separate row for GETs answered not
-  found and does not say whether the GET row includes them; if it does
-  not, the excess is larger still. The documented cadence does not yet
-  account for the difference, so its GET figure is a floor, not the
-  rate: at the measured rate three idle nodes ask for about 25 million
-  GETs in a 30-day month, not 18 million.
-- **A second app costs more than the first.** PUTs and LISTs double;
-  GETs grow about 2.6 times (8.4 against 3.2 on average).
-- The bucket was on loopback, so these are request counts, which the
-  periods in the code set, not latencies; a remote bucket was not
-  measured on this build.
+**Source accounting on `3b94b1c`: the model omitted safety reads.**
+The original CSV's producing script is not in the repository. The repeat
+uses [`bench/idle-requests.py`](../bench/idle-requests.py): three local
+processes, a disposable moto 5.2.5 bucket, the counter deploy, default
+periods, no actor traffic, and one then two apps in sequential windows.
+After readiness and a 40-second warmup, each window lasts 120 seconds.
+A loopback proxy per process counts every request by exact key and HTTP
+status, alongside before/after server metrics. The node-file path is
+used for both cases, with TLS between nodes and secrets following enabled.
+Startup probes and deploy uploads are outside the windows.
+
+The [raw counts](../bench/results/2026-11-20-3b94b1c-idle-bucket-requests-loopback-3nodes-2min.csv)
+contain `wire` and `metric` rows separately: do not add these two views.
+The harness fails on an unknown GET key or a source more than 10% away
+from its modeled rate. Reproduce after building the CLI and counter:
+
+```sh
+# Separate terminal; the existing S3 test fixture, no new project dependency:
+uvx --from 'moto[server]==5.2.5' moto_server -H 127.0.0.1 -p 5055
+python3 bench/idle-requests.py --endpoint http://127.0.0.1:5055 \
+  --wasm examples/counter/target/wasm32-wasip2/release/counter.wasm \
+  --output bench/results/idle-bucket-requests-repeat.csv
+```
+
+Rates per process-second; all three processes had identical GET counts.
+Measured/model values agree to the shown precision (402 and 1,044 GETs
+per process per window, wire counts exactly equal to summed metrics).
+
+| GET source | One app measured / model | Two apps measured / model | Code source |
+| --- | --- | --- | --- |
+| `nodes/*` (own node included) | 1.000 / 1.000 | 4.000 / 4.000 | `Cluster::list_and_refresh` → `Transport::{list_nodes,read_nodes}` |
+| `control/changed` | 0.333 / 0.333 | 0.667 / 0.667 | `Cluster::refresh_control_if_changed` |
+| `apps/.../current` | 0.333 / 0.333 | 0.667 / 0.667 | `AppRef::follow` → `update` → `current` |
+| `apps/.../deleted` | 0.333 / 0.333 | 0.667 / 0.667 | `AppRef::still_ours` → `tombstone` |
+| `apps/.../restoring` | 0.333 / 0.333 | 0.667 / 0.667 | `AppRef::still_ours` |
+| `apps/.../recreated` | 0.333 / 0.333 | 0.667 / 0.667 | `AppRef::still_ours` |
+| `apps/.../restored` | 0.333 / 0.333 | 0.667 / 0.667 | `AppRef::still_ours` |
+| `apps/.../secrets/current` | 0.333 / 0.333 | 0.667 / 0.667 | `SecretStore::follow` → `current` |
+| `state/.../blob-usage` | 0.017 / 0.017 | 0.033 / 0.033 | `blob_sweeps::sweep_loop` → `Blobs::read_usage` |
+| **All GETs** | **3.350 / 3.350** | **8.700 / 8.700** | |
+| Of those, not found | 2.017 / 2.017 | 4.033 / 4.033 | 242 / 484 negative reads per window |
+| Lease-renewal extra GETs; unchanged manifests/components; empty alarms; readiness; node files | 0 / 0 | 0 / 0 | See below |
+
+PUTs were 0.333 and 0.667 per process-second. LISTs were 0.133 / 0.117 /
+0.117 with one app and 0.267 / 0.233 / 0.233 with two: process a collected
+files for both apps, adding one empty `blob-sweeps/` LIST per app per minute.
+No HEAD, DELETE, retry or failed request other than the expected 404s
+appeared in either steady-state window.
+
+The main missing 1 GET/s is exactly `restoring`, `recreated` and `restored`.
+`AppRef::update` calls `still_ours` before reading `current`; the four
+safety markers guard app deletion, recreation and whole-app restore.
+They are retained: a cached absence would change the time at which the
+node observes a fence or invalidates its local files. The initial
+`app_check`, and its repeat after a lease lapse, are additional reads
+outside this healthy steady state. An unchanged deploy reads no manifest
+or component. Readiness reads flags, and node files are local startup
+configuration. Lease renewal succeeds with a PUT and no extra GET; the
+own-node GET is already in membership (including the twin check).
+An empty alarm sweep lists but reads no objects. File maintenance adds
+`blob-usage` once a minute on every app/node, plus `blob-sweeps/` LISTs
+on the collector. The source-accounting assertion first rejected
+`blob-usage` as unmodeled; the corrected model includes it.
+
+Each app's membership loop reads every logical node heartbeat, even for
+other apps. With three processes, a second app doubles both the loops
+and the number of heartbeats: membership grows from 1 to 4 GET/s per
+process. The other seven reads per app per 3 seconds double from 2.333
+to 4.667. File-usage reads add 0.017 and 0.033 respectively. Thus
+**3.350 → 8.700 GET/s**, about a 2.6× ratio; there is no
+unexplained multi-app GET source. Sharing a transport does not coalesce
+these independently timed membership observations. No polling or safety
+timing is changed by this investigation.
+
+**Not-found is a subset of GET.** The server labels each request once
+with `operation` and `status` (`counted_store::get_opts`); total GET is the
+sum across all statuses. With no secrets or markers, six negative reads
+per app per period, plus file usage once a minute, give 2.017 GET/s
+until the collector publishes usage. The repeat verifies the sum against
+the wire, not just against another derived counter. The old CSV alone does
+not preserve its extraction expression, so its aggregation cannot be
+proved retrospectively; its GET and not-found rates are consistent with
+this inclusive definition, not two disjoint totals.
+
+The corrected model is **3.350 GET/s, 0.333 PUT/s and 0.117 LIST/s** per
+process with one app, plus 0.017 LIST/s on the file collector. LIST now
+includes the fourth intent prefix, actor restores: 0.067 for intents + 0.033 membership + 0.017 empty alarms.
+Hourly file maintenance on the collector adds four marker GETs, two LISTs
+and one usage PUT for an empty app (code-derived, not reached by these
+windows). Including it, three idle processes over 30 days ask for about
+**26.05 million GETs**, not 18.1 million. Both the original and repeated
+GET rates are within 10% of the corrected model. Follow loops sleep after their reads, so latency
+can lower their rates; membership schedules from the start of its period.
+This is a local request-count measurement, not a remote-bucket latency or
+billing measurement (client retries and pagination can add wire calls).
 
 ## The change feed at 100,000 actors
 
