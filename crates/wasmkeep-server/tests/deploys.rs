@@ -76,6 +76,11 @@ async fn setup_idle(idle: Duration) -> Setup {
 
 /// With these `--env` values on the node.
 async fn setup_with(idle: Duration, env: wasmkeep_server::ActorEnv) -> Setup {
+    setup_tuned(idle, |config| config.env = env).await
+}
+
+/// With `tune` applied to the node's configuration.
+async fn setup_tuned(idle: Duration, tune: impl FnOnce(&mut ActorConfig)) -> Setup {
     let v1 = guests::build_guest("../../examples/counter", "counter");
     let v2 = guests::build_guest("tests/guests/test-actor", "test_actor");
     let runtime = Runtime::new(&RuntimeConfig {
@@ -88,7 +93,7 @@ async fn setup_with(idle: Duration, env: wasmkeep_server::ActorEnv) -> Setup {
     let mut config = ActorConfig::new(dir.path());
     config.mailbox.idle_timeout = idle;
     config.deploy_seq = 1;
-    config.env = env;
+    tune(&mut config);
     let service =
         ActorService::new(runtime.clone(), config, vec![("c".into(), component, v1)]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -270,9 +275,17 @@ async fn a_queued_request_is_decided_by_the_rules_of_the_class_it_runs() {
     // ADR 0013: request B is admitted at the front door under `open`, then
     // waits behind A while a deploy makes the class `internal`. B must be
     // refused, not run on the new version from outside.
-    let t = setup().await;
+    //
+    // No timing: A is held at its database's open until the deploy has
+    // landed, and B is known to be queued because the actor's queue holds
+    // one event and the next request is refused as overloaded.
+    let t = setup_tuned(Duration::from_millis(200), |config| {
+        config.mailbox.queue_capacity = 1;
+    })
+    .await;
     let v1 = guests::build_guest("../../examples/counter", "counter");
-    wasmkeep_storage::faults::delay_next("open", Duration::from_millis(800));
+    let component = t.runtime.compile(&v1).unwrap();
+    wasmkeep_storage::faults::hold_next("open");
     let a = tokio::spawn(send(t.addr, "GET", "/actor/c/x"));
     let started = std::time::Instant::now();
     while !wasmkeep_storage::faults::held("open") {
@@ -282,12 +295,27 @@ async fn a_queued_request_is_decided_by_the_rules_of_the_class_it_runs() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let b = tokio::spawn(send(t.addr, "GET", "/actor/c/x"));
-    // B is past the front door and queued behind A.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Requests until one is refused as overloaded: then one of those still
+    // waiting (B) passed the front door under `open` and fills A's queue.
+    // Any other still waiting is answered 429 or, if it reaches the front
+    // door only after the deploy, 403 there.
+    let mut waiting = Vec::new();
+    loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the queue never filled"
+        );
+        let mut probe = tokio::spawn(send(t.addr, "GET", "/actor/c/x"));
+        match tokio::time::timeout(Duration::from_millis(100), &mut probe).await {
+            Ok(answer) => {
+                assert_eq!(answer.unwrap().0, 429, "only A runs, and it is held");
+                break;
+            }
+            Err(_) => waiting.push(probe),
+        }
+    }
     let mut rules = wasmkeep_server::AccessRules::default();
     rules.set("c", wasmkeep_server::Access::Internal);
-    let component = t.runtime.compile(&v1).unwrap();
     t.service
         .apply_version(
             2,
@@ -296,16 +324,21 @@ async fn a_queued_request_is_decided_by_the_rules_of_the_class_it_runs() {
             &std::collections::BTreeMap::new(),
         )
         .unwrap();
+    wasmkeep_storage::faults::release("open");
     assert_eq!(
         a.await.unwrap(),
         (200, "0".into()),
         "A runs on what it took"
     );
-    assert_eq!(
-        b.await.unwrap().0,
-        403,
-        "B ran under a rule its class does not have"
-    );
+    let mut refused = 0;
+    for request in waiting {
+        match request.await.unwrap().0 {
+            403 => refused += 1,
+            429 => {}
+            status => panic!("B ran under a rule its class does not have: {status}"),
+        }
+    }
+    assert!(refused >= 1, "B was not refused");
     assert_eq!(send(t.addr, "GET", "/actor/c/x").await.0, 403);
 }
 

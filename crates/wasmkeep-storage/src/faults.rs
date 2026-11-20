@@ -45,8 +45,76 @@ pub fn delay_next(point: &str, delay: std::time::Duration) {
         .push((point.to_owned(), delay));
 }
 
-/// Waits, if a delay is armed at `point` (consuming it).
+/// Gates armed by [`hold_next`], and the points [`release`] opened.
+static GATES: Mutex<Gates> = Mutex::new(Gates {
+    armed: Vec::new(),
+    released: Vec::new(),
+});
+static GATE_OPENED: std::sync::Condvar = std::sync::Condvar::new();
+
+struct Gates {
+    armed: Vec<String>,
+    released: Vec<String>,
+}
+
+/// How long a gate holds at most, so a test that fails before releasing
+/// it does not hang its process.
+const GATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Makes the next operation at `point` wait (on its blocking thread) until
+/// [`release`] opens it, once: like [`delay_next`], but the test decides
+/// when it goes on, not a timer. [`held`] tells when it is waiting. Points:
+/// those of [`delay_next`].
+pub fn hold_next(point: &str) {
+    GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .armed
+        .push(point.to_owned());
+}
+
+/// Lets the operation [`hold_next`] holds at `point` go on (or the next
+/// one to reach it, if none is held yet).
+pub fn release(point: &str) {
+    GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .released
+        .push(point.to_owned());
+    GATE_OPENED.notify_all();
+}
+
+fn hold(point: &str) {
+    let mut gates = GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(i) = gates.armed.iter().position(|p| p == point) else {
+        return;
+    };
+    gates.armed.swap_remove(i);
+    HELD.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(point.to_owned());
+    let (mut gates, _) = GATE_OPENED
+        .wait_timeout_while(gates, GATE_LIMIT, |g| {
+            !g.released.iter().any(|p| p == point)
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = gates.released.iter().position(|p| p == point) {
+        gates.released.swap_remove(i);
+    }
+    drop(gates);
+    let mut h = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = h.iter().position(|p| p == point) {
+        h.swap_remove(i);
+    }
+}
+
+/// Waits, if a delay or a gate is armed at `point` (consuming it).
 pub(crate) fn pause(point: &str) {
+    hold(point);
     let delay = {
         let mut delays = DELAYS
             .lock()
