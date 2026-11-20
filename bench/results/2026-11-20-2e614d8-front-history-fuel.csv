@@ -1,0 +1,9 @@
+revision,engine,window,page_rows,max_front_fuel_per_history_request
+80c44f9+history-fuel-test,quickjs,2000x200B,256,245394391
+80c44f9+history-fuel-test,quickjs,2000x4193B,61,936783561
+80c44f9+history-fuel-test,starlingmonkey,2000x200B,256,57828590
+80c44f9+history-fuel-test,starlingmonkey,2000x4193B,61,47195535
+2e614d8,quickjs,2000x200B,256,1086987
+2e614d8,quickjs,2000x4193B,15,1086861
+2e614d8,starlingmonkey,2000x200B,256,4902037
+2e614d8,starlingmonkey,2000x4193B,15,4901198

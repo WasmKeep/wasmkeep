@@ -235,13 +235,17 @@ omitted when absent), byte for byte what `JSON.stringify` of the
 converted binary page makes, rendered by one SQLite statement
 (`json_quote` escapes as `JSON.stringify` does; shared vectors check it).
 The front returns the bytes unread. Its page holds at most 256 messages
-and 64 KiB of bodies, at least one message, `more` when cut. Before, a
+and 64 KiB of bodies, at least one message, `more` when cut. A room of an
+earlier release answers the operation 400: the TypeScript client then
+converts the binary page itself, but the Rust `Client::history_json` has
+no fallback, so a Rust front that uses it deploys with its room. Before, a
 front decoded each page into objects and encoded it again in the guest,
 so a reader far behind got full pages over the front's 50 ms budget (a
 500), which the client then answered by reconnecting, again and again. Fuel per front history request on a full
-window, the most over every page (deterministic, from
+window, the most over every page (deterministic, measured by
 `typescript_big_room_history_page_fuel` in
-`crates/wasmkeep-server/tests/big_room.rs`):
+`crates/wasmkeep-server/tests/big_room.rs`;
+[raw measurements](../../bench/results/2026-11-20-2e614d8-front-history-fuel.csv)):
 
 | Front | 256 messages of 200 B | 61 (now 15) messages of 4 KiB |
 |---|---|---|

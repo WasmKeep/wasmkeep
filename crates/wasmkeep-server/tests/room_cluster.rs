@@ -900,6 +900,17 @@ impl ObjectStore for HoldPusherSegments {
 /// the same one, which then completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
+    batched_pusher_crash(4).await;
+}
+/// The same with six clients: the split begins at four sockets, so a later
+/// join may go to the new edge while the split is held at its `range` step.
+/// Under load such a client once never became ready within 90 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known failing: a client on a new edge mid-split never becomes ready; under investigation"]
+async fn room_cluster_batched_pusher_crash_with_a_join_on_the_new_edge() {
+    batched_pusher_crash(6).await;
+}
+async fn batched_pusher_crash(count: usize) {
     let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
     let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -920,12 +931,12 @@ async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
     assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
     assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
     // The split four sockets call for (80 % of 5) sticks at its `range`
-    // step. Four, not more: a join after the split began may go to the new
-    // edge, a case this test is not about.
+    // step. With four clients, all are on the first edge when it begins;
+    // with more, a later join may go to the new edge.
     let (status, body) = get(a.addr, "/r6/refuse-range?room=quiet&edge=1&on=1").await;
     assert_eq!(status, 200, "{body}");
     let mut clients = vec![];
-    for i in 0..4 {
+    for i in 0..count {
         let p = Arc::new(Progress::default());
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(client(

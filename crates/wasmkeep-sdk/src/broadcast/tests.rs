@@ -356,6 +356,21 @@ fn history_json_is_the_browsers_json_byte_for_byte() {
         })
         .collect();
     room.publish(&input, 1_700_000_000_000).unwrap();
+    // Bodies and ids are bound as TEXT: `json_quote` refuses a BLOB, so a
+    // BLOB row would make every page that holds it fail.
+    let kinds = room
+        .db
+        .query(
+            "SELECT DISTINCT typeof(body), coalesce(typeof(id),'') FROM wasmkeep_room_history",
+            &[],
+        )
+        .unwrap();
+    assert!(
+        kinds.iter().all(
+            |r| r[0].as_str() == Some("text") && matches!(r[1].as_str(), Some("text" | "null"))
+        ),
+        "{kinds:?}"
+    );
     for after in [
         None,
         Some(Position { e: 1, n: 0 }),

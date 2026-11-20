@@ -22,7 +22,9 @@ The text under a version's heading is its GitHub release text
   messages and 64 KiB of bodies, at least one message, `more` when cut.
   A TypeScript front returns `room.historyJSON(after, limit)` unread
   (Rust: `Client::history_json`); its fuel per page no longer grows with
-  the page: 1.1 M on QuickJS and 4.9 M on StarlingMonkey. Against a room
+  the page: 1.1 M on QuickJS and 4.9 M on StarlingMonkey
+  ([raw measurements](bench/results/2026-11-20-2e614d8-front-history-fuel.csv)).
+  Against a room
   of an earlier release the TypeScript client converts the binary page
   as before. The binary `history` is unchanged. The example front
   accepts `limit` (clamped to 1..256). See ADR 0040, section 3.
@@ -52,8 +54,10 @@ The text under a version's heading is its GitHub release text
   `wasmkeep deploy --writes pusher=batched` (part of the version), or
   `writes = "batched"` under `[classes.pusher]` in `wasmkeep.toml`, or
   `serve --writes pusher=batched`. Deploy the front and the room
-  together for `history-json`; a new front against an older room still
-  works, at the old cost.
+  together for `history-json`. A new TypeScript front against an older
+  room still works, at the old cost; a Rust front's
+  `Client::history_json` has no such fallback (an older room answers
+  400), so a Rust front that uses it must be deployed with its room.
 
 - **`on-alarm` keeps the alarm it sets, even for the delivered time.**
   After a successful `on-alarm` the host cleared an alarm still at the
