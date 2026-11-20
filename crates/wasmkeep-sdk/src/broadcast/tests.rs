@@ -57,15 +57,19 @@ fn window_gaps_reset_and_head_only() {
     assert_eq!(room.history(None, 100, Some(2)).unwrap().messages.len(), 2);
 }
 #[test]
-fn confirm_precedes_push_and_retries() {
+fn confirm_a_pull_flushes_first_and_refuses_until_the_upload_is_in() {
     let mut room = Core::new(Db::new(), true);
     room.init().unwrap();
     room.publish(&[message("a", None)], 0).unwrap();
     room.db.flush_error = Some("not durable: still uploading".into());
-    assert!(!room.before_push(20).unwrap());
-    assert_eq!(room.db.alarm, Some(70));
+    let at = Some(Position { e: 1, n: 0 });
+    assert!(
+        room.pull(at, 1 << 20, false, 20)
+            .unwrap_err()
+            .contains("not durable")
+    );
     room.db.flush_error = None;
-    assert!(room.before_push(70).unwrap());
+    assert_eq!(room.pull(at, 1 << 20, false, 70).unwrap().messages.len(), 1);
     assert_eq!(room.db.flushes, 2);
 }
 fn message(body: &str, id: Option<&str>) -> Publish {
@@ -76,7 +80,6 @@ fn message(body: &str, id: Option<&str>) -> Publish {
 }
 struct Db {
     conn: rusqlite::Connection,
-    alarm: Option<u64>,
     flushes: usize,
     flush_error: Option<String>,
     /// Queries run and rows they returned.
@@ -87,7 +90,6 @@ impl Db {
     fn new() -> Self {
         Self {
             conn: rusqlite::Connection::open_in_memory().unwrap(),
-            alarm: None,
             flushes: 0,
             flush_error: None,
             read: Default::default(),
@@ -124,10 +126,6 @@ impl Store for Db {
             .collect();
         self.rows.set(self.rows.get() + rows.len());
         Ok(rows)
-    }
-    fn alarm(&mut self, at: u64) -> Result<(), String> {
-        self.alarm = Some(at);
-        Ok(())
     }
     fn flush(&mut self) -> Result<(), String> {
         self.flushes += 1;
@@ -211,7 +209,7 @@ fn byte_window_and_limits_are_atomic() {
     assert_eq!(r.history(None, 100, None).unwrap().head.n, 129);
     r.db.flush_error = Some("fatal storage failure".into());
     r.confirm = true;
-    assert!(r.before_push(0).is_err());
+    assert!(r.pull(None, 0, false, 0).is_err());
 }
 
 #[test]
@@ -259,11 +257,13 @@ fn unicode_room_wire_vectors_for_typescript_front() {
     let mut room = Core::new(Db::new(), false);
     room.init().unwrap();
     assert_eq!(
-        super::super::protocol::serve(&mut room, "publish", &vectors[0], 0).unwrap(),
+        super::super::protocol::serve(&mut room, "publish", &vectors[0], 0, "app/front", "")
+            .unwrap(),
         vectors[1]
     );
     assert_eq!(
-        super::super::protocol::serve(&mut room, "history", &vectors[2], 0).unwrap(),
+        super::super::protocol::serve(&mut room, "history", &vectors[2], 0, "app/front", "")
+            .unwrap(),
         vectors[3]
     );
     let messages = room.messages().unwrap();
@@ -335,9 +335,15 @@ fn per_event_reads_are_bounded_by_the_answer() {
     );
     assert!(room.db.rows.get() <= 80);
     room.db.rows.set(0);
-    let slice = room.rows(1000, 513, 512 * 1024).unwrap();
-    assert!(slice.len() > 500 && slice.len() <= 513, "{}", slice.len());
-    assert!(room.db.rows.get() <= 513 + 32);
+    let slice = room
+        .pull(Some(Position { e: 1, n: 999 }), 1 << 20, false, 0)
+        .unwrap();
+    assert!(
+        slice.messages.len() > 490 && slice.messages.len() <= 513,
+        "{}",
+        slice.messages.len()
+    );
+    assert!(room.db.rows.get() <= 513 + 32 + 70);
     // The byte window: 8 MiB of bodies, oldest first.
     let big: Vec<_> = (0..4).map(|_| message(&"z".repeat(65536), None)).collect();
     for _ in 0..33 {
@@ -356,4 +362,173 @@ fn per_event_reads_are_bounded_by_the_answer() {
         bytes <= 8 * 1024 * 1024 && bytes > 8 * 1024 * 1024 - 65536,
         "{bytes}"
     );
+}
+/// The room's pull (ADR 0040, section 13), shared with TypeScript.
+#[test]
+fn shared_pull_vectors() {
+    let text = include_str!("pull-vectors.txt");
+    let scenarios: Vec<Vec<&str>> = text
+        .split("\n\n")
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .collect()
+        })
+        .filter(|s: &Vec<&str>| !s.is_empty())
+        .collect();
+    assert!(scenarios.len() >= 5);
+    for lines in scenarios {
+        let mut core = Core::new(Db::new(), false);
+        core.init().unwrap();
+        let mut now = 0;
+        for line in lines {
+            let a: Vec<&str> = line.split(' ').collect();
+            let int = |s: &str| s.parse::<u64>().unwrap();
+            match a[0] {
+                "publish" => {
+                    for _ in 0..int(a[1]) {
+                        let size = a.get(2).map_or(1, |s| int(s)) as usize;
+                        core.publish(&[message(&"x".repeat(size), None)], now)
+                            .unwrap();
+                    }
+                }
+                "lose" | "trim" | "epochdrop" => {
+                    let sql = match a[0] {
+                        "lose" => "DELETE FROM wasmkeep_room_history WHERE n>?1",
+                        "trim" => "DELETE FROM wasmkeep_room_history WHERE n<=?1",
+                        _ => "DELETE FROM wasmkeep_room_epochs WHERE e=?1",
+                    };
+                    core.db
+                        .exec(sql, &[Value::Integer(int(a[1]) as i64)], false)
+                        .unwrap();
+                }
+                "restart" => core = Core::new(core.db, false),
+                "clock" => now = int(a[1]),
+                "poke" => assert_eq!(u64::from(core.poke(now)), int(a[1]), "{line}"),
+                "pull" => {
+                    let after = (a[1] != "-").then(|| Position {
+                        e: int(a[1]),
+                        n: int(a[2]),
+                    });
+                    let p = core
+                        .pull(after, int(a[3]) as usize, a[4] == "1", now)
+                        .unwrap();
+                    let last = p.messages.last();
+                    let got = [
+                        p.e,
+                        p.base,
+                        p.first,
+                        p.head,
+                        u64::from(p.recover),
+                        p.messages.len() as u64,
+                        last.map_or(0, |(m, _)| m.position.e),
+                        last.map_or(0, |(_, b)| *b),
+                    ]
+                    .map(|n| n.to_string())
+                    .join(" ");
+                    assert_eq!(got, a[6..].join(" "), "{line}");
+                    for (i, (m, _)) in p.messages.iter().enumerate() {
+                        assert_eq!(m.position.n, p.first + i as u64);
+                    }
+                }
+                _ => panic!("unknown vector command {line}"),
+            }
+        }
+    }
+}
+/// A pull reads what it answers, never the window (TypeScript has the same test).
+#[test]
+fn a_pull_reads_what_it_answers_whatever_the_position() {
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    room.wake().unwrap();
+    room.db.exec("BEGIN", &[], false).unwrap();
+    for n in 1..=2000u64 {
+        let body = if n % 2 == 1 {
+            String::new()
+        } else {
+            "x".repeat(4096)
+        };
+        room.db
+            .exec(
+                "INSERT INTO wasmkeep_room_history(n,e,at,id,body) VALUES(?1,1,0,NULL,?2)",
+                &[Value::Integer(n as i64), body.into()],
+                false,
+            )
+            .unwrap();
+    }
+    room.db.exec("COMMIT", &[], false).unwrap();
+    for (after, budget) in [
+        (0, 1 << 20),
+        (999, 1 << 20),
+        (1990, 1 << 20),
+        (0, 0),
+        (1500, 1),
+        (2000, 1 << 20),
+    ] {
+        room.db.rows.set(0);
+        let p = room
+            .pull(Some(Position { e: 1, n: after }), budget, false, 0)
+            .unwrap();
+        assert!(p.messages.len() <= 513);
+        assert!(
+            room.db.rows.get() <= p.messages.len() + 32 + 70,
+            "pull after {after} read {} rows for {}",
+            room.db.rows.get(),
+            p.messages.len()
+        );
+        let bytes: usize = p.messages.iter().map(|(m, _)| m.body.len()).sum();
+        assert!(bytes <= 512 * 1024 + 65536, "{bytes} bytes");
+    }
+    assert!(
+        room.pull(Some(Position { e: 1, n: 0 }), (1 << 20) + 1, false, 0)
+            .is_err()
+    );
+    assert!(
+        room.pull(Some(Position { e: 1, n: 2001 }), 0, false, 0)
+            .is_err()
+    );
+    assert!(
+        room.pull(Some(Position { e: 2, n: 0 }), 0, false, 0)
+            .is_err()
+    );
+}
+/// pull and adopt answer the room's pusher only; the publish answer carries
+/// the idle flag a front pokes on.
+#[cfg(feature = "actor")]
+#[test]
+fn pull_answers_the_pusher_only_and_publish_carries_the_poke_flag() {
+    use crate::wire::{Reader, Writer};
+    let mut room = Core::new(Db::new(), false);
+    room.init().unwrap();
+    let mut pull = Writer::default();
+    pull.u64(0).u64(0).u64(0);
+    let pull = pull.finish();
+    for caller in ["t/front/main", "t/edge/r.e1", "t/pusher/other"] {
+        assert!(
+            super::super::protocol::serve(&mut room, "pull", &pull, 0, caller, "t/pusher/r")
+                .unwrap_err()
+                .starts_with("forbidden")
+        );
+    }
+    let mut publish = Writer::default();
+    publish.u64(1).u64(0).bytes(b"m");
+    let publish = publish.finish();
+    let flag = |answer: Vec<u8>| {
+        let mut r = Reader::new(&answer);
+        r.u64();
+        r.u64();
+        r.u64();
+        r.u64()
+    };
+    let serve = |room: &mut Core<Db>, op: &str, body: &[u8]| {
+        super::super::protocol::serve(room, op, body, 0, "t/pusher/r", "t/pusher/r").unwrap()
+    };
+    assert_eq!(flag(serve(&mut room, "publish", &publish)), Some(1), "cold");
+    serve(&mut room, "pull", &pull);
+    assert_eq!(flag(serve(&mut room, "publish", &publish)), Some(0), "busy");
+    let mut idle = Writer::default();
+    idle.u64(1).u64(1).u64(2).u64(0).u64(1);
+    serve(&mut room, "pull", &idle.finish());
+    assert_eq!(flag(serve(&mut room, "publish", &publish)), Some(1), "idle");
 }

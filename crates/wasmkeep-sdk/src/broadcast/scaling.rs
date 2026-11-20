@@ -617,6 +617,8 @@ use crate::{
 #[derive(Debug)]
 pub struct ScaleHost {
     pub directory: String,
+    /// The controller's own address, which edges accept and which owns the
+    /// map: since 0.7.0 the pusher's (ADR 0040, section 13).
     pub room: String,
     pub capacity: u64,
     pub head: Position,
@@ -759,6 +761,41 @@ fn get_relays(r: &mut Reader<'_>) -> Result<Vec<Relay>, String> {
     Ok(rs)
 }
 impl ScaleHost {
+    /// The state and its operation row, durably; with `adopted`, the
+    /// migration row of section 13 in the same transaction.
+    fn write(&self, s: &ScaleState, adopted: bool) -> Result<(), String> {
+        storage::exec("BEGIN", &[]).map_err(|e| e.to_string())?;
+        let result = (|| {
+            if adopted {
+                storage::exec(
+                    "INSERT INTO wasmkeep_pusher_migration(id,step) VALUES(1,1) ON CONFLICT(id) DO UPDATE SET step=1",
+                    &[],
+                )?;
+            }
+            storage::exec(
+                "INSERT INTO wasmkeep_room_scale(id,data) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                &[encode_state(s).into()],
+            )?;
+            storage::exec("DELETE FROM wasmkeep_room_ops", &[])?;
+            if let Some(o) = &s.op {
+                storage::exec(
+                    "INSERT INTO wasmkeep_room_ops(id,kind,step,args) VALUES(?1,?2,?3,?4)",
+                    &[
+                        o.id.clone().into(),
+                        format!("{:?}", o.kind).into(),
+                        (o.step as i64).into(),
+                        encode_op(o).into(),
+                    ],
+                )?;
+            }
+            storage::exec_durable("COMMIT", &[])?;
+            Ok::<(), crate::SqlError>(())
+        })();
+        if result.is_err() {
+            let _ = storage::exec("ROLLBACK", &[]);
+        }
+        result.map_err(|e| e.to_string())
+    }
     pub fn init(&self) -> Result<(), String> {
         storage::exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_scale(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL)",&[]).map_err(|e|e.to_string())?;
         storage::exec("CREATE TABLE IF NOT EXISTS wasmkeep_room_ops(id TEXT PRIMARY KEY,kind TEXT NOT NULL,step INTEGER NOT NULL,args BLOB NOT NULL)",&[]).map_err(|e|e.to_string())?;
@@ -808,31 +845,7 @@ impl ScaleIo for ScaleHost {
         Ok(s)
     }
     fn save(&mut self, s: &ScaleState) -> Result<(), String> {
-        storage::exec("BEGIN", &[]).map_err(|e| e.to_string())?;
-        let result = (|| {
-            storage::exec(
-                "INSERT INTO wasmkeep_room_scale(id,data) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-                &[encode_state(s).into()],
-            )?;
-            storage::exec("DELETE FROM wasmkeep_room_ops", &[])?;
-            if let Some(o) = &s.op {
-                storage::exec(
-                    "INSERT INTO wasmkeep_room_ops(id,kind,step,args) VALUES(?1,?2,?3,?4)",
-                    &[
-                        o.id.clone().into(),
-                        format!("{:?}", o.kind).into(),
-                        (o.step as i64).into(),
-                        encode_op(o).into(),
-                    ],
-                )?;
-            }
-            storage::exec_durable("COMMIT", &[])?;
-            Ok::<(), crate::SqlError>(())
-        })();
-        if result.is_err() {
-            let _ = storage::exec("ROLLBACK", &[]);
-        }
-        result.map_err(|e| e.to_string())
+        self.write(s, false)
     }
     fn execute(&mut self, c: ScaleCommand) -> Result<(), String> {
         if let ScaleCommand::RelayInit(name) | ScaleCommand::RelayEnd(name) = &c {
@@ -894,42 +907,149 @@ impl ScaleIo for ScaleHost {
     }
 }
 impl Scaling<ScaleHost> {
-    /// Called only by the alarm. Poke itself performs no calls.
-    pub fn run<S: Store>(
+    /// Called only by the pusher's alarm: one round, then at most one scale
+    /// step. Answers the alarm that stands afterwards, for the idle pull.
+    pub fn run(
         &mut self,
         round: &mut Round,
-        core: &mut Core<S>,
+        source: &mut impl Source,
         now: u64,
-    ) -> Result<(), String> {
+    ) -> Result<RoundResult, String> {
         self.io.init()?;
-        let e = core.wake()?;
-        self.io.head = Position {
-            e: e.e,
-            n: core.last()?.unwrap_or(e.base),
-        };
         let mut s = self.state()?;
         let mut stepped = false;
+        let mut failed = false;
+        // A step that fails (a directory or an edge unreachable, the edge
+        // ceiling) is retried 2 s later, its operation kept; it never keeps
+        // the round from running or the pusher from saying it is idle, so
+        // publishes still poke it (section 13).
+        let step = |scale: &mut Self, s: &mut ScaleState, failed: &mut bool| {
+            scale.advance(s, now).unwrap_or_else(|e| {
+                *failed = true;
+                eprintln!("room scale step failed, retried in 2 s: {e}");
+                false
+            })
+        };
         // A group without children boots first, so this round reaches its edge.
         if s.children.is_empty() {
-            stepped = self.advance(&mut s, now)?;
+            let h = source.pull(None, 0, false, now)?;
+            self.io.head = Position { e: h.e, n: h.head };
+            stepped = step(self, &mut s, &mut failed);
         }
         round.sync_relays(&s.children, &s.relays);
-        round.run(core, now)?;
+        let result = round.run(source, now)?;
+        if let Some(head) = result.delivered {
+            self.io.head = head;
+        }
         for c in &mut s.children {
             c.sockets = round.count(&c.name);
         }
-        if !stepped {
-            stepped = self.advance(&mut s, now)?;
+        if !stepped && !failed {
+            stepped = step(self, &mut s, &mut failed);
+        }
+        if failed && !stepped {
+            let at = result
+                .next
+                .unwrap_or(u64::MAX)
+                .min(now.saturating_add(2000));
+            crate::alarms::set_alarm(at);
+            return Ok(RoundResult {
+                next: Some(at),
+                ..result
+            });
         }
         // The alarm the round set stands unless scaling has more to do.
         if stepped {
-            crate::alarms::set_alarm(if s.op.is_some() {
-                now
+            let at = if s.op.is_some() {
+                // now + 1, not now: an alarm left at the delivered time is cleared after on-alarm.
+                now.saturating_add(1)
             } else {
                 now.saturating_add(20)
+            };
+            crate::alarms::set_alarm(at);
+            return Ok(RoundResult {
+                next: Some(at),
+                ..result
             });
         }
-        Ok(())
+        // Not get_alarm(): inside on-alarm it answers the alarm being delivered.
+        Ok(result)
+    }
+    /// Section 13: a 0.6.0 room's scale rows move to this pusher, one step
+    /// per alarm. True once there is nothing (left) to move.
+    pub fn migrate(&mut self, room: &Pulled, now: u64) -> Result<bool, String> {
+        self.io.init()?;
+        let sql = |s: &str, p: &[crate::Value]| storage::exec(s, p).map_err(|e| e.to_string());
+        sql(
+            "CREATE TABLE IF NOT EXISTS wasmkeep_pusher_migration(id INTEGER PRIMARY KEY CHECK(id=1),step INTEGER NOT NULL)",
+            &[],
+        )?;
+        let step = storage::query("SELECT step FROM wasmkeep_pusher_migration WHERE id=1", &[])
+            .map_err(|e| e.to_string())?
+            .values
+            .first()
+            .and_then(|r| r[0].as_i64());
+        let finish = || {
+            storage::exec_durable(
+                "INSERT INTO wasmkeep_pusher_migration(id,step) VALUES(1,-1) ON CONFLICT(id) DO UPDATE SET step=-1",
+                &[],
+            )
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+        };
+        if step == Some(-1) {
+            return Ok(true);
+        }
+        let result = (|| -> Result<bool, String> {
+            let Some(step) = step else {
+                let have = storage::query("SELECT 1 FROM wasmkeep_room_scale WHERE id=1", &[])
+                    .map_err(|e| e.to_string())?;
+                if !have.values.is_empty() {
+                    return finish(); // A pusher with its own state: nothing to move.
+                }
+                let answer = room.adopt(0, "", &[])?;
+                let mut r = Reader::new(&answer);
+                let data = (r.u64() == Some(1))
+                    .then(|| r.bytes().map(<[u8]>::to_vec))
+                    .flatten();
+                let op = (r.u64() == Some(1))
+                    .then(|| r.bytes().map(<[u8]>::to_vec))
+                    .flatten();
+                let Some(data) = data else {
+                    return finish();
+                };
+                let mut legacy = decode_state(&data)?;
+                legacy.op = op.as_deref().map(decode_op).transpose()?;
+                // The adopted state and the migration row land together.
+                self.io.write(&legacy, true)?;
+                crate::alarms::set_alarm(now.saturating_add(1));
+                return Ok(false);
+            };
+            let names: Vec<String> = self.state()?.children.into_iter().map(|c| c.name).collect();
+            let steps = names.len().div_ceil(16).max(1) as i64;
+            if step > steps {
+                room.adopt(2, "", &[])?;
+                return finish();
+            }
+            let at = ((step - 1) * 16) as usize;
+            let slice = &names[at.min(names.len())..(at + 16).min(names.len())];
+            room.adopt(1, if step == 1 { &self.io.directory } else { "" }, slice)?;
+            storage::exec_durable(
+                "UPDATE wasmkeep_pusher_migration SET step=?1 WHERE id=1",
+                &[(step + 1).into()],
+            )
+            .map_err(|e| e.to_string())?;
+            crate::alarms::set_alarm(now.saturating_add(1));
+            Ok(false)
+        })();
+        match result {
+            Ok(done) => Ok(done),
+            Err(_) => {
+                // Every step repeats after an unknown outcome.
+                crate::alarms::set_alarm(now.saturating_add(2000));
+                Ok(false)
+            }
+        }
     }
     /// One durable step of the pending operation, or of a new one the
     /// counts call for: never more per event, so publishes, pokes and

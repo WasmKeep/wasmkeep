@@ -170,20 +170,24 @@ TypeScript exposes `directory`, `broadcast` and the browser-only
 [TypeScript room](../examples/ts-big-room/README.md) and
 [ADR 0040](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md).
 
-Deploy an internal directory, room, edge and relay class. The front admits
-clients, looks up their edge through the directory and hands off the socket.
-Publish over HTTP through the front; the socket accepts only keepalive pings.
-The room numbers messages, batches pushes and retries failed children. Edges
-hold sockets; above 16 edges, one relay layer distributes the pushes.
-Calls go downward: an edge never calls the room, and a relay only calls its
-edges. Calling back into an actor waiting for you would stall the chain.
+Deploy an internal directory, room, pusher, edge and relay class. The front
+admits clients, looks up their edge through the directory and hands off the
+socket. Publish over HTTP through the front; the socket accepts only
+keepalive pings. The room numbers messages and keeps the history; the pusher
+(`pusher/<room name>`) pulls from it, batches pushes, retries failed children
+and scales the edges, so a round waiting on a slow edge never holds a
+publish. The room asks the front to poke the pusher only when the pusher said
+it went idle. Edges hold sockets; above 16 edges, one relay layer distributes
+the pushes. Calls go one way: the room never calls the pusher, an edge never
+calls anyone, and a relay only calls its edges. Calling back into an actor
+waiting for you would stall the chain.
 
 The defaults and ceilings are **protocol limits, not measured capacity**:
 
 | Setting | Bound |
 | --- | --- |
 | Sockets per edge | 500 by default, no higher than the host's per-actor cap |
-| Fan-out per room or relay | 16 children |
+| Fan-out per pusher or relay | 16 children |
 | One relay layer | 256 edges maximum; 128,000 sockets is only the arithmetic ceiling at 500 each |
 | Room history | Last 2,000 messages or 8 MiB, whichever is less |
 | Edge buffer | Last 512 messages or 1 MiB |

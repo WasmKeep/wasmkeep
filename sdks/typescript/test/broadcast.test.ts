@@ -1,13 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Core } from "../src/broadcast-core";
+import { Core, errorMessage } from "../src/broadcast-core";
 import * as db from "./directory-storage-stub";
 function room(confirm = false) {
-    return new Core(db, { setAlarm(n: bigint) {
-            alarm = n;
-        } }, confirm);
+    return new Core(db, confirm);
 }
-let alarm = 0n;
 test("room numbering, crash void, clean wake and deduplication", () => {
     db.install(":memory:");
     let r = room();
@@ -38,22 +35,19 @@ test("window, reset, gap fetch and last", () => {
     assert.equal(r.history(undefined, 100, 2).messages.length, 2);
     db.close();
 });
-test("confirm flush before push, retry after 50ms", () => {
+test("confirm: a pull flushes first and refuses until the upload is in", () => {
     db.install(":memory:");
     let fail = true, calls = 0;
     const r = new Core({ ...db, flush() {
             calls++;
             if (fail)
                 throw { kind: "internal", message: "not durable: still uploading" };
-        } }, { setAlarm(n: bigint) {
-            alarm = n;
         } }, true);
     r.init();
     r.publish([{ body: "a" }], 0n);
-    assert.equal(r.beforePush(20n), false);
-    assert.equal(alarm, 70n);
+    assert.throws(() => r.pull({ e: 1n, n: 0n }, 1 << 20, false, 20), (e: unknown) => errorMessage(e).includes("not durable"));
     fail = false;
-    assert.equal(r.beforePush(70n), true);
+    assert.equal(r.pull({ e: 1n, n: 0n }, 1 << 20, false, 70).pull.messages.length, 1);
     assert.equal(calls, 2);
     db.close();
 });

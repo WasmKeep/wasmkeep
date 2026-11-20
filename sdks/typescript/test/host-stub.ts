@@ -30,4 +30,7 @@ export function install(host: Host): void {
 export function call(address: string, request: Request): Response {
   return state.host(address, request);
 }
-export function selfAddress() { return {tenant:"tenant",class:"room",name:"r"}; }
+let me = { tenant: "tenant", class: "room", name: "r" };
+/** Who `selfAddress` says this actor is (tests of several actors). */
+export function setSelf(a: { tenant: string; class: string; name: string }) { me = a; }
+export function selfAddress() { return me; }

@@ -18,6 +18,8 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use wasmkeep_runtime::{Runtime, RuntimeConfig};
 use wasmkeep_server::{ActorConfig, ActorService, App, ClusterConfig, HttpComponent, LeaseConfig};
+#[path = "support/fuel.rs"]
+mod fuel;
 #[path = "support/guests.rs"]
 mod guests;
 struct Node {
@@ -59,8 +61,11 @@ async fn node(
         rt.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            // Fuel per event (independent of CPU speed): the pusher tests
+            // bound every room event, the 513-row pull included.
             let runtime = Runtime::new(&RuntimeConfig {
                 max_instances: 16,
+                measure_fuel: true,
                 ..RuntimeConfig::default()
             })
             .unwrap();
@@ -75,7 +80,7 @@ async fn node(
             // the 350 rounds before it speaks take longer than that. This
             // test is about the 4802 slow close, not the idle one.
             config.websocket_ping_after = Duration::from_secs(600);
-            for class in ["room", "edge", "directory", "relay"] {
+            for class in ["room", "pusher", "edge", "directory", "relay"] {
                 config.access.set(class, wasmkeep_server::Access::Internal);
             }
             let mut cluster = ClusterConfig::new(id, format!("http://{addr}"), store);
@@ -92,7 +97,7 @@ async fn node(
             let service = ActorService::new(
                 runtime,
                 config,
-                ["room", "edge", "directory", "relay"]
+                ["room", "pusher", "edge", "directory", "relay"]
                     .into_iter()
                     .map(|c| (c.into(), component.clone(), wasm.clone()))
                     .collect(),
@@ -199,6 +204,20 @@ fn apply(f: &str, last: &mut u64, allow_repeat: bool) -> bool {
     }
     false
 }
+/// Why an actor may have started cold (a new room epoch): instances that
+/// left memory, and leases lost or fenced, from the process's metrics.
+fn restarts() -> String {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .filter(|l| {
+            !l.starts_with('#')
+                && (l.starts_with("wasmkeep_hibernations_total")
+                    || l.contains("lease_lost")
+                    || l.contains("fenced"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 #[derive(Default)]
 struct Progress {
     last: AtomicU64,
@@ -304,9 +323,13 @@ async fn caught_up(
         .iter()
         .any(|(p, _, _)| p.last.load(Ordering::SeqCst) < head)
     {
+        // A client stops on an epoch it did not expect: say whether an
+        // event trapped on its CPU budget (a room restart) or not.
         assert!(
             clients.iter().all(|(_, _, t)| !t.is_finished()),
-            "client task failed"
+            "client task failed; CPU-budget traps so far: {}; {}",
+            wasmkeep_runtime::cpu_budget_exceeded_total(),
+            restarts()
         );
         assert!(
             Instant::now() < deadline,
@@ -493,4 +516,288 @@ async fn room_cluster_30_clients() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn room_cluster_300_clients() {
     exercise(300).await;
+}
+
+// ADR 0040, section 13: the pusher, in its own class, on a real cluster.
+
+/// Every `(e, n)` one socket was handed, in order.
+type Seen = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+/// One socket that never reconnects: every `(e, n)` it was handed, repeats
+/// in the same epoch dropped (the client's rule 1).
+fn listener(addr: SocketAddr, room: &'static str, id: &str) -> (Seen, tokio::task::JoinHandle<()>) {
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let url = format!("ws://{addr}/r6/join?room={room}&c={id}&n=0");
+    let out = seen.clone();
+    let task = tokio::spawn(async move {
+        let mut ws = None;
+        for _ in 0..100 {
+            if let Ok((s, _)) = tokio_tungstenite::connect_async(&url).await {
+                ws = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut ws = ws.expect("join");
+        let mut last = (0u64, 0u64);
+        while let Some(Ok(Message::Text(s))) = ws.next().await {
+            let j: serde_json::Value = serde_json::from_str(&s).unwrap();
+            // Before its first message a socket may start behind; after it, no hole.
+            assert!(
+                j["t"] != "behind" || out.lock().unwrap().is_empty(),
+                "a hole: {s}"
+            );
+            if j["t"] != "m" {
+                continue;
+            }
+            let e = j["e"].as_u64().unwrap();
+            let first = j["n"].as_u64().unwrap();
+            for n in first..first + j["m"].as_array().unwrap().len() as u64 {
+                if e == last.0 && n <= last.1 {
+                    continue;
+                }
+                // The first message is where this socket starts; then no gap.
+                let started = out.lock().unwrap().is_empty();
+                assert!(
+                    started || (e >= last.0 && n == last.1 + 1),
+                    "{e}.{n} after {last:?}"
+                );
+                last = (e, n);
+                out.lock().unwrap().push(last);
+            }
+        }
+    });
+    (seen, task)
+}
+async fn heard(seen: &[Seen], head: u64, within: Duration) {
+    let deadline = Instant::now() + within;
+    while seen
+        .iter()
+        .any(|s| s.lock().unwrap().last().map_or(0, |p| p.1) < head)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "delivery deadline at {head}: {:?}",
+            seen.iter()
+                .map(|s| s.lock().unwrap().last().copied())
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+/// The pusher alone on a node that dies while rounds run: the room keeps
+/// numbering, the pusher wakes on a live node from its durable state (its
+/// children are the directory's), and every client catches up in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_pusher_node_dies_mid_round() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node("a", store.clone(), wasm.clone(), front.clone()).await;
+    let mut b = node("b", store.clone(), wasm.clone(), front.clone()).await;
+    let c = node("c", store.clone(), wasm, front).await;
+    let room = "small";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The directory and the room on a, the edges on a and c, the pusher on b.
+    get(a.addr, "/r6/map?room=small").await;
+    for (addr, edge) in [(a.addr, 1), (c.addr, 3)] {
+        assert_eq!(
+            get(addr, &format!("/r6/warm?room={room}&edge={edge}"))
+                .await
+                .0,
+            200
+        );
+    }
+    assert_eq!(get(a.addr, "/r6/history?room=small&n=0").await.0, 200);
+    assert_eq!(get(b.addr, "/r6/warm-pusher?room=small").await.0, 200);
+    let mut clients = vec![];
+    for i in 0..16 {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("client{i}"),
+            p.clone(),
+            stopped,
+        ));
+        clients.push((p, stop, task));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
+    // A stream of publishes keeps rounds going while the pusher's node dies.
+    let addr = a.addr;
+    let stream = tokio::spawn(async move {
+        let mut head = 0;
+        for _ in 0..60 {
+            head = publish(addr, room, false).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        head
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    b.kill();
+    let streamed = stream.await.unwrap();
+    let head = publish(a.addr, room, false).await;
+    assert!(head > streamed);
+    caught_up(&clients, head).await;
+    // The pusher woke cold on a live node: its durable children are the map's.
+    let (status, children) = get(a.addr, "/r6/children?room=small").await;
+    assert_eq!(status, 200, "{children}");
+    let (_, map) = get(a.addr, "/r6/map?room=small").await;
+    let mut map: Vec<_> = map.split(',').collect();
+    map.sort_unstable();
+    assert_eq!(children, map.join(","));
+    for (p, stop, task) in clients {
+        assert_eq!(p.last.load(Ordering::SeqCst), head);
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
+    // No event trapped and every room event (pulls, publishes, history)
+    // stayed under the fuel the 50 ms budget is calibrated for.
+    fuel::assert_ceiling(500_000_000);
+}
+/// A room event that traps discards the instance: the next operation opens
+/// an epoch, the pusher's pulls carry it, and the clients go on in order
+/// with nothing void (the trap lost no committed write).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_room_trap_opens_an_epoch() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node("a", store, wasm, front).await;
+    let room = "small";
+    assert_eq!(
+        get(a.addr, &format!("/r6/warm?room={room}&edge=1")).await.0,
+        200
+    );
+    let mut seen = vec![];
+    let mut tasks = vec![];
+    for i in 0..6 {
+        let (s, t) = listener(a.addr, room, &format!("trap{i}"));
+        seen.push(s);
+        tasks.push(t);
+    }
+    // Every socket is connected once the first publish reaches them all.
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while seen.iter().any(|s| s.lock().unwrap().is_empty()) {
+        assert!(Instant::now() < deadline, "joins");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    heard(&seen, head, Duration::from_secs(10)).await;
+    let (status, _) = get(a.addr, "/r6/trap?room=small").await;
+    assert_ne!(status, 200, "the room trapped");
+    for _ in 0..3 {
+        head = publish(a.addr, room, false).await;
+    }
+    heard(&seen, head, Duration::from_secs(10)).await;
+    for s in &seen {
+        let s = s.lock().unwrap();
+        assert_eq!(s.last().unwrap().0, 2, "the trap opened epoch 2: {s:?}");
+        assert!(s.iter().any(|p| p.0 == 1));
+    }
+    for t in tasks {
+        t.abort();
+    }
+}
+/// Stage 1 still blocks a round on its slowest child, but only the pusher
+/// waits: publishes are the room's and are acknowledged at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_publish_acknowledged_while_a_round_is_held_by_a_slow_edge() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node("a", store, wasm, front).await;
+    let room = "small";
+    assert_eq!(
+        get(a.addr, &format!("/r6/warm?room={room}&edge=1")).await.0,
+        200
+    );
+    let (seen, task) = listener(a.addr, room, "patient");
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while seen.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "join");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    heard(std::slice::from_ref(&seen), head, Duration::from_secs(10)).await;
+    // Every push to the edge now takes 3 s: each round is held that long.
+    let (status, body) = get(a.addr, "/r6/slow?room=small&edge=1&ms=3000").await;
+    assert_eq!(status, 200, "{body}");
+    let held = Instant::now();
+    head = publish(a.addr, room, false).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..5 {
+        let t = Instant::now();
+        head = publish(a.addr, room, false).await;
+        slowest = slowest.max(t.elapsed());
+    }
+    assert!(
+        slowest < Duration::from_millis(1000),
+        "a publish waited {slowest:?} behind a held round"
+    );
+    heard(std::slice::from_ref(&seen), head, Duration::from_secs(30)).await;
+    assert!(
+        held.elapsed() > Duration::from_millis(2500),
+        "the round was not held: the test proves nothing"
+    );
+    task.abort();
+}
+/// A quiet room loses its pusher's node; one publish comes during the
+/// takeover and nothing after it. Its poke fails, yet the message is
+/// delivered: an idle pusher whose group holds sockets keeps a durable
+/// alarm (3 s for this room, 60 s by default), which the sweep delivers on
+/// a live node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_quiet_room_delivers_a_publish_made_during_the_pusher_takeover() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node("a", store.clone(), wasm.clone(), front.clone()).await;
+    let mut b = node("b", store.clone(), wasm.clone(), front.clone()).await;
+    let _c = node("c", store.clone(), wasm, front).await;
+    let room = "quiet";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    get(a.addr, "/r6/map?room=quiet").await;
+    assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
+    assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
+    assert_eq!(get(b.addr, "/r6/warm-pusher?room=quiet").await.0, 200);
+    let mut clients = vec![];
+    for i in 0..2 {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("quiet{i}"),
+            p.clone(),
+            stopped,
+        ));
+        clients.push((p, stop, task));
+    }
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
+    }) {
+        assert!(Instant::now() < deadline, "joins");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    caught_up(&clients, head).await;
+    // Quiet past the safety round: only the idle alarm stands.
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    b.kill();
+    // One publish during the takeover, then nothing.
+    let head = publish(a.addr, room, false).await;
+    caught_up(&clients, head).await;
+    for (p, stop, task) in clients {
+        assert_eq!(p.last.load(Ordering::SeqCst), head);
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
 }

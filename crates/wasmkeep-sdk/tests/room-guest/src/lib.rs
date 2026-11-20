@@ -6,7 +6,8 @@ impl Actor for TestRoom {
         handler::init(false)
     }
     fn on_alarm() -> Result<(), String> {
-        handler::before_push().map(|_| ())
+        // The room sets no alarm since 0.7.0 (ADR 0040, section 13).
+        Ok(())
     }
 }
 impl http::Guest for TestRoom {

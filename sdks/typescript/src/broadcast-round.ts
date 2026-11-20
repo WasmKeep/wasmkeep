@@ -3,16 +3,39 @@ import { Suspect, type Relay } from "./room-scale";
 import * as calls from "wasmkeep:actor/calls@0.2.0";
 import * as actors from "wasmkeep:actor/actors@0.2.0";
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
-import type { Core, Position } from "./broadcast-core";
+import { Core, errorMessage, ROW_COST, type Position, type Pull } from "./broadcast-core";
 import type { Push } from "./room-edge";
 import { encode } from "./room-utf8";
 /** Message bytes one round builds for its children (ADR 0040, section 4). */
 const ROUND_BYTES = 1024 * 1024;
-/** What reading one row costs the round's budget besides its JSON: at
- * most about 1,000 rows a round, which an interpreter turns into items and
- * JSON well inside the default budget. */
-const ROW_COST = 1024;
+/** What a round reads from: the room's `pull` (a `Pulled` source in the
+ * pusher), or a `Core` in this instance (`local`). */
+export interface Source {
+    pull(after: Position | undefined, budget: number, idle: boolean, now: number): Pull;
+}
+/** A `Core` as a source, in one instance: tests, and the shared vectors
+ * run both ways. */
+export function local(core: Core): Source {
+    return { pull: (after, budget, idle, now) => core.pull(after, budget, idle, now).pull };
+}
+/** A source, or a `Core` taken as `local(core)`. */
+export function asSource(from: Source | Core): Source {
+    return from instanceof Core ? local(from) : from;
+}
+export interface RoundResult {
+    /** The alarm the round set, if any. */
+    next?: number;
+    /** The lowest head a pushed child was given: where an idle pull claims to be. */
+    delivered?: Position;
+    /** Some child holds sockets, or did not say: an idle pusher keeps an alarm. */
+    occupied?: boolean;
+}
+/** Distinct positions one round pulls at most: the rest are deferred to
+ * the next round, so laggards at many positions never make one round a
+ * long chain of synchronous calls to the room. */
+export const MAX_PULLS = 16;
 interface Slice {
+    header: Pull;
     first?: number;
     messages: Push["messages"];
     sizes?: number[];
@@ -66,12 +89,14 @@ export class Round {
     private relayOf = new Map<string, Relay>();
     private byAddress = new Map<string, Child>();
     count(name: string) { return this.byAddress.get(name)?.sockets; }
-    run(core: Core, now: number) {
+    /** One round over `source` (the room's `pull`, or a local `Core`).
+     * Sets the next alarm when one is due and answers it, with the
+     * position every pushed child was brought to (the lowest header
+     * used), for the pusher's idle pull. */
+    run(input: Source | Core, now: number): RoundResult {
+        const source = asSource(input);
         for (const c of this.children)
             c.sockets = undefined;
-        if (!core.beforePush(BigInt(now)))
-            return;
-        const epoch = core.wake(), epochs = core.epochs(), head = core.last() ?? epoch.base;
         const ready = this.children.filter(c => {
             const r = this.relayOf.get(c.address);
             return c.suspect.due <= now && !(r && (this.suspects.get(r.name)?.due ?? 0) > now);
@@ -81,34 +106,47 @@ export class Round {
         const from = Math.max(0, ready.findIndex(c => c.address === this.resume));
         const due = [...ready.slice(from), ...ready.slice(0, from)];
         this.resume = undefined;
-        // Slices by start: children at one position share one read and one encoding.
-        const slices = new Map<string, Slice>();
-        let read = 0;
-        const slice = (from: bigint, b: number): Slice | undefined => {
-            const key = `${from}.${b}`;
-            let s = slices.get(key);
-            if (s)
-                return s;
+        // Pulls by position: children at one position share one pull and one encoding.
+        const slices = new Map<string, Slice | undefined>();
+        let read = 0, pulls = 0, retry = 20, delivered: Position | undefined, current: Pull | undefined;
+        const slice = (position: Position | undefined): Slice | undefined => {
+            const key = position ? `${position.e}.${position.n}` : "";
+            if (slices.has(key))
+                return slices.get(key);
+            // A child at a head the round already pulled needs no read.
+            if (position && current && position.e === current.e && position.n === current.head)
+                return { header: { ...current, first: current.head + 1n, recover: false, messages: [] }, messages: [], recover: false };
             // Reads stop with the budget too: a deferred child costs nothing.
-            if (read >= ROUND_BYTES || budget <= 0)
+            if (position && (read >= ROUND_BYTES || budget <= 0))
                 return;
-            s = { messages: [], recover: false };
-            // Never more rows than the budget has left (one at least).
-            const rows = Math.max(1, Math.min(513, Math.floor((ROUND_BYTES - read) / ROW_COST)));
-            for (const m of core.rows(from, rows, 512 * 1024)) {
-                const boundary = epochs.find(e => e.e === m.position.e);
-                if (!boundary) {
-                    s = { messages: [], recover: true };
-                    break;
-                }
-                const item = { e: number(m.position.e), b: number(boundary.base), a: number(m.at), i: m.id, d: m.body };
+            if (pulls >= MAX_PULLS)
+                return;
+            pulls++;
+            let pull: Pull;
+            try {
+                pull = source.pull(position, position ? ROUND_BYTES - read : 0, false, now);
+            }
+            catch (e) {
+                // Not durable yet (confirm): the upload's retry is 50 ms.
+                if (errorMessage(e).includes("not durable"))
+                    retry = 50;
+                slices.set(key, undefined);
+                return;
+            }
+            // The header of a current-epoch position (or none) carries the epoch's own base.
+            if (!position || position.e === pull.e)
+                current = pull;
+            if (!delivered || pull.e < delivered.e || (pull.e === delivered.e && pull.head < delivered.n))
+                delivered = { e: pull.e, n: pull.head };
+            const s: Slice = { header: pull, messages: [], sizes: [], recover: pull.recover };
+            for (const m of pull.messages) {
+                const item = { e: number(m.position.e), b: number(m.b), a: number(m.at), i: m.id, d: m.body };
                 // JSON escapes are ASCII: the UTF-8 size is the text's length plus each string's non-ASCII surplus.
                 const bytes = JSON.stringify(item).length + (m.bodyBytes - m.body.length) + (m.id === undefined ? 0 : m.idBytes - m.id.length);
                 if (!s.messages.length)
                     s.first = number(m.position.n);
                 s.messages.push(item);
-                s.sizes ??= [];
-                s.sizes.push(bytes);
+                s.sizes!.push(bytes);
                 // Every row costs, an empty one too: its lift, its item and its JSON.
                 read += ROW_COST + bytes;
             }
@@ -122,12 +160,12 @@ export class Round {
             deferred = true;
             this.resume ??= c.address;
         };
-        const sent: Child[] = [], pushes: Push[] = [], requests: [
+        const sent: Child[] = [], pushes: Push[] = [], heads: Pull[] = [], requests: [
             string,
             actors.Request
         ][] = [];
         for (const c of due) {
-            let body: string, op: string;
+            let body: string, op: string, header: Pull | undefined;
             if (!c.initialized) {
                 const a = actors.selfAddress();
                 op = "init";
@@ -136,36 +174,34 @@ export class Round {
             }
             else {
                 op = "push";
-                const p: Push = { e: number(epoch.e), b: number(epoch.base), first: number(head < 9007199254740991n ? head + 1n : head), head: number(head), messages: [] };
-                if (c.position) {
-                    p.b = number(epochs.filter(e => e.e > c.position!.e).reduce((b, e) => b < e.base ? b : e.base, epoch.base));
-                    const n = epochs.filter(e => e.e > c.position!.e).reduce((n, e) => n < e.base ? n : e.base, c.position.n);
-                    const s = n < head ? slice(n + 1n, p.b) : undefined;
-                    if (n < head && !s) {
+                const s = slice(c.position);
+                if (!s) {
+                    defer(c);
+                    continue;
+                }
+                const h = header = s.header;
+                const p: Push = { e: number(h.e), b: number(h.b), first: number(h.head < 9007199254740991n ? h.head + 1n : h.head), head: number(h.head), messages: [] };
+                if (s.recover)
+                    p.recover = true;
+                else if (s.messages.length) {
+                    // The old cut: at most 512 messages and 512 KiB of JSON per request.
+                    const fixed = JSON.stringify({ ...p, first: s.first, messages: [] }).length;
+                    let k = 0, total = fixed;
+                    while (k < s.messages.length && k < 512 && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
+                        total += s.sizes![k] + (k++ ? 1 : 0);
+                    if (k && total - fixed > budget && budget < ROUND_BYTES) {
                         defer(c);
                         continue;
                     }
-                    if (s?.recover)
-                        p.recover = true;
-                    else if (s?.messages.length) {
-                        // The old cut: at most 512 messages and 512 KiB of JSON per request.
-                        const fixed = JSON.stringify({ ...p, first: s.first, messages: [] }).length;
-                        let k = 0, total = fixed;
-                        while (k < s.messages.length && k < 512 && total + s.sizes![k] + (k ? 1 : 0) <= 512 * 1024)
-                            total += s.sizes![k] + (k++ ? 1 : 0);
-                        if (k && total - fixed > budget && budget < ROUND_BYTES) {
-                            defer(c);
-                            continue;
-                        }
-                        budget -= total - fixed;
-                        p.first = s.first!;
-                        p.messages = s.messages.slice(0, k);
-                    }
+                    budget -= total - fixed;
+                    p.first = s.first!;
+                    p.messages = s.messages.slice(0, k);
                 }
                 pushes.push(p);
                 body = JSON.stringify(p);
             }
             sent.push(c);
+            heads.push(header!);
             requests.push([c.address, { method: "POST", path: `/wasmkeep-edge/v1/${op}`, headers: [], body: this.relays.length ? new Uint8Array() : encode(body) }]);
         }
         let next = Infinity;
@@ -203,7 +239,7 @@ export class Round {
             });
         }
         if (deferred)
-            next = now + 20;
+            next = now + retry;
         sent.forEach((c, i) => {
             if (skipped.has(i))
                 return; // Relay failure belongs to the relay, not its edges.
@@ -216,18 +252,20 @@ export class Round {
                     next = Math.min(next, now + 20);
                 }
                 else {
+                    // Each child's answer is checked against its own pull's header.
+                    const { e: epoch, head } = heads[i];
                     const a = JSON.parse(new TextDecoder().decode(r.val.body));
-                    if (![a.e, a.n, a.lagging].every(n => Number.isSafeInteger(n) && n >= 0) || BigInt(a.e) > epoch.e || (BigInt(a.e) === epoch.e && BigInt(a.n) > head))
+                    if (![a.e, a.n, a.lagging].every(n => Number.isSafeInteger(n) && n >= 0) || BigInt(a.e) > epoch || (BigInt(a.e) === epoch && BigInt(a.n) > head))
                         throw Error("invalid acknowledgment");
                     const position = { e: BigInt(a.e), n: BigInt(a.n) };
-                    const stalledOnly = a.lagging > 0 && a.stalled === a.lagging && position.e === epoch.e && position.n === head;
+                    const stalledOnly = a.lagging > 0 && a.stalled === a.lagging && position.e === epoch && position.n === head;
                     const unchanged = c.position?.e === position.e && c.position?.n === position.n && c.stalled === a.stalled;
                     c.stallDelay = stalledOnly && unchanged ? Math.min(45000, (c.stallDelay ?? 10) * 2) : 20;
                     c.stalled = stalledOnly ? a.stalled : undefined;
                     c.position = position;
                     if (Number.isSafeInteger(a.sockets) && a.sockets >= 0)
                         c.sockets = a.sockets;
-                    if (position.e !== epoch.e || position.n < head || a.lagging)
+                    if (position.e !== epoch || position.n < head || a.lagging)
                         next = Math.min(next, now + (stalledOnly ? c.stallDelay : 20));
                 }
                 c.suspect.success();
@@ -244,5 +282,7 @@ export class Round {
                 next = Math.min(next, c.suspect.due);
         if (next !== Infinity)
             alarms.setAlarm(BigInt(next));
+        const occupied = this.children.some(c => c.sockets === undefined || c.sockets > 0);
+        return { next: next === Infinity ? undefined : next, delivered, occupied };
     }
 }

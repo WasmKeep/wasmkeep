@@ -40,6 +40,7 @@ async fn room_edge_slow_socket_and_restart() {
         config,
         vec![
             ("t".into(), component.clone(), wasm.clone()),
+            ("pusher".into(), component.clone(), wasm.clone()),
             ("edge".into(), component, wasm),
         ],
     )

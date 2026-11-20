@@ -1,7 +1,9 @@
 # Reconnecting room, in TypeScript
 
-A public lobby built from the SDK's directory, room, edge and relay classes
-([ADR 0040](../../docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
+A public lobby built from the SDK's directory, room, pusher, edge and relay
+classes ([ADR 0040](../../docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
+The room numbers messages and keeps the history; the pusher pulls from it and
+delivers to the edges, so a slow delivery round never holds a publish.
 The front serves a plain HTML page and bundles `@wasmkeep/sdk/room-client`:
 messages, send box, connection state, delivery counters and a button that drops
 the socket. Rejoining always goes through the front and directory; missing
@@ -14,10 +16,11 @@ From the repository root:
 (cd examples/ts-big-room && npm ci && npm run build)
 cargo run -j 4 -p wasmkeep-cli -- serve examples/ts-big-room/front.wasm \
   --actor room=examples/ts-big-room/room.wasm \
+  --actor pusher=examples/ts-big-room/pusher.wasm \
   --actor edge=examples/ts-big-room/edge.wasm \
   --actor relay=examples/ts-big-room/relay.wasm \
   --actor directory=examples/ts-big-room/directory.wasm \
-  --access room=internal --access edge=internal \
+  --access room=internal --access pusher=internal --access edge=internal \
   --access relay=internal --access directory=internal
 ```
 
@@ -29,7 +32,7 @@ Names are public labels, **not authentication**; this example has no accounts,
 presence or private rooms. Add real authorization in the front before exposing
 private content.
 
-`npm run build:starlingmonkey` builds the same five components with the
+`npm run build:starlingmonkey` builds the same six components with the
 `-starlingmonkey.wasm` suffix. Both builds run `npm test` first and are picked up
 by CI and `scripts/languages.sh` through their `examples/ts-*/` loop. The browser
 bundle and HTML are embedded in the front; `src/assets.ts` is generated.
@@ -41,8 +44,9 @@ the room actor can run out of guest memory when its node is short of CPU
 
 The front accepts `GET /join`, `POST /publish`, `GET /history` and `GET /stats`,
 with `?name=<chosen name>`. Publish takes `{ "text": "hello", "id": "retry-id" }`;
-history accepts `after=<epoch>.<number>`. Stats reports the head and persisted
-edge/relay counts; it does not claim to expose the full ADR's runtime metrics.
+history accepts `after=<epoch>.<number>`. Stats reports the head (from the room)
+and persisted edge/relay counts (from the pusher); it does not claim to expose
+the full ADR's runtime metrics.
 The browser counters show delivered messages, repeated items discarded,
 reconnect attempts, HTTP history requests, void numbers and resets. A reset
 clears the view; void numbers are removed from it. Only 2,000 displayed messages
@@ -50,7 +54,10 @@ are retained.
 
 Capacity is 150 per edge, with the SDK's normal minute hysteresis. A room grows
 by splitting ranges and closing moved sockets with 4801. Relay fan-out begins
-above 16 edges. The room uses plain writes (`confirm` defaults to false); on a
+above 16 edges. A room deployed with 0.6.0 (four classes) moves its edges and
+map to the pusher by itself once the five classes are deployed together; see
+the [changelog](../../CHANGELOG.md). The room uses plain writes (`confirm`
+defaults to false); on a
 cluster, choose batched writes in deployment configuration for throughput, and
 set `confirm: true` in `src/room.ts` when delivery must wait for upload. The
 history window is bounded: a client away too long receives a reset, and lost

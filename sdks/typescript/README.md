@@ -450,9 +450,16 @@ Rust.
 
 Use a batched class. One durable epoch boundary is recorded at the first
 operation after each cold start, including history, so reconnects learn
-losses before the next publish. Plain publishes schedule a 20 ms alarm and
-retain 2,000 messages or 8 MiB of UTF-8 bodies. History replies, including
-framing, stay within 256 KiB. With `confirm: true`, the alarm's confirmation
-barrier flushes before permitting a round; an upload still pending retries
-50 ms later. There are no delivery children in R2. R3–R5 add edge delivery,
-join/poke, scaling and relays.
+losses before the next publish. Plain publishes retain 2,000 messages or
+8 MiB of UTF-8 bodies and set no alarm. History replies, including framing,
+stay within 256 KiB.
+
+Delivery is a fifth class since 0.7.0 (ADR 0040, section 13):
+`broadcast.definePusher({ scaling: { directory, edgeClass, capacity } })`
+(or `{ edges }`), deployed internally as `pusher`. It pulls from the room
+`room/<its name>` and runs the rounds, relays and scaling. With
+`confirm: true` the room's pull flushes first and the pusher retries 50 ms
+later while the upload is pending. `Client.publish` pokes the pusher only
+when the room's answer asks for it; `broadcast.join` pokes the pusher. A
+room deployed with 0.6.0 moves its group to its pusher by itself (see the
+changelog).

@@ -40,6 +40,26 @@ export function defineEdge(): ActorDefinition {
                 storage.deleteSelf();
                 return { status: 200, body: '{}' };
             }
+            if (req.path === "/wasmkeep-edge/v1/handover") {
+                // ADR 0040, section 13: the controller names its successor (a
+                // 0.6.0 room its pusher). Repeated, or with no configuration: nothing to do.
+                let next: { room?: unknown };
+                try {
+                    next = JSON.parse(req.text(4096) ?? "null") ?? {};
+                }
+                catch {
+                    return { status: 400 };
+                }
+                if (typeof next.room !== "string" || !next.room)
+                    return { status: 400 };
+                if (!config || config.room === next.room)
+                    return { status: 200, body: "{}" };
+                if (config.room !== caller)
+                    return { status: 403 };
+                config = { ...config, room: next.room };
+                storage.execDurable("UPDATE wasmkeep_edge SET config=?1 WHERE id=1", [{ tag: "text", val: JSON.stringify(config) }]);
+                return { status: 200, body: "{}" };
+            }
             if (["init", "range", "drain"].some(op => req.path === `/wasmkeep-edge/v1/${op}`)) {
                 if (config && config.room !== caller)
                     return { status: 403 };

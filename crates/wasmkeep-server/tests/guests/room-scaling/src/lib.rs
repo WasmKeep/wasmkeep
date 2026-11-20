@@ -1,10 +1,14 @@
 use wasmkeep_sdk::{
     Actor, actors,
-    broadcast::{EdgeActor, Position, RelayActor, Round, ScaleHost, ScaleIo, Scaling, handler},
+    broadcast::{
+        EdgeActor, Position, RelayActor, Round, ScaleHost, ScaleIo, Scaling, handler, pusher,
+    },
     directory::Directory,
     http,
 };
 thread_local! {static ROUND:std::cell::RefCell<Round>=std::cell::RefCell::new(Round::default());}
+/// The quiet room's idle alarm (room_cluster).
+const QUIET_IDLE_MS: u64 = 3000;
 struct Guest;
 impl Actor for Guest {
     fn on_init() -> Result<(), String> {
@@ -12,12 +16,15 @@ impl Actor for Guest {
             "directory" => Directory::on_init(),
             "edge" => EdgeActor::on_init(),
             "relay" => RelayActor::on_init(),
+            "pusher" => Ok(()),
             _ => handler::init(false),
         }
     }
+    /// The pusher runs the rounds and scaling (ADR 0040, section 13); the
+    /// room's alarm, if a 0.6.0 one is left, does nothing.
     fn on_alarm() -> Result<(), String> {
         let a = actors::self_address();
-        if a.class != "room" {
+        if a.class != "pusher" {
             return Ok(());
         }
         let mut scale = Scaling::new(
@@ -54,7 +61,11 @@ impl Actor for Guest {
         } else {
             1000
         });
-        ROUND.with_borrow_mut(|r| handler::scaling(&mut scale, r))
+        // room_cluster: a quiet room whose idle alarm is short enough to test.
+        if a.name == "quiet" {
+            pusher::handler::idle_period(QUIET_IDLE_MS);
+        }
+        ROUND.with_borrow_mut(|r| pusher::handler::scaling(&mut scale, r))
     }
     fn on_websocket_open(id: u64, path: String) -> Result<(), String> {
         EdgeActor::on_websocket_open(id, path)
@@ -66,8 +77,88 @@ impl Actor for Guest {
         EdgeActor::on_websocket_close(id, c, r);
     }
 }
+thread_local! {
+    /// The pusher tests' slow edge: how long each push waits before it is applied.
+    static SLOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 impl http::Guest for Guest {
     fn handle(req: http::IncomingRequest, out: http::ResponseOutparam) {
+        let path = req.path_with_query().unwrap_or_default();
+        // The pusher tests (room_cluster): a room event that traps, a slow
+        // edge, and the pusher's children by name.
+        if path == "/test-trap" {
+            panic!("a room event that traps");
+        }
+        if let Some(ms) = path.strip_prefix("/test-slow?ms=") {
+            SLOW.set(ms.parse().unwrap_or(0));
+            http::respond(out, 200, "text/plain", b"ok");
+            return;
+        }
+        if path == "/wasmkeep-edge/v1/push" && SLOW.get() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(SLOW.get()));
+        }
+        // A group as a 0.6.0 room left it (room_scaling): the room is the
+        // controller, its own scale rows, the map's owner and the edges' room.
+        if path == "/test-legacy-boot" {
+            let a = actors::self_address();
+            let result = (|| -> Result<(), String> {
+                let mut core = wasmkeep_sdk::broadcast::Core::new(wasmkeep_sdk::broadcast::Host, false);
+                core.init()?;
+                let mut scale = Scaling::new(
+                    ScaleHost {
+                        directory: format!("directory/bg:{}", a.name),
+                        room: format!("{}/{}/{}", a.tenant, a.class, a.name),
+                        capacity: 5,
+                        head: Position { e: 0, n: 0 },
+                    },
+                    format!("edge/{}", a.name),
+                    5,
+                )?;
+                let mut round = Round::default();
+                for _ in 0..3 {
+                    scale.run(&mut round, &mut core, wasmkeep_sdk::now_ms())?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => http::respond(out, 200, "text/plain", b"ok"),
+                Err(e) => http::respond(out, 500, "text/plain", e.as_bytes()),
+            }
+            return;
+        }
+        if path == "/test-owner" || path == "/test-legacy-rows" {
+            let sql = if path == "/test-owner" {
+                "SELECT owner FROM wasmkeep_directory_map"
+            } else {
+                "SELECT group_concat(name) FROM sqlite_master WHERE name IN ('wasmkeep_room_scale','wasmkeep_room_ops')"
+            };
+            let rows = wasmkeep_sdk::storage::query(sql, &[]).unwrap();
+            let v = rows
+                .values
+                .first()
+                .and_then(|r| r[0].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            http::respond(out, 200, "text/plain", v.as_bytes());
+            return;
+        }
+        if path == "/test-children" {
+            let host = ScaleHost {
+                directory: String::new(),
+                room: String::new(),
+                capacity: 5,
+                head: Position { e: 0, n: 0 },
+            };
+            let mut names: Vec<_> = host
+                .load()
+                .unwrap()
+                .children
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            names.sort();
+            http::respond(out, 200, "text/plain", names.join(",").as_bytes());
+            return;
+        }
         if matches!(
             req.path_with_query().as_deref(),
             Some("/test-scale-state" | "/test-relay-state")
@@ -101,6 +192,7 @@ impl http::Guest for Guest {
             "directory" => Directory::handle(req, out),
             "edge" => EdgeActor::handle(req, out),
             "relay" => RelayActor::handle(req, out),
+            "pusher" => pusher::handler::handle(req, out),
             _ => handler::handle(req, out),
         }
     }

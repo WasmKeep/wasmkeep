@@ -12,41 +12,50 @@ const U32_MAX = 0xffff_ffff;
 
 // ------------------------------------------------------------------ framing
 
-/** Appends to a buffer. */
+/** Appends to one growing buffer. A room's pull writes thousands of
+ * fields (ADR 0040, section 13): on an interpreter, one allocation (and
+ * one bigint) per field cost more than the reads it frames. */
 export class Writer {
-  private chunks: Uint8Array[] = [];
+  private buf = new Uint8Array(256);
+  private view = new DataView(this.buf.buffer);
   private length = 0;
 
   /** An unsigned 64-bit integer (a non-negative safe integer or bigint). */
   u64(v: number | bigint): this {
-    const b = new Uint8Array(8);
-    new DataView(b.buffer).setBigUint64(0, toU64(v));
-    return this.push(b);
+    this.room(8);
+    if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) {
+      // A safe integer splits into two exact 32-bit halves, without a bigint.
+      this.view.setUint32(this.length, Math.floor(v / 0x1_0000_0000));
+      this.view.setUint32(this.length + 4, v >>> 0);
+    } else {
+      this.view.setBigUint64(this.length, toU64(v));
+    }
+    this.length += 8;
+    return this;
   }
 
   /** A byte string: its length (4 bytes), then the bytes. */
   bytes(v: Uint8Array): this {
-    const len = new Uint8Array(4);
+    this.room(4 + v.length);
     // Bodies are capped at 16 MB by `actors.call`, so a length always fits.
-    new DataView(len.buffer).setUint32(0, Math.min(v.length, U32_MAX));
-    this.push(len);
-    return this.push(v);
+    this.view.setUint32(this.length, Math.min(v.length, U32_MAX));
+    this.buf.set(v, this.length + 4);
+    this.length += 4 + v.length;
+    return this;
   }
 
   finish(): Uint8Array {
-    const out = new Uint8Array(this.length);
-    let at = 0;
-    for (const c of this.chunks) {
-      out.set(c, at);
-      at += c.length;
-    }
-    return out;
+    return this.buf.slice(0, this.length);
   }
 
-  private push(b: Uint8Array): this {
-    this.chunks.push(b);
-    this.length += b.length;
-    return this;
+  private room(n: number) {
+    if (this.length + n <= this.buf.length) return;
+    let size = this.buf.length * 2;
+    while (size < this.length + n) size *= 2;
+    const next = new Uint8Array(size);
+    next.set(this.buf.subarray(0, this.length));
+    this.buf = next;
+    this.view = new DataView(next.buffer);
   }
 }
 

@@ -26,5 +26,7 @@ export class Client {
         return { entry, version };
     }
     change(c: Change): Map { return decodeMap(this.call(c.kind, encodeChange(c))); }
+    /** The owner hands the map to `owner`; repeated, it changes nothing. */
+    transfer(owner: string): void { this.call("transfer", new Writer().bytes(toBytes(owner)).finish()); }
     delete(expect: bigint): void { this.call("delete", new Writer().u64(expect).finish()); }
 }

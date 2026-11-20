@@ -171,6 +171,45 @@ impl http::Guest for EdgeActor {
                 storage::delete_self();
                 return Ok("{}".into());
             }
+            if path == "/wasmkeep-edge/v1/handover" {
+                // ADR 0040, section 13: the controller names its successor (a
+                // 0.6.0 room its pusher). Repeated, or with no configuration:
+                // nothing to do.
+                let j = crate::json::parse_unique(body).ok_or("invalid handover")?;
+                let next = super::edge::string(&j, "room")?;
+                if next.is_empty() {
+                    return Err("invalid handover".into());
+                }
+                let Some(old) = old.filter(|c| c.room != next) else {
+                    return Ok("{}".into());
+                };
+                if old.room != caller {
+                    return Err("forbidden".into());
+                }
+                let raw = storage::query("SELECT config FROM wasmkeep_edge WHERE id=1", &[])
+                    .map_err(|e| e.to_string())?;
+                let raw = raw
+                    .values
+                    .first()
+                    .and_then(|r| r[0].as_str())
+                    .ok_or("invalid config")?;
+                let mut stored = crate::json::parse_unique(raw).ok_or("invalid config")?;
+                if let crate::json::Json::Object(fields) = &mut stored {
+                    for (k, v) in fields.iter_mut() {
+                        if k == "room" {
+                            *v = crate::json::Json::String(next.into());
+                        }
+                    }
+                }
+                let mut text = String::new();
+                stored.write(&mut text);
+                storage::exec_durable(
+                    "UPDATE wasmkeep_edge SET config=?1 WHERE id=1",
+                    &[text.into()],
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok("{}".into());
+            }
             if ["init", "range", "drain"]
                 .iter()
                 .any(|op| path == format!("/wasmkeep-edge/v1/{op}"))

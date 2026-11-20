@@ -139,7 +139,7 @@ test('a blocked scale operation never prevents rounds to either side of its map 
     host.init();
     const a = child(0n, undefined, 8), b = child(1n << 63n, undefined, 0);
     host.save({ children: [a, b], next: 3, version: 1n, op: { id: 'split', kind: 'split', step: 1, a, b, expect: 1n, started: 0 } });
-    const core = new Core(db, alarms);
+    const core = new Core(db);
     core.init();
     let pushes = 0;
     install((address, r) => {
@@ -149,7 +149,9 @@ test('a blocked scale operation never prevents rounds to either side of its map 
         pushes++;
         return { status: 200, headers: [], body: new TextEncoder().encode('{"e":1,"n":0,"sockets":0,"lagging":0}') };
     });
-    assert.throws(() => host.run(new Round([]), core, 10), /unavailable/);
+    // The failed step waits 2 s; the round still ran and its result stands.
+    assert.equal(host.run(new Round([]), core, 10).next, 2010);
+    assert.equal(alarms.pending, 2010n);
     assert.equal(pushes, 2);
     assert.equal(host.load()!.op!.step, 1);
     db.close();

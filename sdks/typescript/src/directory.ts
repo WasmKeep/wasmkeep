@@ -94,6 +94,21 @@ function serve(caller: string, op: string, body: Uint8Array): Uint8Array {
             return transaction(() => { const before = load(), after = change(before, caller, c); if (after !== before)
                 save(before, after); return after.lastResult ?? invalid(); });
         }
+        case "transfer": {
+            // The owner names its successor (ADR 0040, section 13); the
+            // map's version is unchanged. Repeated: already done.
+            const owner = text(r);
+            end(r);
+            return transaction(() => {
+                const state = load();
+                if (state.owner !== owner) {
+                    if (state.owner !== caller)
+                        throw new DirectoryError(403, "not the owner");
+                    storage.exec("UPDATE wasmkeep_directory_map SET owner=?1 WHERE id=1", [string(owner)]);
+                }
+                return new Uint8Array();
+            });
+        }
         case "entries":
             end(r);
             return encodeMap(load().map);
