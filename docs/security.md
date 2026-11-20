@@ -53,7 +53,8 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 - Capabilities: only what the `wasmkeep:actor` world imports. Filesystem and
   sockets interfaces that toolchains import anyway are inert (no
   directories, every socket and lookup refused).
-- CPU: 50 ms of guest time per event, and 2 s of SQL CPU per event
+- CPU: 50 ms of guest CPU time per event (the thread's own CPU time, so
+  other threads sharing the core are not charged to the guest), and 2 s of SQL CPU per event
   (SQLite runs in the host, so it has its own budget, measured with the
   thread's CPU clock and enforced inside a statement); wall clock 30 s per
   event (also for a front request, response included). The front has

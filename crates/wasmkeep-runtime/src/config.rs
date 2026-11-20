@@ -17,7 +17,11 @@ pub struct RuntimeConfig {
     /// 50 ms). A guest that exceeds it traps with
     /// [`CpuBudgetExceeded`](crate::CpuBudgetExceeded). Measured with the
     /// thread CPU clock on Linux and macOS, wall time elsewhere; see
-    /// `cpu.rs` for how the two clocks share the work.
+    /// `cpu.rs` for how the wall clock stands in for the thread CPU clock on
+    /// short stretches of guest code, and how preemption is kept out of
+    /// them. Time a hypervisor steals from the VM may be counted: the thread
+    /// CPU clock leaves it out only where the guest kernel accounts steal
+    /// apart.
     pub cpu_budget: Duration,
     /// How often the epoch advances; the CPU budget is enforced with this
     /// granularity. Must be non-zero.
