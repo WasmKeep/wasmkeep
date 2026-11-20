@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 pub(super) enum Work {
     StaleAlarmHint,
     CompleteUploads,
-    SnapshotInGap,
+    SnapshotCopy,
     FlushToBarrier,
     Hibernate,
     Restore,
@@ -21,7 +21,7 @@ pub(super) enum Work {
 const NAMES: [&str; 7] = [
     "stale_alarm_hint",
     "complete_uploads",
-    "snapshot_in_gap",
+    "snapshot_copy",
     "flush_to_barrier",
     "hibernate",
     "restore",
@@ -53,6 +53,9 @@ pub(super) struct Timing {
     guest: AtomicU64,
     host: AtomicU64,
     depth: AtomicUsize,
+    /// Host work timed apart inside an outer guard ([`Timing::apart`]),
+    /// which that guard leaves out: monotonic.
+    apart: AtomicU64,
 }
 impl Timing {
     pub(super) fn new(app: &str, class: &str) -> Arc<Self> {
@@ -71,6 +74,7 @@ impl Timing {
             guest: AtomicU64::new(0),
             host: AtomicU64::new(0),
             depth: AtomicUsize::new(0),
+            apart: AtomicU64::new(0),
         })
     }
     pub(super) fn job(&self, timing: wasmkeep_runtime::JobTiming) {
@@ -112,7 +116,15 @@ impl Timing {
             work,
             started: outer.then(Instant::now),
             guest: self.guest.load(Relaxed),
+            apart: self.apart.load(Relaxed),
         }
+    }
+    /// Records `elapsed` of `work` that ran inside whatever guard is open
+    /// (a periodic snapshot's copy inside a completion job or an event's
+    /// step), and takes it out of that guard's time: exclusive still.
+    pub(super) fn apart(&self, work: Work, elapsed: Duration) {
+        self.record(work, elapsed);
+        self.apart.fetch_add(nanos(elapsed), Relaxed);
     }
 }
 fn nanos(d: Duration) -> u64 {
@@ -124,6 +136,7 @@ pub(super) struct Guard {
     work: Work,
     started: Option<Instant>,
     guest: u64,
+    apart: u64,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -131,8 +144,15 @@ impl Drop for Guard {
         if let Some(started) = self.started {
             let guest =
                 Duration::from_nanos(self.timing.guest.load(Relaxed).saturating_sub(self.guest));
-            self.timing
-                .record(self.work, started.elapsed().saturating_sub(guest));
+            let apart =
+                Duration::from_nanos(self.timing.apart.load(Relaxed).saturating_sub(self.apart));
+            self.timing.record(
+                self.work,
+                started
+                    .elapsed()
+                    .saturating_sub(guest)
+                    .saturating_sub(apart),
+            );
         }
     }
 }
@@ -187,10 +207,28 @@ mod tests {
             let _flush = timing.work(Work::FlushToBarrier);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        {
+            // A snapshot's copy inside a completion job: its own label,
+            // and out of the job's.
+            let _complete = timing.work(Work::CompleteUploads);
+            let copy = Instant::now();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            timing.apart(Work::SnapshotCopy, copy.elapsed());
+        }
         let elapsed = start.elapsed();
         timing.job(JobTiming::Finished { elapsed });
         let guest = Duration::from_nanos(timing.guest.load(Relaxed)).as_secs_f64();
-        let host = sum("restore") + sum("stale_alarm_hint") + sum("other");
+        assert!(sum("snapshot_copy") >= 0.009);
+        assert!(
+            sum("complete_uploads") < 0.005,
+            "{}",
+            sum("complete_uploads")
+        );
+        let host = sum("restore")
+            + sum("stale_alarm_hint")
+            + sum("complete_uploads")
+            + sum("snapshot_copy")
+            + sum("other");
         assert!((guest + host - elapsed.as_secs_f64()).abs() < 1e-8);
         assert_eq!(sum("flush_to_barrier"), 0.0);
         assert_eq!(timing.depth.load(Relaxed), 0);

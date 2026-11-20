@@ -443,6 +443,9 @@ pub(super) struct Uploads {
     /// A failed snapshot's wait a restore set aside (fewer than 64
     /// segments restored), for a batched hold due by bytes.
     pub(super) set_aside_wait: Option<super::SnapshotWait>,
+    /// A periodic snapshot uploading off the mailbox, if one is
+    /// ([`Replica::start_periodic_snapshot`]).
+    pub(super) periodic: Option<super::PeriodicUpload>,
 }
 
 impl Default for Uploads {
@@ -462,6 +465,7 @@ impl Default for Uploads {
             bytes_since_snapshot: 0,
             snapshot_bytes: SNAPSHOT_BYTES,
             set_aside_wait: None,
+            periodic: None,
         }
     }
 }
@@ -642,6 +646,7 @@ impl Replica {
             || self.batched.bytes_since_snapshot >= self.batched.snapshot_bytes;
         // Both gates of a failed snapshot's backoff, whichever bound came.
         reached
+            && self.batched.periodic.is_none()
             && self.since_snapshot >= self.snapshot_retry_at
             && (self.snapshot_failures == 0
                 || tokio::time::Instant::now() >= self.snapshot_retry_after)
@@ -897,6 +902,7 @@ impl Replica {
     /// so an apply cancelled half-way leaves the sidecar behind the
     /// acknowledged head, never ahead of it; the next apply writes it.
     pub(crate) async fn apply(&mut self) -> Result<Applied, ReplicaError> {
+        self.settle_periodic();
         let slot = self.batched.shared.slot.borrow().clone();
         let applied = match slot {
             Slot::Idle | Slot::Reserved(_) | Slot::Uploading { .. } => Applied::Nothing,

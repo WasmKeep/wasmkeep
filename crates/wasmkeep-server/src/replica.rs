@@ -12,6 +12,7 @@ pub mod history;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::watch;
 
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -445,7 +446,9 @@ const UPLOAD_ATTEMPTS: u32 = 3;
 const UPLOAD_BUDGET_IDLES: u32 = 4;
 
 /// A periodic snapshot is an optimisation (the segments are the history),
-/// taken after an event while the actor is held: it must cost the events
+/// taken after an event while the actor is held (with strict writes; a
+/// batched hold's uploads off the mailbox, ADR 0034, section 7, and holds
+/// only a barrier, a reset or another snapshot): it must cost the events
 /// behind it little even when the bucket leaves every snapshot upload
 /// hanging. A caller queued behind the actor waits 30 s at most where its
 /// wait is bounded at all (`wall_per_event` for `actors.call`,
@@ -567,6 +570,206 @@ fn periodic_snapshot_bound(idle: std::time::Duration, bytes: usize) -> std::time
         .min(idle.saturating_mul(PERIODIC_SNAPSHOT_IDLES))
 }
 
+/// A node's periodic snapshots of batched holds uploading off the mailbox,
+/// by actor ([`Cluster::periodic_flights`]). An upload outlives the hold
+/// that started it when that hold ends without its barrier (given up,
+/// failed, a stop past its deadline): the actor's next hold on this node
+/// finds it here, and its resets and barriers wait for it as for its own
+/// (ADR 0034, section 7). A hold that ends without its barrier cancels it:
+/// an upload whose request has not started then never sends it; one whose
+/// request is under way cannot be recalled, and is waited for until its
+/// one attempt ends.
+#[derive(Debug, Default)]
+pub(crate) struct PeriodicFlights(std::sync::Mutex<PeriodicFlightsInner>);
+
+#[derive(Debug, Default)]
+struct PeriodicFlightsInner {
+    next: u64,
+    flights: std::collections::HashMap<ActorAddress, PeriodicFlight>,
+}
+
+#[derive(Debug)]
+struct PeriodicFlight {
+    id: u64,
+    settled: watch::Receiver<Option<PeriodicOutcome>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PeriodicFlights {
+    fn inner(&self) -> std::sync::MutexGuard<'_, PeriodicFlightsInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records `address`'s upload; `None` if one is recorded already.
+    fn start(
+        &self,
+        address: &ActorAddress,
+        settled: watch::Receiver<Option<PeriodicOutcome>>,
+    ) -> Option<(u64, Arc<std::sync::atomic::AtomicBool>)> {
+        let mut inner = self.inner();
+        if inner.flights.contains_key(address) {
+            return None;
+        }
+        inner.next = inner.next.wrapping_add(1);
+        let (id, cancelled) = (inner.next, Arc::default());
+        inner.flights.insert(
+            address.clone(),
+            PeriodicFlight {
+                id,
+                settled,
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        Some((id, cancelled))
+    }
+
+    /// The upload `id` of `address` ended.
+    fn end(&self, address: &ActorAddress, id: u64) {
+        let mut inner = self.inner();
+        if inner.flights.get(address).is_some_and(|f| f.id == id) {
+            inner.flights.remove(address);
+        }
+    }
+
+    /// Whether `address` has an upload recorded.
+    pub(crate) fn uploading(&self, address: &ActorAddress) -> bool {
+        self.inner().flights.contains_key(address)
+    }
+
+    /// A wait for `address`'s upload to end; `None` if none is recorded.
+    fn settled(
+        &self,
+        address: &ActorAddress,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + use<>> {
+        let mut settled = self.inner().flights.get(address)?.settled.clone();
+        Some(async move {
+            let _ = settled.wait_for(Option::is_some).await;
+        })
+    }
+
+    /// `address`'s hold ended without its barrier: its upload sends no
+    /// request it has not started. It stays recorded until it ends.
+    pub(crate) fn cancel(&self, address: &ActorAddress) {
+        if let Some(f) = self.inner().flights.get(address) {
+            f.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Ends an upload's record in [`PeriodicFlights`] however its task ends.
+struct FlightRecord {
+    flights: Arc<PeriodicFlights>,
+    address: ActorAddress,
+    id: u64,
+}
+
+impl Drop for FlightRecord {
+    fn drop(&mut self) {
+        self.flights.end(&self.address, self.id);
+    }
+}
+
+/// How a batched hold's periodic snapshot's upload ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeriodicOutcome {
+    /// Created by this upload and acknowledged: collection may follow.
+    Created,
+    /// The same position already held it.
+    Existed,
+    /// Not acknowledged (given up, refused, landed after the lease ran
+    /// out): counted in `wasmkeep_snapshot_upload_failures_total`.
+    Failed,
+}
+
+/// The replica's side of a periodic snapshot uploading off the mailbox.
+#[derive(Debug)]
+pub(crate) struct PeriodicUpload {
+    /// Segments and bytes counted toward a snapshot when it was taken: what
+    /// its landing takes off the counts.
+    segments: u64,
+    bytes: u64,
+    settled: watch::Receiver<Option<PeriodicOutcome>>,
+}
+
+/// A periodic snapshot's upload, run off the actor's mailbox
+/// ([`Replica::start_periodic_snapshot`]): it holds nothing of the replica.
+pub(crate) struct PeriodicSnapshot {
+    target: UploadTarget,
+    position: SegmentId,
+    all: Changes,
+    collector: Collector,
+    outcome: watch::Sender<Option<PeriodicOutcome>>,
+    record: FlightRecord,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PeriodicSnapshot {
+    /// The acknowledged head it is labelled at: the snapshot a collection
+    /// after it names, whatever the head is once it lands.
+    pub(crate) fn position(&self) -> SegmentId {
+        self.position
+    }
+
+    /// What a collection after it runs with.
+    pub(crate) fn collector(&self) -> Collector {
+        self.collector.clone()
+    }
+
+    /// Encodes and uploads it under a periodic snapshot's bound (one
+    /// attempt, [`periodic_snapshot_bound`]), and publishes the outcome
+    /// to the replica. The object's conditional create is the only
+    /// publication: a restore lists it once it is whole, and until then
+    /// finds the previous snapshot and every segment after it.
+    pub(crate) async fn run(self) -> PeriodicOutcome {
+        let Self {
+            target,
+            position,
+            all,
+            outcome,
+            record,
+            cancelled,
+            ..
+        } = self;
+        let encoded = tokio::task::spawn_blocking(move || {
+            all.to_ltx(1, position.txid.max(1), crate::alarm::now_ms_i64())
+        })
+        .await;
+        let result = match encoded {
+            // Its hold ended without its barrier before the request: none.
+            Ok(Ok(_)) if cancelled.load(std::sync::atomic::Ordering::SeqCst) => {
+                PeriodicOutcome::Failed
+            }
+            Ok(Ok(bytes)) => {
+                let bound = periodic_snapshot_bound(target.upload_idle, bytes.len());
+                match target.put_once(&snapshot_key(position), bytes, bound).await {
+                    Ok(()) => PeriodicOutcome::Created,
+                    Err(ReplicaError::Exists) => PeriodicOutcome::Existed,
+                    Err(e) => {
+                        tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot failed");
+                        PeriodicOutcome::Failed
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot could not be encoded");
+                PeriodicOutcome::Failed
+            }
+            Err(e) => {
+                tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot's encoding stopped");
+                PeriodicOutcome::Failed
+            }
+        };
+        if result == PeriodicOutcome::Failed {
+            crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
+        }
+        outcome.send_replace(Some(result));
+        drop(record);
+        result
+    }
+}
+
 /// Which snapshot an upload is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotKind {
@@ -671,6 +874,8 @@ pub(crate) struct Replica {
     /// (ADR 0038, section 8).
     app: Arc<str>,
     snapshot_waits: Arc<SnapshotWaits>,
+    /// The node's periodic snapshots uploading ([`PeriodicFlights`]).
+    periodic_flights: Arc<PeriodicFlights>,
     /// Periodic snapshots that failed since the last snapshot taken.
     snapshot_failures: u32,
     /// After a periodic snapshot failed, none is tried again before
@@ -949,6 +1154,7 @@ impl Replica {
             address: address.clone(),
             app: Arc::from(cluster.serves()),
             snapshot_waits: Arc::clone(&cluster.snapshot_waits),
+            periodic_flights: Arc::clone(&cluster.periodic_flights),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),
@@ -1309,6 +1515,10 @@ impl Replica {
         all: &Changes,
         kind: SnapshotKind,
     ) -> Result<bool, ReplicaError> {
+        // A batched hold's periodic snapshot still uploading ends first
+        // (bounded by its one attempt): nothing labelled at an older head
+        // lands after this one, or after the reset this one may follow.
+        self.settle_periodic_upload().await;
         self.finish_sidecar().await?;
         let position = match kind {
             SnapshotKind::First => SegmentId {
@@ -1381,6 +1591,116 @@ impl Replica {
         self.failed = None;
         self.batched.shared.failure.send_replace(None);
         Ok(true)
+    }
+
+    /// Starts a batched hold's periodic snapshot from `all`, the database
+    /// at the captured position (`ActorDb::snapshot_at_captured`), taken
+    /// in a mailbox gap with nothing in flight: so at the acknowledged
+    /// head, which is where it is labelled (ADR 0034, section 7). Checked
+    /// here as `ship_snapshot` checks it, before anything is counted.
+    ///
+    /// Only the label and the bookkeeping happen here; the encoding and the
+    /// upload run in the returned job, off the actor's mailbox, while the
+    /// actor captures and uploads the segments after the head. Until the
+    /// job ends no other periodic snapshot starts, and resets, other
+    /// snapshots and barriers wait for it (see
+    /// [`Self::periodic_upload_settled`]). The try counts as failed until
+    /// it is known to have landed, as in `ship_snapshot`.
+    pub(crate) async fn start_periodic_snapshot(
+        &mut self,
+        all: Changes,
+    ) -> Result<PeriodicSnapshot, ReplicaError> {
+        self.finish_sidecar().await?;
+        if let Some(reason) = &self.failed {
+            return Err(ReplicaError::Local(format!(
+                "replication stopped: {reason}"
+            )));
+        }
+        if self.batched.periodic.is_some() || self.periodic_flights.uploading(&self.address) {
+            return Err(ReplicaError::Local(
+                "a periodic snapshot is uploading".into(),
+            ));
+        }
+        self.refuse_unless_at_head(&all, SnapshotKind::Periodic)?;
+        let (outcome, settled) = watch::channel(None);
+        let Some((id, cancelled)) = self.periodic_flights.start(&self.address, settled.clone())
+        else {
+            return Err(ReplicaError::Local(
+                "a periodic snapshot is uploading".into(),
+            ));
+        };
+        self.snapshot_failed();
+        self.batched.periodic = Some(PeriodicUpload {
+            segments: self.since_snapshot,
+            bytes: self.batched.bytes_since_snapshot,
+            settled,
+        });
+        Ok(PeriodicSnapshot {
+            target: self.target(),
+            position: self.head,
+            all,
+            collector: self.collector(),
+            outcome,
+            record: FlightRecord {
+                flights: Arc::clone(&self.periodic_flights),
+                address: self.address.clone(),
+                id,
+            },
+            cancelled,
+        })
+    }
+
+    /// A periodic snapshot's copy failed before anything was labelled: the
+    /// try waits as after a failed upload.
+    pub(crate) fn periodic_try_failed(&mut self) {
+        self.snapshot_failed();
+    }
+
+    /// Takes in the outcome of a periodic snapshot's upload if it ended:
+    /// landed, the counts start again from its position (the segments
+    /// acknowledged since stay counted); not, the try stays counted as
+    /// failed. Called at every apply.
+    pub(crate) fn settle_periodic(&mut self) {
+        let Some(upload) = &self.batched.periodic else {
+            return;
+        };
+        let outcome = *upload.settled.borrow();
+        // A job dropped before its outcome (its task cancelled) failed.
+        let ended = outcome.is_some() || upload.settled.has_changed().is_err();
+        if !ended {
+            return;
+        }
+        let Some(upload) = self.batched.periodic.take() else {
+            return;
+        };
+        if outcome.is_some_and(|o| o != PeriodicOutcome::Failed) {
+            self.since_snapshot = self.since_snapshot.saturating_sub(upload.segments);
+            self.batched.bytes_since_snapshot = self
+                .batched
+                .bytes_since_snapshot
+                .saturating_sub(upload.bytes);
+            self.snapshot_failures = 0;
+            self.snapshot_retry_at = 0;
+            self.snapshot_waits.forget(&self.address);
+        }
+    }
+
+    /// A wait for the actor's periodic snapshot uploading now to end, this
+    /// hold's or one an earlier hold on this node left ([`PeriodicFlights`]),
+    /// held without the replica; `None` if none is. Cancel-safe.
+    pub(crate) fn periodic_upload_settled(
+        &self,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + use<>> {
+        self.periodic_flights.settled(&self.address)
+    }
+
+    /// Waits, holding the replica, for a periodic snapshot's upload to end
+    /// (its one attempt is bounded), then takes in its outcome.
+    async fn settle_periodic_upload(&mut self) {
+        if let Some(settled) = self.periodic_upload_settled() {
+            settled.await;
+        }
+        self.settle_periodic();
     }
 
     /// The lease generation this replica uploads under: the owner's, for
@@ -1515,6 +1835,10 @@ impl Replica {
     /// It needs no checksum guard: it chains on the acknowledged head's
     /// checksum by construction, whatever the database it replaces.
     pub(crate) async fn ship_reset(&mut self, all: Changes) -> Result<(), ReplicaError> {
+        // A periodic snapshot still uploading ends first: one that landed
+        // after the reset (and the erasure after it) would bring back what
+        // the reset erases.
+        self.settle_periodic_upload().await;
         self.finish_sidecar().await?;
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
@@ -1585,8 +1909,9 @@ impl Replica {
     /// try again, and neither does one restored on this node after a
     /// hibernation: its wait is taken up again
     /// ([`Self::resume_snapshot_wait`]). Each try captures the whole
-    /// database and holds the actor for its upload:
-    /// [`PERIODIC_SNAPSHOT_IDLES`] has the sums.
+    /// database and, with strict writes, holds the actor for its upload:
+    /// [`PERIODIC_SNAPSHOT_IDLES`] has the sums. A batched hold's upload
+    /// runs off the mailbox ([`Self::start_periodic_snapshot`]).
     pub(crate) fn snapshot_due(&self) -> bool {
         self.since_snapshot >= SNAPSHOT_EVERY.max(self.snapshot_retry_at)
             && (self.snapshot_failures == 0
@@ -1664,44 +1989,14 @@ impl Replica {
         );
     }
 
-    /// A periodic snapshot's upload: one conditional create (one call
-    /// to the client, which may send it again after an error answer),
-    /// given up after `bound` and not called again, then the
-    /// acknowledgement rule as
-    /// in [`Self::put_bounded`]. What is given up may still land; nothing
-    /// depends on it. A create refused as existing counts as "already
-    /// there" only if the object is seen within the same bound.
+    /// See [`UploadTarget::put_once`].
     async fn put_once(
         &self,
         key: &str,
         bytes: Vec<u8>,
         bound: std::time::Duration,
     ) -> Result<(), ReplicaError> {
-        use tokio::time::timeout_at;
-        let location = StorePath::from(format!("{}{key}", self.prefix));
-        let until = tokio::time::Instant::now() + bound;
-        let opts = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        let sent = self
-            .store
-            .put_opts(&location, PutPayload::from(bytes), opts);
-        let reason = match timeout_at(until, sent).await {
-            // A snapshot at the head: a check, never an advance.
-            Ok(Ok(_)) => return self.acknowledged(None),
-            Ok(Err(object_store::Error::AlreadyExists { .. })) => {
-                match timeout_at(until, self.store.head(&location)).await {
-                    Ok(Ok(_)) => return Err(ReplicaError::Exists),
-                    Ok(Err(e)) => format!("refused as existing, then: {e}"),
-                    Err(_) => "refused as existing, then no answer in time".into(),
-                }
-            }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!("no answer within {bound:?}"),
-        };
-        tracing::warn!(object = %location, what = "snapshot", %reason, "a periodic snapshot's upload was given up");
-        Err(ReplicaError::Bucket(format!("{location}: {reason}")))
+        self.target().put_once(key, bytes, bound).await
     }
 
     async fn record(&mut self, sum: DbChecksum) -> Result<(), ReplicaError> {
@@ -1818,6 +2113,46 @@ struct UploadTarget {
 }
 
 impl UploadTarget {
+    /// A periodic snapshot's upload: one conditional create (one call
+    /// to the client, which may send it again after an error answer),
+    /// given up after `bound` and not called again, then the
+    /// acknowledgement rule as
+    /// in [`Self::put_bounded`]. What is given up may still land; nothing
+    /// depends on it. A create refused as existing counts as "already
+    /// there" only if the object is seen within the same bound.
+    async fn put_once(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        bound: std::time::Duration,
+    ) -> Result<(), ReplicaError> {
+        use tokio::time::timeout_at;
+        let location = StorePath::from(format!("{}{key}", self.prefix));
+        let until = tokio::time::Instant::now() + bound;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let sent = self
+            .store
+            .put_opts(&location, PutPayload::from(bytes), opts);
+        let reason = match timeout_at(until, sent).await {
+            // A snapshot at the head: a check, never an advance.
+            Ok(Ok(_)) => return self.acknowledged(None),
+            Ok(Err(object_store::Error::AlreadyExists { .. })) => {
+                match timeout_at(until, self.store.head(&location)).await {
+                    Ok(Ok(_)) => return Err(ReplicaError::Exists),
+                    Ok(Err(e)) => format!("refused as existing, then: {e}"),
+                    Err(_) => "refused as existing, then no answer in time".into(),
+                }
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer within {bound:?}"),
+        };
+        tracing::warn!(object = %location, what = "snapshot", %reason, "a periodic snapshot's upload was given up");
+        Err(ReplicaError::Bucket(format!("{location}: {reason}")))
+    }
+
     /// See [`Replica::put_bounded`].
     async fn put_bounded(
         &self,
@@ -2050,13 +2385,6 @@ impl UploadTarget {
         self.lease
             .acknowledge(advance)
             .map_err(|_| ReplicaError::Late)
-    }
-}
-
-impl Replica {
-    /// See [`UploadTarget::acknowledged`].
-    fn acknowledged(&self, advance: Option<Position>) -> Result<(), ReplicaError> {
-        self.target().acknowledged(advance)
     }
 }
 
@@ -2473,6 +2801,7 @@ mod tests {
             address: ActorAddress::new("t", "c", "a").unwrap(),
             app: Arc::from("t/default"),
             snapshot_waits: Arc::default(),
+            periodic_flights: Arc::default(),
             snapshot_failures: 0,
             snapshot_retry_at: 0,
             snapshot_retry_after: tokio::time::Instant::now(),

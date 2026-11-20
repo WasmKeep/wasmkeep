@@ -855,6 +855,21 @@ impl ActorDb {
         capture.snapshot()
     }
 
+    /// Every page of the database as of the captured position, for a
+    /// batched hold's periodic snapshot (ADR 0034, section 7): commits not
+    /// captured yet are left out, nothing is consumed and nothing is
+    /// checkpointed. Only in batched mode, where the main file never holds
+    /// an uncaptured commit ([`WalCapture::snapshot_at_captured`]).
+    pub fn snapshot_at_captured(&self) -> Result<Changes, CaptureError> {
+        if !self.batched_capture_enabled() {
+            return Err(CaptureError::Sql("no live batched capture hold".into()));
+        }
+        self.capture
+            .as_ref()
+            .ok_or(CaptureError::Sql("capture not started".into()))?
+            .snapshot_at_captured()
+    }
+
     /// WAL position as of the last capture, if capturing.
     pub fn captured_wal_bytes(&self) -> Option<u64> {
         self.capture.as_ref().map(WalCapture::wal_bytes)

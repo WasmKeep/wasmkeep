@@ -164,6 +164,102 @@ impl WalCapture {
         Ok(self.scan_since(cursor)?.is_some())
     }
 
+    /// Every page of the database as of the captured position, for a
+    /// snapshot labelled there (ADR 0034, section 7): the main file with,
+    /// over it, the newest version of each page among the WAL frames the
+    /// capture consumed. Commits after the captured position (marked or
+    /// not) are left out, so this needs no flush and no checkpoint, and
+    /// consumes nothing.
+    ///
+    /// Sound because in batched mode the main file never holds anything
+    /// uncaptured: automatic and on-close checkpoints are off, and every
+    /// checkpoint of this mode first refuses uncaptured commits and then
+    /// restarts the capture at offset 0. So the main file is the state at
+    /// the last checkpoint, and the frames before `offset` are exactly the
+    /// commits captured since. Checked all the same: each page's checksum
+    /// must be the one the capture tracked, and their sum the captured
+    /// checksum, or this fails with [`CaptureError::Lost`] and nothing is
+    /// labelled.
+    pub fn snapshot_at_captured(&self) -> Result<Changes, CaptureError> {
+        let size = self.page_size as usize;
+        let commit = self.pages();
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| CaptureError::Io {
+                path: path.clone(),
+                source,
+            }
+        };
+        // Page number -> offset of its newest captured version in the WAL.
+        let mut newest: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut wal = None;
+        if self.offset > 0 {
+            let header = self.header.ok_or(CaptureError::Lost("no WAL header"))?;
+            let mut file = File::open(&*self.wal_path).map_err(io(&self.wal_path))?;
+            let len = file.metadata().map_err(io(&self.wal_path))?.len();
+            let mut h = [0u8; WAL_HEADER];
+            file.read_exact(&mut h).map_err(io(&self.wal_path))?;
+            if len < self.offset || parse_header(&h, self.page_size)? != header {
+                return Err(CaptureError::Lost("the WAL changed under a snapshot"));
+            }
+            let mut at = WAL_HEADER as u64;
+            let mut frame = [0u8; FRAME_HEADER];
+            while at + (FRAME_HEADER + size) as u64 <= self.offset {
+                file.seek(SeekFrom::Start(at)).map_err(io(&self.wal_path))?;
+                file.read_exact(&mut frame).map_err(io(&self.wal_path))?;
+                newest.insert(be32(&frame), at + FRAME_HEADER as u64);
+                at += (FRAME_HEADER + size) as u64;
+            }
+            wal = Some(file);
+        }
+        let mut main = std::io::BufReader::with_capacity(
+            size * 16,
+            File::open(&self.db_path).map_err(io(&self.db_path))?,
+        );
+        let main_pages = main.get_ref().metadata().map_err(io(&self.db_path))?.len() / size as u64;
+        let lock = lock_pgno(self.page_size);
+        let mut sum = DbChecksum::default();
+        let mut pages = BTreeMap::new();
+        let mut page = vec![0u8; size];
+        for pgno in 1..=commit {
+            // The main file is read in order, every page of it up to the
+            // captured size, whether or not the WAL holds a newer one.
+            let in_main = u64::from(pgno) <= main_pages;
+            if in_main {
+                main.read_exact(&mut page).map_err(io(&self.db_path))?;
+            }
+            if pgno == lock {
+                continue;
+            }
+            match (newest.get(&pgno), wal.as_mut()) {
+                (Some(&at), Some(file)) => {
+                    file.seek(SeekFrom::Start(at)).map_err(io(&self.wal_path))?;
+                    file.read_exact(&mut page).map_err(io(&self.wal_path))?;
+                }
+                _ if in_main => {}
+                _ => return Err(CaptureError::Lost("a captured page is missing")),
+            }
+            let i = pgno as usize - 1;
+            if self.page_sums.get(i) != Some(&page_checksum(pgno, &page)) {
+                return Err(CaptureError::Lost("a page differs from what was captured"));
+            }
+            sum.toggle(pgno, &page, self.page_size);
+            pages.insert(pgno, page.clone());
+        }
+        if sum != self.db {
+            return Err(CaptureError::Lost(
+                "the database differs from what was captured",
+            ));
+        }
+        Ok(Changes {
+            commit,
+            page_size: self.page_size,
+            pages,
+            pre_apply: DbChecksum::default(),
+            post_apply: self.db,
+        })
+    }
+
     /// Plan the next capped capture without consuming WAL or reading pages.
     pub fn next_capture(&self, byte_cap: u64) -> Option<BoundaryPlan> {
         let mut count: usize = 0;

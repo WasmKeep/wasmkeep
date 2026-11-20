@@ -1470,3 +1470,71 @@ async fn a_batched_snapshot_is_due_by_acknowledged_bytes() {
     drop(hold);
     drop(db);
 }
+
+/// A batched hold's periodic snapshot, copied at the captured position and
+/// uploaded off the mailbox (ADR 0034, section 7): labelled at the
+/// acknowledged head with a commit uncaptured behind it, one at a time,
+/// segments acknowledged beside it, and once it lands the counts start
+/// again from its position, the segments after it still counted; the
+/// bucket's chain from it restores the head. A job dropped before its
+/// outcome counts as a failed try.
+#[tokio::test]
+async fn a_periodic_snapshot_uploads_beside_segments_and_counts_from_its_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let Actor {
+        mut r,
+        store: _store,
+        mut db,
+        hold,
+    } = actor(dir.path(), 1 << 30).await;
+    let budget = UploadBudget::node();
+    r.set_snapshot_bytes(16 << 10);
+    db.exec("INSERT INTO t VALUES (randomblob(40000))", &[])
+        .unwrap();
+    db.mark_boundary().unwrap().unwrap();
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert!(r.batched_snapshot_due());
+    let head = r.head();
+    // Committed and marked, not captured: left out of the copy.
+    db.exec("INSERT INTO t VALUES ('behind')", &[]).unwrap();
+    db.mark_boundary().unwrap().unwrap();
+    let job = r
+        .start_periodic_snapshot(db.snapshot_at_captured().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(job.position(), head);
+    assert!(!r.batched_snapshot_due(), "one at a time");
+    assert!(
+        r.start_periodic_snapshot(db.snapshot_at_captured().unwrap())
+            .await
+            .is_err()
+    );
+    // The segments after it go up and are acknowledged meanwhile.
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    db.exec("INSERT INTO t VALUES (randomblob(40000))", &[])
+        .unwrap();
+    db.mark_boundary().unwrap().unwrap();
+    start(&mut r, &mut db, &budget).await;
+    land(&mut r).await.unwrap();
+    assert_eq!(job.run().await, crate::replica::PeriodicOutcome::Created);
+    land(&mut r).await.unwrap();
+    assert!(
+        r.batched_snapshot_due(),
+        "the large segment after its label still counts"
+    );
+    assert_eq!(r.since_snapshot, 2, "two segments after its label");
+    assert_eq!(restored(&r, dir.path()).await, r.acknowledged_position().1);
+    // A dropped job: a failed try, which waits.
+    let dropped = r
+        .start_periodic_snapshot(db.snapshot_at_captured().unwrap())
+        .await
+        .unwrap();
+    drop(dropped);
+    land(&mut r).await.unwrap();
+    assert_eq!(r.snapshot_failures, 1);
+    assert!(!r.batched_snapshot_due(), "waits as after a failure");
+    drop(hold);
+    drop(db);
+}

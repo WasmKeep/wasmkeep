@@ -79,6 +79,20 @@ pub(crate) enum Switch {
     /// in flight, but commits not yet captured are in it, labelled at the
     /// acknowledged head (ADR 0034, section 7).
     SnapshotUncaptured,
+    /// A periodic snapshot uploading off the mailbox is visible to a
+    /// restore (its pointer published) before its upload landed: a
+    /// restore meanwhile, or after a crash that ends the upload, reads a
+    /// snapshot that is not whole.
+    SnapshotPublishedEarly,
+    /// Collection below a periodic snapshot's position runs when the
+    /// upload starts, not once it is acknowledged.
+    SnapshotCollectEarly,
+    /// A periodic snapshot is labelled at the head its upload lands at,
+    /// not the acknowledged head its copy was taken at.
+    SnapshotLabelAtLanding,
+    /// A reset does not wait for a periodic snapshot uploading on its node,
+    /// this hold's or one a given-up hold left: it lands after the erasure.
+    ResetSkipsSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +118,9 @@ pub(crate) enum Violation {
     /// An index entry at a time named by no state, left after a delivery
     /// from the index (a sweep) of that time.
     OrphanLeft,
+    /// A periodic snapshot of rows a reset on its node erased, created in
+    /// the bucket after that reset: deleted data left behind.
+    ErasedLeft,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,6 +156,37 @@ enum Stage {
     Reply,
     Completion,
     Done,
+}
+
+/// A batched hold's periodic snapshot uploading off the mailbox (ADR 0034,
+/// section 7): copied at an idle uploader, at the acknowledged head, while
+/// later commits stay pending; created once its PUT lands, collection only
+/// after it is acknowledged.
+#[derive(Clone)]
+struct SnapshotUpload {
+    actor: usize,
+    hold: u64,
+    // The node whose task uploads it: the one whose record later holds of
+    // the actor there consult.
+    node: usize,
+    started: u64,
+    at: SegmentId,
+    db: Db,
+    path: BTreeSet<SegmentId>,
+    due: u64,
+    // Encoded and its request sent: no longer cancelled by its hold's end.
+    requested: bool,
+    put: bool,
+    created: bool,
+    done: bool,
+}
+
+/// What a snapshot published before its upload landed holds for a restore.
+fn torn() -> Db {
+    Db {
+        boundary: u64::MAX,
+        ..Db::default()
+    }
 }
 
 #[derive(Clone)]
@@ -202,6 +250,8 @@ struct Actor {
     acknowledged_positions: BTreeSet<SegmentId>,
     snapshot_paths: BTreeMap<SegmentId, BTreeSet<SegmentId>>,
     position_paths: BTreeMap<SegmentId, BTreeSet<SegmentId>>,
+    // Acknowledged resets: the node and the tick.
+    reset_nodes: Vec<(usize, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +299,17 @@ pub(crate) struct Counts {
     pub(crate) reset_late: u64,
     pub(crate) reset_collision: u64,
     pub(crate) cache_hits: u64,
+    pub(crate) snapshots_started: u64,
+    pub(crate) snapshots_over_pending: u64,
+    pub(crate) snapshots_created: u64,
+    pub(crate) snapshots_dropped: u64,
+    pub(crate) snapshots_late: u64,
+    pub(crate) captures_beside_snapshot: u64,
+    pub(crate) restores_beside_snapshot: u64,
+    pub(crate) snapshot_collections: u64,
+    pub(crate) snapshots_cancelled: u64,
+    pub(crate) resets_after_given_up_snapshot: u64,
+    pub(crate) snapshots_after_foreign_reset: u64,
 }
 
 impl Counts {
@@ -304,6 +365,17 @@ impl Counts {
         self.reset_late += other.reset_late;
         self.reset_collision += other.reset_collision;
         self.cache_hits += other.cache_hits;
+        self.snapshots_started += other.snapshots_started;
+        self.snapshots_over_pending += other.snapshots_over_pending;
+        self.snapshots_created += other.snapshots_created;
+        self.snapshots_dropped += other.snapshots_dropped;
+        self.snapshots_late += other.snapshots_late;
+        self.captures_beside_snapshot += other.captures_beside_snapshot;
+        self.restores_beside_snapshot += other.restores_beside_snapshot;
+        self.snapshot_collections += other.snapshot_collections;
+        self.snapshots_cancelled += other.snapshots_cancelled;
+        self.resets_after_given_up_snapshot += other.resets_after_given_up_snapshot;
+        self.snapshots_after_foreign_reset += other.snapshots_after_foreign_reset;
     }
 }
 
@@ -338,6 +410,10 @@ struct World {
     rng: Rng,
     actors: Vec<Actor>,
     uploads: Vec<Upload>,
+    snapshot_uploads: Vec<SnapshotUpload>,
+    // Delays and crash choices of staged snapshots: a stream of their own,
+    // so the other workloads draw exactly what they drew before.
+    snapshot_rng: Rng,
     entry_puts: Vec<(u64, usize, Entry)>,
     retires: Vec<(u64, Upload)>,
     random_faults: bool,
@@ -366,6 +442,8 @@ impl World {
             rng: Rng::new(seed),
             actors: (0..ACTORS).map(|_| Actor::default()).collect(),
             uploads: Vec::new(),
+            snapshot_uploads: Vec::new(),
+            snapshot_rng: Rng::new(seed ^ 0x5A4D_5E07),
             entry_puts: Vec::new(),
             retires: Vec::new(),
             random_faults: false,
@@ -690,6 +768,9 @@ impl World {
             a.entries.remove(&entry);
         }
         self.outcome.counts.captures += 1;
+        if self.snapshot_uploading(actor) {
+            self.outcome.counts.captures_beside_snapshot += 1;
+        }
         if boundaries.len() > 1 {
             self.outcome.counts.batched += 1;
         }
@@ -1008,6 +1089,7 @@ impl World {
                     self.check();
                 }
             }
+            self.step_snapshots();
             for a in 0..ACTORS {
                 self.capture(a);
             }
@@ -1019,6 +1101,28 @@ impl World {
         let Some(h) = self.actors[actor].hold.take() else {
             return;
         };
+        // A hold that ends without its barrier cancels its upload: one not
+        // requested yet never is (`PeriodicFlights::cancel`).
+        for u in &mut self.snapshot_uploads {
+            if u.actor == actor && u.hold == h.generation && !u.requested && !u.done {
+                u.done = true;
+                self.outcome.counts.snapshots_cancelled += 1;
+            }
+        }
+        // A node dying mid-upload: its snapshot PUT may never complete
+        // (and a lease cut leaves it running, to land late).
+        for u in &mut self.snapshot_uploads {
+            if crash
+                && u.actor == actor
+                && u.hold == h.generation
+                && !u.put
+                && !u.done
+                && self.snapshot_rng.below(2) == 0
+            {
+                u.done = true;
+                self.outcome.counts.snapshots_dropped += 1;
+            }
+        }
         if crash && !h.flights.is_empty() && !h.pending.is_empty() {
             self.outcome.counts.crash_pending += 1;
         }
@@ -1190,16 +1294,18 @@ impl World {
                     .hold
                     .as_ref()
                     .is_none_or(|h| h.pending.is_empty() && h.flights.is_empty())
+                    && !self.snapshot_uploading(actor)
                 {
                     break;
                 }
                 self.advance(1).await;
             }
             if kind != 4
-                && self.actors[actor]
+                && (self.actors[actor]
                     .hold
                     .as_ref()
                     .is_some_and(|h| !h.pending.is_empty() || !h.flights.is_empty())
+                    || self.snapshot_uploading(actor))
             {
                 self.outcome.counts.busy += 1;
                 return;
@@ -1232,6 +1338,176 @@ impl World {
         }
         self.acquire(actor);
         self.check();
+    }
+
+    /// Whether the current hold of `actor` has a periodic snapshot
+    /// uploading.
+    fn snapshot_uploading(&self, actor: usize) -> bool {
+        let Some(h) = &self.actors[actor].hold else {
+            return false;
+        };
+        self.snapshot_uploads
+            .iter()
+            .any(|u| u.actor == actor && u.node == h.node && !u.done)
+    }
+
+    /// What a reset waits for first: the node's periodic snapshot of the
+    /// actor uploading, whichever hold left it.
+    fn snapshot_blocks_reset(&self, actor: usize) -> bool {
+        self.rule != Switch::ResetSkipsSnapshot && self.snapshot_uploading(actor)
+    }
+
+    /// A reset is starting: counted when an upload a given-up hold left on
+    /// this node is still under way (what the waits are for).
+    fn note_reset_beside_snapshot(&mut self, actor: usize) {
+        let Some(h) = &self.actors[actor].hold else {
+            return;
+        };
+        let (generation, node) = (h.generation, h.node);
+        if self
+            .snapshot_uploads
+            .iter()
+            .any(|u| u.actor == actor && u.node == node && u.hold != generation && !u.done)
+        {
+            self.outcome.counts.resets_after_given_up_snapshot += 1;
+        }
+    }
+
+    /// Collection after a snapshot at `at` by the owner of `generation`
+    /// (retention zero, ADR 0012 permits it), on `listing`.
+    fn collect(&mut self, actor: usize, listing: &Listing, generation: u64, at: SegmentId) {
+        for key in collectable(listing, generation, at) {
+            self.actors[actor].objects.remove(&key);
+            let snapshots = &mut self.actors[actor].snapshots;
+            snapshots.retain(|id, _| snapshot_key(*id) != key);
+            self.outcome.counts.collected += 1;
+        }
+    }
+
+    /// The periodic snapshot of a batched hold (ADR 0034, section 7): at
+    /// an idle uploader, the database at the captured position (the
+    /// acknowledged head) is copied, uncaptured commits left pending, and
+    /// its upload goes on while events, captures and segments do.
+    fn start_snapshot(&mut self, actor: usize) {
+        if self.snapshot_uploading(actor) {
+            return;
+        }
+        let a = &mut self.actors[actor];
+        let Some(h) = &a.hold else { return };
+        if h.head == EMPTY || !h.flights.is_empty() {
+            return;
+        }
+        let db = if self.rule == Switch::SnapshotUncaptured {
+            h.local.clone()
+        } else {
+            h.acknowledged.clone()
+        };
+        let (at, generation, node) = (h.head, h.generation, h.node);
+        if !h.pending.is_empty() {
+            self.outcome.counts.snapshots_over_pending += 1;
+        }
+        let path = a.position_paths[&at].clone();
+        if self.rule == Switch::SnapshotPublishedEarly
+            && let std::collections::btree_map::Entry::Vacant(slot) = a.snapshots.entry(at)
+        {
+            slot.insert(torn());
+            a.snapshot_paths.insert(at, path.clone());
+        }
+        let due = self.now + 1 + self.snapshot_rng.below(30);
+        self.snapshot_uploads.push(SnapshotUpload {
+            actor,
+            hold: generation,
+            node,
+            started: self.now,
+            at,
+            db,
+            path,
+            due,
+            requested: false,
+            put: false,
+            created: false,
+            done: false,
+        });
+        self.outcome.counts.snapshots_started += 1;
+        if self.rule == Switch::SnapshotCollectEarly {
+            let mut listing = self.listing(actor);
+            listing.snapshots.push(at);
+            self.collect(actor, &listing, generation, at);
+        }
+        self.check();
+    }
+
+    /// One tick of the periodic snapshots uploading: a PUT lands (a
+    /// conditional create), then its reply says whether the hold was still
+    /// valid, and only then is the history below it collected.
+    fn step_snapshots(&mut self) {
+        for i in 0..self.snapshot_uploads.len() {
+            let u = self.snapshot_uploads[i].clone();
+            if u.done || u.due > self.now {
+                continue;
+            }
+            let valid = self.actors[u.actor]
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.generation == u.hold);
+            let u = &mut self.snapshot_uploads[i];
+            if !u.requested {
+                // Encoded; its request goes out and lands some ticks later.
+                u.requested = true;
+                u.due = self.now + 1 + self.snapshot_rng.below(20);
+                continue;
+            }
+            if !u.put {
+                u.put = true;
+                if !valid {
+                    self.outcome.counts.snapshots_late += 1;
+                }
+                u.due = self.now + 1 + self.snapshot_rng.below(2);
+                let label = match (&self.actors[u.actor].hold, self.rule) {
+                    (Some(h), Switch::SnapshotLabelAtLanding) if valid => h.head,
+                    _ => u.at,
+                };
+                let a = &mut self.actors[u.actor];
+                match a.snapshots.entry(label) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(u.db.clone());
+                        a.snapshot_paths.insert(label, u.path.clone());
+                        u.created = true;
+                    }
+                    // What an early publication showed is completed now.
+                    std::collections::btree_map::Entry::Occupied(mut slot)
+                        if *slot.get() == torn() =>
+                    {
+                        slot.insert(u.db.clone());
+                        u.created = true;
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+                if u.created {
+                    self.outcome.counts.snapshots_created += 1;
+                    self.outcome.counts.snapshots += 1;
+                    let (node, started) = (u.node, u.started);
+                    let a = &self.actors[u.actor];
+                    let erased = u.db.rows.iter().any(|r| a.deleted.contains(r));
+                    let after = |&(n, t): &(usize, u64)| t >= started && n == node;
+                    if erased && a.reset_nodes.iter().any(after) {
+                        self.outcome.violations.insert(Violation::ErasedLeft);
+                    } else if erased && a.reset_nodes.iter().any(|&(_, t)| t >= started) {
+                        self.outcome.counts.snapshots_after_foreign_reset += 1;
+                    }
+                }
+                self.check();
+                continue;
+            }
+            u.done = true;
+            let (actor, hold, at, created) = (u.actor, u.hold, u.at, u.created);
+            if created && valid && self.rule != Switch::SnapshotCollectEarly {
+                self.outcome.counts.snapshot_collections += 1;
+                let listing = self.listing(actor);
+                self.collect(actor, &listing, hold, at);
+            }
+            self.check();
+        }
     }
 
     fn snapshot(&mut self, actor: usize) {
@@ -1285,6 +1561,18 @@ impl World {
         if !matches!(self.rule, Switch::ResetCaptured | Switch::ResetInFlight)
             && !self.flush_until(actor, 100).await
         {
+            return;
+        }
+        // `ship_reset` ends a periodic snapshot's upload first, this hold's
+        // or one an earlier hold on this node left.
+        self.note_reset_beside_snapshot(actor);
+        for _ in 0..100 {
+            if !self.snapshot_blocks_reset(actor) {
+                break;
+            }
+            self.advance(1).await;
+        }
+        if self.snapshot_blocks_reset(actor) {
             return;
         }
         if let Some((i, reset_id)) = self.start_reset(actor) {
@@ -1376,6 +1664,9 @@ impl World {
                 .deleted
                 .extend(self.uploads[i].object.after.erased.iter().copied());
             self.actors[actor].reset_acks.insert(reset_id);
+            if let Some(node) = self.actors[actor].hold.as_ref().map(|h| h.node) {
+                self.actors[actor].reset_nodes.push((node, self.now));
+            }
             self.outcome.counts.resets += 1;
             self.snapshot(actor);
         }
@@ -1483,6 +1774,7 @@ impl World {
             .hold
             .as_ref()
             .is_some_and(|h| h.pending.is_empty() && h.flights.is_empty())
+            && !self.snapshot_uploading(actor)
     }
 
     fn poll_operation(&mut self, actor: usize, operation: Operation) -> Option<Operation> {
@@ -1520,7 +1812,14 @@ impl World {
                 }
             }
             Operation::ResetBarrier => {
-                if self.idle(actor)
+                let drained = self.actors[actor]
+                    .hold
+                    .as_ref()
+                    .is_some_and(|h| h.pending.is_empty() && h.flights.is_empty());
+                if drained && !self.snapshot_blocks_reset(actor) {
+                    self.note_reset_beside_snapshot(actor);
+                }
+                if (drained && !self.snapshot_blocks_reset(actor))
                     || matches!(self.rule, Switch::ResetCaptured | Switch::ResetInFlight)
                 {
                     self.start_reset(actor)
@@ -1605,6 +1904,11 @@ impl World {
                             operation,
                         });
                 }
+                // Periodic snapshots start on their own stream, at an idle
+                // uploader, as `pump` starts them (ADR 0034, section 7).
+                if self.snapshot_rng.below(8) == 0 {
+                    self.start_snapshot(actor);
+                }
                 // Operation choices and bucket faults use the workload stream;
                 // node crashes/cuts use advance's independent fault stream.
                 let op = self.rng.below(24);
@@ -1679,6 +1983,9 @@ impl World {
     }
 
     fn check(&mut self) {
+        if self.snapshot_uploads.iter().any(|u| !u.done) {
+            self.outcome.counts.restores_beside_snapshot += 1;
+        }
         for actor in 0..ACTORS {
             match self.observe_restore(actor) {
                 Err(e) => {
@@ -2277,6 +2584,29 @@ pub(crate) fn safe(batching: bool) {
     } else {
         assert_eq!(totals.batched, 0, "strict captured several events");
         assert_eq!(totals.crash_pending, 0, "strict ran ahead of its upload");
+    }
+    if batching {
+        for (name, value) in [
+            ("snapshots started", totals.snapshots_started),
+            (
+                "snapshots over pending commits",
+                totals.snapshots_over_pending,
+            ),
+            ("snapshots created", totals.snapshots_created),
+            ("snapshots cancelled", totals.snapshots_cancelled),
+            ("snapshots landed after their hold", totals.snapshots_late),
+            (
+                "segments beside a snapshot",
+                totals.captures_beside_snapshot,
+            ),
+        ] {
+            assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
+        }
+        // Holds here rarely live long enough for an acknowledged landing.
+        assert!(
+            totals.snapshot_collections * 5 >= count,
+            "collections after a snapshot: {totals:?}"
+        );
     }
     eprintln!("batched model: {count} seeds, batching={batching}: {totals:?}");
 }
@@ -3018,4 +3348,158 @@ pub(crate) fn back_to_back_caught(rule: Switch, expected: Violation) {
         "seed {seed} did not reproduce"
     );
     eprintln!("caught back to back: {rule:?} seed={seed} expected={expected:?}");
+}
+
+/// Periodic snapshots uploading off the mailbox (ADR 0034, section 7):
+/// each round leaves commits uncaptured behind the acknowledged head,
+/// starts a snapshot at an idle uploader, runs events (and their segments)
+/// beside its upload, then crashes the node mid-upload, cuts its lease,
+/// hands the actor over or resets it. Every tick restores every actor
+/// (`check`): no acknowledged durable write lost, no snapshot read that is
+/// not the database at its label.
+pub(crate) fn simulate_snapshots(seed: u64, rule: Switch) -> Outcome {
+    Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async {
+        let mut result = Outcome::default();
+        for scenario in 0..8 {
+            let mut w = World::new(seed.wrapping_mul(31) + scenario, rule, true);
+            for a in 0..ACTORS {
+                w.event(a, Some(1000)).await;
+                w.flush(a).await;
+            }
+            for _ in 0..6 {
+                let a = w.snapshot_rng.below(ACTORS as u64) as usize;
+                if w.actors[a].hold.is_none() {
+                    w.acquire(a);
+                }
+                // A durable write the snapshot's label covers.
+                w.event(a, Some(2000)).await;
+                if let Some(row) = w.actors[a]
+                    .hold
+                    .as_ref()
+                    .and_then(|h| h.local.rows.last())
+                    .copied()
+                {
+                    w.actors[a].durable_waiting.insert(row);
+                }
+                w.flush(a).await;
+                // An idle uploader, with commits left uncaptured behind it.
+                for _ in 0..40 {
+                    if w.actors[a]
+                        .hold
+                        .as_ref()
+                        .is_none_or(|h| h.flights.is_empty())
+                    {
+                        break;
+                    }
+                    w.apply_landed(a);
+                    w.advance(1).await;
+                }
+                if w.actors[a]
+                    .hold
+                    .as_ref()
+                    .is_some_and(|h| h.flights.is_empty())
+                {
+                    w.commit(a, None);
+                }
+                w.start_snapshot(a);
+                for _ in 0..1 + w.snapshot_rng.below(4) {
+                    w.event(a, None).await;
+                }
+                w.request_flush(a);
+                let ticks = w.snapshot_rng.below(6);
+                w.advance(ticks).await;
+                let kind = w.snapshot_rng.below(4) as usize;
+                match w.snapshot_rng.below(6) {
+                    0 | 1 => w.crash_node(a),
+                    2 => w.cut_node(a),
+                    3 => w.handover(a, kind).await,
+                    4 => w.reset(a).await,
+                    _ => {
+                        // Fable's interleaving: the hold is given up with its
+                        // upload's request out, the actor is held again on
+                        // the same node and deleted while it is under way.
+                        for _ in 0..40 {
+                            if w.snapshot_uploads
+                                .iter()
+                                .all(|u| u.actor != a || u.done || u.requested)
+                            {
+                                break;
+                            }
+                            w.advance(1).await;
+                        }
+                        if let Some(node) = w.actors[a].hold.as_ref().map(|h| h.node) {
+                            w.outcome.counts.failed_hold_dropped += 1;
+                            w.drop_hold(a, false);
+                            w.acquire_at(a, Some(node));
+                            w.reset(a).await;
+                        }
+                    }
+                }
+                if w.actors[a].hold.is_none() {
+                    w.acquire(a);
+                }
+                w.event(a, None).await;
+                w.flush(a).await;
+                w.advance(10).await;
+            }
+            for a in 0..ACTORS {
+                w.drop_hold(a, false);
+            }
+            w.advance(100).await;
+            w.check();
+            result.counts.add(w.outcome.counts);
+            result.per.push(w.outcome.violations.clone());
+            result.violations.extend(w.outcome.violations);
+        }
+        result
+    })
+}
+
+pub(crate) fn snapshots_safe() {
+    let count = seeds();
+    let mut totals = Counts::default();
+    for seed in 0..count {
+        let out = simulate_snapshots(seed, Switch::Safe);
+        assert!(
+            out.violations.is_empty(),
+            "seed {seed}: {:?}; scenarios={:?}",
+            out.violations,
+            out.per
+        );
+        totals.add(out.counts);
+    }
+    for (name, value) in [
+        ("started", totals.snapshots_started),
+        ("over pending commits", totals.snapshots_over_pending),
+        ("created", totals.snapshots_created),
+        ("dropped by a crash", totals.snapshots_dropped),
+        ("landed after its hold", totals.snapshots_late),
+        ("segments beside one", totals.captures_beside_snapshot),
+        ("restores beside one", totals.restores_beside_snapshot),
+        ("collections after one", totals.snapshot_collections),
+        (
+            "resets after a given-up hold's",
+            totals.resets_after_given_up_snapshot,
+        ),
+        ("durable", totals.durable),
+        ("resets", totals.resets),
+    ] {
+        assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
+    }
+    eprintln!("staged snapshots: {count} seeds: {totals:?}");
+}
+
+pub(crate) fn snapshots_caught(rule: Switch, expected: Violation) {
+    let (seed, outcome) = (0..seeds())
+        .find_map(|seed| {
+            let out = simulate_snapshots(seed, rule);
+            out.violations.contains(&expected).then_some((seed, out))
+        })
+        .unwrap_or_else(|| panic!("{rule:?}: no {expected:?} within {} seeds", seeds()));
+    let again = simulate_snapshots(seed, rule);
+    assert_eq!(outcome.per, again.per, "seed {seed} did not reproduce");
+    eprintln!(
+        "caught: {rule:?} seed={seed} expected={expected:?}: {:?}",
+        outcome.violations
+    );
 }

@@ -1116,7 +1116,7 @@ async fn timing_host_work_fetch_sums_to_job() {
     let host: f64 = [
         "stale_alarm_hint",
         "complete_uploads",
-        "snapshot_in_gap",
+        "snapshot_copy",
         "flush_to_barrier",
         "hibernate",
         "restore",

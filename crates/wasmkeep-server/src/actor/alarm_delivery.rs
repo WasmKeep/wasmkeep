@@ -97,7 +97,7 @@ impl ActorState {
         // back later; on a failure the actor is given up, nothing cleared.
         if self.live.is_none() && self.batched_replica().is_some() {
             let deadline = self.upload_deadline().await;
-            match self.flush_to_barrier(Some(deadline)).await {
+            match self.flush_to_acknowledged_head(Some(deadline)).await {
                 Some(Barrier::Flushed) => {}
                 Some(Barrier::GaveUp(_)) => {
                     self.abandon("replication stopped before an alarm");
@@ -643,7 +643,7 @@ impl ActorState {
         let indexed = match self.batched_replica() {
             Some(slot) => {
                 let deadline = self.upload_deadline().await;
-                match self.flush_to_barrier(Some(deadline)).await {
+                match self.flush_to_acknowledged_head(Some(deadline)).await {
                     Some(Barrier::Flushed) => {}
                     Some(Barrier::GaveUp(_)) => {
                         self.abandon("replication stopped before clearing alarm entries");
@@ -760,7 +760,7 @@ impl ActorState {
                 return false;
             }
             let deadline = self.upload_deadline().await;
-            match self.flush_to_barrier(Some(deadline)).await {
+            match self.flush_to_acknowledged_head(Some(deadline)).await {
                 Some(Barrier::Flushed) => {}
                 Some(Barrier::GaveUp(_)) => {
                     self.abandon("fencing before clearing alarm entries: replication stopped");

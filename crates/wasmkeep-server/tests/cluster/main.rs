@@ -956,6 +956,10 @@ struct Flaky {
     /// The next this-many snapshot (`/snapshot/`) uploads never answer,
     /// and are applied 8 s later: after their sender gave them up.
     late_snapshot_puts: Arc<std::sync::atomic::AtomicU32>,
+    /// While set, snapshot (`/snapshot/`) uploads wait, counted in
+    /// `snapshot_puts_held`, and go on (and land) once it is cleared.
+    hold_snapshot_puts: Arc<AtomicBool>,
+    snapshot_puts_held: Arc<std::sync::atomic::AtomicU32>,
     /// Releases of ownership records (a record naming nobody) land at
     /// once and are answered this many ms later (0: at once). Each one
     /// held counts in `releases_held`, and `release_held_until_ms` says
@@ -1001,6 +1005,8 @@ impl Flaky {
             hang_snapshot_puts: Arc::default(),
             fail_snapshot_puts: Arc::default(),
             late_snapshot_puts: Arc::default(),
+            hold_snapshot_puts: Arc::default(),
+            snapshot_puts_held: Arc::default(),
             hold_release_replies_ms: Arc::default(),
             releases_held: Arc::default(),
             release_held_until_ms: Arc::default(),
@@ -1162,6 +1168,12 @@ impl ObjectStore for Flaky {
             std::future::pending::<()>().await;
         }
         if location.as_ref().contains("/snapshot/") {
+            if self.hold_snapshot_puts.load(Ordering::SeqCst) {
+                self.snapshot_puts_held.fetch_add(1, Ordering::SeqCst);
+                while self.hold_snapshot_puts.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             if self
                 .late_snapshot_puts
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
