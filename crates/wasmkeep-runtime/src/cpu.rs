@@ -46,6 +46,11 @@ fn thread_cpu() -> Duration {
     ORIGIN.get_or_init(Instant::now).elapsed()
 }
 
+/// A CPU-timed segment this short is conservatively charged its wall time,
+/// avoiding the ending CPU-clock syscall. Keep the start read: the segment
+/// may turn out long (for example, if preempted) and need exact CPU timing.
+const SHORT_CPU_SEGMENT: Duration = Duration::from_micros(50);
+
 /// Guest CPU time of one store, kept per *segment*: a stretch of guest code
 /// between two call hooks. Wasmtime brackets every host call and every
 /// epoch check (where async stores yield) with hooks, so a segment runs on
@@ -58,9 +63,7 @@ fn thread_cpu() -> Duration {
 /// at every hook makes a small request markedly slower, so the meter reads
 /// it only where the wall clock can be wrong:
 ///
-/// - A segment that follows an epoch check (the guest has been running for
-///   a tick or more) is measured with the thread CPU clock: one reading per
-///   tick, exact.
+/// - A segment that follows an epoch check starts with a thread CPU reading.
 /// - Until then, segments are measured with the (cheap) wall clock, capped
 ///   at two ticks. Without an epoch check in between, a guest cannot really
 ///   run longer than about one tick, so the cap bounds what preemption adds
@@ -68,11 +71,16 @@ fn thread_cpu() -> Duration {
 /// - Once a wall-clock segment lasts longer than a quarter of a tick, the
 ///   thread was likely preempted (or the guest computes in long stretches,
 ///   where a reading is cheap next to the work): every later segment of the
-///   event reads the thread CPU clock at both ends. That segment often ends
+///   event starts with a thread CPU reading. That segment often ends
 ///   at an epoch check, since the epoch advanced while the thread was off its
-///   core. An event that makes many host calls on an oversubscribed core is
-///   then charged at most one capped segment beyond its CPU time, instead of
-///   up to two ticks per segment.
+///   core. An event that makes many host calls on an oversubscribed core
+///   avoids repeatedly charging long preemptions as guest time.
+/// - CPU-timed segments of at most `SHORT_CPU_SEGMENT` are charged their
+///   wall time without an ending CPU read. Wall time bounds CPU time from
+///   above, so this cannot undercharge a burner. Longer segments still read
+///   CPU time at the end, excluding preemption. The start read is always
+///   needed because a segment's length is not known in advance; short
+///   segments never switch the event back to wall-only mode.
 #[derive(Debug)]
 struct Meter {
     used: Duration,
@@ -80,7 +88,7 @@ struct Meter {
     /// The next segment follows an epoch check.
     precise_next: bool,
     /// A wall-clock segment of this event ran long: measure every later one
-    /// with the thread CPU clock.
+    /// with a CPU start reading and an end reading only if it runs long.
     precise_rest: bool,
     /// Most a wall-clock segment is charged.
     cap: Duration,
@@ -133,9 +141,11 @@ impl Meter {
     }
 
     fn charge(&self, segment: Segment, wall: Instant, cpu: impl FnOnce() -> Duration) -> Duration {
+        let elapsed = wall.saturating_duration_since(segment.wall);
         match segment.cpu {
+            Some(_) if elapsed <= SHORT_CPU_SEGMENT => elapsed,
             Some(start) => cpu().saturating_sub(start),
-            None => wall.saturating_duration_since(segment.wall).min(self.cap),
+            None => elapsed.min(self.cap),
         }
     }
 
@@ -191,8 +201,9 @@ impl CpuMeter {
         store.get_fuel().ok().map(|remaining| u64::MAX - remaining)
     }
 
-    /// Guest CPU time used since the last reset. Exact while the guest is
-    /// not running, or when called from the thread running it.
+    /// Guest time charged since the last reset, including conservative wall
+    /// charges for short segments. Call while the guest is stopped or from
+    /// the thread running it.
     pub fn used(&self) -> Duration {
         self.meter
             .lock()
@@ -361,13 +372,74 @@ mod tests {
         let mut m = Meter::new(TICK);
         m.enter_guest(t0, || unreachable!());
         m.leave_guest(t0 + ms(30), || unreachable!()); // preempted: capped
-        // Every later segment, short or not, is read with the CPU clock.
+        // Every later segment starts with a CPU reading; long ones end with one.
         m.enter_guest(t0 + ms(31), || ms(100));
         m.leave_guest(t0 + ms(32), || ms(100) + Duration::from_micros(300));
         assert_eq!(
             m.total(t0 + ms(32), || unreachable!()),
             ms(2) + Duration::from_micros(300)
         );
+    }
+
+    #[test]
+    fn short_switched_segments_charge_wall_without_an_end_cpu_read() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let mut m = Meter::new(TICK);
+        m.enter_guest(t0, || unreachable!());
+        m.leave_guest(t0 + ms(30), || unreachable!());
+        let reads = Cell::new(0);
+        let cpu = || {
+            reads.set(reads.get() + 1);
+            ms(100)
+        };
+        let mut expected = ms(2);
+        for us in [0, 1, 49, 50] {
+            let wall = Duration::from_micros(us);
+            m.enter_guest(t0, cpu);
+            let starts = reads.get();
+            assert_eq!(m.total(t0 + wall, cpu), expected + wall);
+            m.leave_guest(t0 + wall, cpu);
+            assert_eq!(reads.get(), starts, "no end read for {us} us");
+            expected += wall;
+        }
+        assert_eq!(reads.get(), 4, "one start read per segment");
+        assert!(m.precise_rest);
+        assert_eq!(m.used, expected);
+        // Even after many short calls, a preempted segment needs both reads.
+        for _ in 0..100 {
+            m.enter_guest(t0, cpu);
+            m.leave_guest(t0 + Duration::from_micros(1), cpu);
+        }
+        for wall in [Duration::from_micros(51), ms(30)] {
+            let before = m.used;
+            let before_reads = reads.get();
+            m.enter_guest(t0, cpu);
+            m.leave_guest(t0 + wall, || {
+                reads.set(reads.get() + 1);
+                ms(100) + Duration::from_micros(10)
+            });
+            assert_eq!(reads.get(), before_reads + 2);
+            assert_eq!(m.used - before, Duration::from_micros(10));
+        }
+    }
+
+    #[test]
+    fn mixed_short_and_long_busy_segments_are_never_undercharged() {
+        let mut t = Thread::new();
+        let mut m = Meter::new(TICK);
+        let mut burned = Duration::ZERO;
+        for _ in 0..100 {
+            for cpu in [900, 1, 49, 50, 51] {
+                let cpu = Duration::from_micros(cpu);
+                t.segment(&mut m, cpu, cpu);
+                burned += cpu;
+                assert!(m.used >= burned, "charged {:?} for {burned:?}", m.used);
+                t.host(ms(1), ms(1));
+            }
+        }
+        assert_eq!(m.used, burned);
     }
 
     #[test]

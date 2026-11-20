@@ -47,9 +47,13 @@ The text under a version's heading is its GitHub release text
   CPU could be charged past its budget and answer 500 as a CPU-budget
   trap. Once one of an event's wall-clock stretches runs longer than a
   quarter of a tick, the rest of the event is now measured with the
-  thread CPU clock, so it is charged at most one capped stretch beyond
-  its CPU time. An unloaded event with short stretches still reads only
-  the wall clock. A guest that burns CPU still traps at its budget, and a
+  thread CPU clock. Later stretches of at most 50 µs use their wall
+  time instead, saving the ending CPU-clock syscall while conservatively
+  charging the guest. Every later stretch still reads CPU time at its
+  start, so a long, preempted stretch is charged its actual CPU time;
+  the meter stays switched until the event resets. An unloaded event
+  with short stretches still reads only the wall clock. A guest that burns
+  CPU still traps at its budget, and a
   tight loop is still interrupted at the next epoch tick.
 
 - **The room renders the browser's history page.** A front answering
