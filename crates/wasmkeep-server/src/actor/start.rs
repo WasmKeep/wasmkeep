@@ -377,6 +377,11 @@ impl ActorService {
         );
         let _ = fire_to.set(Arc::downgrade(&service.inner));
         tokio::spawn(sample_disk(Arc::downgrade(&service.inner), data_dir));
+        memory::spawn(
+            Arc::downgrade(&service.inner),
+            config.resident_pool.clone(),
+            config.idle_memory_trim,
+        );
         if config.no_alarms {
             tracing::info!(
                 "alarms are off (--no-alarms): this node fires no alarm and sweeps none; \

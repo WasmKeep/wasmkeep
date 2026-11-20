@@ -108,6 +108,37 @@ mailboxes, so it can briefly fall before retiring resources release capacity.
 Each resident actor costs about 250 KB for Rust and 740 KB for TypeScript
 on QuickJS ([benchmarks](benchmarks.md)); `wasmkeep_actors_resident` times
 that, plus the compiled classes, is roughly the process's resident memory.
+These small-actor estimates do not include a large room's sockets, replay
+buffers or allocator high-water mark. Zero resident actors does not imply
+that RSS returns to its startup value. See
+[room memory and capacity limits](reference/socket-limits.md#room-memory-after-clients-leave).
+
+On Linux/glibc, `serve --idle-memory-trim-secs 60` (the default) samples
+resident actors plus sockets in use once a minute. It tracks the process's
+sampled peak since the last trim and asks glibc to return unused pages when
+activity falls to at most half that peak, or is zero. Shared resident and
+socket budgets cover all apps. Attempts run on a blocking worker, are
+serialized across the process, and have a minimum 60-second cooldown from
+completion. Each actual trim resets the peak, even if no pages are released.
+Steady nonzero activity never triggers a trim just because time passes.
+`--idle-memory-trim-secs 0` disables maintenance; other platforms do not run
+it. Sampling can miss peaks between checks. New work can race the check;
+glibc is thread-safe but can contend with allocations for arena locks.
+
+- `wasmkeep_allocator_trim_seconds`: process-wide histogram of time spent
+  in each actual `malloc_trim(0)` call, in seconds.
+- `wasmkeep_allocator_trims_total{released="true|false"}`: process-wide
+  counter of actual calls, split by whether glibc reported releasing pages.
+  Skipped checks (busy, cooldown or lock contention) do not increment either
+  metric. A true result reports no byte count or RSS guarantee.
+
+This build does not export `process_resident_memory_bytes` on `/metrics`.
+The room harness records that missing series as `null`. On Linux, collect
+RSS from `cat /proc/$pid/status` and `cat /proc/$pid/smaps_rollup` alongside
+`wasmkeep_actors_resident`, `wasmkeep_socket_sessions`,
+`wasmkeep_websockets_open`, wakes and hibernations. Full
+`cat /proc/$pid/smaps` is needed to separate mappings: secondary glibc
+heaps are anonymous mappings, not the region labelled `[heap]`.
 
 On Linux, `wasmkeep serve` and `wasmkeep dev` turn transparent huge pages
 off for their own process. Where the kernel sets them to `always` (some

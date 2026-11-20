@@ -1662,6 +1662,19 @@ Ranges are across the six generators. The other two nodes stayed under
 These are the first items of `0.7.0` in the [roadmap](../ROADMAP.md).
 
 
+## Local room-memory recovery
+
+A baseline diagnostic at `7b0b544` on Linux/glibc attributed retained room
+memory to the allocator: `malloc_info` reported about **222 MiB free inside
+32 arenas**. A manual `malloc_trim(0)` reduced RSS from approximately
+**225 to 90 MiB**. This diagnoses allocator retention; it does not prove
+the absence of live-allocation leaks or establish a long-run plateau.
+[Raw baseline and diagnostic data](../bench/results/2026-11-20-7b0b544-room-memory.json).
+
+The patched workstation runs paged and are not accepted RSS measurements.
+The fleet measurement of the peak-drop trim and arena cap is **pending**.
+See [the controls and their limits](reference/socket-limits.md#room-memory-after-clients-leave).
+
 ## Reproduce
 
 Both entry points require Bash. Full comparisons and `bench/run.sh` require

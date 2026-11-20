@@ -419,6 +419,7 @@ fn serve(argv: &[&str]) -> Result<crate::ServeArgs, String> {
     match crate::Cli::try_parse_from(all).map_err(|e| e.to_string())? {
         crate::Cli {
             command: crate::Command::Serve(args),
+            ..
         } => Ok(*args),
         _ => unreachable!(),
     }

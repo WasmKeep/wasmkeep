@@ -159,6 +159,7 @@ fn actor_move_refuses_an_unmigrated_tenant() {
         .unwrap();
     let super::Cli {
         command: super::Command::Actor(super::ActorCommand::Move(args)),
+        ..
     } = super::Cli::try_parse_from([
         "wasmkeep",
         "actor",
@@ -202,6 +203,7 @@ fn delete_args(extra: &[&str]) -> super::DeleteArgs {
     argv.extend_from_slice(extra);
     let super::Cli {
         command: super::Command::Actor(super::ActorCommand::Delete(args)),
+        ..
     } = super::Cli::try_parse_from(argv).unwrap()
     else {
         unreachable!()
@@ -1092,6 +1094,7 @@ fn parse_serve(extra: &[&str]) -> Result<super::ServeArgs, String> {
     match super::Cli::try_parse_from(argv).map_err(|e| e.to_string())? {
         super::Cli {
             command: super::Command::Serve(args),
+            ..
         } => Ok(*args),
         _ => unreachable!(),
     }
@@ -1586,4 +1589,44 @@ fn node_links_point_at_the_configured_base() {
     ])
     .unwrap();
     assert_eq!(args.blob_links, wasmkeep_cli::blob_links::Mode::Node);
+}
+
+#[test]
+fn allocator_cli_defaults_overrides_and_validation() {
+    use clap::Parser as _;
+    let cli = super::Cli::try_parse_from(["wasmkeep", "serve"]).unwrap();
+    assert_eq!(
+        cli.malloc_arena_max,
+        wasmkeep_runtime::default_malloc_arena_max()
+    );
+    let super::Command::Serve(args) = cli.command else {
+        unreachable!()
+    };
+    assert_eq!(args.idle_memory_trim_secs, 60);
+    for argv in [
+        vec!["wasmkeep", "--malloc-arena-max", "0", "serve"],
+        vec!["wasmkeep", "serve", "--malloc-arena-max", "0"],
+    ] {
+        assert_eq!(
+            super::Cli::try_parse_from(argv).unwrap().malloc_arena_max,
+            0
+        );
+    }
+    assert_eq!(
+        super::Cli::try_parse_from(["wasmkeep", "serve", "--malloc-arena-max", "16"])
+            .unwrap()
+            .malloc_arena_max,
+        16
+    );
+    for value in ["-1", "2147483648", "invalid"] {
+        assert!(
+            super::Cli::try_parse_from(["wasmkeep", "serve", "--malloc-arena-max", value]).is_err()
+        );
+    }
+    assert_eq!(
+        parse_serve(&["--idle-memory-trim-secs", "0"])
+            .unwrap()
+            .idle_memory_trim_secs,
+        0
+    );
 }

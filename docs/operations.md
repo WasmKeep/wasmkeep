@@ -40,3 +40,28 @@ A 0.5.0 CLI reports a superseded delete as dropped and fails closed. A 0.5.0
 node neither recognises nor expires the `.superseded` key; an upgraded node
 is needed to expire it. Request bindings, capability negotiation and durable
 completion receipts are deferred to 0.6.0.
+
+## Allocator policy
+
+On Linux/glibc, the CLI applies `--malloc-arena-max N` before starting worker
+threads. It defaults to available parallelism clamped to 2..8 (2 if detection
+fails). `0` skips `mallopt`, preserving glibc's default or environment policy.
+Explicit positive values override `MALLOC_ARENA_MAX`; other platforms ignore
+this setting. To manage the cap through a systemd service unit instead:
+
+```ini
+[Service]
+Environment=MALLOC_ARENA_MAX=8
+```
+
+Add `--malloc-arena-max 0` to the unit's existing `wasmkeep` command. The
+environment must be present when the process starts. A smaller cap can
+reduce allocator retention at the cost of contention.
+
+`serve --idle-memory-trim-secs 60` samples resident actors plus socket
+sessions and trims at half the peak since the previous trim, or at zero.
+Calls are serialized, run on a blocking worker, and are separated by at
+least 60 seconds after completion. `0` disables trimming. Steady busy
+activity does not trigger trimming on a timer. See [socket limits](reference/socket-limits.md#room-memory-after-clients-leave)
+and [allocator metrics](monitoring.md). These controls have no RSS target;
+patched workstation runs paged and fleet measurement remains pending.
