@@ -165,12 +165,12 @@ async fn node(
 }
 
 /// [`node`], with another component as the edge class, and another CPU
-/// budget for the front.
+/// budget for every event, the front's included.
 async fn node_with(
     suffix: &str,
     data: &std::path::Path,
     edge: Option<PathBuf>,
-    front_budget: Option<Duration>,
+    budget: Option<Duration>,
 ) -> Option<(
     std::net::SocketAddr,
     tokio::sync::oneshot::Sender<()>,
@@ -192,19 +192,22 @@ async fn node_with(
         eprintln!("skipped: build examples/ts-big-room and tests/guests/ts-fetch ({suffix})");
         return None;
     }
-    let config = RuntimeConfig {
+    let mut config = RuntimeConfig {
         max_instances: 512,
         measure_fuel: true,
         ..RuntimeConfig::default()
     };
     assert_eq!(config.cpu_budget, Duration::from_millis(50));
+    if let Some(budget) = budget {
+        config.cpu_budget = budget;
+    }
     let rt = Runtime::new(&config).unwrap();
     let mut front = HttpComponent::new(
         rt.clone(),
         &guests::compile(&rt, &std::fs::read(&paths[0]).unwrap()),
     )
     .unwrap();
-    if let Some(budget) = front_budget {
+    if let Some(budget) = budget {
         front = front.with_cpu_budget(budget);
     }
     let mut cfg = ActorConfig::new(data);
@@ -624,9 +627,10 @@ async fn fill(addr: std::net::SocketAddr, tag: &str, count: u64, text: &str) {
 
 /// A front's history request forwards the page the room rendered: its fuel
 /// does not grow with the page. A full window of 2,000 small messages,
-/// then one of 2,000 messages and about 8 MiB, every page walked. The front
-/// gets a long CPU budget so that a costly page is measured rather than cut
-/// at 50 ms; the room keeps the default.
+/// then one of 2,000 messages and about 8 MiB, every page walked. Fuel does
+/// not depend on the machine: every event gets a long CPU budget, so a
+/// costly page is measured rather than cut at 50 ms and a loaded runner
+/// cannot fail it; the ceilings are in fuel.
 async fn history_fuel(suffix: &str) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("wasmkeep=info")

@@ -935,7 +935,27 @@ async fn room_cluster_batched_pusher_crash_keeps_its_operation_and_delivers() {
         ));
         clients.push((p, stop, task));
     }
-    let mut head;
+    // Every socket joined and caught up first: a join refused while the
+    // group is cold backs off, up to 30 s on a loaded runner.
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "joins: {:?}",
+            clients
+                .iter()
+                .map(|(p, _, _)| (
+                    p.ready.load(Ordering::SeqCst),
+                    p.last.load(Ordering::SeqCst)
+                ))
+                .collect::<Vec<_>>()
+        );
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     let op = loop {
         assert!(Instant::now() < deadline, "no scale operation began");
