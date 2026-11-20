@@ -2317,7 +2317,13 @@ struct Reg {
     /// Made by an event's end while a delivery of the same time was in
     /// flight: a second delivery of one round.
     second: bool,
+    /// Drops redelivered in a row.
+    drops: u32,
 }
+
+/// The server's `MAX_DROPPED_REDELIVERIES`: past it a dropped delivery's
+/// registration is given up, for the next event or the sweep.
+const DROP_BOUND: u32 = 6;
 
 enum Job {
     /// An event that leaves the alarm as it is.
@@ -2405,6 +2411,7 @@ impl Deliveries {
             covered: false,
             refusals: 0,
             second: false,
+            drops: 0,
         });
     }
 
@@ -2444,7 +2451,13 @@ impl Deliveries {
         }
         match retry {
             Some(true) if self.rule == DeliveryRule::DropForgotten => self.complete(now, r),
-            Some(_) => {
+            Some(true) if r.drops >= DROP_BOUND => {
+                // Given up: left to the next event (whose sync registers
+                // anew) or the sweep, as the server does.
+                self.local.reg = None;
+                self.local.synced_by_event = false;
+            }
+            Some(dropped) => {
                 self.local.ids += 1;
                 self.local.reg = Some(Reg {
                     waiting: true,
@@ -2452,6 +2465,7 @@ impl Deliveries {
                     id: self.local.ids,
                     covered: false,
                     refusals: r.refusals + 1,
+                    drops: r.drops + u32::from(dropped),
                     ..r
                 });
             }

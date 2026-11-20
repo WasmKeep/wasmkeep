@@ -14,6 +14,11 @@ use std::hash::BuildHasher;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
+
+/// How many times in a row a delivery the mailbox dropped is delivered
+/// again (with the admission backoff) before its registration is given up:
+/// the actor's next event or the sweep delivers the alarm then.
+pub(crate) const MAX_DROPPED_REDELIVERIES: u32 = 6;
 use wasmkeep_runtime::ActorAddress;
 
 enum Cmd {
@@ -110,7 +115,9 @@ impl AlarmHandle {
     /// Deliver again, with the same backoff as [`retry`](Self::retry), a
     /// delivery the mailbox dropped before it answered (the actor failed to
     /// start, or the event stopped): nothing else would arm its alarm
-    /// until the actor's next event or a sweep. Newer Set/Clear wins.
+    /// until the actor's next event or a sweep. At most
+    /// [`MAX_DROPPED_REDELIVERIES`] times in a row; then the registration
+    /// is given up, for the next event or the sweep. Newer Set/Clear wins.
     pub(crate) fn redeliver(&self, address: ActorAddress, delivery: Delivery) {
         let _ = self.tx.send(Cmd::Retry(address, delivery, true));
     }
@@ -185,6 +192,8 @@ struct Registration {
     refusals: u32,
     /// An event's `Sync` was left to this delivery while it was in flight.
     covered: bool,
+    /// Drops by the mailbox redelivered in a row (`MAX_DROPPED_REDELIVERIES`).
+    drops: u32,
 }
 
 #[derive(Default)]
@@ -229,6 +238,7 @@ impl Timer {
                 },
                 refusals: 0,
                 covered: false,
+                drops: 0,
             },
         );
         self.due.insert((at, address));
@@ -292,6 +302,15 @@ impl Timer {
                 if old.delivery != delivery || old.wake.is_some() {
                     return;
                 }
+                // Bounded: an actor that never starts would otherwise be
+                // activated every 5 s at most, forever, with no node-wide
+                // cap. Given up, its alarm waits for the actor's next event
+                // (the next `Sync` registers anew: nothing is in flight) or
+                // the sweep, as before 0.7.0.
+                if dropped && old.drops >= MAX_DROPPED_REDELIVERIES {
+                    self.clear(&address);
+                    return;
+                }
                 let ceiling = (100_u64 << old.refusals.min(6)).min(5000);
                 let floor = ceiling / 2;
                 let random = self.jitter.hash_one((&address, delivery.generation));
@@ -310,6 +329,7 @@ impl Timer {
                         },
                         refusals: old.refusals.saturating_add(1),
                         covered: false,
+                        drops: old.drops.saturating_add(u32::from(dropped)),
                     },
                 );
                 self.due.insert((wake, address));
@@ -627,6 +647,39 @@ mod tests {
             // A second drop backs off further.
             timer.apply(Cmd::Retry(addr(), again, true), 2000);
             assert!(timer.wait(2000) >= Duration::from_millis(100));
+        }
+    }
+
+    /// An actor that never starts (a broken deploy, an unreachable bucket)
+    /// is not redelivered forever: after `MAX_DROPPED_REDELIVERIES` drops
+    /// the registration goes, and the alarm is left to the actor's next
+    /// event or the sweep, which deliver it as before.
+    #[test]
+    fn dropped_redeliveries_stop_after_a_bound_and_the_alarm_is_delivered_later() {
+        for later in ["event", "sweep"] {
+            let mut timer = Timer::default();
+            let mut delivery = start_delivery(&mut timer, 17);
+            // A covered sync before the drops: cleared all the same.
+            timer.apply(Cmd::Sync(addr(), 17), 1000);
+            let mut now = 1000;
+            for _ in 0..MAX_DROPPED_REDELIVERIES {
+                timer.apply(Cmd::Retry(addr(), delivery, true), now);
+                now += 10_000;
+                delivery = timer.pop_due(now).unwrap().1;
+                assert_eq!(delivery.hint, 17);
+            }
+            timer.apply(Cmd::Retry(addr(), delivery, true), now);
+            assert!(timer.by_address.is_empty(), "given up after the bound");
+            assert!(timer.pop_due(u64::MAX).is_none());
+            match later {
+                "event" => timer.apply(Cmd::Sync(addr(), 17), now),
+                _ => timer.apply(Cmd::Sweep(addr(), 17, 0), now),
+            }
+            let again = timer.pop_due(now).unwrap().1;
+            assert_eq!(again.hint, 17, "{later}");
+            // A fresh registration starts its drop count afresh.
+            timer.apply(Cmd::Retry(addr(), again, true), now);
+            assert_eq!(timer.by_address.len(), 1, "{later}");
         }
     }
 

@@ -16,10 +16,10 @@ The text under a version's heading is its GitHub release text
   inside the mailbox. A busy room spent most of its mailbox time there and
   its publishes waited behind it. Now an event's end leaves a delivery for
   the same time alone, a delivery the mailbox dropped (the actor failed to
-  start, or the event stopped) is delivered again with backoff instead of
-  waiting for the next event or a sweep, a local redelivery of a time the
+  start, or the event stopped) is delivered again with backoff, up to six
+  times in a row, instead of waiting for the next event or a sweep, a local redelivery of a time the
   actor's hold already ran skips the stale-hint clear, and that clear's
-  DELETEs run off the mailbox.
+  DELETEs of tagged keys run off the mailbox.
   `wasmkeep_alarm_deliveries_total{tenant,app,class,outcome}` (`ran`,
   `stale`, `duplicate`, `deferred`) and
   `wasmkeep_alarm_dropped_deliveries_total` show it: stale over ran should

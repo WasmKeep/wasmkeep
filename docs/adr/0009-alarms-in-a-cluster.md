@@ -338,7 +338,12 @@ Pure decisions in `alarm_index`, used by the timer (`alarm.rs`) and by
   the event stopped before answering. Before, it was forgotten until the
   actor's next event (which, for the same time, it now covers) or a sweep.
   A delivery that ran, or any delivery while the node shuts down,
-  completes as before. Counted in
+  completes as before. At most six drops in a row
+  (`MAX_DROPPED_REDELIVERIES`): then the registration is given up and the
+  alarm left to the actor's next event (whose sync registers anew: nothing
+  is in flight) or the sweep, as before, so an actor that never starts (a
+  broken deploy, an unreachable bucket) is not activated every few seconds
+  forever, outside the sweep's per-node cap. Counted in
   `wasmkeep_alarm_dropped_deliveries_total`.
 - **A local delivery of a time this hold already ran `on-alarm` for skips
   the stale-hint clear** (`stale_clear_skippable`, the latest such time
@@ -352,10 +357,13 @@ Pure decisions in `alarm_index`, used by the timer (`alarm.rs`) and by
   entries it lists at that time are named by no state (an earlier owner's,
   or one whose exact-key DELETE failed or was dropped with a failed
   segment), and only it removes them.
-- **The stale-hint clear's DELETEs run off the mailbox**, as ADR 0034,
-  section 9 allows: the LIST and the choice of entries stay serialized with
-  the hold's next event; a DELETE landing late cannot remove a newer entry
-  (R1).
+- **The stale-hint clear's DELETEs of tagged keys run off the mailbox**,
+  as ADR 0034, section 9 allows: the LIST and the choice of entries stay
+  serialized with the hold's next event; a DELETE landing late cannot
+  remove a newer entry (R1). The legacy key at the hint is no fresh key (a
+  node of an older version writes it again for that millisecond), so its
+  DELETE stays inside the event, as before: a late one could remove the
+  entry such a node wrote since.
 
 ### What still holds
 
@@ -389,9 +397,15 @@ room before; it should be near zero after ([monitoring](../monitoring.md#alarm-d
   delivery; a move while a delivery is in flight registers the new time;
   a covered delivery that registered nothing is delivered again, in
   either order of its result and the sync; a dropped delivery is delivered
-  again with backoff, not counted as an admission retry; only the sweep
+  again with backoff, not counted as an admission retry, and given up
+  after six drops in a row, the alarm then delivered by the next event or
+  the sweep; only the sweep
   marks deliveries as from the index. The existing tests keep their
   assertions (`Retry` gained its drop flag).
+- `tests/cluster/alarms.rs`,
+  `a_stale_legacy_entry_is_deleted_before_the_alarm_event_ends`: with
+  alarm-index DELETEs slowed, the legacy key is gone once a request queued
+  behind the stale delivery answers.
 - `sim/tests/madsim_alarm_index.rs`,
   `batched_deliveries_keep_one_per_round_and_the_index_invariants`: the
   timer and mailbox on ADR 0034's batched hold, with refused, dropped and

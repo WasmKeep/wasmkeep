@@ -675,10 +675,21 @@ impl ActorState {
                 return true;
             }
         };
-        // Selected here, serialized with the hold's next event; the exact-key
-        // DELETEs finish off the actor's path (ADR 0034, section 9): a late
-        // one cannot remove a newer entry, keys are never reused (R1).
-        let stale = alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation);
+        // Selected here, serialized with the hold's next event; the tagged
+        // keys' DELETEs finish off the actor's path (ADR 0034, section 9): a
+        // late one cannot remove a newer entry, tagged keys are never reused
+        // (R1). The legacy key at `hint` is no fresh key (a node of an older
+        // version writes it again for that millisecond): deleted here, as
+        // before, so a late DELETE cannot remove the one it wrote since.
+        let (legacy, stale): (Vec<_>, Vec<_>) =
+            alarm_index::entries_to_clear(hint, &listed, indexed.as_ref(), generation)
+                .into_iter()
+                .partition(|e| e.tag.is_none());
+        for stale in legacy {
+            if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
+                tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "removing a stale alarm entry failed");
+            }
+        }
         if !stale.is_empty() {
             let (address, app) = (self.address.clone(), self.app_name.clone());
             tokio::spawn(async move {
