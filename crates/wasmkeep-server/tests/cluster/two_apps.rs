@@ -1073,13 +1073,15 @@ async fn a_rolling_upgrade_from_single_app_nodes_and_back() {
             == 200
     })
     .await;
-    // An older node joins again: not ready, actors still served.
+    // An older node joins again: not ready, actors still served. A new
+    // process, so a new instance: the one released above never writes
+    // `live` again, and a live body of it reads as stale.
     let writer = {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             loop {
                 let body = format!(
-                    "wasmkeep-node 3\nlive beef\n{}\nold\nhttp://127.0.0.1:1\n0\nacme/shop\n\n\nserving\n\ntake\n",
+                    "wasmkeep-node 3\nlive cafe\n{}\nold\nhttp://127.0.0.1:1\n0\nacme/shop\n\n\nserving\n\ntake\n",
                     now_ms()
                 );
                 let _ = store

@@ -96,9 +96,23 @@ of what adding nodes does, read
   until a process starts with that id (its start check waits, then it
   takes them back) or the node is fenced: `wasmkeep cluster fence <node>`
   writes a fence even with no object, and the actors are free 15 s
-  later. Node leases, ownership records and markers are never collected;
-  `wasmkeep cluster forget <node>` removes only a retired node's heartbeat
-  in the format from before node leases, once it is older than 25 s.
+  later. Node leases, ownership records and markers are never collected
+  on their own. `wasmkeep cluster forget <node>` removes a retired node's
+  heartbeat in the format from before node leases, or a `released` node
+  lease (a node that stopped cleanly) that no ownership record of any app
+  on the prefix still names, once either is older than 25 s; it refuses a
+  live or fenced node lease, and a released one a record still names (that
+  lease is what frees the record; each such record is taken over by the
+  next request for its actor). A store's DELETE takes no condition, so
+  the command reads the object twice and deletes only if it did not
+  change between the reads; a process starting under that id whose first
+  write lands in the moment between the second read and the delete loses
+  that lease and exits (its next write finds the object gone), and its
+  service manager starts it again: availability only, nothing is taken
+  from another node. Released leases left by earlier clusters on
+  a prefix cost nothing per heartbeat period (nodes read them only when
+  they list `nodes/`, every 30 s), so removing them is tidying, not a
+  fix.
 
 ### When a node dies: what a caller sees
 

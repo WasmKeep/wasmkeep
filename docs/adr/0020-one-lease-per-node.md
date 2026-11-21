@@ -35,6 +35,16 @@
   hello to its peers so they list at once ([ADR 0011](0011-node-to-node-mtls.md),
   amendment of the same day). See "Amendment of 2026-11-14: fewer
   listings of nodes/" at the end.
+- Amended 2026-11-20: a slow bucket. A round reads the heartbeats at
+  once, each within a read attempt; a read that fails leaves its node as
+  last read, trusted until its own horizon; a peer whose trust would end
+  before the next round lands is read early; the intents are read on a
+  task of their own; a heartbeat dated ahead counts from its first read.
+  The horizon (10 s) is unchanged. Listing `nodes/` moved to a task of its
+  own, for discovery only; rounds no longer read stopped (released or
+  fenced) nodes; a hello reads its sender by key; `cluster forget` may
+  delete a released lease no record names. See "Amendment of 2026-11-20:
+  a slow bucket" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -812,3 +822,294 @@ answers 404, as 0.4.1 answers a hello).
 `tests/revocation.rs`: the old process that "does not list the
 heartbeats" (`Revoke::NewKey`, and the node cut off from listings) now
 also cannot read them one by one; the guarantee checked is the same.
+
+## Amendment of 2026-11-20: a slow bucket
+
+A node trusts a peer (its pins, [ADR 0011](0011-node-to-node-mtls.md);
+the sender of its hops; its place in the view) until that peer's
+heartbeat's `written_at` plus the horizon, three heartbeat periods plus
+the allowed skew: 10 s at the defaults. That rule stays. What changes is
+how the node reads, so that its own late reads are not what makes the
+trust run out. Before, the reads of a round went out one after the other,
+none had a time limit, and the read of `control/changed` ran after them in
+the same loop: with N nodes each read's latency counted N times, one read
+that never answered stopped every later round, and forwarding to a
+healthy peer was refused with "the heartbeat naming it expired". A
+listing's reads after its LIST were sequential too.
+
+### The rule
+
+- **At once, each within an attempt.** A round reads the objects of every
+  node it knows at once, each within one read attempt
+  (`heartbeat_read_attempt`: the lease attempt, 2.67 s at the defaults, at
+  most a heartbeat period but never under 1 s). A listing reads what it
+  lists at once too (up to 16 reads in flight), the listing and its reads
+  within two attempts. One slow read costs one read's time, not one more
+  per node.
+- **Per peer.** A read that answers is applied; one that finds no object
+  drops that node, as a listing that leaves it out does; one that fails
+  or times out leaves that node as last read. Such a node keeps the trust
+  its last heartbeat gave, until that heartbeat's own horizon and never
+  past it, and nothing about it changes: its pins stay, no connection
+  pool is dropped, the failover wait sees the same body, and the fence
+  watch neither counts it as seen again nor forgets it (only heartbeats
+  just read are watched). The round reports a failure (the hellos and the
+  scheduled listing go on as before) and the next round reads it again.
+- **Early reads.** After a round, a peer whose trust would end before the
+  next round could land (before `next + lead`, `lead` twice the slowest
+  read of the last round plus 50 ms, at most one attempt) is read again
+  `lead` before its trust ends, once per heartbeat of that peer
+  (`membership::early_reads`). On a healthy bucket no peer is ever due
+  (its trust ends about 7 s after the next round starts), so the counted
+  cadences of the 2026-11-14 amendment are unchanged. The early read is
+  not cancelled by the end of the period; the round waits for it.
+- **The intents apart.** `control/changed` and `control/` are read on a
+  task of their own (`control_loop`), each bucket operation of a refresh
+  within one read attempt (the marker's read, the four listings of the
+  intents, the deletes of expired ones), not the refresh as a whole: a
+  slow bucket that answers still has the intents applied, late, and one
+  operation that does not answer fails the refresh, which keeps the last
+  intents (ADR 0014). Loading the cluster secret at the top of a round is
+  bounded by two attempts.
+- **Order.** The heartbeats as last read are the process's, shared by
+  its apps as the trust table is (ADR 0038), and each app applies its view
+  while holding them, so two apps never publish their views out of order.
+  A node's entry is replaced only by a read issued later than the one it
+  holds, whichever lands last, and a listing issued before a read does not
+  drop the node that read found. Issue order is not the bucket's order: a
+  read issued later may have been served before a write another read
+  already saw. So a `live` body never replaces a held `fenced` or
+  `released` body of the same instance (that process can never write
+  again, so any live body of it is older). Other stale bodies served that
+  way are possible, for example an older `live` body of a node read after
+  a newer one: the next read replaces it, and the trust it gives still
+  ends at that older heartbeat's own horizon, so it is never extended.
+
+### Freshness, and the clocks
+
+A heartbeat is judged by when it was written, never by when this node's
+read of it finished: the trust in it ends at `written_at + horizon` on
+this node's clock, and no read result moves that end later except a newer
+heartbeat. One exception makes it shorter, never longer: a heartbeat dated
+ahead of this clock counts as written when the process first read that
+heartbeat (`membership::FirstSeen`, kept with the heartbeats as last read
+and shared by the process's apps), and reading it again does not move
+that, nor does an app joining the process or a runtime restarted in place.
+A restart of the whole process starts it again: a dead peer whose clock
+is ahead is then trusted for one more horizon from the restarted
+process's first read. Before, a peer whose clock ran an hour fast was trusted for an hour
+after it died.
+
+A peer's clock behind this one makes its trust end early by that much:
+the horizon's skew allowance (1 s) covers the tolerated skew, as before.
+
+### How long a dead or partitioned peer stays trusted
+
+Let `T` be the true time of a peer's last heartbeat write that reached the
+bucket, `d` how far its clock is ahead of this node's (negative if
+behind), and `F` when this node first read that heartbeat. This node
+stops trusting it at `min(T + d, F) + horizon`, whatever its own reads do
+after: at most `T + 11 s` at the defaults while the clocks keep within the
+allowed skew, and at most `F + 10 s` whatever the peer's clock says.
+Without a read of that last heartbeat, the trust ends earlier, at the
+previous one's horizon. So:
+
+- a peer that dies, or is cut off from the bucket (it can no longer
+  write), is distrusted within those bounds; its own lease ran out
+  before, `ttl - safety` (8 s) after its last acknowledged write was sent,
+  and its actors are free `ttl + grace` (15 s) after its last write, as
+  before;
+- a peer fenced, released, forgotten or with a new key is distrusted at
+  the first read that shows it, within a period, as before;
+- a peer cut off from this node only, still writing, stays trusted: its
+  membership is confirmed; the connections to it fail and are handled as
+  before (the suspect list, the failover marks).
+
+### The horizon: unchanged
+
+The trust in a peer that keeps writing must outlast the time until a
+newer heartbeat of it is read. That heartbeat can be one write period
+plus its write's latency old when read, plus the skew, and the read takes
+its own latency. With rounds alone the next round's read lands up to a
+period after the last, so the horizon must cover two periods, the write
+latency, the read latency and the skew: at 10 s, the write and the read
+together get 3 s. With early reads the second period is gone: a read
+issued one attempt before the trust ends renews it if one period, the
+write's latency, the read's attempt and the skew fit in the horizon:
+3 s + 2.67 s (a write slower than the lease attempt fails anyway, and the
+writer's lease is then at risk too) + 2.67 s + 1 s = 9.33 s, within 10 s.
+So no widening: it would lengthen what it costs to revoke a node that
+stops writing (ADR 0011), the time a dead peer is still chosen to place
+or drain to, and the start guard's wait for an old-format heartbeat
+(horizon plus 15 s), for no gain. The horizon must also stay under ttl
+plus grace (15 s): past that, a dead node's actors may be taken over
+while it is still in the view.
+
+Past those latencies the node still fails closed: reads that keep taking
+longer than the margin let the trust end at the newest heartbeat's
+horizon, as before, and a request to a peer whose trust ended still waits
+up to 3 s for a read that renews it (ADR 0011, step 6). A read slower than
+the attempt is now given up rather than waited for: a bucket whose reads
+all take a little longer than 2.67 s renews nothing, where the reads
+before this amendment renewed late. That too fails closed, and the
+horizon would not have covered such reads anyway (a period, the write and
+the skew leave 6 s for one read, and with rounds alone 3 s for the write
+and the read together). An early read planned on the last round's latency
+can also land a little late if the bucket just got slower; the next one
+is planned on the new latency.
+
+### Metrics
+
+`wasmkeep_heartbeat_read_milliseconds` (each read of a peer's heartbeat,
+timed-out ones at the attempt), `wasmkeep_node_lease_write_milliseconds`
+(each write of this node's own, from its send to its answer),
+`wasmkeep_heartbeat_age_milliseconds` (how old each peer's heartbeat was
+when applied: that peer's period and write latency, this node's read
+latency and the clocks' difference), `wasmkeep_heartbeat_read_failures_total`
+and `wasmkeep_heartbeat_early_reads_total`. Read lag against write lag:
+compare a node's reads with its peers' writes; an age's 99th percentile
+nearing the horizon (10 s), or early reads rising, says the margin is
+thin ([monitoring](../monitoring.md)).
+
+### Rolling upgrades
+
+Nothing in the bucket changes, nor what a node writes or how often it
+lists. A node of an older version still reads one object after another.
+
+### Simulation and tests
+
+The protocol under test is the reader's timing, which the simulations do
+not model (they read each peer's object in turn with no latency); the
+safety properties they check (fences, the free rule, ownership) do not
+depend on it, and they pass unchanged. The cases are in the cluster
+suite, plain and over TLS, with a bucket slow for one node:
+
+- `tests/cluster/slow_bucket.rs`:
+  `forwarding_stays_up_on_a_slow_bucket_while_a_dead_peer_expires` (every
+  heartbeat read of one node 100 ms late; its trust in a peer that keeps
+  writing never lapses over 2 s of samples every 10 ms, and every
+  request it forwards there is answered, while a peer that dies is
+  distrusted within the horizon of its last write; before, the trust
+  lapsed in about one sample in seven) and
+  `a_hung_control_read_does_not_hold_up_the_view` (a read of
+  `control/changed` that never answers; before, the trust in the peer
+  lapsed for good a horizon later).
+- `cluster::tests`: `one_hung_heartbeat_read_neither_holds_up_the_view_nor_drops_the_pools`,
+  `heartbeat_reads_go_out_at_once` (a listing and a round of five peers
+  whose every read takes 300 ms end within a second; they took 1.5 s and 1.8 s),
+  `a_heartbeat_dated_ahead_is_trusted_one_horizon_from_its_first_read`,
+  `a_failed_read_carries_a_heartbeat_only_to_its_own_horizon` (the rule
+  kept), `an_older_read_landing_late_never_undoes_a_newer_one`,
+  `a_live_body_read_late_never_undoes_a_fence_of_its_instance`,
+  `a_runtime_that_joins_late_does_not_trust_a_dead_fast_clock_peer_again`
+  and `a_slow_bucket_still_applies_the_intents` (every intents operation
+  200 ms, under the attempt, five of them past two attempts together).
+- `membership::tests`: `a_trust_about_to_end_before_the_next_round_lands_is_read_early`
+  and `a_heartbeat_dated_ahead_counts_from_its_first_read`.
+
+### Second part (same amendment): listing off the read path
+
+The first part left two costs on a slow bucket: every
+tenth round still listed `nodes/` inline and waited for the LIST and its
+reads (up to two attempts) before reading by key, and a listing that
+failed left the next one due, so with a steadily slow LIST every round
+listed again, back to back. And a prefix that holds many `released`
+node leases left by earlier clusters had every round read them all by
+key, beside the few live nodes.
+
+- **Listing is discovery only, on a task of its own** (`listing_loop`):
+  new node ids, nodes whose object is gone, and the objects of stopped
+  nodes. The first period's round still lists (within two attempts), to
+  find the peers before saying hello; from then on every round reads the
+  known nodes by key. The listing task lists every ten periods and when
+  asked (a hello, a record naming an unknown node, an unknown pin, a first
+  listing that failed), at once but at most once a period; an ask that
+  arrives while it lists is kept for its next listing (an ask is no
+  longer lost when the period ends). Each listing gets the longest of two
+  attempts, the scheduled interval and 30 s, since nothing waits for it;
+  one that fails or runs out is tried again after one period, then two,
+  four, at most the interval. Its results are applied like any read's,
+  ordered by when they were issued, so a listing landing late changes
+  nothing a later read saw.
+- **Stopped nodes are not read every round.** A node whose heartbeat as
+  last read is `released` or `fenced` for an instance cannot come back
+  as that instance (instances change only through conditional writes, and
+  a new process has a new one), so rounds leave it out; the listings
+  still read it, so a new process under that id is found by the next
+  listing, or sooner by its hello. Its object stays as last read for the
+  free rule (section 3) and the failover wait, as before. With 90
+  released leases and three live nodes a round makes four reads, not 94.
+- **A join is not held up by a slow LIST.** A hello, a hop from a signed
+  sender, or this node looking for a node (`address_of`, a record naming
+  it) makes this node read that node's object by key at once, on a task of
+  its own, at most once a period per node (`join_read_loop`), unless that
+  node is in its view and not stopped. So a node restarted under its id
+  after a clean stop (`released`, which the rounds no longer read) is
+  found within about a period, whatever the listing does; the process's
+  table of live senders, which keeps the stopped instance's last live
+  heartbeat until its horizon, does not decide it. Over TLS the first hello of a
+  new process is refused at the handshake (its pin is not known yet),
+  which asks for a listing as before: such a join waits for that listing,
+  which now lands however slow the LIST, where a listing given two
+  attempts never did. Reading the certificate's name at the handshake
+  would avoid that wait; not done (it would need a certificate parser).
+- **The dead-peer bound is unchanged**: rounds by key renew a peer's
+  trust, so a slow LIST changes nothing about when a dead one lapses.
+
+#### Long-released node leases: `cluster forget`
+
+A `released` node lease can now be deleted by `wasmkeep cluster forget`,
+by the operator, under three conditions: it is older than its horizon
+plus a lease's ttl and grace (25 s at the defaults, the window already
+used for old-format heartbeats); no ownership record of any app under the
+prefix names that node, any instance (one listing per tenant and app of
+`state/`, one read per record; a record that cannot be read counts as
+naming it); and the object is unchanged when read again right before the
+delete. Why that is safe: the released object is what frees a record
+still naming the node (section 3; an absent object frees nothing), so it
+must stay while any does; no new record can name it, since only its own
+process writes records naming itself and that process released; and a
+new process under the id replaces the object first, which the second
+read sees. What remains: a store's DELETE takes no condition (the bucket adapter
+has no conditional delete), so a process starting under that id whose
+first write lands between the second read and the delete loses its lease
+(its next write finds no object, `LostCause::Deleted`) and exits, to be
+started again. That costs availability only: nothing was held under the
+new instance yet, and no other node's state is touched. A `fenced` lease stays: its process did not stop cleanly, so
+records likely still name it, and the fence is the evidence that frees
+them and that ends that instance. A `live` one stays (fence it to revoke
+the node).
+
+The other option, nodes removing long-released leases on their own, was
+not taken: every node would delete lease state, racing a process starting
+under that id (its start check reads that object) and each other, to save
+what is now nothing per period (rounds no longer read stopped nodes). An
+operator command, run when wanted, with the record check, is the
+conservative choice.
+
+#### Tests (second part)
+
+- `tests/cluster/slow_bucket.rs`:
+  `a_slow_listing_holds_up_no_read_and_a_dead_peer_still_expires` (every
+  LIST from one node 1.5 s late, three times what an inline listing had:
+  its trust in a writing peer never lapses over 3 s of samples, every
+  forwarded request is answered, and a peer that dies is distrusted
+  within the horizon of its last write; before, the trust lapsed in 81 of
+  271 samples) and
+  `a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello`
+  (LIST 3 s late: plain, the joining node is trusted within 2 s through
+  its hello's read by key; over TLS within 10 s, through the listing its
+  refused handshake asks for; before, never) and
+  `a_node_restarted_under_its_id_is_read_by_key_whatever_the_listing` (a
+  clean stop, then the same id again: trusted within 1 s with listings 3 s
+  late or refused; before, only a listing found it).
+- `cluster::tests::a_round_reads_only_the_nodes_that_may_still_write`
+  (90 released leases and three live nodes: four reads a round, 94
+  before).
+- `status::tests::a_released_lease_no_record_names_may_be_forgotten`
+  (wasmkeep-cli: removed when no record names it; kept when one does,
+  when recent, and when fenced or live).
+- `tests/cluster/listings.rs`: a listing's read of a node's own object is
+  no longer one of its rounds, and a listing's reads are left out of the
+  heartbeats read a period (three, as before).
+

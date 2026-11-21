@@ -18,6 +18,9 @@ pub(super) struct FenceDue {
     epoch: u64,
 }
 
+use super::process::Heartbeats;
+use wasmkeep_cluster::lease::BucketError;
+
 /// The nodes as one refresh saw them: id, instance, lease state, live.
 pub(super) type ViewShape = Vec<(String, Option<String>, Option<NodeState>, bool)>;
 
@@ -53,105 +56,82 @@ pub(super) async fn fence_loop(
     }
 }
 
-/// Refreshes the peer list, loads the cluster secret and reads the
-/// operator's intents every heartbeat period, once the node lease's first
-/// write landed (the node lease itself is written by its own task,
-/// `node_lease_loop`).
+/// Refreshes the peer list and loads the cluster secret every heartbeat
+/// period, once the node lease's first write landed (the node lease itself
+/// is written by its own task, `node_lease_loop`; the operator's intents
+/// are read by theirs, [`control_loop`]; listings of `nodes/` by theirs,
+/// [`listing_loop`]).
 ///
-/// The peer list (ADR 0020 and 0011, amendments of 2026-11-14): a listing
-/// of `nodes/` at the first period and every
-/// [`membership::FULL_LISTING_EVERY`] periods; in between, one read of
-/// each node the last refresh found, which gives the same bodies. A
-/// listing is also made at once when a peer says hello (it just started),
-/// when a record names a node this node does not know, or, with TLS, when
-/// an unknown pin knocks (a peer that just started, or one that changed
-/// its key): at most one such early listing a period, none in a period
-/// that listed already, and one asked for after that at the next period.
-/// So at most two listings a period, as before the amendment over TLS;
-/// strangers can ask only by knocking with a pin (TLS), since a hello is
-/// signed.
+/// The peer list (ADR 0020, amendments of 2026-11-14 and 2026-11-20): a
+/// listing of `nodes/` at the first period, within two read attempts;
+/// then every period one read of each node that may still write (the
+/// nodes as last read, less those whose heartbeat is `released` or
+/// `fenced`: their instance never writes again), all at once, each within
+/// [`heartbeat_read_attempt`]. A peer whose read fails or times out stays
+/// as last read. A peer whose trust would end before the next round could
+/// land is read again early, once per heartbeat of it
+/// ([`wasmkeep_cluster::membership::early_reads`]). Discovery (new node
+/// ids, nodes whose object is gone, and the stopped nodes' objects) is the
+/// listing task's: a slow LIST never holds up a round.
 ///
-/// After its first refresh, the node says hello to the peers it found, so
-/// that they list at once and see it within a period; again the next two
-/// periods if a peer did not take it.
-///
-/// The intents: see [`Cluster::refresh_control_if_changed`].
+/// Once its rounds find a peer, the node says hello to the peers it found,
+/// so that they read it at once and see it within a period; again the
+/// next two periods if a peer did not take it.
 pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
-    // Held apart from the cluster, so waiting does not keep it alive.
-    let tls = cluster.upgrade().and_then(|c| c.transport.tls.clone());
-    if let Some(t) = &tls {
-        // An unlisted sender's hop waits for this loop's next listing.
-        t.pins().listed_every(every);
-    }
-    let Some(asked) = cluster.upgrade().map(|c| Arc::clone(&c.listing_asked)) else {
+    if !identity_unique(cluster.clone()).await {
         return;
-    };
-    // Nothing until the start check passed and the first lease write
-    // landed; never if another process runs with this id.
-    {
-        let Some(c) = cluster.upgrade() else {
-            return;
-        };
-        let mut seen = c.identity.subscribe();
-        drop(c);
-        let unique = seen
-            .wait_for(|s| *s != Identity::Checking)
-            .await
-            .is_ok_and(|s| *s == Identity::Unique);
-        if !unique {
-            return;
-        }
     }
-    // Periods since the last listing of `nodes/` that succeeded, that
-    // listing's period counted as the first.
-    let mut since_full: Option<u32> = None;
-    let mut watch = control::ControlWatch::new();
-    // Rounds of hellos left: the first after the first refresh, and again
-    // the next periods while a peer did not take it (lost, or refused
-    // because its cluster secret was not loaded yet).
+    // Rounds of hellos left: the first once a round found a peer, and
+    // again the next periods while a peer did not take it (lost, or
+    // refused because its cluster secret was not loaded yet).
     let mut hellos_left = HELLO_ROUNDS;
     let hello_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The peers read early, each with the `written_at` it was read early
+    // for: at most one early read per heartbeat of a peer.
+    let mut read_early: HashMap<String, u64> = HashMap::new();
+    let mut first = true;
     loop {
         // From the top: the period does not stretch by the bucket's latency.
         let next = tokio::time::Instant::now() + every;
         let Some(c) = cluster.upgrade() else {
             return;
         };
-        // Another process found running as this node: no more listings.
+        // Another process found running as this node: no more reads.
         if c.identity_taken() {
             return;
         }
-        // Until loaded, calls from other nodes are refused; retried here.
+        // Until loaded, calls from other nodes are refused; retried here,
+        // within two read attempts so that a slow bucket does not hold up
+        // the view.
         if c.secret.get().is_none() {
-            c.load_secret().await;
+            let limit = c.heartbeat_read_attempt * 2;
+            let loading = Arc::clone(&c);
+            let _ = tokio::time::timeout(limit, async move { loading.load_secret().await }).await;
         }
-        let wanted = c.take_listing_wanted();
-        let full = wasmkeep_cluster::membership::full_listing_due(since_full, wanted);
-        let mut ok = c.refresh_view(full).await;
-        // A listing that failed (a store that throttles or refuses LIST
-        // while it answers GET) must not leave the nodes this node knows
-        // unread: their heartbeats, and the trust in their pins, are
-        // renewed by one read each, as in the periods between listings.
-        // The listing is tried again next period.
-        let read_known = full && !ok && c.refresh_view(false).await;
-        since_full = match (full, ok) {
-            (true, true) => Some(1),
-            // A listing asked for and not made: asked again.
-            (true, false) => {
-                if wanted {
-                    c.want_listing();
-                }
-                since_full
+        let ok = if first {
+            first = false;
+            // The first period lists, to find the peers; one that fails or
+            // runs out leaves it to the listing task, asked at once.
+            let listed = c.refresh_view(true).await;
+            if !listed {
+                c.want_listing();
             }
-            (false, _) => since_full.map(|n| n.saturating_add(1)),
+            listed || c.refresh_view(false).await
+        } else {
+            c.refresh_view(false).await
         };
-        ok |= read_known;
         if c.identity_taken() {
             return;
         }
+        let found_peers = c
+            .known_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|n| *n != c.node_id);
         let retry = hellos_left < HELLO_ROUNDS
             && hello_failed.swap(false, std::sync::atomic::Ordering::AcqRel);
-        if (hellos_left == HELLO_ROUNDS || retry)
+        if ((hellos_left == HELLO_ROUNDS && found_peers) || retry)
             && hellos_left > 0
             && ok
             && c.secret.get().is_some()
@@ -159,37 +139,245 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
             hellos_left -= 1;
             c.say_hello(Arc::clone(&hello_failed));
         }
-        c.refresh_control_if_changed(&mut watch).await;
+        c.forget_early_reads(&mut read_early);
         drop(c);
-        // An early listing, at most one a period, and none in a period
-        // that listed already: an unknown pin (TLS) or a peer's hello. One
-        // asked for after that is made at the next period. So at most two
-        // listings a period, a scheduled or asked-for one and an early one.
-        let mut early_left = !(full && ok);
-        let mark = async {
-            loop {
-                listing_asked(&tls, &asked).await;
-                let Some(c) = cluster.upgrade() else {
-                    return;
-                };
-                if early_left {
-                    early_left = false;
-                    c.take_listing_wanted();
-                    if c.refresh_view(true).await {
-                        since_full = Some(1);
-                    } else {
-                        c.want_listing();
-                    }
-                } else {
-                    c.listing_wanted
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
+        loop {
+            let Some(c) = cluster.upgrade() else {
+                return;
+            };
+            let due = c.early_reads_due(next, &read_early);
+            drop(c);
+            let early_at = due.as_ref().map_or(next, |(at, _)| *at);
+            // The early read itself is awaited outside the `select!`: the
+            // period's end must not cancel it halfway, since it is what
+            // renews the trust before that period's round could.
+            let early = tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(next) => None,
+                () = tokio::time::sleep_until(early_at), if due.is_some() => due,
+            };
+            let Some((_, ids)) = early else {
+                break;
+            };
+            let Some(c) = cluster.upgrade() else {
+                return;
+            };
+            c.read_early(&ids, &mut read_early).await;
+        }
+    }
+}
+
+/// Lists `nodes/` on a task of its own, for discovery (ADR 0020,
+/// amendment of 2026-11-20): new node ids, the nodes whose object is gone,
+/// and the objects of stopped nodes, which the rounds do not read. Every
+/// [`wasmkeep_cluster::membership::FULL_LISTING_EVERY`] periods after the first period's
+/// listing (made by [`heartbeat_loop`]), and when a listing is asked for
+/// (a hello, a record naming a node this node does not know, an unknown
+/// pin knocking, a first listing that failed): at once, at most one
+/// listing a period, so strangers knocking with a pin cannot make it list
+/// more. An ask that arrives during a listing is kept for the next one.
+/// Each listing within [`Cluster::listing_limit`]; one that fails or runs
+/// out is tried again after one period, then two, four, and so on, at most
+/// the scheduled interval. Nothing here is cancelled at a period's end.
+pub(super) async fn listing_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
+    // Held apart from the cluster, so waiting does not keep it alive.
+    let tls = cluster.upgrade().and_then(|c| c.transport.tls.clone());
+    if let Some(t) = &tls {
+        // An unlisted sender's hop waits for this task's next listing.
+        t.pins().listed_every(every);
+    }
+    let Some(asked) = cluster.upgrade().map(|c| Arc::clone(&c.listing_asked)) else {
+        return;
+    };
+    if !identity_unique(cluster.clone()).await {
+        return;
+    }
+    let scheduled = every.saturating_mul(wasmkeep_cluster::membership::FULL_LISTING_EVERY);
+    let mut next = tokio::time::Instant::now() + scheduled;
+    let mut last: Option<tokio::time::Instant> = None;
+    let mut failures: u32 = 0;
+    loop {
+        let wanted = {
+            let Some(c) = cluster.upgrade() else {
+                return;
+            };
+            c.listing_wanted.load(std::sync::atomic::Ordering::Acquire)
+        };
+        let at = if wanted {
+            last.map_or_else(tokio::time::Instant::now, |l| l + every)
+                .min(next)
+        } else {
+            next
         };
         tokio::select! {
             biased;
-            () = tokio::time::sleep_until(next) => {}
-            () = mark => {}
+            () = tokio::time::sleep_until(at) => {}
+            () = listing_asked(&tls, &asked) => {
+                if let Some(c) = cluster.upgrade() {
+                    c.listing_wanted.store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
+        }
+        let Some(c) = cluster.upgrade() else {
+            return;
+        };
+        if c.identity_taken() {
+            return;
+        }
+        c.take_listing_wanted();
+        let started = tokio::time::Instant::now();
+        let listed = c.list_heartbeats(c.listing_limit()).await;
+        drop(c);
+        // Counted from when it ended: a listing that hung until its limit
+        // is not followed by another at once.
+        let ended = tokio::time::Instant::now();
+        last = Some(ended);
+        if listed {
+            failures = 0;
+            next = started + scheduled;
+        } else {
+            failures = failures.saturating_add(1);
+            let periods = 2u32
+                .saturating_pow(failures.saturating_sub(1))
+                .min(wasmkeep_cluster::membership::FULL_LISTING_EVERY);
+            next = ended + every.saturating_mul(periods);
+        }
+    }
+}
+
+/// Reads by key, at once and on a task of their own, the heartbeats of
+/// nodes a signed call named that this node holds no live heartbeat of (a
+/// hello, a hop: a node that just joined), so that it is seen without
+/// waiting for a listing (ADR 0020, amendment of 2026-11-20). Each id at
+/// most once a period.
+pub(super) async fn join_read_loop(
+    cluster: std::sync::Weak<Cluster>,
+    mut wanted: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    if !identity_unique(cluster.clone()).await {
+        return;
+    }
+    let mut read_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+    while let Some(first) = wanted.recv().await {
+        let mut ids = vec![first];
+        while let Ok(id) = wanted.try_recv() {
+            ids.push(id);
+        }
+        let Some(c) = cluster.upgrade() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let every = c.heartbeat_every;
+        read_at.retain(|_, at| now.saturating_duration_since(*at) < every);
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|id| *id != c.node_id && !read_at.contains_key(id));
+        if ids.is_empty() {
+            continue;
+        }
+        for id in &ids {
+            read_at.insert(id.clone(), now);
+        }
+        tracing::debug!(nodes = ?ids, "reading the heartbeats of nodes that called before they were seen");
+        c.read_heartbeats(&ids).await;
+    }
+}
+
+/// Resolves once the start check passed and the first lease write landed:
+/// true then, false if another process runs with this id (or the cluster
+/// is gone).
+async fn identity_unique(cluster: std::sync::Weak<Cluster>) -> bool {
+    let Some(c) = cluster.upgrade() else {
+        return false;
+    };
+    let mut seen = c.identity.subscribe();
+    drop(c);
+    seen.wait_for(|s| *s != Identity::Checking)
+        .await
+        .is_ok_and(|s| *s == Identity::Unique)
+}
+
+/// Reads the operator's intents every heartbeat period
+/// ([`Cluster::refresh_control_if_changed`]), on a task of its own (ADR
+/// 0020, amendment of 2026-11-20): before, it ran after the view's refresh
+/// in [`heartbeat_loop`], and a read of `control/` that hung held up the
+/// heartbeats' reads, and the trust in every peer lapsed a horizon later.
+/// Each bucket operation of a refresh is bounded by one heartbeat read
+/// attempt ([`Bounded`]), not the whole refresh: a slow bucket that answers
+/// still has the intents applied, late; one operation that does not answer
+/// fails the refresh, which keeps the last intents read (ADR 0014).
+pub(super) async fn control_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
+    if !identity_unique(cluster.clone()).await {
+        return;
+    }
+    let mut watch = control::ControlWatch::new();
+    loop {
+        let next = tokio::time::Instant::now() + every;
+        let Some(c) = cluster.upgrade() else {
+            return;
+        };
+        if c.identity_taken() {
+            return;
+        }
+        c.refresh_control_if_changed(&mut watch).await;
+        drop(c);
+        tokio::time::sleep_until(next).await;
+    }
+}
+
+/// The bucket's `control/` and intents, each operation within `attempt`
+/// (one that runs out is a failure, as the bucket not answering).
+pub(super) struct Bounded<'a> {
+    keys: &'a ObjectStoreBucket,
+    attempt: Duration,
+}
+
+impl Bounded<'_> {
+    async fn within<T>(
+        &self,
+        op: impl std::future::Future<Output = Result<T, BucketError>>,
+    ) -> Result<T, BucketError> {
+        tokio::time::timeout(self.attempt, op)
+            .await
+            .unwrap_or_else(|_| {
+                Err(BucketError::Unavailable(format!(
+                    "no answer within {:?}",
+                    self.attempt
+                )))
+            })
+    }
+}
+
+impl control::Keys for Bounded<'_> {
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+        self.within(self.keys.list_keys(prefix)).await
+    }
+
+    async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+        self.within(self.keys.put_empty(key)).await
+    }
+
+    async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+        self.within(self.keys.put_body(key, body)).await
+    }
+
+    async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+        self.within(self.keys.get_body(key)).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BucketError> {
+        self.within(self.keys.delete(key)).await
+    }
+}
+
+impl Cluster {
+    /// `control/` and the intents, each operation within one heartbeat
+    /// read attempt.
+    pub(super) fn bounded_control(&self) -> Bounded<'_> {
+        Bounded {
+            keys: &self.control_keys,
+            attempt: self.heartbeat_read_attempt,
         }
     }
 }
@@ -217,7 +405,7 @@ impl Cluster {
     /// 0014, amendment of 2026-11-14).
     pub(super) async fn refresh_control_if_changed(&self, watch: &mut control::ControlWatch) {
         use control::Keys as _;
-        let marker = self.control_keys.get_body(control::CHANGED).await;
+        let marker = self.bounded_control().get_body(control::CHANGED).await;
         if let Err(e) = &marker {
             tracing::debug!(error = %e, "reading control/changed failed");
         }
@@ -232,7 +420,7 @@ impl Cluster {
     /// this node is asked to drain. A failed listing keeps the last intents
     /// read (ADR 0014); false then.
     pub(super) async fn refresh_control(&self) -> bool {
-        match control::read(&self.control_keys, Some(&self.root), now_ms()).await {
+        match control::read(&self.bounded_control(), Some(&self.root), now_ms()).await {
             Ok(read) => {
                 let asked = read.draining.contains(&self.node_id);
                 let was = std::mem::replace(
@@ -513,8 +701,9 @@ impl Cluster {
     /// Reads the nodes' heartbeats, by a listing of `nodes/` (`full`) or
     /// one read of each node the last refresh found, and refreshes from
     /// them where to reach each live node (the peer list) and, with TLS,
-    /// the pins this node trusts. False if the bucket did not answer (the
-    /// view is kept).
+    /// the pins this node trusts. False if the bucket did not answer every
+    /// read (what did answer is applied; the others stay as last read) or
+    /// the listing failed (the view is kept).
     pub(super) async fn refresh_view(&self, full: bool) -> bool {
         // Timed (`wasmkeep_listing_seconds`): past the heartbeat horizon,
         // peers' pins would expire before this renews them.
@@ -527,80 +716,260 @@ impl Cluster {
     }
 
     async fn list_and_refresh(&self, full: bool) -> bool {
-        let read = if full {
-            self.transport.list_nodes().await
-        } else {
-            let mut known = self
-                .known_nodes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            // This node's own object too: the twin check, and this node's
-            // place in the live set (alarm shards) come from it.
-            if !known.contains(&self.node_id) {
-                known.push(self.node_id.clone());
-            }
-            self.transport.read_nodes(&known).await
-        };
-        match read {
-            Ok(all) => {
-                *self.known_nodes.lock().unwrap_or_else(|p| p.into_inner()) =
-                    all.iter().map(|n| n.id.clone()).collect();
-                // Against every heartbeat, live or not: a twin whose clock
-                // lags may look stale.
-                self.check_twin(&all);
-                self.note_old_versions(&all);
-                self.note_future_leases(&all);
-                let nodes = self.membership.live(all.clone());
-                self.note_multi_app(&nodes);
-                let mixed = older_nodes(&self.node_id, &nodes);
-                let now = now_ms();
-                let period = u64::try_from(self.heartbeat_every.as_millis()).unwrap_or(u64::MAX);
-                let logged = self
-                    .conflict_logged_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if !mixed.is_empty() && now.saturating_sub(logged) >= period {
-                    self.conflict_logged_ms
-                        .store(now, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(serves = %self.serves, "{}", older_nodes_advice(&mixed));
-                }
-                // The process's trust table; when an address changed hands
-                // (or its node left), every pooled connection is dropped.
-                self.transport
-                    .refresh_trust(&nodes, self.heartbeat_horizon_ms);
-                if self.refuse_plaintext {
-                    self.note_plain_peers(&nodes, now);
-                }
-                // Plain `http://` bases and `https://` cluster listeners
-                // only: calls between nodes carry signatures, and the
-                // forwarding clients speak HTTP, over TLS or not.
-                let mut peers = nodes
-                    .iter()
-                    .filter_map(|n| Some((n.id.clone(), Peer::of(n)?)))
-                    .collect();
-                {
-                    let mut view = self.peers.write().unwrap_or_else(|p| p.into_inner());
-                    carry_first_seen(&view, &mut peers);
-                    *view = peers;
-                }
-                // The same bodies, for the requests kept until a dead
-                // node's actors are free: no bucket request.
-                self.failover.observe(&all, now);
-                // Last, and handed to the fence task: a fence awaits the
-                // bucket, and neither this view nor the next listing may
-                // wait for it.
-                let due = self.fences_due(&all);
-                if !due.is_empty() {
-                    let _ = self.fences_due.send(due);
-                }
-                self.note_view_shape(&nodes, &all);
+        if full {
+            // In a round (the first period's): two attempts.
+            return self.list_heartbeats(self.heartbeat_read_attempt * 2).await;
+        }
+        let stopped = self
+            .stopped_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut ids: Vec<String> = self
+            .known_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|id| !stopped.contains(*id))
+            .cloned()
+            .collect();
+        // This node's own object too: the twin check, and this node's
+        // place in the live set (alarm shards) come from it.
+        if !ids.contains(&self.node_id) {
+            ids.push(self.node_id.clone());
+        }
+        self.read_heartbeats(&ids).await
+    }
+
+    /// How long a listing of the listing task may take: it is off the
+    /// read path, so a slow LIST still finds new nodes, late. Two read
+    /// attempts, the scheduled interval, or 30 s, whichever is longest.
+    pub(super) fn listing_limit(&self) -> Duration {
+        (self.heartbeat_read_attempt * 2)
+            .max(
+                self.heartbeat_every
+                    .saturating_mul(wasmkeep_cluster::membership::FULL_LISTING_EVERY),
+            )
+            .max(Duration::from_secs(30))
+    }
+
+    /// Lists `nodes/` and reads what it lists, within `limit`, and applies
+    /// it. False if the bucket did not answer in time (nothing applied).
+    pub(super) async fn list_heartbeats(&self, limit: Duration) -> bool {
+        let issued = std::time::Instant::now();
+        let transport = Arc::clone(&self.transport);
+        match tokio::time::timeout(limit, async move { transport.list_nodes().await }).await {
+            Ok(Ok(all)) => {
+                self.apply_heartbeats(Heartbeats::Listed(all), issued);
                 true
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "reading the nodes' heartbeats failed");
                 false
             }
+            Err(_) => {
+                tracing::warn!("listing the nodes' heartbeats took longer than {limit:?}");
+                false
+            }
         }
+    }
+
+    /// Reads the heartbeats of `ids`, all at once, each within one
+    /// attempt, and applies what came back: a node whose read failed stays
+    /// as last read. True if every read answered.
+    pub(super) async fn read_heartbeats(&self, ids: &[String]) -> bool {
+        let started = std::time::Instant::now();
+        let issued = std::time::Instant::now();
+        let reads = self
+            .transport
+            .read_each(ids, self.heartbeat_read_attempt)
+            .await;
+        // The reads went out at once: the round took its slowest one (a
+        // timed-out read at the attempt).
+        self.slowest_read_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut failed = Vec::new();
+        for (id, read) in &reads {
+            if let super::process::HeartbeatRead::Failed(e) = read {
+                failed.push(format!("{id}: {e}"));
+            }
+        }
+        if !failed.is_empty() {
+            crate::metrics::METRICS.heartbeat_read_failures.fetch_add(
+                u64::try_from(failed.len()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            tracing::warn!(
+                failed = %failed.join("; "),
+                "reading some nodes' heartbeats failed; each stays as last read, until its own horizon"
+            );
+        }
+        let answered = failed.is_empty();
+        if failed.len() == reads.len() {
+            return false;
+        }
+        self.apply_heartbeats(Heartbeats::Read(reads), issued);
+        answered
+    }
+
+    /// Reads `ids` before the next round ([`Self::early_reads_due`]),
+    /// noting the heartbeat each was read early for.
+    pub(super) async fn read_early(&self, ids: &[String], read_early: &mut HashMap<String, u64>) {
+        {
+            let held = self.trust_ends.lock().unwrap_or_else(|p| p.into_inner());
+            for id in ids {
+                if let Some((written_at, _)) = held.get(id) {
+                    read_early.insert(id.clone(), *written_at);
+                }
+            }
+        }
+        crate::metrics::METRICS.heartbeat_early_reads.fetch_add(
+            u64::try_from(ids.len()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::debug!(peers = ?ids, "reading heartbeats early: their trust would end before the next round lands");
+        self.read_heartbeats(ids).await;
+    }
+
+    /// Drops from `read_early` the peers whose heartbeat changed since
+    /// (or that left): they may be read early again.
+    pub(super) fn forget_early_reads(&self, read_early: &mut HashMap<String, u64>) {
+        let held = self.trust_ends.lock().unwrap_or_else(|p| p.into_inner());
+        read_early.retain(|id, w| held.get(id).is_some_and(|(now, _)| now == w));
+    }
+
+    /// The early reads due before the round at `next`
+    /// ([`wasmkeep_cluster::membership::early_reads`]): when, and which
+    /// peers, leaving out those already read early for their current
+    /// heartbeat. Planned `lead` ahead: twice the slowest read of the last
+    /// round plus 50 ms, at most one attempt.
+    pub(super) fn early_reads_due(
+        &self,
+        next: tokio::time::Instant,
+        read_early: &HashMap<String, u64>,
+    ) -> Option<(tokio::time::Instant, Vec<String>)> {
+        let now = now_ms();
+        let at_now = tokio::time::Instant::now();
+        let to_ms = |i: tokio::time::Instant| {
+            now.saturating_add(
+                u64::try_from(i.saturating_duration_since(at_now).as_millis()).unwrap_or(u64::MAX),
+            )
+        };
+        let attempt = u64::try_from(self.heartbeat_read_attempt.as_millis()).unwrap_or(u64::MAX);
+        let slowest = self
+            .slowest_read_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let lead = slowest.saturating_mul(2).saturating_add(50).min(attempt);
+        let held = self.trust_ends.lock().unwrap_or_else(|p| p.into_inner());
+        let claims = held
+            .iter()
+            .filter(|(id, (written_at, _))| read_early.get(*id) != Some(written_at))
+            .map(|(id, (_, ends))| (id.as_str(), *ends));
+        let (at, ids) = wasmkeep_cluster::membership::early_reads(claims, now, to_ms(next), lead)?;
+        let at = at_now + Duration::from_millis(at.saturating_sub(now));
+        Some((at, ids.into_iter().map(str::to_owned).collect()))
+    }
+
+    /// Applies heartbeats just read by a listing or reads issued at
+    /// `issued` ([`super::process::Transport::note_heartbeats`]: a node
+    /// found gone is dropped, one whose read failed stays as last read, and
+    /// a read issued earlier than the one held, by this app or another of
+    /// the process, changes nothing). Then refreshes, from every node as
+    /// last read, the view, the trust and the watches.
+    fn apply_heartbeats(&self, read: Heartbeats, issued: std::time::Instant) {
+        let transport = Arc::clone(&self.transport);
+        transport.note_heartbeats(read, issued, |all, judged, fresh| {
+            self.apply_view(all, judged, fresh);
+        });
+    }
+
+    /// [`Self::apply_heartbeats`]'s second half, under the process's lock
+    /// of the heartbeats as last read: every node as last read (`all`),
+    /// the same judged by their first read (`judged`), and those just read
+    /// (`fresh`).
+    fn apply_view(&self, all: &[NodeInfo], judged: &[NodeInfo], fresh: &[String]) {
+        let now = now_ms();
+        *self.known_nodes.lock().unwrap_or_else(|p| p.into_inner()) =
+            all.iter().map(|n| n.id.clone()).collect();
+        for n in all
+            .iter()
+            .filter(|n| n.id != self.node_id && fresh.contains(&n.id))
+        {
+            crate::metrics::METRICS
+                .heartbeat_age_ms
+                .observe_ms(now.saturating_sub(n.written_at_ms));
+        }
+        // Against every heartbeat, live or not: a twin whose clock lags
+        // may look stale.
+        self.check_twin(all);
+        self.note_old_versions(all);
+        self.note_future_leases(all);
+        // The view and the trust judge each heartbeat by its `written_at`,
+        // or by when the process first read it if that is earlier (a clock
+        // ahead): never by when a read finished, and never later than its
+        // own date.
+        *self.stopped_nodes.lock().unwrap_or_else(|p| p.into_inner()) = all
+            .iter()
+            .filter(|n| matches!(n.lease, Some(NodeState::Released | NodeState::Fenced)))
+            .map(|n| n.id.clone())
+            .collect();
+        let nodes = self.membership.live(judged.to_vec());
+        {
+            let raw = |id: &str| all.iter().find(|n| n.id == id).map(|n| n.written_at_ms);
+            *self.trust_ends.lock().unwrap_or_else(|p| p.into_inner()) = nodes
+                .iter()
+                .filter(|n| n.id != self.node_id)
+                .filter_map(|n| {
+                    let ends = n.written_at_ms.saturating_add(self.heartbeat_horizon_ms);
+                    Some((n.id.clone(), (raw(&n.id)?, ends)))
+                })
+                .collect();
+        }
+        self.note_multi_app(&nodes);
+        let mixed = older_nodes(&self.node_id, &nodes);
+        let period = u64::try_from(self.heartbeat_every.as_millis()).unwrap_or(u64::MAX);
+        let logged = self
+            .conflict_logged_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !mixed.is_empty() && now.saturating_sub(logged) >= period {
+            self.conflict_logged_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(serves = %self.serves, "{}", older_nodes_advice(&mixed));
+        }
+        // The process's trust table; when an address changed hands (or its
+        // node left), every pooled connection is dropped. A node kept as
+        // last read has the same pins there: nothing is dropped for it.
+        self.transport
+            .refresh_trust(&nodes, self.heartbeat_horizon_ms);
+        if self.refuse_plaintext {
+            self.note_plain_peers(&nodes, now);
+        }
+        // Plain `http://` bases and `https://` cluster listeners only:
+        // calls between nodes carry signatures, and the forwarding clients
+        // speak HTTP, over TLS or not.
+        let mut peers = nodes
+            .iter()
+            .filter_map(|n| Some((n.id.clone(), Peer::of(n)?)))
+            .collect();
+        {
+            let mut view = self.peers.write().unwrap_or_else(|p| p.into_inner());
+            carry_first_seen(&view, &mut peers);
+            *view = peers;
+        }
+        // The same bodies, for the requests kept until a dead node's
+        // actors are free: no bucket request.
+        self.failover.observe(all, now);
+        // Last, and handed to the fence task: a fence awaits the bucket,
+        // and neither this view nor the next listing may wait for it. Only
+        // the heartbeats just read are watched as seen again: one kept as
+        // last read is not evidence that its node stopped writing.
+        let due = self.fences_due(all, fresh);
+        if !due.is_empty() {
+            let _ = self.fences_due.send(due);
+        }
+        self.note_view_shape(&nodes, all);
     }
 
     /// Wakes the alarm sweep when the nodes it shares the index with
@@ -627,6 +996,34 @@ impl Cluster {
         if changed {
             self.view_changed.notify_one();
         }
+    }
+
+    /// Reads node `id`'s heartbeat by key soon, on a task of its own
+    /// ([`join_read_loop`]), unless it is in this node's view and not
+    /// stopped: a signed call named it, or this node looks for it, so it
+    /// may have just joined, or restarted under its id after a clean stop
+    /// (its heartbeat as last read `released`, which the rounds no longer
+    /// read; the process's table of live senders may still hold the
+    /// stopped instance's last live heartbeat until its horizon, so it is
+    /// not what decides).
+    pub(crate) fn read_soon(&self, id: &str) {
+        if id == self.node_id {
+            return;
+        }
+        let in_view = self
+            .peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id);
+        let stopped = self
+            .stopped_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(id);
+        if in_view && !stopped {
+            return;
+        }
+        let _ = self.reads_wanted.send(id.to_owned());
     }
 
     /// Asks for a listing of `nodes/` at once (at most one early listing a
@@ -656,14 +1053,17 @@ impl Cluster {
     /// fenced (an old binary would not see it).
     #[cfg(test)]
     pub(super) async fn fence_stale_nodes(&self, all: &[NodeInfo]) {
-        let due = self.fences_due(all);
+        let read: Vec<String> = all.iter().map(|n| n.id.clone()).collect();
+        let due = self.fences_due(all, &read);
         self.fence_due(due).await;
     }
 
-    /// The listing's side of [`Self::fence_stale_nodes`]: watches every
-    /// node's lease in the listing and returns those due for a fence. No
-    /// bucket request.
-    pub(super) fn fences_due(&self, all: &[NodeInfo]) -> Vec<FenceDue> {
+    /// The listing's side of [`Self::fence_stale_nodes`]: watches the
+    /// lease of every node `all` holds (as last read) that `read` names
+    /// (read just now) and returns those due for a fence; a node only kept
+    /// as last read is neither seen again nor forgotten. No bucket
+    /// request.
+    pub(super) fn fences_due(&self, all: &[NodeInfo], read: &[String]) -> Vec<FenceDue> {
         let now = now_ms();
         // One read: the validity the watch counts from and the epoch each
         // fence is checked against are the same.
@@ -673,7 +1073,10 @@ impl Cluster {
             watch.own_lease(validity.until_ms, now);
             watch.retain(|node| all.iter().any(|n| n.id == node));
             let mut due = Vec::new();
-            for n in all.iter().filter(|n| n.id != self.node_id) {
+            for n in all
+                .iter()
+                .filter(|n| n.id != self.node_id && read.contains(&n.id))
+            {
                 match (&n.lease, &n.instance) {
                     (Some(NodeState::Live), Some(instance)) => {
                         if watch.observe(&n.id, instance, n.written_at_ms, now) {

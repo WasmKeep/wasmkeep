@@ -731,6 +731,14 @@ impl ActorService {
         }
     }
 
+    /// Whether this node would send to the node `node` now: in its view of
+    /// the cluster, its heartbeat live here, and over TLS the pins at its
+    /// address trusted. False outside a cluster. For tests and diagnostics.
+    #[doc(hidden)]
+    pub fn reaches_node(&self, node: &str) -> bool {
+        self.inner.cluster.as_ref().is_some_and(|c| c.reaches(node))
+    }
+
     /// Whether the node lease is valid now (always, outside a cluster).
     pub fn lease_valid_now(&self) -> bool {
         self.inner

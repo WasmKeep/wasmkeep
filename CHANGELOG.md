@@ -9,6 +9,40 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **A slow bucket no longer makes nodes distrust healthy peers** (ADR 0020
+  and ADR 0011, amendments of 2026-11-20). A node read its peers'
+  heartbeats one after the other, with no time limit, and read
+  `control/changed` after them in the same loop: on a slow bucket the
+  newer heartbeats came too late, the trust in a peer ran out although it
+  kept writing, and forwarding, calls and sockets to it failed with "the
+  heartbeat naming it expired". Now the reads go out at once, each within
+  a read attempt (2.67 s at the defaults); a read that fails or times out
+  keeps that peer as last read, trusted until its own horizon and no
+  longer, without dropping any pooled connection; a peer whose trust would
+  end before the next round lands is read again early; and the intents
+  are read on a task of their own. A heartbeat is judged by when it was
+  written, as before; one dated ahead of the node's clock now counts from
+  when the node first read it, so a dead peer whose clock ran fast is no
+  longer trusted for that much longer. The 10 s horizon is unchanged. New
+  metrics: `wasmkeep_heartbeat_read_milliseconds`,
+  `wasmkeep_node_lease_write_milliseconds`,
+  `wasmkeep_heartbeat_age_milliseconds`,
+  `wasmkeep_heartbeat_read_failures_total` and
+  `wasmkeep_heartbeat_early_reads_total`.
+- **Listing `nodes/` no longer holds up the heartbeat reads** (ADR 0020,
+  amendment of 2026-11-20). A node listed `nodes/` inline every ten
+  periods, and after a failed listing every period, so a slow LIST
+  stalled its reads. Listing now runs on a task of its own, for
+  discovery only, with a longer limit and a backoff; every period reads
+  the known nodes by key. Nodes whose lease is `released` or `fenced` are
+  read only when listing, not every period: a prefix holding many leases
+  left by earlier clusters costs nothing per period any more. A node that
+  says hello, or sends a signed hop, before it was listed is read by key
+  at once, so a join does not wait for a slow LIST (over TLS it still
+  waits for the listing its refused handshake asks for).
+- **`wasmkeep cluster forget` removes a released node lease** that no
+  ownership record names and that is older than 25 s. It still refuses
+  a live or fenced node lease, and a released one a record still names.
 - **An edge woken from hibernation delivers its first push to the sockets
   it kept, and answers every ping** (ADR 0040, sections 5 and 6). The edge
   used to place those sockets at the push's `head` before applying it, so

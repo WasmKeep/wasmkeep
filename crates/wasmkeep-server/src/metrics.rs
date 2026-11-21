@@ -170,6 +170,40 @@ impl Counts {
     }
 }
 
+/// Upper bounds, in milliseconds, of the histograms of the heartbeats'
+/// timing (ADR 0020, amendment of 2026-11-20): fine around the default
+/// period (3 s), the lease attempt (2.67 s) and the horizon (10 s).
+const HEARTBEAT_MS: [u64; 16] = [
+    10, 25, 50, 100, 250, 500, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 6_000, 8_000, 10_000,
+    15_000,
+];
+
+/// A histogram of the heartbeats' timing, in milliseconds.
+#[derive(Debug)]
+pub(crate) struct HeartbeatMs(Counts);
+impl Default for HeartbeatMs {
+    fn default() -> Self {
+        Self(Counts::new(&HEARTBEAT_MS))
+    }
+}
+
+impl HeartbeatMs {
+    pub(crate) fn observe(&self, d: Duration) {
+        self.0
+            .observe(u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn observe_ms(&self, ms: u64) {
+        self.0.observe(ms);
+    }
+
+    /// Observations so far.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.0.count.load(Ordering::Relaxed)
+    }
+}
+
 /// Fuel units per guest event.
 #[derive(Debug)]
 pub(crate) struct EventFuel(Counts);
@@ -420,6 +454,19 @@ pub(crate) struct Metrics {
     /// refreshes (every heartbeat period, and early on an unknown pin).
     /// Fences run apart.
     pub(crate) listing_seconds: Histogram,
+    /// One read of a peer's heartbeat object (ms), timed out ones at the
+    /// read attempt: this node's side of how late a heartbeat is seen.
+    pub(crate) heartbeat_read_ms: HeartbeatMs,
+    /// How old each peer's heartbeat was when this node applied it (ms,
+    /// this clock less its `written_at`): the writer's period and write
+    /// latency, this node's read latency, and the clocks' difference.
+    pub(crate) heartbeat_age_ms: HeartbeatMs,
+    /// Reads of a peer's heartbeat that failed or timed out: that peer is
+    /// kept as last read, trusted until its own horizon.
+    pub(crate) heartbeat_read_failures: AtomicU64,
+    /// Peers' heartbeats read before the next round because the trust in
+    /// them would have ended before that round could land.
+    pub(crate) heartbeat_early_reads: AtomicU64,
     /// One object a restore read from the bucket (a segment or a
     /// snapshot), from its request to its last byte, resends included.
     pub(crate) restore_read_seconds: Histogram,
@@ -432,6 +479,9 @@ pub(crate) struct Metrics {
     /// Node lease writes that failed or timed out: with the defaults, two
     /// in a row (a write every 3 s, valid for 8 s) and the lease runs out.
     pub(crate) node_lease_failures: AtomicU64,
+    /// One node lease write, from its send to its answer (ms): the
+    /// writer's side of how late peers see this node's heartbeat.
+    pub(crate) node_lease_write_ms: HeartbeatMs,
     /// Fences this node wrote over another node's lease (ADR 0020): that
     /// node stopped writing it for longer than its ttl plus grace.
     pub(crate) node_fences: AtomicU64,
@@ -1342,6 +1392,45 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
     );
     m.listing_seconds
         .render(&mut out, "wasmkeep_listing_seconds", "");
+    head(
+        &mut out,
+        "wasmkeep_heartbeat_read_milliseconds",
+        "histogram",
+        "One read of a peer's heartbeat, timed out ones at the read attempt.",
+    );
+    m.heartbeat_read_ms
+        .0
+        .render(&mut out, "wasmkeep_heartbeat_read_milliseconds");
+    head(
+        &mut out,
+        "wasmkeep_heartbeat_age_milliseconds",
+        "histogram",
+        "How old each peer's heartbeat was when this node applied it, by this node's clock.",
+    );
+    m.heartbeat_age_ms
+        .0
+        .render(&mut out, "wasmkeep_heartbeat_age_milliseconds");
+    head(
+        &mut out,
+        "wasmkeep_node_lease_write_milliseconds",
+        "histogram",
+        "One node lease (heartbeat) write of this node, from its send to its answer.",
+    );
+    m.node_lease_write_ms
+        .0
+        .render(&mut out, "wasmkeep_node_lease_write_milliseconds");
+    counter(
+        &mut out,
+        "wasmkeep_heartbeat_read_failures_total",
+        "Reads of a peer's heartbeat that failed or timed out; the peer is kept as last read until its own horizon.",
+        m.heartbeat_read_failures.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_heartbeat_early_reads_total",
+        "Peers' heartbeats read before the next round, the trust in them ending before it could land.",
+        m.heartbeat_early_reads.load(Ordering::Relaxed),
+    );
     head(
         &mut out,
         "wasmkeep_restore_read_seconds",

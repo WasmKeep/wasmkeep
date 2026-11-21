@@ -49,7 +49,7 @@ pub(crate) use forwarding::*;
 pub(crate) use handoff::*;
 pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
-pub(crate) use node_lease_task::lease_attempt;
+pub(crate) use node_lease_task::{heartbeat_read_attempt, lease_attempt};
 use node_lease_task::{lease_every, node_lease_loop};
 pub(crate) use placing::*;
 pub use process::NodeProcess;
@@ -516,6 +516,23 @@ pub(crate) struct Cluster {
     /// one by one between listings of `nodes/` (ADR 0020, amendment of
     /// 2026-11-14).
     known_nodes: Mutex<Vec<String>>,
+    /// Until when (ms, this clock) the trust in each live peer lasts, with
+    /// the `written_at` of the heartbeat it comes from: what an early read
+    /// is planned on.
+    trust_ends: Mutex<HashMap<String, (u64, u64)>>,
+    /// The nodes whose heartbeat, as last read, is `released` or `fenced`:
+    /// their instance never writes again, so rounds do not read them (the
+    /// listings do).
+    stopped_nodes: Mutex<std::collections::HashSet<String>>,
+    /// Node ids a signed call named that this node holds no live heartbeat
+    /// of, for [`view::join_read_loop`].
+    reads_wanted: tokio::sync::mpsc::UnboundedSender<String>,
+    /// How long one read of a heartbeat may take
+    /// ([`heartbeat_read_attempt`]); a listing gets two.
+    heartbeat_read_attempt: Duration,
+    /// The slowest heartbeat read of the last round (ms): early reads are
+    /// planned that far ahead, twice over, at most one attempt.
+    slowest_read_ms: std::sync::atomic::AtomicU64,
     /// A listing of `nodes/` was asked for (a hello, a failed early one):
     /// the next refresh lists.
     listing_wanted: std::sync::atomic::AtomicBool,
@@ -723,6 +740,7 @@ impl Cluster {
         // heartbeats, alarms, replication), counted for the metrics page.
         let store = crate::counted_store::counted(Arc::clone(&config.store));
         let (fences_due, fences_due_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reads_wanted, reads_wanted_rx) = tokio::sync::mpsc::unbounded_channel();
         let bucket = ObjectStoreBucket::new(Arc::clone(&store), config.prefix.clone());
         // Three tries to renew the node lease before it runs out (ADR 0020).
         if config.heartbeat > Duration::from_millis(config.lease.ttl_ms() / 3) {
@@ -852,6 +870,11 @@ impl Cluster {
             }),
             follows_app: config.follows_app,
             known_nodes: Mutex::new(Vec::new()),
+            trust_ends: Mutex::new(HashMap::new()),
+            stopped_nodes: Mutex::default(),
+            reads_wanted,
+            heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),
+            slowest_read_ms: std::sync::atomic::AtomicU64::new(0),
             listing_wanted: std::sync::atomic::AtomicBool::new(false),
             listing_asked: Arc::new(tokio::sync::Notify::new()),
             view_shape: Mutex::new(None),
@@ -869,6 +892,9 @@ impl Cluster {
         tokio::spawn(node_lease_loop(Arc::downgrade(&cluster)));
         tokio::spawn(pending_loop(Arc::downgrade(&cluster)));
         tokio::spawn(heartbeat_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(control_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(listing_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(join_read_loop(Arc::downgrade(&cluster), reads_wanted_rx));
         tokio::spawn(fence_loop(Arc::downgrade(&cluster), fences_due_rx));
         Ok(cluster)
     }
@@ -1595,6 +1621,7 @@ impl Cluster {
             Some(_) => Err("hop's sender is a node of another app"),
             None if on_cluster_port || self.refuse_plaintext => {
                 self.want_listing();
+                self.read_soon(&sender);
                 Err("hop's sender is not a live node")
             }
             None => Ok(Some(sender)),
@@ -2451,6 +2478,9 @@ impl Cluster {
         let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         let Some(peer) = peers.get(node) else {
             drop(peers);
+            // Its object by key at once: it may have just joined, or
+            // restarted under its id (ADR 0020, amendment of 2026-11-20).
+            self.read_soon(node);
             let known = self
                 .known_nodes
                 .lock()
@@ -2477,6 +2507,15 @@ impl Cluster {
 
     fn clients(&self) -> Arc<Clients> {
         self.transport.clients()
+    }
+
+    /// Whether this node would send to `node` now: in the view, its
+    /// heartbeat live here (as the sender check of its hops sees it), and
+    /// over TLS the pins at its address trusted.
+    pub(crate) fn reaches(&self, node: &str) -> bool {
+        self.address_of(node).is_some_and(|base| {
+            self.transport.live_app(node).is_some() && self.check_tls_target(&base).is_ok()
+        })
     }
 
     /// Before sending to `base` over TLS (perhaps on a pooled connection):

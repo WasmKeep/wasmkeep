@@ -1,0 +1,359 @@
+//! A slow bucket, as seen from one node (ADR 0020 and ADR 0011,
+//! amendments of 2026-11-20): its reads of the heartbeats answer late, or
+//! its read of `control/changed` never answers. Its trust in a peer that
+//! keeps writing must not lapse because of its own late reads, while a
+//! peer that stopped writing still lapses one horizon after its last
+//! write.
+//!
+//! Timings here: heartbeats every 100 ms, a horizon of 400 ms (three
+//! periods plus 100 ms of allowed skew), one heartbeat read at most 266 ms
+//! (the lease attempt).
+
+use super::*;
+
+/// How often the samples below look at `a`'s view.
+const SAMPLE: Duration = Duration::from_millis(10);
+
+/// Samples whether `node` reaches `peer` every [`SAMPLE`] for `span`:
+/// how many samples found it did not, of how many.
+async fn unreached(node: &ActorService, peer: &str, span: Duration) -> (usize, usize) {
+    let started = std::time::Instant::now();
+    let (mut missed, mut taken) = (0, 0);
+    while started.elapsed() < span {
+        taken += 1;
+        if !node.reaches_node(peer) {
+            missed += 1;
+        }
+        tokio::time::sleep(SAMPLE).await;
+    }
+    (missed, taken)
+}
+
+/// Waits (up to 5 s) until `node` reaches every one of `peers`.
+async fn reaches_all(node: &ActorService, peers: &[&str]) {
+    let started = std::time::Instant::now();
+    while !peers.iter().all(|p| node.reaches_node(p)) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never reached all of {peers:?}"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+}
+
+/// Every heartbeat read from `a` answers 100 ms late. Read one after the
+/// other, with `control/changed` after them in the same loop, `a`'s view
+/// of three nodes would be renewed only every 300 ms or more, and its trust
+/// in each peer (400 ms after that peer's write) would lapse for part of
+/// every round: forwarding refused, hops from that peer refused. Read at
+/// once, each is renewed every period. A peer that dies meanwhile (cut
+/// off from the bucket, then gone) still lapses within the horizon of its
+/// last write.
+#[tokio::test(flavor = "multi_thread")]
+async fn forwarding_stays_up_on_a_slow_bucket_while_a_dead_peer_expires() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let down_c = Arc::new(AtomicBool::new(false));
+    let seen_by_c: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down_c)));
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let c = node_unplaced("c", dc.path(), &seen_by_c, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    // `x` lives on b.
+    let r = send(b.addr, "GET", "/actor/t/x/fired", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("b")));
+    reaches_all(&a.service, &["b", "c"]).await;
+
+    flaky_a.delay_node_gets_ms.store(100, Ordering::SeqCst);
+    // Requests through a for b's actor all along, while the view is sampled.
+    let addr = a.addr;
+    let traffic = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut failed = Vec::new();
+        let mut sent = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            sent += 1;
+            let r = send(addr, "GET", "/actor/t/x/fired", "").await;
+            if (r.status, r.node.as_deref()) != (200, Some("b")) {
+                failed.push((r.status, r.body));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (sent, failed)
+    });
+    let (missed, taken) = unreached(&a.service, "b", Duration::from_secs(2)).await;
+    let (sent, failed) = traffic.await.unwrap();
+    assert_eq!(
+        missed, 0,
+        "a's trust in b lapsed in {missed} of {taken} samples on a slow bucket"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {sent} forwarded requests failed: {failed:?}",
+        failed.len()
+    );
+
+    // c dies: cut off from the bucket (it can neither renew nor release
+    // its heartbeat), then gone. Its last write came before this.
+    down_c.store(true, Ordering::SeqCst);
+    let died = std::time::Instant::now();
+    stop_listening(c).await;
+    while a.service.reaches_node("c") {
+        assert!(
+            died.elapsed() < Duration::from_secs(5),
+            "a still trusts c 5 s after it died"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    let lapsed = died.elapsed();
+    // The horizon (400 ms) after its last write, whatever a's reads do;
+    // the slack is the sampling and a loaded machine.
+    assert!(
+        lapsed < Duration::from_millis(900),
+        "a trusted c for {lapsed:?} after it died"
+    );
+    // And b stayed reachable through it all.
+    let (missed, taken) = unreached(&a.service, "b", Duration::from_millis(500)).await;
+    assert_eq!(missed, 0, "b unreached in {missed} of {taken} samples");
+    eprintln!("a stopped trusting c {lapsed:?} after it died");
+}
+
+/// A read of `control/changed` that never answers does not hold up the
+/// view: the operator's intents are read on a task of their own, so the
+/// heartbeats are still read every period and the trust in a peer that
+/// keeps writing never lapses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_control_read_does_not_hold_up_the_view() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    reaches_all(&a.service, &["b"]).await;
+    flaky_a.hang_control_changed.store(true, Ordering::SeqCst);
+    let (missed, taken) = unreached(&a.service, "b", Duration::from_millis(1_500)).await;
+    assert_eq!(
+        missed, 0,
+        "a's trust in b lapsed in {missed} of {taken} samples while control/changed hung"
+    );
+    let r = send(a.addr, "GET", "/actor/t/y/fired", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    drop(b);
+}
+
+/// A listing of `nodes/` that takes 1.5 s from a (three times the two read
+/// attempts a listing had, inline in a round, before the amendment's
+/// second part): the listing runs on a task of its own, for discovery
+/// only, and every round reads the known peers by key, so the trust in a
+/// peer that keeps writing never lapses and forwarding stays up, while a
+/// peer that dies still lapses within the horizon of its last write.
+/// Before, every round listed again (the failed listing left it due),
+/// waited out the listing's limit, then read by key: rounds of more than
+/// half a second against a 400 ms horizon.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_listing_holds_up_no_read_and_a_dead_peer_still_expires() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let down_c = Arc::new(AtomicBool::new(false));
+    let seen_by_c: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down_c)));
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let c = node_unplaced("c", dc.path(), &seen_by_c, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    let r = send(b.addr, "GET", "/actor/t/x/fired", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("b")));
+    reaches_all(&a.service, &["b", "c"]).await;
+
+    flaky_a.delay_node_lists_ms.store(1_500, Ordering::SeqCst);
+    let addr = a.addr;
+    let traffic = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut failed = Vec::new();
+        let mut sent = 0;
+        while started.elapsed() < Duration::from_secs(3) {
+            sent += 1;
+            let r = send(addr, "GET", "/actor/t/x/fired", "").await;
+            if (r.status, r.node.as_deref()) != (200, Some("b")) {
+                failed.push((r.status, r.body));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (sent, failed)
+    });
+    let (missed, taken) = unreached(&a.service, "b", Duration::from_secs(3)).await;
+    let (sent, failed) = traffic.await.unwrap();
+    assert_eq!(
+        missed, 0,
+        "a's trust in b lapsed in {missed} of {taken} samples while listings were slow"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {sent} forwarded requests failed: {failed:?}",
+        failed.len()
+    );
+
+    down_c.store(true, Ordering::SeqCst);
+    let died = std::time::Instant::now();
+    stop_listening(c).await;
+    while a.service.reaches_node("c") {
+        assert!(
+            died.elapsed() < Duration::from_secs(5),
+            "a still trusts c 5 s after it died"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    let lapsed = died.elapsed();
+    assert!(
+        lapsed < Duration::from_millis(900),
+        "a trusted c for {lapsed:?} after it died"
+    );
+}
+
+/// A node that joins while a's listings take 3 s: its hello (a signed
+/// node call naming it) makes a read its heartbeat by key at once, so a
+/// trusts it within about a period rather than after a listing. Over TLS
+/// its first hello is refused at the handshake (a does not know its pin
+/// yet), which asks for a listing: it is trusted once that slow listing
+/// lands, which a listing given only two read attempts never did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    reaches_all(&a.service, &["b"]).await;
+    flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
+    let joined = std::time::Instant::now();
+    let c = node_unplaced("c", dc.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let limit = if over_tls() {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(2)
+    };
+    while !a.service.reaches_node("c") {
+        assert!(
+            joined.elapsed() < limit,
+            "a did not trust c within {limit:?} of its start while listings took 3 s"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    eprintln!("a trusted c {:?} after it started", joined.elapsed());
+    drop((b, c));
+}
+
+/// A rolling restart: b stops cleanly (its lease `released`) and starts
+/// again under the same id, a new instance. a's rounds leave a released
+/// node out, so a must read b's object by key when b' calls (its hello,
+/// plain) or when a looks for b (a request naming it, or this test's
+/// samples, over TLS where the hello is refused at the handshake): it
+/// trusts b' within about a period, whether its listings are slow or
+/// refused. Before, only a listing found b'.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_restarted_under_its_id_is_read_by_key_whatever_the_listing() {
+    for refused in [false, true] {
+        let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+        let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+        let (da, db, db2) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let idle = Duration::from_secs(30);
+        // a allows 2 s of skew, so its horizon (2.3 s) outlasts b's restart
+        // (its start check waits ttl plus grace, 1.2 s, after the release),
+        // as the defaults' 10 s horizon outlasts a restart after a clean
+        // stop: a still holds b's last live heartbeat when b' calls.
+        let a = node_configured(
+            "a",
+            da.path(),
+            &seen_by_a,
+            idle,
+            &["t"],
+            test_actor_wasm(),
+            Duration::from_secs(30),
+            "",
+            |config| {
+                no_placement(config);
+                config.cluster.as_mut().unwrap().lease =
+                    LeaseConfig::new(1_000, 4_000, 200, 2_000).unwrap();
+            },
+        )
+        .await;
+        let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+        settle().await;
+        reaches_all(&a.service, &["b"]).await;
+        if refused {
+            flaky_a.fail_node_list.store(true, Ordering::SeqCst);
+        } else {
+            flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
+        }
+        // b stops cleanly: its lease is released.
+        stop_listening(b).await;
+        let started = std::time::Instant::now();
+        loop {
+            use object_store::ObjectStoreExt as _;
+            let body = shared
+                .get(&"nodes/b".into())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            if String::from_utf8_lossy(&body).contains("\nreleased ") {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "b never released"
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        while a.service.reaches_node("b") {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a still trusts b"
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        // b' : the same id, a new instance (and over TLS a new key).
+        let b2 = node_unplaced("b", db2.path(), &shared, idle, "t", test_actor_wasm()).await;
+        let up = std::time::Instant::now();
+        while !a.service.reaches_node("b") {
+            assert!(
+                up.elapsed() < Duration::from_secs(1),
+                "a did not trust b restarted under its id within 1 s (listing {})",
+                if refused { "refused" } else { "3 s late" }
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        drop(b2);
+    }
+}

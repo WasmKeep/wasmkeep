@@ -106,6 +106,8 @@ mod room;
 mod routing;
 #[path = "signed_calls.rs"]
 mod signed_calls;
+#[path = "slow_bucket.rs"]
+mod slow_bucket;
 #[path = "snapshots.rs"]
 mod snapshots;
 #[path = "supervisor.rs"]
@@ -993,6 +995,17 @@ struct Flaky {
     fail_node_list: Arc<AtomicBool>,
     /// Every read of a lease object waits this many ms first.
     delay_lease_get_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Every read and listing of heartbeats (`nodes/`) waits this many ms
+    /// first: a slow bucket, as seen from this node only.
+    delay_node_gets_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// While set, reads of `control/changed` never answer.
+    hang_control_changed: Arc<AtomicBool>,
+    /// Every listing of `nodes/` waits this many ms first (reads of each
+    /// object do not): a slow LIST.
+    delay_node_lists_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Reads of this key fail while set (`nodes/b`: this node cannot read
+    /// b's heartbeat by key, as after a hello).
+    fail_gets_of: Arc<std::sync::Mutex<Option<String>>>,
     /// Writes of ownership records (`owners/...`) fail while set.
     fail_owner_puts: Arc<AtomicBool>,
     /// The next this-many segment (`/wal/`) uploads never answer and are
@@ -1054,6 +1067,10 @@ impl Flaky {
             fail_control_list: Arc::default(),
             fail_node_list: Arc::default(),
             delay_lease_get_ms: Arc::default(),
+            delay_node_gets_ms: Arc::default(),
+            hang_control_changed: Arc::default(),
+            delay_node_lists_ms: Arc::default(),
+            fail_gets_of: Arc::default(),
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
@@ -1329,6 +1346,24 @@ impl ObjectStore for Flaky {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         self.check()?;
+        let failed = self.fail_gets_of.lock().unwrap().as_deref() == Some(location.as_ref());
+        if failed {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "read refused".into(),
+            });
+        }
+        if location.as_ref().starts_with("nodes/") {
+            let delay = self.delay_node_gets_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+        if location.as_ref().ends_with("control/changed")
+            && self.hang_control_changed.load(Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         if location.as_ref().contains("/wal/") || location.as_ref().contains("/snapshot/") {
             self.history_gets.fetch_add(1, Ordering::SeqCst);
             if self.hang_history_gets.load(Ordering::SeqCst) {
@@ -1519,6 +1554,21 @@ impl ObjectStore for Flaky {
                 })
             })
             .boxed();
+        }
+        if prefix.is_some_and(|p| p.as_ref() == "nodes") {
+            let delay = self
+                .delay_node_gets_ms
+                .load(Ordering::SeqCst)
+                .max(self.delay_node_lists_ms.load(Ordering::SeqCst));
+            if delay > 0 {
+                let listing = self.inner.list(prefix);
+                return futures_util::stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    listing
+                })
+                .flatten()
+                .boxed();
+            }
         }
         if prefix.is_some_and(|p| p.as_ref().contains("/owners/")) {
             let delay = self.delay_owner_lists_ms.load(Ordering::SeqCst);

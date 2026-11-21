@@ -184,6 +184,7 @@ impl NodeProcess {
                     connector,
                     nodes,
                     live: RwLock::default(),
+                    heard: Mutex::default(),
                 });
                 *slot = Some(Arc::clone(&t));
                 t
@@ -264,9 +265,156 @@ pub(crate) struct Transport {
     /// sender of a hop is checked against it, as its pin is against the
     /// process's pins (ADR 0038, section 5).
     live: RwLock<std::collections::HashMap<String, (String, u64)>>,
+    /// Each node's heartbeat as last read by any app of the process (a
+    /// listing or one read of its object; `None`: found gone), with when
+    /// that read was issued (ADR 0020, amendment of 2026-11-20). The read
+    /// issued last wins, whichever lands last, so a body read earlier never
+    /// undoes a fence or a new key read since, by this app or another. A
+    /// read that fails changes nothing: its node stays as last read,
+    /// trusted until that heartbeat's own horizon and no longer.
+    heard: Mutex<Heard>,
+}
+
+/// [`Transport::note_heartbeats`]'s state.
+#[derive(Debug, Default)]
+struct Heard {
+    /// Each node's heartbeat as last read, with when that read was issued.
+    bodies: std::collections::HashMap<String, (std::time::Instant, Option<NodeInfo>)>,
+    /// When the process first read each node's current heartbeat.
+    first_seen: wasmkeep_cluster::membership::FirstSeen,
+}
+
+/// Heartbeats just read, to record ([`Transport::note_heartbeats`]).
+pub(super) enum Heartbeats {
+    /// A listing of `nodes/`: every node there is.
+    Listed(Vec<NodeInfo>),
+    /// Reads of some nodes' objects, each with what it found.
+    Read(Vec<(String, HeartbeatRead)>),
 }
 
 impl Transport {
+    /// Records heartbeats read by a listing or reads issued at `issued`,
+    /// then runs `apply` on the result while still holding it, so that two
+    /// apps of the process never apply their views out of order (each
+    /// applies the newest the process has):
+    ///
+    /// - a node's entry is replaced only by a read issued later than the
+    ///   one it holds, and a listing marks the nodes it leaves out gone;
+    /// - never by a `live` body of the instance a held `fenced` or
+    ///   `released` body names: that process cannot write again, so such a
+    ///   body was served before the fence or the release landed, however
+    ///   late its read was issued;
+    /// - each heartbeat is judged by its `written_at`, or by when the
+    ///   process first read it if that is earlier (a clock ahead,
+    ///   [`wasmkeep_cluster::membership::FirstSeen`]): the same for every
+    ///   app, and kept while the process runs (a restart of the process
+    ///   starts it again).
+    ///
+    /// `apply` gets every node as last read (by id), the same judged, and
+    /// the nodes this call replaced.
+    pub(super) fn note_heartbeats<R>(
+        &self,
+        read: Heartbeats,
+        issued: std::time::Instant,
+        apply: impl FnOnce(&[NodeInfo], &[NodeInfo], &[String]) -> R,
+    ) -> R {
+        let now = crate::cluster_tls::now_ms();
+        let mut heard = self.heard.lock().unwrap_or_else(|p| p.into_inner());
+        let Heard { bodies, first_seen } = &mut *heard;
+        let stopped_instance = |held: Option<&(std::time::Instant, Option<NodeInfo>)>| {
+            held.and_then(|(_, b)| b.as_ref())
+                .filter(|b| {
+                    matches!(
+                        b.lease,
+                        Some(
+                            wasmkeep_cluster::node_lease::NodeState::Fenced
+                                | wasmkeep_cluster::node_lease::NodeState::Released
+                        )
+                    )
+                })
+                .and_then(|b| b.instance.clone())
+        };
+        let mut put = |id: String, body: Option<NodeInfo>| {
+            let held = bodies.get(&id);
+            if held.is_some_and(|(at, _)| *at > issued) {
+                return false;
+            }
+            let stale_live = body.as_ref().is_some_and(|b| {
+                b.lease == Some(wasmkeep_cluster::node_lease::NodeState::Live)
+                    && b.instance.is_some()
+                    && stopped_instance(held) == b.instance
+            });
+            if stale_live {
+                return false;
+            }
+            bodies.insert(id, (issued, body));
+            true
+        };
+        let mut fresh = Vec::new();
+        match read {
+            Heartbeats::Listed(listed) => {
+                let mut listed_ids = std::collections::HashSet::new();
+                for n in listed {
+                    let id = n.id.clone();
+                    listed_ids.insert(id.clone());
+                    if put(id.clone(), Some(n)) {
+                        fresh.push(id);
+                    }
+                }
+                drop(put);
+                let gone: Vec<String> = bodies
+                    .keys()
+                    .filter(|id| !listed_ids.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    if bodies.get(&id).is_some_and(|(at, _)| *at <= issued) {
+                        bodies.insert(id, (issued, None));
+                    }
+                }
+            }
+            Heartbeats::Read(reads) => {
+                for (id, read) in reads {
+                    match read {
+                        HeartbeatRead::Found(n) => {
+                            if put(id.clone(), Some(*n)) {
+                                fresh.push(id);
+                            }
+                        }
+                        HeartbeatRead::Gone => {
+                            put(id, None);
+                        }
+                        HeartbeatRead::Failed(_) => {}
+                    }
+                }
+                drop(put);
+            }
+        }
+        let mut all: Vec<NodeInfo> = bodies.values().filter_map(|(_, b)| b.clone()).collect();
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+        first_seen.retain(|id| all.iter().any(|n| n.id == id));
+        let judged: Vec<NodeInfo> = all
+            .iter()
+            .map(|n| {
+                let mut n = n.clone();
+                n.written_at_ms = first_seen.written_at(&n.id, n.written_at_ms, now);
+                n
+            })
+            .collect();
+        apply(&all, &judged, &fresh)
+    }
+
+    /// Node `id`'s heartbeat as last read.
+    #[cfg(test)]
+    pub(super) fn heard_body(&self, id: &str) -> Option<NodeInfo> {
+        self.heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bodies
+            .get(id)
+            .and_then(|(_, b)| b.clone())
+    }
+
     /// The clients to other nodes, as they are now.
     pub(super) fn clients(&self) -> Arc<Clients> {
         Arc::clone(&self.clients.read().unwrap_or_else(|p| p.into_inner()))
@@ -314,10 +462,63 @@ impl Transport {
         wasmkeep_cluster::membership::all_heartbeats(&self.nodes).await
     }
 
-    /// The heartbeats of the nodes `ids` names, read one by one.
-    pub(super) async fn read_nodes(&self, ids: &[String]) -> Result<Vec<NodeInfo>, BucketError> {
-        wasmkeep_cluster::membership::heartbeats_of(&self.nodes, ids).await
+    /// The heartbeats of the nodes `ids` names, all read at once, each
+    /// within `attempt` (ADR 0020, amendment of 2026-11-20): one slow or
+    /// hung read costs one attempt, not the others' reads. Each with what
+    /// its read found, in the order given.
+    pub(super) async fn read_each(
+        &self,
+        ids: &[String],
+        attempt: std::time::Duration,
+    ) -> Vec<(String, HeartbeatRead)> {
+        // Owned, each its own future, collected first: nothing borrowed is
+        // held across the joined reads.
+        let reads: Vec<_> = ids
+            .iter()
+            .map(|id| read_one(self.nodes.clone(), id.clone(), attempt))
+            .collect();
+        futures_util::future::join_all(reads).await
     }
+}
+
+/// One read of node `id`'s heartbeat, within `attempt`.
+async fn read_one(
+    nodes: ObjectStoreBucket,
+    id: String,
+    attempt: std::time::Duration,
+) -> (String, HeartbeatRead) {
+    let started = std::time::Instant::now();
+    let keys = [id];
+    let read = tokio::time::timeout(
+        attempt,
+        wasmkeep_cluster::membership::heartbeats_of(&nodes, &keys),
+    )
+    .await;
+    crate::metrics::METRICS
+        .heartbeat_read_ms
+        .observe(started.elapsed());
+    let [id] = keys;
+    let read = match read {
+        Ok(Ok(found)) => match found.into_iter().find(|n| n.id == id) {
+            Some(n) => HeartbeatRead::Found(Box::new(n)),
+            None => HeartbeatRead::Gone,
+        },
+        Ok(Err(e)) => HeartbeatRead::Failed(e.to_string()),
+        Err(_) => HeartbeatRead::Failed(format!("no answer within {attempt:?}")),
+    };
+    (id, read)
+}
+
+/// What one read of a node's heartbeat object found.
+#[derive(Debug, Clone)]
+pub(super) enum HeartbeatRead {
+    /// Its heartbeat.
+    Found(Box<NodeInfo>),
+    /// No object (`cluster forget`), or one this version cannot read: no
+    /// longer a node, as a listing would leave it out.
+    Gone,
+    /// No answer in time, or an error: what was last read of it stands.
+    Failed(String),
 }
 
 #[cfg(test)]

@@ -583,8 +583,10 @@ async fn fuller_then_run_here(call: bool) {
     for i in 0..9 {
         assert_eq!(wake(&a, &format!("a{i}")).await.node.as_deref(), Some("a"));
     }
-    // Exercise delayed discovery without CPU load or a startup-phase guess.
+    // Exercise delayed discovery without CPU load or a startup-phase guess:
+    // no listing, and no read of b's object by key (b's hello asks for one).
     a_bucket.fail_node_list.store(true, Ordering::SeqCst);
+    *a_bucket.fail_gets_of.lock().unwrap() = Some("nodes/b".to_owned());
     let b_bucket = Arc::new(Flaky::new(Arc::clone(&store), Arc::default()));
     let b_store: Arc<dyn ObjectStore> = b_bucket.clone();
     let b = placing_node_full(
@@ -628,6 +630,7 @@ async fn fuller_then_run_here(call: bool) {
         probe.head
     );
     a_bucket.fail_node_list.store(false, Ordering::SeqCst);
+    *a_bucket.fail_gets_of.lock().unwrap() = None;
     eventually(
         "a's fresh view routes to b with its advertised load",
         async || {

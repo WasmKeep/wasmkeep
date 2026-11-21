@@ -7,6 +7,14 @@
   five places a node claims, the hand-over racing its own release, alarms
   and sockets during a hand-over, and the cost of the control listing.
   The first draft's "warm-up" became an alarm hand-off.
+- Amended 2026-11-20: the intents (`control/changed`, and `control/` when
+  it changed) are read on a task of their own, every heartbeat period,
+  each bucket operation within one heartbeat read attempt, so a slow
+  bucket that answers still has them applied; one operation that does not
+  answer keeps the last intents, as a failed refresh does. They were read after the
+  heartbeats in the same loop, so a read of `control/` that hung stopped
+  the heartbeats' reads too ([ADR 0020](0020-one-lease-per-node.md),
+  amendment of the same day).
 - Amended by [ADR 0022](0022-app-owned-state-and-the-one-time-migration.md)
   (0.4.0): move keys are under the app's root, `state/<t>/<a>/moves/...`
   (below, `control/move/<tenant>/...` is the layout before 0.4.0); calls

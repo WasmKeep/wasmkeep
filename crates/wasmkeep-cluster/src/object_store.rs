@@ -154,47 +154,69 @@ impl Directory for ObjectStoreBucket {
                 Path::from(self.prefix.trim_end_matches('/')).as_ref()
             )
         };
-        let mut out = Vec::with_capacity(metas.len());
-        for meta in metas {
-            // Not under the prefix in the store's encoding: never expected;
-            // skip it rather than hand back a key that is not relative.
-            let Some(key) = meta.location.as_ref().strip_prefix(encoded_prefix.as_str()) else {
-                continue;
-            };
-            let key = key.to_owned();
-            match self.store.get(&meta.location).await {
-                Ok(r) => out.push((
-                    key,
-                    r.bytes()
-                        .await
-                        .map_err(|e| BucketError::Unavailable(e.to_string()))?
-                        .to_vec(),
-                )),
-                // Deleted between list and get: skip it.
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(BucketError::Unavailable(e.to_string())),
-            }
-        }
-        Ok(out)
+        // Not under the prefix in the store's encoding: never expected;
+        // skipped rather than hand back a key that is not relative.
+        let listed: Vec<(String, Path)> = metas
+            .into_iter()
+            .filter_map(|meta| {
+                let key = meta
+                    .location
+                    .as_ref()
+                    .strip_prefix(encoded_prefix.as_str())?
+                    .to_owned();
+                Some((key, meta.location))
+            })
+            .collect();
+        self.bodies(listed).await
     }
 
     async fn read(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            match self.store.get(&self.path(key)).await {
-                Ok(r) => out.push((
-                    key.clone(),
-                    r.bytes()
-                        .await
-                        .map_err(|e| BucketError::Unavailable(e.to_string()))?
-                        .to_vec(),
-                )),
-                // Deleted (`cluster forget`): no longer a node.
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(BucketError::Unavailable(e.to_string())),
-            }
-        }
-        Ok(out)
+        let objects: Vec<(String, Path)> = keys
+            .iter()
+            .map(|key| (key.clone(), self.path(key)))
+            .collect();
+        self.bodies(objects).await
+    }
+}
+
+/// Reads a listing or a set of keys sends at once: one slow object costs
+/// one read's time, not one more read per object before it.
+const READS_AT_ONCE: usize = 16;
+
+impl ObjectStoreBucket {
+    /// The bodies of `objects` (each its key and its location), read up to
+    /// [`READS_AT_ONCE`] at a time, in the order given; one that is gone
+    /// (deleted between a listing and its read, or by `cluster forget`) is
+    /// left out. Any other failure fails the whole read.
+    async fn bodies(
+        &self,
+        objects: Vec<(String, Path)>,
+    ) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+        use futures_util::{StreamExt, TryStreamExt};
+        // Each read owns what it uses: nothing borrowed is held across
+        // the reads in flight (the futures must be `Send` for any lifetime).
+        let reads: Vec<_> = objects
+            .into_iter()
+            .map(|(key, location)| {
+                let store = Arc::clone(&self.store);
+                async move {
+                    match store.get(&location).await {
+                        Ok(r) => r
+                            .bytes()
+                            .await
+                            .map(|b| Some((key, b.to_vec())))
+                            .map_err(|e| BucketError::Unavailable(e.to_string())),
+                        Err(object_store::Error::NotFound { .. }) => Ok(None),
+                        Err(e) => Err(BucketError::Unavailable(e.to_string())),
+                    }
+                }
+            })
+            .collect();
+        let found: Vec<Option<(String, Vec<u8>)>> = futures_util::stream::iter(reads)
+            .buffered(READS_AT_ONCE)
+            .try_collect()
+            .await?;
+        Ok(found.into_iter().flatten().collect())
     }
 }
 
