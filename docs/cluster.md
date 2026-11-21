@@ -1298,6 +1298,9 @@ never an actor is not created.
 - **Not a pin.** Once idle, the actor hibernates on `node-c`, and its next
   event claims it wherever that event lands. A draining node does not act
   on move requests; its drain moves everything.
+- **Big rooms.** For a large room, move its pusher so it does not share a
+  node with the room; placement does not yet keep them apart. See
+  [Place a large room's pusher on another node](designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node).
 - **Retries.** A move that cannot finish (a socket that will not close, a
   target that does not answer) is tried again on every heartbeat until it
   works or the request expires (5 minutes).
