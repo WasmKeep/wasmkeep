@@ -274,17 +274,19 @@ async fn an_idle_node_lists_and_reads_what_its_cadences_say() {
         let periods = r.periods.max(1);
         let per = |n: usize| n as f64 / periods as f64;
         // `nodes/` every 10 periods (0.1 a period), and three heartbeats
-        // read a period, plus the listing's three every ten periods (on
-        // its own task since ADR 0020's amendment of 2026-11-20).
+        // read a period by the rounds, the listing's own reads of the three
+        // left out (on its own task since ADR 0020's amendment of
+        // 2026-11-20).
         assert!(
             (0.05..=0.2).contains(&per(r.list_nodes)),
             "{id} listed nodes/ {} times in {periods} periods",
             r.list_nodes
         );
         assert!(
-            (2.7..=3.6).contains(&per(r.get_nodes)),
-            "{id} read {} heartbeats in {periods} periods",
-            r.get_nodes
+            (2.7..=3.3).contains(&per(r.get_nodes.saturating_sub(3 * r.list_nodes))),
+            "{id} read {} heartbeats in {periods} periods, {} listings",
+            r.get_nodes,
+            r.list_nodes
         );
         // `control/changed` once a period; the intents (four prefixes:
         // drains, the app's moves, deletes and restores) every 20 periods.

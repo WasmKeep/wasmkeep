@@ -227,8 +227,13 @@ pub(super) async fn listing_loop(cluster: std::sync::Weak<Cluster>, every: Durat
         }
         c.take_listing_wanted();
         let started = tokio::time::Instant::now();
-        last = Some(started);
-        if c.list_heartbeats(c.listing_limit()).await {
+        let listed = c.list_heartbeats(c.listing_limit()).await;
+        drop(c);
+        // Counted from when it ended: a listing that hung until its limit
+        // is not followed by another at once.
+        let ended = tokio::time::Instant::now();
+        last = Some(ended);
+        if listed {
             failures = 0;
             next = started + scheduled;
         } else {
@@ -236,7 +241,7 @@ pub(super) async fn listing_loop(cluster: std::sync::Weak<Cluster>, every: Durat
             let periods = 2u32
                 .saturating_pow(failures.saturating_sub(1))
                 .min(wasmkeep_cluster::membership::FULL_LISTING_EVERY);
-            next = started + every.saturating_mul(periods);
+            next = ended + every.saturating_mul(periods);
         }
     }
 }
@@ -993,11 +998,29 @@ impl Cluster {
         }
     }
 
-    /// Reads node `id`'s heartbeat by key soon, on a task of its own, if
-    /// this node holds no live heartbeat of it: a signed call named it, so
-    /// it may have just joined ([`join_read_loop`]).
+    /// Reads node `id`'s heartbeat by key soon, on a task of its own
+    /// ([`join_read_loop`]), unless it is in this node's view and not
+    /// stopped: a signed call named it, or this node looks for it, so it
+    /// may have just joined, or restarted under its id after a clean stop
+    /// (its heartbeat as last read `released`, which the rounds no longer
+    /// read; the process's table of live senders may still hold the
+    /// stopped instance's last live heartbeat until its horizon, so it is
+    /// not what decides).
     pub(crate) fn read_soon(&self, id: &str) {
-        if id == self.node_id || self.transport.live_app(id).is_some() {
+        if id == self.node_id {
+            return;
+        }
+        let in_view = self
+            .peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id);
+        let stopped = self
+            .stopped_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(id);
+        if in_view && !stopped {
             return;
         }
         let _ = self.reads_wanted.send(id.to_owned());

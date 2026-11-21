@@ -267,3 +267,93 @@ async fn a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello() {
     eprintln!("a trusted c {:?} after it started", joined.elapsed());
     drop((b, c));
 }
+
+/// A rolling restart: b stops cleanly (its lease `released`) and starts
+/// again under the same id, a new instance. a's rounds leave a released
+/// node out, so a must read b's object by key when b' calls (its hello,
+/// plain) or when a looks for b (a request naming it, or this test's
+/// samples, over TLS where the hello is refused at the handshake): it
+/// trusts b' within about a period, whether its listings are slow or
+/// refused. Before, only a listing found b'.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_restarted_under_its_id_is_read_by_key_whatever_the_listing() {
+    for refused in [false, true] {
+        let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+        let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+        let (da, db, db2) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let idle = Duration::from_secs(30);
+        // a allows 2 s of skew, so its horizon (2.3 s) outlasts b's restart
+        // (its start check waits ttl plus grace, 1.2 s, after the release),
+        // as the defaults' 10 s horizon outlasts a restart after a clean
+        // stop: a still holds b's last live heartbeat when b' calls.
+        let a = node_configured(
+            "a",
+            da.path(),
+            &seen_by_a,
+            idle,
+            &["t"],
+            test_actor_wasm(),
+            Duration::from_secs(30),
+            "",
+            |config| {
+                no_placement(config);
+                config.cluster.as_mut().unwrap().lease =
+                    LeaseConfig::new(1_000, 4_000, 200, 2_000).unwrap();
+            },
+        )
+        .await;
+        let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+        settle().await;
+        reaches_all(&a.service, &["b"]).await;
+        if refused {
+            flaky_a.fail_node_list.store(true, Ordering::SeqCst);
+        } else {
+            flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
+        }
+        // b stops cleanly: its lease is released.
+        stop_listening(b).await;
+        let started = std::time::Instant::now();
+        loop {
+            use object_store::ObjectStoreExt as _;
+            let body = shared
+                .get(&"nodes/b".into())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            if String::from_utf8_lossy(&body).contains("\nreleased ") {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "b never released"
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        while a.service.reaches_node("b") {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a still trusts b"
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        // b' : the same id, a new instance (and over TLS a new key).
+        let b2 = node_unplaced("b", db2.path(), &shared, idle, "t", test_actor_wasm()).await;
+        let up = std::time::Instant::now();
+        while !a.service.reaches_node("b") {
+            assert!(
+                up.elapsed() < Duration::from_secs(1),
+                "a did not trust b restarted under its id within 1 s (listing {})",
+                if refused { "refused" } else { "3 s late" }
+            );
+            tokio::time::sleep(SAMPLE).await;
+        }
+        drop(b2);
+    }
+}

@@ -103,7 +103,13 @@ of what adding nodes does, read
   on the prefix still names, once either is older than 25 s; it refuses a
   live or fenced node lease, and a released one a record still names (that
   lease is what frees the record; each such record is taken over by the
-  next request for its actor). Released leases left by earlier clusters on
+  next request for its actor). A store's DELETE takes no condition, so
+  the command reads the object twice and deletes only if it did not
+  change between the reads; a process starting under that id whose first
+  write lands in the moment between the second read and the delete loses
+  that lease and exits (its next write finds the object gone), and its
+  service manager starts it again: availability only, nothing is taken
+  from another node. Released leases left by earlier clusters on
   a prefix cost nothing per heartbeat period (nodes read them only when
   they list `nodes/`, every 30 s), so removing them is tidying, not a
   fix.

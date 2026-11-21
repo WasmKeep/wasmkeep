@@ -2478,6 +2478,9 @@ impl Cluster {
         let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
         let Some(peer) = peers.get(node) else {
             drop(peers);
+            // Its object by key at once: it may have just joined, or
+            // restarted under its id (ADR 0020, amendment of 2026-11-20).
+            self.read_soon(node);
             let known = self
                 .known_nodes
                 .lock()

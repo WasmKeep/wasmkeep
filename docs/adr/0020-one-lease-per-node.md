@@ -1039,10 +1039,15 @@ key, beside the few live nodes.
   listing, or sooner by its hello. Its object stays as last read for the
   free rule (section 3) and the failover wait, as before. With 90
   released leases and three live nodes a round makes four reads, not 94.
-- **A join is not held up by a slow LIST.** A hello, or a hop whose
-  signed sender this node holds no live heartbeat of, makes this node
-  read that node's object by key at once, on a task of its own, at most
-  once a period per node (`join_read_loop`). Over TLS the first hello of a
+- **A join is not held up by a slow LIST.** A hello, a hop from a signed
+  sender, or this node looking for a node (`address_of`, a record naming
+  it) makes this node read that node's object by key at once, on a task of
+  its own, at most once a period per node (`join_read_loop`), unless that
+  node is in its view and not stopped. So a node restarted under its id
+  after a clean stop (`released`, which the rounds no longer read) is
+  found within about a period, whatever the listing does; the process's
+  table of live senders, which keeps the stopped instance's last live
+  heartbeat until its horizon, does not decide it. Over TLS the first hello of a
   new process is refused at the handshake (its pin is not known yet),
   which asks for a listing as before: such a join waits for that listing,
   which now lands however slow the LIST, where a listing given two
@@ -1065,7 +1070,12 @@ still naming the node (section 3; an absent object frees nothing), so it
 must stay while any does; no new record can name it, since only its own
 process writes records naming itself and that process released; and a
 new process under the id replaces the object first, which the second
-read sees. A `fenced` lease stays: its process did not stop cleanly, so
+read sees. What remains: a store's DELETE takes no condition (the bucket adapter
+has no conditional delete), so a process starting under that id whose
+first write lands between the second read and the delete loses its lease
+(its next write finds no object, `LostCause::Deleted`) and exits, to be
+started again. That costs availability only: nothing was held under the
+new instance yet, and no other node's state is touched. A `fenced` lease stays: its process did not stop cleanly, so
 records likely still name it, and the fence is the evidence that frees
 them and that ends that instance. A `live` one stays (fence it to revoke
 the node).
@@ -1089,7 +1099,10 @@ conservative choice.
   `a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello`
   (LIST 3 s late: plain, the joining node is trusted within 2 s through
   its hello's read by key; over TLS within 10 s, through the listing its
-  refused handshake asks for; before, never).
+  refused handshake asks for; before, never) and
+  `a_node_restarted_under_its_id_is_read_by_key_whatever_the_listing` (a
+  clean stop, then the same id again: trusted within 1 s with listings 3 s
+  late or refused; before, only a listing found it).
 - `cluster::tests::a_round_reads_only_the_nodes_that_may_still_write`
   (90 released leases and three live nodes: four reads a round, 94
   before).
@@ -1097,6 +1110,6 @@ conservative choice.
   (wasmkeep-cli: removed when no record names it; kept when one does,
   when recent, and when fenced or live).
 - `tests/cluster/listings.rs`: a listing's read of a node's own object is
-  no longer one of its rounds, and a node now reads three heartbeats a
-  period plus a listing's three every ten periods; the counts follow.
+  no longer one of its rounds, and a listing's reads are left out of the
+  heartbeats read a period (three, as before).
 
