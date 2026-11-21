@@ -272,7 +272,16 @@ pub(crate) struct Transport {
     /// undoes a fence or a new key read since, by this app or another. A
     /// read that fails changes nothing: its node stays as last read,
     /// trusted until that heartbeat's own horizon and no longer.
-    heard: Mutex<std::collections::HashMap<String, (std::time::Instant, Option<NodeInfo>)>>,
+    heard: Mutex<Heard>,
+}
+
+/// [`Transport::note_heartbeats`]'s state.
+#[derive(Debug, Default)]
+struct Heard {
+    /// Each node's heartbeat as last read, with when that read was issued.
+    bodies: std::collections::HashMap<String, (std::time::Instant, Option<NodeInfo>)>,
+    /// When the process first read each node's current heartbeat.
+    first_seen: wasmkeep_cluster::membership::FirstSeen,
 }
 
 /// Heartbeats just read, to record ([`Transport::note_heartbeats`]).
@@ -284,22 +293,62 @@ pub(super) enum Heartbeats {
 }
 
 impl Transport {
-    /// Records heartbeats read by a listing or reads issued at `issued`:
-    /// a node's entry is replaced only by a read issued later than the one
-    /// it holds; a listing marks the nodes it leaves out gone. Returns every
-    /// node as last read (by id) and the nodes this call replaced.
-    pub(super) fn note_heartbeats(
+    /// Records heartbeats read by a listing or reads issued at `issued`,
+    /// then runs `apply` on the result while still holding it, so that two
+    /// apps of the process never apply their views out of order (each
+    /// applies the newest the process has):
+    ///
+    /// - a node's entry is replaced only by a read issued later than the
+    ///   one it holds, and a listing marks the nodes it leaves out gone;
+    /// - never by a `live` body of the instance a held `fenced` or
+    ///   `released` body names: that process cannot write again, so such a
+    ///   body was served before the fence or the release landed, however
+    ///   late its read was issued;
+    /// - each heartbeat is judged by its `written_at`, or by when the
+    ///   process first read it if that is earlier (a clock ahead,
+    ///   [`wasmkeep_cluster::membership::FirstSeen`]): the same for every
+    ///   app, and kept while the process runs (a restart of the process
+    ///   starts it again).
+    ///
+    /// `apply` gets every node as last read (by id), the same judged, and
+    /// the nodes this call replaced.
+    pub(super) fn note_heartbeats<R>(
         &self,
         read: Heartbeats,
         issued: std::time::Instant,
-    ) -> (Vec<NodeInfo>, Vec<String>) {
+        apply: impl FnOnce(&[NodeInfo], &[NodeInfo], &[String]) -> R,
+    ) -> R {
+        let now = crate::cluster_tls::now_ms();
         let mut heard = self.heard.lock().unwrap_or_else(|p| p.into_inner());
-        let mut put = |id: String, body: Option<NodeInfo>| match heard.get(&id) {
-            Some((at, _)) if *at > issued => false,
-            _ => {
-                heard.insert(id, (issued, body));
-                true
+        let Heard { bodies, first_seen } = &mut *heard;
+        let stopped_instance = |held: Option<&(std::time::Instant, Option<NodeInfo>)>| {
+            held.and_then(|(_, b)| b.as_ref())
+                .filter(|b| {
+                    matches!(
+                        b.lease,
+                        Some(
+                            wasmkeep_cluster::node_lease::NodeState::Fenced
+                                | wasmkeep_cluster::node_lease::NodeState::Released
+                        )
+                    )
+                })
+                .and_then(|b| b.instance.clone())
+        };
+        let mut put = |id: String, body: Option<NodeInfo>| {
+            let held = bodies.get(&id);
+            if held.is_some_and(|(at, _)| *at > issued) {
+                return false;
             }
+            let stale_live = body.as_ref().is_some_and(|b| {
+                b.lease == Some(wasmkeep_cluster::node_lease::NodeState::Live)
+                    && b.instance.is_some()
+                    && stopped_instance(held) == b.instance
+            });
+            if stale_live {
+                return false;
+            }
+            bodies.insert(id, (issued, body));
+            true
         };
         let mut fresh = Vec::new();
         match read {
@@ -313,14 +362,14 @@ impl Transport {
                     }
                 }
                 drop(put);
-                let gone: Vec<String> = heard
+                let gone: Vec<String> = bodies
                     .keys()
                     .filter(|id| !listed_ids.contains(*id))
                     .cloned()
                     .collect();
                 for id in gone {
-                    if heard.get(&id).is_some_and(|(at, _)| *at <= issued) {
-                        heard.insert(id, (issued, None));
+                    if bodies.get(&id).is_some_and(|(at, _)| *at <= issued) {
+                        bodies.insert(id, (issued, None));
                     }
                 }
             }
@@ -341,9 +390,18 @@ impl Transport {
                 drop(put);
             }
         }
-        let mut all: Vec<NodeInfo> = heard.values().filter_map(|(_, b)| b.clone()).collect();
+        let mut all: Vec<NodeInfo> = bodies.values().filter_map(|(_, b)| b.clone()).collect();
         all.sort_by(|a, b| a.id.cmp(&b.id));
-        (all, fresh)
+        first_seen.retain(|id| all.iter().any(|n| n.id == id));
+        let judged: Vec<NodeInfo> = all
+            .iter()
+            .map(|n| {
+                let mut n = n.clone();
+                n.written_at_ms = first_seen.written_at(&n.id, n.written_at_ms, now);
+                n
+            })
+            .collect();
+        apply(&all, &judged, &fresh)
     }
 
     /// Node `id`'s heartbeat as last read.
@@ -352,6 +410,7 @@ impl Transport {
         self.heard
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .bodies
             .get(id)
             .and_then(|(_, b)| b.clone())
     }

@@ -19,6 +19,7 @@ pub(super) struct FenceDue {
 }
 
 use super::process::Heartbeats;
+use wasmkeep_cluster::lease::BucketError;
 
 /// The nodes as one refresh saw them: id, instance, lease state, live.
 pub(super) type ViewShape = Vec<(String, Option<String>, Option<NodeState>, bool)>;
@@ -233,8 +234,10 @@ async fn identity_unique(cluster: std::sync::Weak<Cluster>) -> bool {
 /// 0020, amendment of 2026-11-20): before, it ran after the view's refresh
 /// in [`heartbeat_loop`], and a read of `control/` that hung held up the
 /// heartbeats' reads, and the trust in every peer lapsed a horizon later.
-/// Each refresh is bounded by two heartbeat read attempts; one that runs
-/// out keeps the last intents read, as a failed one does (ADR 0014).
+/// Each bucket operation of a refresh is bounded by one heartbeat read
+/// attempt ([`Bounded`]), not the whole refresh: a slow bucket that answers
+/// still has the intents applied, late; one operation that does not answer
+/// fails the refresh, which keeps the last intents read (ADR 0014).
 pub(super) async fn control_loop(cluster: std::sync::Weak<Cluster>, every: Duration) {
     if !identity_unique(cluster.clone()).await {
         return;
@@ -248,13 +251,65 @@ pub(super) async fn control_loop(cluster: std::sync::Weak<Cluster>, every: Durat
         if c.identity_taken() {
             return;
         }
-        let limit = c.heartbeat_read_attempt * 2;
-        let watching = &mut watch;
-        let reading = async move { c.refresh_control_if_changed(watching).await };
-        if tokio::time::timeout(limit, reading).await.is_err() {
-            tracing::warn!("reading control/ took longer than {limit:?}; keeping the last intents");
-        }
+        c.refresh_control_if_changed(&mut watch).await;
+        drop(c);
         tokio::time::sleep_until(next).await;
+    }
+}
+
+/// The bucket's `control/` and intents, each operation within `attempt`
+/// (one that runs out is a failure, as the bucket not answering).
+pub(super) struct Bounded<'a> {
+    keys: &'a ObjectStoreBucket,
+    attempt: Duration,
+}
+
+impl Bounded<'_> {
+    async fn within<T>(
+        &self,
+        op: impl std::future::Future<Output = Result<T, BucketError>>,
+    ) -> Result<T, BucketError> {
+        tokio::time::timeout(self.attempt, op)
+            .await
+            .unwrap_or_else(|_| {
+                Err(BucketError::Unavailable(format!(
+                    "no answer within {:?}",
+                    self.attempt
+                )))
+            })
+    }
+}
+
+impl control::Keys for Bounded<'_> {
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+        self.within(self.keys.list_keys(prefix)).await
+    }
+
+    async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+        self.within(self.keys.put_empty(key)).await
+    }
+
+    async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+        self.within(self.keys.put_body(key, body)).await
+    }
+
+    async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+        self.within(self.keys.get_body(key)).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), BucketError> {
+        self.within(self.keys.delete(key)).await
+    }
+}
+
+impl Cluster {
+    /// `control/` and the intents, each operation within one heartbeat
+    /// read attempt.
+    pub(super) fn bounded_control(&self) -> Bounded<'_> {
+        Bounded {
+            keys: &self.control_keys,
+            attempt: self.heartbeat_read_attempt,
+        }
     }
 }
 
@@ -281,7 +336,7 @@ impl Cluster {
     /// 0014, amendment of 2026-11-14).
     pub(super) async fn refresh_control_if_changed(&self, watch: &mut control::ControlWatch) {
         use control::Keys as _;
-        let marker = self.control_keys.get_body(control::CHANGED).await;
+        let marker = self.bounded_control().get_body(control::CHANGED).await;
         if let Err(e) = &marker {
             tracing::debug!(error = %e, "reading control/changed failed");
         }
@@ -296,7 +351,7 @@ impl Cluster {
     /// this node is asked to drain. A failed listing keeps the last intents
     /// read (ADR 0014); false then.
     pub(super) async fn refresh_control(&self) -> bool {
-        match control::read(&self.control_keys, Some(&self.root), now_ms()).await {
+        match control::read(&self.bounded_control(), Some(&self.root), now_ms()).await {
             Ok(read) => {
                 let asked = read.draining.contains(&self.node_id);
                 let was = std::mem::replace(
@@ -736,8 +791,18 @@ impl Cluster {
     /// the process, changes nothing). Then refreshes, from every node as
     /// last read, the view, the trust and the watches.
     fn apply_heartbeats(&self, read: Heartbeats, issued: std::time::Instant) {
+        let transport = Arc::clone(&self.transport);
+        transport.note_heartbeats(read, issued, |all, judged, fresh| {
+            self.apply_view(all, judged, fresh);
+        });
+    }
+
+    /// [`Self::apply_heartbeats`]'s second half, under the process's lock
+    /// of the heartbeats as last read: every node as last read (`all`),
+    /// the same judged by their first read (`judged`), and those just read
+    /// (`fresh`).
+    fn apply_view(&self, all: &[NodeInfo], judged: &[NodeInfo], fresh: &[String]) {
         let now = now_ms();
-        let (all, fresh) = self.transport.note_heartbeats(read, issued);
         *self.known_nodes.lock().unwrap_or_else(|p| p.into_inner()) =
             all.iter().map(|n| n.id.clone()).collect();
         for n in all
@@ -750,25 +815,14 @@ impl Cluster {
         }
         // Against every heartbeat, live or not: a twin whose clock lags
         // may look stale.
-        self.check_twin(&all);
-        self.note_old_versions(&all);
-        self.note_future_leases(&all);
+        self.check_twin(all);
+        self.note_old_versions(all);
+        self.note_future_leases(all);
         // The view and the trust judge each heartbeat by its `written_at`,
-        // or by when this node first read it if that is earlier (a clock
+        // or by when the process first read it if that is earlier (a clock
         // ahead): never by when a read finished, and never later than its
         // own date.
-        let judged: Vec<NodeInfo> = {
-            let mut seen = self.first_seen.lock().unwrap_or_else(|p| p.into_inner());
-            seen.retain(|id| all.iter().any(|n| n.id == id));
-            all.iter()
-                .map(|n| {
-                    let mut n = n.clone();
-                    n.written_at_ms = seen.written_at(&n.id, n.written_at_ms, now);
-                    n
-                })
-                .collect()
-        };
-        let nodes = self.membership.live(judged);
+        let nodes = self.membership.live(judged.to_vec());
         {
             let raw = |id: &str| all.iter().find(|n| n.id == id).map(|n| n.written_at_ms);
             *self.trust_ends.lock().unwrap_or_else(|p| p.into_inner()) = nodes
@@ -813,16 +867,16 @@ impl Cluster {
         }
         // The same bodies, for the requests kept until a dead node's
         // actors are free: no bucket request.
-        self.failover.observe(&all, now);
+        self.failover.observe(all, now);
         // Last, and handed to the fence task: a fence awaits the bucket,
         // and neither this view nor the next listing may wait for it. Only
         // the heartbeats just read are watched as seen again: one kept as
         // last read is not evidence that its node stopped writing.
-        let due = self.fences_due(&all, &fresh);
+        let due = self.fences_due(all, fresh);
         if !due.is_empty() {
             let _ = self.fences_due.send(due);
         }
-        self.note_view_shape(&nodes, &all);
+        self.note_view_shape(&nodes, all);
     }
 
     /// Wakes the alarm sweep when the nodes it shares the index with

@@ -861,16 +861,26 @@ listing's reads after its LIST were sequential too.
   cadences of the 2026-11-14 amendment are unchanged. The early read is
   not cancelled by the end of the period; the round waits for it.
 - **The intents apart.** `control/changed` and `control/` are read on a
-  task of their own (`control_loop`), each refresh within two attempts;
-  one that runs out keeps the last intents, as a failed one does (ADR
-  0014). Loading the cluster secret at the top of a round is bounded the
-  same way.
+  task of their own (`control_loop`), each bucket operation of a refresh
+  within one read attempt (the marker's read, the four listings of the
+  intents, the deletes of expired ones), not the refresh as a whole: a
+  slow bucket that answers still has the intents applied, late, and one
+  operation that does not answer fails the refresh, which keeps the last
+  intents (ADR 0014). Loading the cluster secret at the top of a round is
+  bounded by two attempts.
 - **Order.** The heartbeats as last read are the process's, shared by
-  its apps as the trust table is (ADR 0038), and a node's entry is
-  replaced only by a read issued later than the one it holds, whichever
-  lands last: a stale `live` body, read by this app or another, cannot
-  undo a fence or a new key read since, and a listing issued before a read
-  does not drop the node that read found.
+  its apps as the trust table is (ADR 0038), and each app applies its view
+  while holding them, so two apps never publish their views out of order.
+  A node's entry is replaced only by a read issued later than the one it
+  holds, whichever lands last, and a listing issued before a read does not
+  drop the node that read found. Issue order is not the bucket's order: a
+  read issued later may have been served before a write another read
+  already saw. So a `live` body never replaces a held `fenced` or
+  `released` body of the same instance (that process can never write
+  again, so any live body of it is older). Other stale bodies served that
+  way are possible, for example an older `live` body of a node read after
+  a newer one: the next read replaces it, and the trust it gives still
+  ends at that older heartbeat's own horizon, so it is never extended.
 
 ### Freshness, and the clocks
 
@@ -878,9 +888,13 @@ A heartbeat is judged by when it was written, never by when this node's
 read of it finished: the trust in it ends at `written_at + horizon` on
 this node's clock, and no read result moves that end later except a newer
 heartbeat. One exception makes it shorter, never longer: a heartbeat dated
-ahead of this clock counts as written when this node first read that
-heartbeat (`membership::FirstSeen`), and reading it again does not move
-that. Before, a peer whose clock ran an hour fast was trusted for an hour
+ahead of this clock counts as written when the process first read that
+heartbeat (`membership::FirstSeen`, kept with the heartbeats as last read
+and shared by the process's apps), and reading it again does not move
+that, nor does an app joining the process or a runtime restarted in place.
+A restart of the whole process starts it again: a dead peer whose clock
+is ahead is then trusted for one more horizon from the restarted
+process's first read. Before, a peer whose clock ran an hour fast was trusted for an hour
 after it died.
 
 A peer's clock behind this one makes its trust end early by that much:
@@ -982,6 +996,10 @@ suite, plain and over TLS, with a bucket slow for one node:
   whose every read takes 300 ms end within a second; they took 1.5 s and 1.8 s),
   `a_heartbeat_dated_ahead_is_trusted_one_horizon_from_its_first_read`,
   `a_failed_read_carries_a_heartbeat_only_to_its_own_horizon` (the rule
-  kept) and `an_older_read_landing_late_never_undoes_a_newer_one`.
+  kept), `an_older_read_landing_late_never_undoes_a_newer_one`,
+  `a_live_body_read_late_never_undoes_a_fence_of_its_instance`,
+  `a_runtime_that_joins_late_does_not_trust_a_dead_fast_clock_peer_again`
+  and `a_slow_bucket_still_applies_the_intents` (every intents operation
+  200 ms, under the attempt, five of them past two attempts together).
 - `membership::tests`: `a_trust_about_to_end_before_the_next_round_lands_is_read_early`
   and `a_heartbeat_dated_ahead_counts_from_its_first_read`.

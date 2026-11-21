@@ -4717,6 +4717,9 @@ struct SlowNodeReads {
     hang: std::sync::Mutex<Option<String>>,
     /// Reads of this key fail at once.
     fail: std::sync::Mutex<Option<String>>,
+    /// Every other read and listing (`control/`, the app's intents) waits
+    /// this long first (ms): a slow bucket that still answers.
+    others_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Display for SlowNodeReads {
@@ -4766,6 +4769,13 @@ impl ObjectStore for SlowNodeReads {
                     source: "read refused".into(),
                 });
             }
+        } else {
+            let delay = self
+                .others_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
         }
         self.inner.get_opts(location, options).await
     }
@@ -4782,7 +4792,20 @@ impl ObjectStore for SlowNodeReads {
         prefix: Option<&StorePath>,
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
     {
-        self.inner.list(prefix)
+        use futures_util::StreamExt as _;
+        let delay = self
+            .others_delay_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let listing = self.inner.list(prefix);
+        if delay == 0 || prefix.is_some_and(|p| p.as_ref() == "nodes") {
+            return listing;
+        }
+        futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            listing
+        })
+        .flatten()
+        .boxed()
     }
 
     async fn list_with_delimiter(
@@ -4980,24 +5003,155 @@ async fn an_older_read_landing_late_never_undoes_a_newer_one() {
     );
     let found =
         |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
-    let (_, fresh) = a.transport.note_heartbeats(found(body("fenced")), newer);
+    let fresh = a
+        .transport
+        .note_heartbeats(found(body("fenced")), newer, |_, _, f| f.to_vec());
     assert_eq!(fresh, ["b"]);
-    let (all, fresh) = a.transport.note_heartbeats(found(body("live")), older);
+    let (all, fresh) = a
+        .transport
+        .note_heartbeats(found(body("live")), older, |a, _, f| {
+            (a.to_vec(), f.to_vec())
+        });
     assert!(fresh.is_empty(), "an older read replaced a newer one");
     assert_eq!(
         all[0].lease,
         Some(wasmkeep_cluster::node_lease::NodeState::Fenced)
     );
-    let (all, _) = a
+    let all = a
         .transport
-        .note_heartbeats(Heartbeats::Listed(Vec::new()), older);
+        .note_heartbeats(Heartbeats::Listed(Vec::new()), older, |a, _, _| a.to_vec());
     assert_eq!(all.len(), 1, "an older listing dropped a node read since");
-    let (all, _) = a.transport.note_heartbeats(
+    let all = a.transport.note_heartbeats(
         Heartbeats::Read(vec![(
             "b".to_owned(),
             HeartbeatRead::Failed("down".to_owned()),
         )]),
         newer + Duration::from_millis(1),
+        |a, _, _| a.to_vec(),
     );
     assert_eq!(all.len(), 1, "a failed read keeps the node as last read");
+}
+
+/// The first read of a heartbeat dated ahead is the process's (ADR 0038:
+/// its apps share the trust table): a runtime that joins the process after
+/// another one clamped a dead peer with a fast clock, or one restarted in
+/// place, does not count that heartbeat as written now and trust the peer
+/// for another horizon, nor rebuild the pools for it.
+#[tokio::test]
+async fn a_runtime_that_joins_late_does_not_trust_a_dead_fast_clock_peer_again() {
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        // Horizon 400 ms; a 3 h ttl, so nothing runs in the background.
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = runtime("shop-1", "shop");
+    // c's clock is an hour fast; it dies right after this write.
+    publish_tls(&store, "c", now_ms() + 3_600_000, 1).await;
+    let first_read = std::time::Instant::now();
+    assert!(shop.refresh_view(true).await);
+    assert_eq!(shop.check_tls_target("https://c.test:7443"), Ok(()));
+    tokio::time::sleep(Duration::from_millis(600).saturating_sub(first_read.elapsed())).await;
+    assert!(shop.refresh_view(true).await);
+    assert!(shop.check_tls_target("https://c.test:7443").is_err());
+    let pools = shop.clients();
+    // Another app joins the process, and reads the same heartbeat.
+    let blog = runtime("blog-1", "blog");
+    assert!(blog.refresh_view(true).await);
+    assert!(
+        shop.check_tls_target("https://c.test:7443").is_err(),
+        "the process trusts dead c again once another runtime joined"
+    );
+    // Restarted in place: the same again.
+    drop(blog);
+    let blog = runtime("blog-1", "blog");
+    assert!(blog.refresh_view(true).await);
+    assert!(shop.refresh_view(true).await);
+    assert!(blog.check_tls_target("https://c.test:7443").is_err());
+    assert!(Arc::ptr_eq(&pools, &shop.clients()), "pools churned");
+}
+
+/// The intents are read one bucket operation at a time, each within a
+/// read attempt, not the whole refresh within one limit: a bucket that
+/// answers every operation of a refresh slowly (200 ms each here, under
+/// the 266 ms attempt, five of them past two attempts together) still has
+/// the intents applied, late.
+#[tokio::test]
+async fn a_slow_bucket_still_applies_the_intents() {
+    let store = Arc::new(SlowNodeReads::default());
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+    let a = fast_node("a", &shared);
+    a.identity().await.unwrap();
+    store
+        .others_delay_ms
+        .store(200, std::sync::atomic::Ordering::SeqCst);
+    store
+        .inner
+        .put(&StorePath::from("control/drain/a"), Vec::new().into())
+        .await
+        .unwrap();
+    store
+        .inner
+        .put(
+            &StorePath::from("control/changed"),
+            b"drain a".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !a.draining() {
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the drain intent was never applied on a slow bucket"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A read issued later can still have been served before a fence or a
+/// release landed: its `live` body of the same instance must not undo the
+/// `fenced` one read before it. That process can never write again (its
+/// object only changes by conditional writes, and the fence took it), so
+/// a live body of it is stale whenever it is read.
+#[tokio::test]
+async fn a_live_body_read_late_never_undoes_a_fence_of_its_instance() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    let at = now_ms();
+    let body = |state: &str, instance: &str| {
+        let text = format!(
+            "wasmkeep-node 3\n{state} {instance}\n{at}\nb\nhttp://b\n0.0.0\nt/\nhttps://b.test:7443\n{}\nserving\n\ntake\n",
+            "ab".repeat(32)
+        );
+        NodeInfo::decode(text.as_bytes()).unwrap()
+    };
+    let found =
+        |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
+    let t0 = std::time::Instant::now();
+    a.transport
+        .note_heartbeats(found(body("fenced", "beef")), t0, |_, _, _| ());
+    let fresh = a.transport.note_heartbeats(
+        found(body("live", "beef")),
+        t0 + Duration::from_millis(1),
+        |_, _, f| f.to_vec(),
+    );
+    assert!(fresh.is_empty(), "a stale live body undid the fence");
+    assert_eq!(
+        a.transport.heard_body("b").and_then(|n| n.lease),
+        Some(wasmkeep_cluster::node_lease::NodeState::Fenced)
+    );
+    // A new process under that id may go live.
+    let fresh = a.transport.note_heartbeats(
+        found(body("live", "cafe")),
+        t0 + Duration::from_millis(2),
+        |_, _, f| f.to_vec(),
+    );
+    assert_eq!(fresh, ["b"]);
 }

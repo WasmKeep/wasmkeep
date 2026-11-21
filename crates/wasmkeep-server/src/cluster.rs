@@ -516,9 +516,6 @@ pub(crate) struct Cluster {
     /// one by one between listings of `nodes/` (ADR 0020, amendment of
     /// 2026-11-14).
     known_nodes: Mutex<Vec<String>>,
-    /// When this node first read each peer's current heartbeat: one dated
-    /// ahead of this clock is judged from then.
-    first_seen: Mutex<wasmkeep_cluster::membership::FirstSeen>,
     /// Until when (ms, this clock) the trust in each live peer lasts, with
     /// the `written_at` of the heartbeat it comes from: what an early read
     /// is planned on.
@@ -865,7 +862,6 @@ impl Cluster {
             }),
             follows_app: config.follows_app,
             known_nodes: Mutex::new(Vec::new()),
-            first_seen: Mutex::default(),
             trust_ends: Mutex::new(HashMap::new()),
             heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),
             slowest_read_ms: std::sync::atomic::AtomicU64::new(0),

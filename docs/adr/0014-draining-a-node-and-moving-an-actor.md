@@ -9,8 +9,9 @@
   The first draft's "warm-up" became an alarm hand-off.
 - Amended 2026-11-20: the intents (`control/changed`, and `control/` when
   it changed) are read on a task of their own, every heartbeat period,
-  each refresh within two heartbeat read attempts; one that runs out keeps
-  the last intents, as a failed one does. They were read after the
+  each bucket operation within one heartbeat read attempt, so a slow
+  bucket that answers still has them applied; one operation that does not
+  answer keeps the last intents, as a failed refresh does. They were read after the
   heartbeats in the same loop, so a read of `control/` that hung stopped
   the heartbeats' reads too ([ADR 0020](0020-one-lease-per-node.md),
   amendment of the same day).
