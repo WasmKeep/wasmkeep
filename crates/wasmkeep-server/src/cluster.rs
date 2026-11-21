@@ -49,7 +49,7 @@ pub(crate) use forwarding::*;
 pub(crate) use handoff::*;
 pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
-pub(crate) use node_lease_task::lease_attempt;
+pub(crate) use node_lease_task::{heartbeat_read_attempt, lease_attempt};
 use node_lease_task::{lease_every, node_lease_loop};
 pub(crate) use placing::*;
 pub use process::NodeProcess;
@@ -516,6 +516,25 @@ pub(crate) struct Cluster {
     /// one by one between listings of `nodes/` (ADR 0020, amendment of
     /// 2026-11-14).
     known_nodes: Mutex<Vec<String>>,
+    /// Each node's heartbeat as last read (by a listing or one read of its
+    /// object), live or not: a read that fails or times out leaves its
+    /// node here as it was, trusted until its own horizon and no longer
+    /// (ADR 0020, amendment of 2026-11-20). Only a listing that leaves a
+    /// node out, or a read that finds no object, drops it.
+    heartbeats_read: Mutex<HashMap<String, NodeInfo>>,
+    /// When this node first read each peer's current heartbeat: one dated
+    /// ahead of this clock is judged from then.
+    first_seen: Mutex<wasmkeep_cluster::membership::FirstSeen>,
+    /// Until when (ms, this clock) the trust in each live peer lasts, with
+    /// the `written_at` of the heartbeat it comes from: what an early read
+    /// is planned on.
+    trust_ends: Mutex<HashMap<String, (u64, u64)>>,
+    /// How long one read of a heartbeat may take
+    /// ([`heartbeat_read_attempt`]); a listing gets two.
+    heartbeat_read_attempt: Duration,
+    /// The slowest heartbeat read of the last round (ms): early reads are
+    /// planned that far ahead, twice over, at most one attempt.
+    slowest_read_ms: std::sync::atomic::AtomicU64,
     /// A listing of `nodes/` was asked for (a hello, a failed early one):
     /// the next refresh lists.
     listing_wanted: std::sync::atomic::AtomicBool,
@@ -852,6 +871,11 @@ impl Cluster {
             }),
             follows_app: config.follows_app,
             known_nodes: Mutex::new(Vec::new()),
+            heartbeats_read: Mutex::new(HashMap::new()),
+            first_seen: Mutex::default(),
+            trust_ends: Mutex::new(HashMap::new()),
+            heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),
+            slowest_read_ms: std::sync::atomic::AtomicU64::new(0),
             listing_wanted: std::sync::atomic::AtomicBool::new(false),
             listing_asked: Arc::new(tokio::sync::Notify::new()),
             view_shape: Mutex::new(None),
@@ -869,6 +893,7 @@ impl Cluster {
         tokio::spawn(node_lease_loop(Arc::downgrade(&cluster)));
         tokio::spawn(pending_loop(Arc::downgrade(&cluster)));
         tokio::spawn(heartbeat_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(control_loop(Arc::downgrade(&cluster), config.heartbeat));
         tokio::spawn(fence_loop(Arc::downgrade(&cluster), fences_due_rx));
         Ok(cluster)
     }
@@ -2477,6 +2502,15 @@ impl Cluster {
 
     fn clients(&self) -> Arc<Clients> {
         self.transport.clients()
+    }
+
+    /// Whether this node would send to `node` now: in the view, its
+    /// heartbeat live here (as the sender check of its hops sees it), and
+    /// over TLS the pins at its address trusted.
+    pub(crate) fn reaches(&self, node: &str) -> bool {
+        self.address_of(node).is_some_and(|base| {
+            self.transport.live_app(node).is_some() && self.check_tls_target(&base).is_ok()
+        })
     }
 
     /// Before sending to `base` over TLS (perhaps on a pooled connection):

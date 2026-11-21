@@ -952,6 +952,68 @@ pub fn without_recorded_head<'a>(
         .collect()
 }
 
+/// Which peers to read again before the next round of heartbeat reads,
+/// and when (ADR 0020, amendment of 2026-11-20). `claims`: each peer and
+/// when this node's trust in it ends (its heartbeat's `written_at` plus
+/// the horizon, ms on this clock). `next_ms`: when the next round is
+/// issued; `lead_ms`: how long one read may take. A peer whose trust ends
+/// before the next round could land (`next_ms + lead_ms`) is read
+/// `lead_ms` before it ends, at once if that passed; every peer so due is
+/// read with the earliest. `None` when the next round lands in time for
+/// all (a healthy bucket: no extra read).
+///
+/// So the trust in a peer that keeps writing does not lapse for want of a
+/// read: one issued `lead_ms` before the end returns a heartbeat at most
+/// one write period plus that write's latency old, which renews it as
+/// long as that and `lead_ms` fit in the horizon. Nothing is extended: the
+/// trust still ends at the date of the newest heartbeat read.
+pub fn early_reads<'a>(
+    claims: impl IntoIterator<Item = (&'a str, u64)>,
+    now_ms: u64,
+    next_ms: u64,
+    lead_ms: u64,
+) -> Option<(u64, Vec<&'a str>)> {
+    let landed_by = next_ms.saturating_add(lead_ms);
+    let mut due: Vec<(&str, u64)> = claims
+        .into_iter()
+        .filter(|(_, ends)| *ends < landed_by)
+        .map(|(id, ends)| (id, ends.saturating_sub(lead_ms).max(now_ms)))
+        .collect();
+    let at = due.iter().map(|(_, at)| *at).min()?;
+    due.sort_unstable();
+    due.dedup_by_key(|(id, _)| *id);
+    Some((at, due.into_iter().map(|(id, _)| id).collect()))
+}
+
+/// When this node first read each peer's current heartbeat, so that one
+/// dated ahead of this clock counts as written then, not at its date
+/// (ADR 0020, amendment of 2026-11-20): a peer whose clock is fast is not
+/// trusted past one horizon after this node first saw its last write,
+/// however far ahead its clock is.
+#[derive(Debug, Default)]
+pub struct FirstSeen(std::collections::HashMap<String, (u64, u64)>);
+
+impl FirstSeen {
+    /// The date to judge `id`'s heartbeat written at `written_at_ms` by,
+    /// read at `now_ms`: its own, or when this node first read that same
+    /// heartbeat if that is earlier. Reading it again changes nothing.
+    pub fn written_at(&mut self, id: &str, written_at_ms: u64, now_ms: u64) -> u64 {
+        let first = match self.0.get(id) {
+            Some((w, first)) if *w == written_at_ms => *first,
+            _ => {
+                self.0.insert(id.to_owned(), (written_at_ms, now_ms));
+                now_ms
+            }
+        };
+        written_at_ms.min(first)
+    }
+
+    /// Forgets the nodes `keep` does not keep.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.0.retain(|id, _| keep(id));
+    }
+}
+
 /// Hex of a pin, as heartbeats publish it.
 pub fn pin_hex(pin: &[u8; 32]) -> String {
     hex(pin)
@@ -968,6 +1030,55 @@ mod tests {
 
     #[derive(Default)]
     struct Mem(RefCell<BTreeMap<String, Vec<u8>>>);
+
+    /// ADR 0020, amendment of 2026-11-20: a peer whose trust would end
+    /// before the next round of reads could land is read again early,
+    /// `lead` before its trust ends (at once if that passed); peers with
+    /// room are left to the round.
+    #[test]
+    fn a_trust_about_to_end_before_the_next_round_lands_is_read_early() {
+        let (now, next, lead) = (100_000, 103_000, 2_670);
+        // A healthy bucket: every trust ends well after the next round.
+        assert_eq!(
+            early_reads([("b", 107_500), ("c", 105_700)], now, next, lead),
+            None
+        );
+        // One whose trust ends before `next + lead`: read `lead` ahead.
+        assert_eq!(
+            early_reads([("b", 107_500), ("c", 105_000)], now, next, lead),
+            Some((102_330, vec!["c"]))
+        );
+        // Already within `lead` of its end, or past it: at once. Every peer
+        // due before the round is read with the earliest.
+        assert_eq!(
+            early_reads(
+                [("b", 101_000), ("c", 105_000), ("d", 99_000)],
+                now,
+                next,
+                lead
+            ),
+            Some((now, vec!["b", "c", "d"]))
+        );
+    }
+
+    /// The clamp at first sight (ADR 0020, amendment of 2026-11-20): a
+    /// heartbeat dated ahead of this clock counts as written when this
+    /// node first read it, never later, and reading it again does not move
+    /// that.
+    #[test]
+    fn a_heartbeat_dated_ahead_counts_from_its_first_read() {
+        let mut seen = FirstSeen::default();
+        assert_eq!(seen.written_at("b", 5_000, 1_000), 1_000);
+        assert_eq!(seen.written_at("b", 5_000, 3_000), 1_000);
+        // Not ahead: its own date.
+        assert_eq!(seen.written_at("c", 900, 1_000), 900);
+        // A new write is a new first sight.
+        assert_eq!(seen.written_at("b", 6_000, 4_000), 4_000);
+        assert_eq!(seen.written_at("b", 3_500, 4_100), 3_500);
+        // Nodes no longer read are forgotten.
+        seen.retain(|id| id == "c");
+        assert_eq!(seen.written_at("b", 6_000, 9_000), 6_000);
+    }
 
     impl Directory for &Mem {
         async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {

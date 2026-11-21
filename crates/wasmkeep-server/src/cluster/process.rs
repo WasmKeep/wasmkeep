@@ -314,10 +314,63 @@ impl Transport {
         wasmkeep_cluster::membership::all_heartbeats(&self.nodes).await
     }
 
-    /// The heartbeats of the nodes `ids` names, read one by one.
-    pub(super) async fn read_nodes(&self, ids: &[String]) -> Result<Vec<NodeInfo>, BucketError> {
-        wasmkeep_cluster::membership::heartbeats_of(&self.nodes, ids).await
+    /// The heartbeats of the nodes `ids` names, all read at once, each
+    /// within `attempt` (ADR 0020, amendment of 2026-11-20): one slow or
+    /// hung read costs one attempt, not the others' reads. Each with what
+    /// its read found, in the order given.
+    pub(super) async fn read_each(
+        &self,
+        ids: &[String],
+        attempt: std::time::Duration,
+    ) -> Vec<(String, HeartbeatRead)> {
+        // Owned, each its own future, collected first: nothing borrowed is
+        // held across the joined reads.
+        let reads: Vec<_> = ids
+            .iter()
+            .map(|id| read_one(self.nodes.clone(), id.clone(), attempt))
+            .collect();
+        futures_util::future::join_all(reads).await
     }
+}
+
+/// One read of node `id`'s heartbeat, within `attempt`.
+async fn read_one(
+    nodes: ObjectStoreBucket,
+    id: String,
+    attempt: std::time::Duration,
+) -> (String, HeartbeatRead) {
+    let started = std::time::Instant::now();
+    let keys = [id];
+    let read = tokio::time::timeout(
+        attempt,
+        wasmkeep_cluster::membership::heartbeats_of(&nodes, &keys),
+    )
+    .await;
+    crate::metrics::METRICS
+        .heartbeat_read_ms
+        .observe(started.elapsed());
+    let [id] = keys;
+    let read = match read {
+        Ok(Ok(found)) => match found.into_iter().find(|n| n.id == id) {
+            Some(n) => HeartbeatRead::Found(n),
+            None => HeartbeatRead::Gone,
+        },
+        Ok(Err(e)) => HeartbeatRead::Failed(e.to_string()),
+        Err(_) => HeartbeatRead::Failed(format!("no answer within {attempt:?}")),
+    };
+    (id, read)
+}
+
+/// What one read of a node's heartbeat object found.
+#[derive(Debug, Clone)]
+pub(super) enum HeartbeatRead {
+    /// Its heartbeat.
+    Found(NodeInfo),
+    /// No object (`cluster forget`), or one this version cannot read: no
+    /// longer a node, as a listing would leave it out.
+    Gone,
+    /// No answer in time, or an error: what was last read of it stands.
+    Failed(String),
 }
 
 #[cfg(test)]

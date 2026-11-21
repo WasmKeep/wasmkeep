@@ -2102,7 +2102,8 @@ async fn a_lapse_after_a_node_was_found_due_cancels_its_fence() {
     }
     a.validity.set_until(Some(now + 4 * attempt));
     let all = a.membership.heartbeats().await.unwrap();
-    let due = a.fences_due(&all);
+    let read: Vec<String> = all.iter().map(|n| n.id.clone()).collect();
+    let due = a.fences_due(&all, &read);
     assert!(!due.is_empty(), "b found due");
     // A lapse, and the lease valid again, before the fence task gets to it.
     a.validity.bump_epoch();
@@ -4703,4 +4704,258 @@ fn node_info(id: &str) -> NodeInfo {
         can_place: false,
         process: None,
     }
+}
+
+/// A store whose reads of heartbeats (`nodes/`) are slow, hang or fail,
+/// as the test sets it.
+#[derive(Debug, Default)]
+struct SlowNodeReads {
+    inner: Arc<object_store::memory::InMemory>,
+    /// Every read of `nodes/` waits this long first (ms).
+    delay_ms: std::sync::atomic::AtomicU64,
+    /// Reads of this key never answer.
+    hang: std::sync::Mutex<Option<String>>,
+    /// Reads of this key fail at once.
+    fail: std::sync::Mutex<Option<String>>,
+}
+
+impl std::fmt::Display for SlowNodeReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowNodeReads({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SlowNodeReads {
+    async fn put_opts(
+        &self,
+        location: &StorePath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &StorePath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &StorePath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let key = location.as_ref();
+        if key.starts_with("nodes/") {
+            let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let hang = self.hang.lock().unwrap().as_deref() == Some(key);
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            let fail = self.fail.lock().unwrap().as_deref() == Some(key);
+            if fail {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "read refused".into(),
+                });
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&StorePath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &StorePath,
+        to: &StorePath,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Node `a` over TLS on `store`, 100 ms heartbeats and a 3 h ttl: it never
+/// gets past its start check, so nothing reads the bucket but the
+/// refreshes the test makes. Its horizon is 300 ms plus `skew_ms`; its
+/// heartbeat reads time out after 1 s.
+fn quiet_tls_node(store: &Arc<SlowNodeReads>, skew_ms: u64) -> Arc<Cluster> {
+    let store: Arc<dyn ObjectStore> = Arc::clone(store) as Arc<dyn ObjectStore>;
+    let mut config = ClusterConfig::new("a", "http://a", store);
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, skew_ms).unwrap();
+    config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
+    Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
+}
+
+/// Publishes a format-2 heartbeat for `id` written at `at`, at
+/// `https://<id>.test:7443` with the pin `pin` repeated.
+async fn publish_tls(store: &SlowNodeReads, id: &str, at: u64, pin: u8) {
+    let body = format!(
+        "wasmkeep-node 2\n{id}\nhttp://{id}\n0\n{at}\nt/\nhttps://{id}.test:7443\n{}\n",
+        format!("{pin:02x}").repeat(32)
+    );
+    store
+        .inner
+        .put(
+            &StorePath::from(format!("nodes/{id}")),
+            body.into_bytes().into(),
+        )
+        .await
+        .unwrap();
+}
+
+/// One peer's heartbeat read hangs: the round still ends within one read
+/// attempt, the other peer's newer heartbeat is applied, the hung one is
+/// kept as last read (trusted until its own horizon, no longer), and no
+/// connection pool is dropped (the view did not change).
+#[tokio::test]
+async fn one_hung_heartbeat_read_neither_holds_up_the_view_nor_drops_the_pools() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    let t0 = now_ms();
+    publish_tls(&store, "b", t0, 1).await;
+    publish_tls(&store, "c", t0, 2).await;
+    assert!(a.refresh_view(true).await);
+    let first = a.clients();
+    *store.hang.lock().unwrap() = Some("nodes/c".to_owned());
+    let later = now_ms() + 1;
+    publish_tls(&store, "b", later, 1).await;
+    let failures = || {
+        crate::metrics::METRICS
+            .heartbeat_read_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let failed_before = failures();
+    let started = std::time::Instant::now();
+    let answered = tokio::time::timeout(Duration::from_millis(2_500), a.refresh_view(false))
+        .await
+        .expect("one hung read held up the whole view");
+    assert!(!answered, "a round with a read unanswered is not a success");
+    assert!(started.elapsed() < Duration::from_millis(2_000));
+    assert_eq!(
+        a.heartbeats_read
+            .lock()
+            .unwrap()
+            .get("b")
+            .map(|n| n.written_at_ms),
+        Some(later),
+        "b's newer heartbeat applied"
+    );
+    assert_eq!(a.check_tls_target("https://b.test:7443"), Ok(()));
+    assert_eq!(
+        a.check_tls_target("https://c.test:7443"),
+        Ok(()),
+        "c kept as last read, within its horizon"
+    );
+    assert!(Arc::ptr_eq(&first, &a.clients()), "pools kept");
+    assert!(failures() > failed_before);
+}
+
+/// The heartbeats are read at once, not one after the other: a listing,
+/// and a round of reads, of the nodes when every read takes 300 ms each
+/// end in about one read.
+#[tokio::test]
+async fn heartbeat_reads_go_out_at_once() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    for (i, id) in ["b", "c", "d", "e", "f"].into_iter().enumerate() {
+        publish_tls(&store, id, now_ms(), u8::try_from(i + 1).unwrap()).await;
+    }
+    store
+        .delay_ms
+        .store(300, std::sync::atomic::Ordering::SeqCst);
+    let reads = || crate::metrics::METRICS.heartbeat_read_ms.count();
+    let ages = || crate::metrics::METRICS.heartbeat_age_ms.count();
+    let (reads_before, ages_before) = (reads(), ages());
+    let started = std::time::Instant::now();
+    assert!(a.refresh_view(true).await);
+    let listing = started.elapsed();
+    let started = std::time::Instant::now();
+    assert!(a.refresh_view(false).await);
+    let round = started.elapsed();
+    assert!(
+        listing < Duration::from_millis(1_000),
+        "listing {listing:?}"
+    );
+    assert!(round < Duration::from_millis(1_000), "round {round:?}");
+    assert_eq!(a.known_nodes.lock().unwrap().len(), 5);
+    // Each read of the round timed (a's own object, absent, too), each
+    // peer's heartbeat aged at both refreshes.
+    assert!(reads() >= reads_before + 6);
+    assert!(ages() >= ages_before + 10);
+}
+
+/// A heartbeat dated ahead of this clock (a peer whose clock is fast, past
+/// the allowed skew) is trusted one horizon from when this node first read
+/// it, not one horizon from its date: a peer that then dies is not trusted
+/// for as long as its clock was ahead. Reading the same heartbeat again
+/// does not move that.
+#[tokio::test]
+async fn a_heartbeat_dated_ahead_is_trusted_one_horizon_from_its_first_read() {
+    let store = Arc::new(SlowNodeReads::default());
+    // Horizon 400 ms.
+    let a = quiet_tls_node(&store, 100);
+    publish_tls(&store, "c", now_ms() + 3_600_000, 1).await;
+    let first_read = std::time::Instant::now();
+    assert!(a.refresh_view(true).await);
+    assert_eq!(a.check_tls_target("https://c.test:7443"), Ok(()));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.refresh_view(false).await);
+    tokio::time::sleep(Duration::from_millis(600).saturating_sub(first_read.elapsed())).await;
+    let refused = a.check_tls_target("https://c.test:7443");
+    assert!(
+        refused.as_ref().is_err_and(|e| e.contains("expired")),
+        "{refused:?}"
+    );
+    assert!(!a.reaches("c"));
+}
+
+/// A read that fails keeps the peer as last read, and so trusted until
+/// that heartbeat's own horizon, never past it, without dropping pools.
+#[tokio::test]
+async fn a_failed_read_carries_a_heartbeat_only_to_its_own_horizon() {
+    let store = Arc::new(SlowNodeReads::default());
+    // Horizon 400 ms.
+    let a = quiet_tls_node(&store, 100);
+    let at = now_ms();
+    publish_tls(&store, "b", at, 1).await;
+    assert!(a.refresh_view(true).await);
+    let first = a.clients();
+    *store.fail.lock().unwrap() = Some("nodes/b".to_owned());
+    assert!(!a.refresh_view(false).await);
+    if now_ms() < at + 300 {
+        assert_eq!(a.check_tls_target("https://b.test:7443"), Ok(()));
+    }
+    assert!(Arc::ptr_eq(&first, &a.clients()), "pools kept");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!a.refresh_view(false).await);
+    assert!(a.check_tls_target("https://b.test:7443").is_err());
 }

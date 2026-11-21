@@ -10,6 +10,12 @@
   amendment of the same day); a node that starts says hello, a signed
   node call that makes each peer list at once, so its pin still reaches
   them within a period. See "Amendment of 2026-11-14" at the end.
+- Amended 2026-11-20: a pin is trusted until its heartbeat's
+  `written_at` plus the horizon, as before, but a heartbeat dated ahead of
+  this node's clock counts from when this node first read it, and a read
+  of the heartbeats that fails or comes late no longer shortens the trust
+  in peers that keep writing ([ADR 0020](0020-one-lease-per-node.md),
+  amendment of the same day). See "Amendment of 2026-11-20" at the end.
 - Date: 2026-11-05
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
 
@@ -344,3 +350,31 @@ expected trusted; what is checked about pins is unchanged.
 addressed to another node, for another path, with a body, with another
 method, replayed, and on the public port in refuse mode, a hello is
 refused and asks for nothing.
+
+## Amendment of 2026-11-20: trust on a slow bucket
+
+[ADR 0020](0020-one-lease-per-node.md), amendment of the same day, changes
+how a node reads the heartbeats its trust table comes from: at once, each
+within a read attempt, a peer whose read fails kept as last read, and a
+peer whose trust would end before the next round read early. What this
+record decided about trust holds:
+
+- **Revocation** is still the heartbeat expiring or changing. A peer
+  whose read fails keeps the pins its last heartbeat published only until
+  that heartbeat's horizon; no read result extends it but a newer
+  heartbeat. A heartbeat dated ahead of this node's clock is trusted one
+  horizon from when this node first read it, not from its date, so a peer
+  with a fast clock is not trusted for that much longer after it stops: a
+  peer that stops writing is distrusted at most 10 s after this node first
+  read its last heartbeat, and at most 11 s after that write while the
+  clocks keep within the allowed skew.
+- **Pools.** A peer kept as last read has the same pins at the same
+  address, so a failed read no longer risks dropping every pooled
+  connection; an address that changes pins or loses its node still drops
+  them, as before.
+- **A connection to a lapsed address** still waits up to 3 s for a read
+  that renews it (step 6).
+
+Tests: `tests/cluster/slow_bucket.rs`, which runs over TLS from
+`tests/cluster_over_tls.rs` too, and
+`cluster::tests::a_heartbeat_dated_ahead_is_trusted_one_horizon_from_its_first_read`.

@@ -43,6 +43,17 @@ pub(crate) fn lease_attempt(lease: &LeaseConfig) -> Duration {
     Duration::from_millis(lease.ttl_ms().saturating_sub(lease.safety_ms()) / 3)
 }
 
+/// How long one read of a peer's heartbeat may take (ADR 0020, amendment
+/// of 2026-11-20): the lease attempt (2.67 s with the defaults), at most a
+/// heartbeat period but never under 1 s. Within the horizon of three
+/// periods plus the skew, a read issued that long before a peer's trust
+/// ends still renews it when that peer's own write took up to the lease
+/// attempt: 3 s of period, 2.67 s of write and 2.67 s of read fit in 10 s
+/// less the 1 s of skew.
+pub(crate) fn heartbeat_read_attempt(heartbeat: Duration, lease: &LeaseConfig) -> Duration {
+    lease_attempt(lease).min(heartbeat.max(Duration::from_secs(1)))
+}
+
 /// Checks the bucket and this node id, writes the node lease's first
 /// `live` write, then renews it every [`lease_every`] from the previous
 /// send, until it is lost or a clean stop asks for its release.
@@ -101,6 +112,7 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         // aborted, and gives the version `released` conditions on), and
         // publishes nothing from it (ADR 0020, section 4).
         let mut stopping = false;
+        let sent = std::time::Instant::now();
         let attempt = {
             let attempt = tokio::time::timeout(c.lease_attempt, lease.renew());
             tokio::pin!(attempt);
@@ -118,6 +130,11 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
             c.release_node_lease(&mut lease).await;
             return;
         }
+        // The writer's side of how late peers see this heartbeat; a write
+        // that timed out counts at the attempt.
+        crate::metrics::METRICS
+            .node_lease_write_ms
+            .observe(sent.elapsed());
         match attempt {
             Ok(Ok(())) => c.node_lease_written(&lease),
             Ok(Err(NodeLeaseError::Lost(cause))) => {
