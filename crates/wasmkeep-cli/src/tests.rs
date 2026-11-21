@@ -1630,3 +1630,105 @@ fn allocator_cli_defaults_overrides_and_validation() {
         0
     );
 }
+
+/// `actor where` reads an actor's ownership record and the owner's
+/// heartbeat, and writes nothing: a placed actor shows its owner, whether
+/// that node is live and since when; an actor with no record, or one whose
+/// owner released it, is "not placed".
+#[test]
+fn actor_where_shows_the_owner_and_writes_nothing() {
+    use clap::Parser as _;
+    use object_store::{
+        ObjectStore, ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path,
+    };
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    use wasmkeep_cluster::state_root::{Family, StateRoot};
+    let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = super::status::now_ms();
+    let put = |key: String, body: Vec<u8>| {
+        rt.block_on(store.put(&Path::from(key), PutPayload::from(body)))
+            .unwrap();
+    };
+    // node-a is live (a heartbeat written now), node-b's is long stale.
+    let heartbeat = |id: &str, at: u64| {
+        format!(
+            "wasmkeep-node 3\nlive beef\n{at}\n{id}\nhttp://{id}\n0.0.0\nacme/shop\n\n\nserving\n\ntake\n"
+        )
+        .into_bytes()
+    };
+    put("wk/nodes/node-a".into(), heartbeat("node-a", now));
+    put(
+        "wk/nodes/node-b".into(),
+        heartbeat("node-b", now - 3_600_000),
+    );
+    let root = StateRoot::new("wk", "acme", "shop");
+    let record = |node: Option<&str>| OwnerRecord {
+        holder: node.map(|n| (n.to_owned(), "beef".to_owned())),
+        generation: 2,
+        recorded: None,
+    };
+    put(
+        root.bucket_key(Family::Owners, "room/lobby"),
+        record(Some("node-a")).encode(),
+    );
+    put(
+        root.bucket_key(Family::Owners, "room/gone"),
+        record(Some("node-b")).encode(),
+    );
+    put(
+        root.bucket_key(Family::Owners, "room/idle"),
+        record(None).encode(),
+    );
+    let before = keys_of(&store);
+    let super::Cli {
+        command: super::Command::Actor(super::ActorCommand::Where(args)),
+        ..
+    } = super::Cli::try_parse_from([
+        "wasmkeep",
+        "actor",
+        "where",
+        "--app",
+        "acme/shop",
+        "--bucket",
+        "s3://b/wk",
+        "room/lobby",
+        "room/gone",
+        "room/idle",
+        "room/never",
+    ])
+    .unwrap()
+    else {
+        unreachable!()
+    };
+    let report =
+        super::actor_where::report_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into())))
+            .unwrap();
+    let text = report.to_text(now);
+    let line = |actor: &str| {
+        text.lines()
+            .find(|l| l.starts_with(actor))
+            .unwrap_or_else(|| panic!("no line for {actor}: {text}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(
+        line("room/lobby").starts_with("room/lobby node-a yes "),
+        "{text}"
+    );
+    assert!(
+        line("room/gone").starts_with("room/gone node-b no "),
+        "{text}"
+    );
+    assert_eq!(line("room/idle"), "room/idle not placed - -");
+    assert_eq!(line("room/never"), "room/never not placed - -");
+    let json = report.to_json();
+    assert_eq!(json[0]["owner"], "node-a");
+    assert_eq!(json[0]["live"], true);
+    assert!(json[0]["since_ms"].is_u64());
+    assert!(json[3]["owner"].is_null());
+    assert_eq!(json[3]["placed"], false);
+    // Read-only: not one key was written, changed or removed.
+    assert_eq!(keys_of(&store), before);
+}
