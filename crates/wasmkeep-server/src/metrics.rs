@@ -501,6 +501,11 @@ pub(crate) struct Metrics {
     /// `list`, `copy`, `rename`, `multipart`) and status (`ok`,
     /// `not_found`, `precondition`, `error`).
     pub(crate) bucket_requests: Family<AtomicU64>,
+    /// How long each bucket request took, by operation and status
+    /// (the labels of `bucket_requests`).
+    pub(crate) bucket_request_seconds: Family<Histogram>,
+    /// How much later than asked the runtime woke the probe task.
+    pub(crate) runtime_schedule_lag_seconds: Histogram,
     /// Actors this node acquired whose ownership record still named another
     /// node, found free because that node's process was fenced, released or
     /// replaced (see `Hold::previous`, ADR 0020).
@@ -1099,6 +1104,34 @@ pub(crate) fn segment_upload(elapsed: Duration, resends: u64, ok: bool) {
     }
 }
 
+/// The interval the scheduling probe sleeps.
+const LAG_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A task that sleeps [`LAG_PROBE_INTERVAL`] over and over and records how
+/// much later than that it woke, in `wasmkeep_runtime_schedule_lag_seconds`.
+/// One timer and one wake-up every 100 ms; stopped when dropped.
+pub(crate) struct LagProbe(tokio::task::JoinHandle<()>);
+
+impl LagProbe {
+    pub(crate) fn start() -> Self {
+        Self(tokio::spawn(async {
+            loop {
+                let asked = tokio::time::Instant::now() + LAG_PROBE_INTERVAL;
+                tokio::time::sleep_until(asked).await;
+                METRICS
+                    .runtime_schedule_lag_seconds
+                    .observe(tokio::time::Instant::now().saturating_duration_since(asked));
+            }
+        }))
+    }
+}
+
+impl Drop for LagProbe {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
@@ -1525,6 +1558,23 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Requests to the bucket, by operation and status.",
         &m.bucket_requests,
     );
+    head(
+        &mut out,
+        "wasmkeep_bucket_request_seconds",
+        "histogram",
+        "How long a bucket request took, by operation and status; a listing counts to its end or drop.",
+    );
+    m.bucket_request_seconds.each(|labels, h| {
+        h.render(&mut out, "wasmkeep_bucket_request_seconds", labels);
+    });
+    head(
+        &mut out,
+        "wasmkeep_runtime_schedule_lag_seconds",
+        "histogram",
+        "How much later than asked a task sleeping 100 ms woke: the async runtime's scheduling delay.",
+    );
+    m.runtime_schedule_lag_seconds
+        .render(&mut out, "wasmkeep_runtime_schedule_lag_seconds", "");
     counter(
         &mut out,
         "wasmkeep_failovers_total",
@@ -2677,6 +2727,24 @@ mod tests {
         ] {
             assert!(page.contains(want), "{want}:\n{page}");
         }
+    }
+
+    /// The scheduling probe's wake-ups reach the page.
+    #[tokio::test(start_paused = true)]
+    async fn the_schedule_lag_probe_reaches_the_page() {
+        let probe = LagProbe::start();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        drop(probe);
+        assert!(METRICS.runtime_schedule_lag_seconds.count() >= 3);
+        let page = render(Gauges::default());
+        assert!(
+            page.contains("# TYPE wasmkeep_runtime_schedule_lag_seconds histogram"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("wasmkeep_runtime_schedule_lag_seconds_count 0\n"),
+            "{page}"
+        );
     }
 
     /// The label values seeded at 0 are the ones the code counts: a value

@@ -14,7 +14,10 @@ The text under a version's heading is its GitHub release text
   `wasmkeep_segment_upload_retries_total` and
   `wasmkeep_segment_upload_failures_total`, next to the existing
   `wasmkeep_segment_bytes` and the event-start rule's wait. No actor
-  labels.
+  labels. Two more tell the two apart across a node:
+  `wasmkeep_bucket_request_seconds{operation,status}` times every bucket
+  request, and `wasmkeep_runtime_schedule_lag_seconds` records how late the
+  async runtime wakes a task that sleeps 100 ms.
 - **A slow bucket no longer makes nodes distrust healthy peers** (ADR 0020
   and ADR 0011, amendments of 2026-11-20). A node read its peers'
   heartbeats one after the other, with no time limit, and read
