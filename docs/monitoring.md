@@ -181,7 +181,7 @@ included), `wasmkeep_admission_refused_total`,
 `wasmkeep_websocket_sweep_unreadable_total`,
 `wasmkeep_parked_releases_total`, `wasmkeep_plain_events_dropped_total`,
 `wasmkeep_batched_waits_total` and the front's two counters. The batched
-metrics (`wasmkeep_segment_*`, `wasmkeep_unsent_age_seconds`,
+metrics (`wasmkeep_segment_events`, `wasmkeep_segment_bytes`, `wasmkeep_unsent_age_seconds`,
 `wasmkeep_flush_seconds`, `wasmkeep_upload_budget_bytes_in_use`) are on
 every node's page; they stay empty while no class is batched (strict is
 the default). So a
@@ -271,6 +271,9 @@ its first request.
 | `wasmkeep_unsent_age_seconds` | histogram | For batched classes: the oldest uncaptured commit's age at each capture, what `--max-unsent-age` bounds ([ADR 0034](adr/0034-batched-plain-writes.md), section 3). |
 | `wasmkeep_segment_events` | histogram | Events per batched segment (buckets 1 to 1,000). |
 | `wasmkeep_segment_bytes` | histogram | Encoded bytes per batched segment (buckets 4 KiB to 256 MiB). |
+| `wasmkeep_segment_upload_seconds` | histogram | One segment's upload, from its first PUT to the bucket's acknowledgement, resends included (batched and strict classes). Only acknowledged uploads are observed. Compare with `wasmkeep_event_start_rule_wait_seconds` and `wasmkeep_batched_waits_total{reason="age"}`: holds with slow uploads point at the bucket; holds with fast uploads point at the node (capture, budget, CPU). |
+| `wasmkeep_segment_upload_retries_total` | counter | PUTs of a segment sent again after an error, a stall or a race with an earlier attempt. Rising with a healthy node: the bucket or the link is flaky. |
+| `wasmkeep_segment_upload_failures_total` | counter | Segment uploads given up without an acknowledgement (the actor's replication fails or the event errs, as for any failed upload). |
 | `wasmkeep_batched_waits_total{reason}` | counter | Times a batched actor's next event waited at the end of the one before (the event-start rule), by `reason`: `age` (a commit waited unsent past `--max-unsent-age`), `bytes` (the next segment was full, an event was over the cap, or the WAL asked for a checkpoint) and `budget` (the node's budget of segments in flight was full). |
 | `wasmkeep_flush_seconds` | histogram | How long a batched `storage.flush` (or `exec-durable`'s flush) took, answered `ok` or not. |
 | `wasmkeep_upload_budget_bytes_in_use` | gauge | Bytes of the node's 256 MiB budget of batched segments in flight in use now. |

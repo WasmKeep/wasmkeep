@@ -9,6 +9,12 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- **Segment upload metrics** tell a slow bucket from a slow node:
+  `wasmkeep_segment_upload_seconds` (first PUT to acknowledgement),
+  `wasmkeep_segment_upload_retries_total` and
+  `wasmkeep_segment_upload_failures_total`, next to the existing
+  `wasmkeep_segment_bytes` and the event-start rule's wait. No actor
+  labels.
 - **A slow bucket no longer makes nodes distrust healthy peers** (ADR 0020
   and ADR 0011, amendments of 2026-11-20). A node read its peers'
   heartbeats one after the other, with no time limit, and read
