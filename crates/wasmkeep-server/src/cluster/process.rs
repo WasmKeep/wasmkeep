@@ -352,7 +352,7 @@ async fn read_one(
     let [id] = keys;
     let read = match read {
         Ok(Ok(found)) => match found.into_iter().find(|n| n.id == id) {
-            Some(n) => HeartbeatRead::Found(n),
+            Some(n) => HeartbeatRead::Found(Box::new(n)),
             None => HeartbeatRead::Gone,
         },
         Ok(Err(e)) => HeartbeatRead::Failed(e.to_string()),
@@ -365,7 +365,7 @@ async fn read_one(
 #[derive(Debug, Clone)]
 pub(super) enum HeartbeatRead {
     /// Its heartbeat.
-    Found(NodeInfo),
+    Found(Box<NodeInfo>),
     /// No object (`cluster forget`), or one this version cannot read: no
     /// longer a node, as a listing would leave it out.
     Gone,

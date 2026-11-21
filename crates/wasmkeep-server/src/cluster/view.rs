@@ -755,7 +755,7 @@ impl Cluster {
                         match read {
                             super::process::HeartbeatRead::Found(n) => {
                                 fresh.push(id.clone());
-                                held.insert(id, n);
+                                held.insert(id, *n);
                             }
                             super::process::HeartbeatRead::Gone => {
                                 held.remove(&id);
