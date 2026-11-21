@@ -2184,6 +2184,28 @@ impl UploadTarget {
         advance: Option<Position>,
         cap: Option<tokio::time::Instant>,
     ) -> Result<(), ReplicaError> {
+        let started = std::time::Instant::now();
+        let mut resends = 0u64;
+        let result = self
+            .put_bounded_attempts(key, bytes, what, advance, cap, &mut resends)
+            .await;
+        if what == "segment" {
+            crate::metrics::segment_upload(started.elapsed(), resends, result.is_ok());
+        }
+        result
+    }
+
+    /// [`Self::put_bounded_by`]'s attempts; `resends` counts the PUTs sent
+    /// again after the first.
+    async fn put_bounded_attempts(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        what: &'static str,
+        advance: Option<Position>,
+        cap: Option<tokio::time::Instant>,
+        resends: &mut u64,
+    ) -> Result<(), ReplicaError> {
         use tokio::time::{Instant, timeout_at};
         let location = StorePath::from(format!("{}{key}", self.prefix));
         // Shared, not copied, by each attempt.
@@ -2232,6 +2254,7 @@ impl UploadTarget {
                                 last = format!("{last}; the lease ran out meanwhile");
                                 break;
                             }
+                            *resends += 1;
                             tracing::info!(object = %location, what, reason = %last, "an upload raced an earlier attempt; sending it again");
                             let left = deadline.saturating_duration_since(Instant::now());
                             tokio::time::sleep(pause.min(left)).await;
@@ -2245,6 +2268,7 @@ impl UploadTarget {
                                 last = format!("{last}; the lease ran out meanwhile");
                                 break;
                             }
+                            *resends += 1;
                             tracing::info!(object = %location, what, reason = %last, "an upload's read-back failed; trying again");
                             let left = deadline.saturating_duration_since(Instant::now());
                             tokio::time::sleep(pause.min(left)).await;
@@ -2271,6 +2295,7 @@ impl UploadTarget {
                         last = format!("{last}; the lease ran out meanwhile");
                         break;
                     }
+                    *resends += 1;
                     tracing::info!(object = %location, what, reason = %last, "an upload failed; sending it again");
                     let left = deadline.saturating_duration_since(Instant::now());
                     tokio::time::sleep(pause.min(left)).await;
@@ -2282,6 +2307,7 @@ impl UploadTarget {
                     if stalled >= UPLOAD_ATTEMPTS {
                         break;
                     }
+                    *resends += 1;
                     tracing::info!(object = %location, what, reason = %last, "an upload stalled; sending it again");
                 }
             }

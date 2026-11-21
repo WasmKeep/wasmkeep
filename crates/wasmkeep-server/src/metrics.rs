@@ -579,6 +579,13 @@ pub(crate) struct Metrics {
     pub(crate) segment_events: SegmentEvents,
     /// Encoded bytes per batched segment.
     pub(crate) segment_bytes: SegmentBytes,
+    /// Segment uploads acknowledged, first PUT to acknowledgement,
+    /// resends included.
+    pub(crate) segment_upload_seconds: Histogram,
+    /// PUTs of a segment sent again after a failure, a stall or a race.
+    pub(crate) segment_upload_retries: AtomicU64,
+    /// Segment uploads given up (not acknowledged).
+    pub(crate) segment_upload_failures: AtomicU64,
     /// The event-start rule acting, by `reason` ([`BATCHED_WAIT_REASONS`]).
     pub(crate) batched_waits: Family<AtomicU64>,
     /// How long a batched `flush` (or `exec-durable`'s flush) took.
@@ -1079,6 +1086,19 @@ impl Metrics {
 pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::seeded);
 
 /// Adds one to a counter.
+/// One segment upload ended: its time (acknowledged ones only), the
+/// PUTs it sent again, and whether it failed.
+pub(crate) fn segment_upload(elapsed: Duration, resends: u64, ok: bool) {
+    let m = &METRICS;
+    m.segment_upload_retries
+        .fetch_add(resends, Ordering::Relaxed);
+    if ok {
+        m.segment_upload_seconds.observe(elapsed);
+    } else {
+        inc(&m.segment_upload_failures);
+    }
+}
+
 pub(crate) fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
@@ -1634,6 +1654,26 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Encoded bytes per batched segment.",
     );
     m.segment_bytes.render(&mut out, "wasmkeep_segment_bytes");
+    head(
+        &mut out,
+        "wasmkeep_segment_upload_seconds",
+        "histogram",
+        "A segment's upload, from its first PUT to the bucket's acknowledgement, resends included; failed uploads are not observed.",
+    );
+    m.segment_upload_seconds
+        .render(&mut out, "wasmkeep_segment_upload_seconds", "");
+    counter(
+        &mut out,
+        "wasmkeep_segment_upload_retries_total",
+        "PUTs of a segment sent again after an error, a stall or a race with an earlier attempt.",
+        m.segment_upload_retries.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_segment_upload_failures_total",
+        "Segment uploads given up without an acknowledgement.",
+        m.segment_upload_failures.load(Ordering::Relaxed),
+    );
     family(
         &mut out,
         "wasmkeep_batched_waits_total",
@@ -2585,6 +2625,9 @@ mod tests {
         m.segment_bytes.observe(5_000);
         crate::metrics::inc(&m.batched_waits.get(&[("reason", "age")]));
         m.flush_seconds.observe(Duration::from_millis(60));
+        m.segment_upload_seconds.observe(Duration::from_millis(40));
+        m.segment_upload_retries.store(2, Ordering::Relaxed);
+        m.segment_upload_failures.store(1, Ordering::Relaxed);
         let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         for want in [
             "wasmkeep_unsent_age_seconds_count 1",
@@ -2596,7 +2639,41 @@ mod tests {
             "wasmkeep_batched_waits_total{reason=\"bytes\"} 0",
             "wasmkeep_batched_waits_total{reason=\"budget\"} 0",
             "wasmkeep_flush_seconds_count 1",
+            "wasmkeep_segment_upload_seconds_bucket{le=\"0.05\"} 1",
+            "wasmkeep_segment_upload_seconds_count 1",
+            "wasmkeep_segment_upload_retries_total 2",
+            "wasmkeep_segment_upload_failures_total 1",
             "# TYPE wasmkeep_upload_budget_bytes_in_use gauge",
+        ] {
+            assert!(page.contains(want), "{want}:\n{page}");
+        }
+    }
+
+    /// A segment upload recorded by `segment_upload` (what the replica
+    /// calls when an upload ends) is on the page: its time when
+    /// acknowledged, its resends, and a failure.
+    #[test]
+    fn a_recorded_segment_upload_shows_on_the_page() {
+        let m = &METRICS;
+        let (seen, resent, failed) = (
+            m.segment_upload_seconds.count(),
+            m.segment_upload_retries.load(Ordering::Relaxed),
+            m.segment_upload_failures.load(Ordering::Relaxed),
+        );
+        segment_upload(Duration::from_millis(30), 1, true);
+        segment_upload(Duration::from_secs(2), 2, false);
+        assert_eq!(m.segment_upload_seconds.count(), seen + 1);
+        assert_eq!(m.segment_upload_retries.load(Ordering::Relaxed), resent + 3);
+        assert_eq!(
+            m.segment_upload_failures.load(Ordering::Relaxed),
+            failed + 1
+        );
+        let page = render_with(m, Gauges::default(), &[Identity::default()]);
+        for want in [
+            "# TYPE wasmkeep_segment_upload_seconds histogram",
+            "wasmkeep_segment_upload_seconds_bucket{le=\"+Inf\"}",
+            "# TYPE wasmkeep_segment_upload_retries_total counter",
+            "# TYPE wasmkeep_segment_upload_failures_total counter",
         ] {
             assert!(page.contains(want), "{want}:\n{page}");
         }
