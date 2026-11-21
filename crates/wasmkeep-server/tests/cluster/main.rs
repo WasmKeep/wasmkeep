@@ -1003,6 +1003,9 @@ struct Flaky {
     /// Every listing of `nodes/` waits this many ms first (reads of each
     /// object do not): a slow LIST.
     delay_node_lists_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Reads of this key fail while set (`nodes/b`: this node cannot read
+    /// b's heartbeat by key, as after a hello).
+    fail_gets_of: Arc<std::sync::Mutex<Option<String>>>,
     /// Writes of ownership records (`owners/...`) fail while set.
     fail_owner_puts: Arc<AtomicBool>,
     /// The next this-many segment (`/wal/`) uploads never answer and are
@@ -1067,6 +1070,7 @@ impl Flaky {
             delay_node_gets_ms: Arc::default(),
             hang_control_changed: Arc::default(),
             delay_node_lists_ms: Arc::default(),
+            fail_gets_of: Arc::default(),
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
@@ -1342,6 +1346,13 @@ impl ObjectStore for Flaky {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         self.check()?;
+        let failed = self.fail_gets_of.lock().unwrap().as_deref() == Some(location.as_ref());
+        if failed {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "read refused".into(),
+            });
+        }
         if location.as_ref().starts_with("nodes/") {
             let delay = self.delay_node_gets_ms.load(Ordering::SeqCst);
             if delay > 0 {
