@@ -18,13 +18,7 @@ pub(super) struct FenceDue {
     epoch: u64,
 }
 
-/// Heartbeats just read, to apply ([`Cluster::apply_heartbeats`]).
-enum Heartbeats {
-    /// A listing of `nodes/`: every node there is.
-    Listed(Vec<NodeInfo>),
-    /// Reads of some nodes' objects, each with what it found.
-    Read(Vec<(String, super::process::HeartbeatRead)>),
-}
+use super::process::Heartbeats;
 
 /// The nodes as one refresh saw them: id, instance, lease state, live.
 pub(super) type ViewShape = Vec<(String, Option<String>, Option<NodeState>, bool)>;
@@ -614,6 +608,7 @@ impl Cluster {
         // A listing and the reads of what it lists: two attempts.
         let limit = self.heartbeat_read_attempt * 2;
         let started = std::time::Instant::now();
+        let issued = std::time::Instant::now();
         let transport = Arc::clone(&self.transport);
         match tokio::time::timeout(limit, async move { transport.list_nodes().await }).await {
             Ok(Ok(all)) => {
@@ -622,7 +617,7 @@ impl Cluster {
                 let half = u64::try_from(started.elapsed().as_millis() / 2).unwrap_or(u64::MAX);
                 self.slowest_read_ms
                     .store(half, std::sync::atomic::Ordering::Relaxed);
-                self.apply_heartbeats(Heartbeats::Listed(all));
+                self.apply_heartbeats(Heartbeats::Listed(all), issued);
                 true
             }
             Ok(Err(e)) => {
@@ -641,6 +636,7 @@ impl Cluster {
     /// as last read. True if every read answered.
     pub(super) async fn read_heartbeats(&self, ids: &[String]) -> bool {
         let started = std::time::Instant::now();
+        let issued = std::time::Instant::now();
         let reads = self
             .transport
             .read_each(ids, self.heartbeat_read_attempt)
@@ -671,7 +667,7 @@ impl Cluster {
         if failed.len() == reads.len() {
             return false;
         }
-        self.apply_heartbeats(Heartbeats::Read(reads));
+        self.apply_heartbeats(Heartbeats::Read(reads), issued);
         answered
     }
 
@@ -733,42 +729,15 @@ impl Cluster {
         Some((at, ids.into_iter().map(str::to_owned).collect()))
     }
 
-    /// Applies heartbeats just read: a listing replaces what was last read
-    /// of every node; reads replace their own nodes' (a node found gone is
-    /// dropped, one whose read failed stays as last read). Then refreshes,
-    /// from every node as last read, the view, the trust and the watches.
-    fn apply_heartbeats(&self, read: Heartbeats) {
+    /// Applies heartbeats just read by a listing or reads issued at
+    /// `issued` ([`super::process::Transport::note_heartbeats`]: a node
+    /// found gone is dropped, one whose read failed stays as last read, and
+    /// a read issued earlier than the one held, by this app or another of
+    /// the process, changes nothing). Then refreshes, from every node as
+    /// last read, the view, the trust and the watches.
+    fn apply_heartbeats(&self, read: Heartbeats, issued: std::time::Instant) {
         let now = now_ms();
-        let mut fresh: Vec<String> = Vec::new();
-        let all: Vec<NodeInfo> = {
-            let mut held = self
-                .heartbeats_read
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            match read {
-                Heartbeats::Listed(listed) => {
-                    fresh = listed.iter().map(|n| n.id.clone()).collect();
-                    *held = listed.into_iter().map(|n| (n.id.clone(), n)).collect();
-                }
-                Heartbeats::Read(reads) => {
-                    for (id, read) in reads {
-                        match read {
-                            super::process::HeartbeatRead::Found(n) => {
-                                fresh.push(id.clone());
-                                held.insert(id, *n);
-                            }
-                            super::process::HeartbeatRead::Gone => {
-                                held.remove(&id);
-                            }
-                            super::process::HeartbeatRead::Failed(_) => {}
-                        }
-                    }
-                }
-            }
-            let mut all: Vec<NodeInfo> = held.values().cloned().collect();
-            all.sort_by(|a, b| a.id.cmp(&b.id));
-            all
-        };
+        let (all, fresh) = self.transport.note_heartbeats(read, issued);
         *self.known_nodes.lock().unwrap_or_else(|p| p.into_inner()) =
             all.iter().map(|n| n.id.clone()).collect();
         for n in all

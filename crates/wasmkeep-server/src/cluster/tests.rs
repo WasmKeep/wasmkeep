@@ -4861,11 +4861,7 @@ async fn one_hung_heartbeat_read_neither_holds_up_the_view_nor_drops_the_pools()
     assert!(!answered, "a round with a read unanswered is not a success");
     assert!(started.elapsed() < Duration::from_millis(2_000));
     assert_eq!(
-        a.heartbeats_read
-            .lock()
-            .unwrap()
-            .get("b")
-            .map(|n| n.written_at_ms),
+        a.transport.heard_body("b").map(|n| n.written_at_ms),
         Some(later),
         "b's newer heartbeat applied"
     );
@@ -4958,4 +4954,50 @@ async fn a_failed_read_carries_a_heartbeat_only_to_its_own_horizon() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!a.refresh_view(false).await);
     assert!(a.check_tls_target("https://b.test:7443").is_err());
+}
+
+/// The heartbeats as last read are the process's (ADR 0038: its apps share
+/// the trust table), and a node's entry is replaced only by a read issued
+/// later: a body read earlier that lands late, by this app or another,
+/// never undoes a fence read since, and a listing issued before a read
+/// does not drop the node it read (ADR 0020, amendment of 2026-11-20).
+#[tokio::test]
+async fn an_older_read_landing_late_never_undoes_a_newer_one() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    let body = |state: &str| {
+        let text = format!(
+            "wasmkeep-node 3\n{state} beef\n{}\nb\nhttp://b\n0.0.0\nt/\nhttps://b.test:7443\n{}\nserving\n\ntake\n",
+            now_ms(),
+            "ab".repeat(32)
+        );
+        NodeInfo::decode(text.as_bytes()).unwrap()
+    };
+    let (older, newer) = (
+        std::time::Instant::now(),
+        std::time::Instant::now() + Duration::from_millis(1),
+    );
+    let found =
+        |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
+    let (_, fresh) = a.transport.note_heartbeats(found(body("fenced")), newer);
+    assert_eq!(fresh, ["b"]);
+    let (all, fresh) = a.transport.note_heartbeats(found(body("live")), older);
+    assert!(fresh.is_empty(), "an older read replaced a newer one");
+    assert_eq!(
+        all[0].lease,
+        Some(wasmkeep_cluster::node_lease::NodeState::Fenced)
+    );
+    let (all, _) = a
+        .transport
+        .note_heartbeats(Heartbeats::Listed(Vec::new()), older);
+    assert_eq!(all.len(), 1, "an older listing dropped a node read since");
+    let (all, _) = a.transport.note_heartbeats(
+        Heartbeats::Read(vec![(
+            "b".to_owned(),
+            HeartbeatRead::Failed("down".to_owned()),
+        )]),
+        newer + Duration::from_millis(1),
+    );
+    assert_eq!(all.len(), 1, "a failed read keeps the node as last read");
 }

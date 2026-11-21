@@ -516,12 +516,6 @@ pub(crate) struct Cluster {
     /// one by one between listings of `nodes/` (ADR 0020, amendment of
     /// 2026-11-14).
     known_nodes: Mutex<Vec<String>>,
-    /// Each node's heartbeat as last read (by a listing or one read of its
-    /// object), live or not: a read that fails or times out leaves its
-    /// node here as it was, trusted until its own horizon and no longer
-    /// (ADR 0020, amendment of 2026-11-20). Only a listing that leaves a
-    /// node out, or a read that finds no object, drops it.
-    heartbeats_read: Mutex<HashMap<String, NodeInfo>>,
     /// When this node first read each peer's current heartbeat: one dated
     /// ahead of this clock is judged from then.
     first_seen: Mutex<wasmkeep_cluster::membership::FirstSeen>,
@@ -871,7 +865,6 @@ impl Cluster {
             }),
             follows_app: config.follows_app,
             known_nodes: Mutex::new(Vec::new()),
-            heartbeats_read: Mutex::new(HashMap::new()),
             first_seen: Mutex::default(),
             trust_ends: Mutex::new(HashMap::new()),
             heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),

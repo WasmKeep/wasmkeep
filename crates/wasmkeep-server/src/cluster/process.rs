@@ -184,6 +184,7 @@ impl NodeProcess {
                     connector,
                     nodes,
                     live: RwLock::default(),
+                    heard: Mutex::default(),
                 });
                 *slot = Some(Arc::clone(&t));
                 t
@@ -264,9 +265,97 @@ pub(crate) struct Transport {
     /// sender of a hop is checked against it, as its pin is against the
     /// process's pins (ADR 0038, section 5).
     live: RwLock<std::collections::HashMap<String, (String, u64)>>,
+    /// Each node's heartbeat as last read by any app of the process (a
+    /// listing or one read of its object; `None`: found gone), with when
+    /// that read was issued (ADR 0020, amendment of 2026-11-20). The read
+    /// issued last wins, whichever lands last, so a body read earlier never
+    /// undoes a fence or a new key read since, by this app or another. A
+    /// read that fails changes nothing: its node stays as last read,
+    /// trusted until that heartbeat's own horizon and no longer.
+    heard: Mutex<std::collections::HashMap<String, (std::time::Instant, Option<NodeInfo>)>>,
+}
+
+/// Heartbeats just read, to record ([`Transport::note_heartbeats`]).
+pub(super) enum Heartbeats {
+    /// A listing of `nodes/`: every node there is.
+    Listed(Vec<NodeInfo>),
+    /// Reads of some nodes' objects, each with what it found.
+    Read(Vec<(String, HeartbeatRead)>),
 }
 
 impl Transport {
+    /// Records heartbeats read by a listing or reads issued at `issued`:
+    /// a node's entry is replaced only by a read issued later than the one
+    /// it holds; a listing marks the nodes it leaves out gone. Returns every
+    /// node as last read (by id) and the nodes this call replaced.
+    pub(super) fn note_heartbeats(
+        &self,
+        read: Heartbeats,
+        issued: std::time::Instant,
+    ) -> (Vec<NodeInfo>, Vec<String>) {
+        let mut heard = self.heard.lock().unwrap_or_else(|p| p.into_inner());
+        let mut put = |id: String, body: Option<NodeInfo>| match heard.get(&id) {
+            Some((at, _)) if *at > issued => false,
+            _ => {
+                heard.insert(id, (issued, body));
+                true
+            }
+        };
+        let mut fresh = Vec::new();
+        match read {
+            Heartbeats::Listed(listed) => {
+                let mut listed_ids = std::collections::HashSet::new();
+                for n in listed {
+                    let id = n.id.clone();
+                    listed_ids.insert(id.clone());
+                    if put(id.clone(), Some(n)) {
+                        fresh.push(id);
+                    }
+                }
+                drop(put);
+                let gone: Vec<String> = heard
+                    .keys()
+                    .filter(|id| !listed_ids.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    if heard.get(&id).is_some_and(|(at, _)| *at <= issued) {
+                        heard.insert(id, (issued, None));
+                    }
+                }
+            }
+            Heartbeats::Read(reads) => {
+                for (id, read) in reads {
+                    match read {
+                        HeartbeatRead::Found(n) => {
+                            if put(id.clone(), Some(*n)) {
+                                fresh.push(id);
+                            }
+                        }
+                        HeartbeatRead::Gone => {
+                            put(id, None);
+                        }
+                        HeartbeatRead::Failed(_) => {}
+                    }
+                }
+                drop(put);
+            }
+        }
+        let mut all: Vec<NodeInfo> = heard.values().filter_map(|(_, b)| b.clone()).collect();
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+        (all, fresh)
+    }
+
+    /// Node `id`'s heartbeat as last read.
+    #[cfg(test)]
+    pub(super) fn heard_body(&self, id: &str) -> Option<NodeInfo> {
+        self.heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .and_then(|(_, b)| b.clone())
+    }
+
     /// The clients to other nodes, as they are now.
     pub(super) fn clients(&self) -> Arc<Clients> {
         Arc::clone(&self.clients.read().unwrap_or_else(|p| p.into_inner()))

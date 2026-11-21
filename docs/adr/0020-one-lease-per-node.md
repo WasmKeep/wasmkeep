@@ -865,10 +865,12 @@ listing's reads after its LIST were sequential too.
   one that runs out keeps the last intents, as a failed one does (ADR
   0014). Loading the cluster secret at the top of a round is bounded the
   same way.
-- **Order.** Every read that changes the view is made and applied by the
-  heartbeat loop, one round, early read or early listing at a time: a read
-  issued earlier never lands after a later one, so a stale `live` body
-  cannot undo a fence or a new key read since.
+- **Order.** The heartbeats as last read are the process's, shared by
+  its apps as the trust table is (ADR 0038), and a node's entry is
+  replaced only by a read issued later than the one it holds, whichever
+  lands last: a stale `live` body, read by this app or another, cannot
+  undo a fence or a new key read since, and a listing issued before a read
+  does not drop the node that read found.
 
 ### Freshness, and the clocks
 
@@ -929,9 +931,15 @@ while it is still in the view.
 Past those latencies the node still fails closed: reads that keep taking
 longer than the margin let the trust end at the newest heartbeat's
 horizon, as before, and a request to a peer whose trust ended still waits
-up to 3 s for a read that renews it (ADR 0011, step 6). An early read
-planned on the last round's latency can also land a little late if the
-bucket just got slower; the next one is planned on the new latency.
+up to 3 s for a read that renews it (ADR 0011, step 6). A read slower than
+the attempt is now given up rather than waited for: a bucket whose reads
+all take a little longer than 2.67 s renews nothing, where the reads
+before this amendment renewed late. That too fails closed, and the
+horizon would not have covered such reads anyway (a period, the write and
+the skew leave 6 s for one read, and with rounds alone 3 s for the write
+and the read together). An early read planned on the last round's latency
+can also land a little late if the bucket just got slower; the next one
+is planned on the new latency.
 
 ### Metrics
 
@@ -973,7 +981,7 @@ suite, plain and over TLS, with a bucket slow for one node:
   `heartbeat_reads_go_out_at_once` (a listing and a round of five peers
   whose every read takes 300 ms end within a second; they took 1.5 s and 1.8 s),
   `a_heartbeat_dated_ahead_is_trusted_one_horizon_from_its_first_read`,
-  and `a_failed_read_carries_a_heartbeat_only_to_its_own_horizon` (the
-  rule kept).
+  `a_failed_read_carries_a_heartbeat_only_to_its_own_horizon` (the rule
+  kept) and `an_older_read_landing_late_never_undoes_a_newer_one`.
 - `membership::tests`: `a_trust_about_to_end_before_the_next_round_lands_is_read_early`
   and `a_heartbeat_dated_ahead_counts_from_its_first_read`.
