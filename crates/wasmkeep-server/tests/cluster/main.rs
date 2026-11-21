@@ -1000,6 +1000,9 @@ struct Flaky {
     delay_node_gets_ms: Arc<std::sync::atomic::AtomicU64>,
     /// While set, reads of `control/changed` never answer.
     hang_control_changed: Arc<AtomicBool>,
+    /// Every listing of `nodes/` waits this many ms first (reads of each
+    /// object do not): a slow LIST.
+    delay_node_lists_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Writes of ownership records (`owners/...`) fail while set.
     fail_owner_puts: Arc<AtomicBool>,
     /// The next this-many segment (`/wal/`) uploads never answer and are
@@ -1063,6 +1066,7 @@ impl Flaky {
             delay_lease_get_ms: Arc::default(),
             delay_node_gets_ms: Arc::default(),
             hang_control_changed: Arc::default(),
+            delay_node_lists_ms: Arc::default(),
             fail_owner_puts: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
@@ -1541,7 +1545,10 @@ impl ObjectStore for Flaky {
             .boxed();
         }
         if prefix.is_some_and(|p| p.as_ref() == "nodes") {
-            let delay = self.delay_node_gets_ms.load(Ordering::SeqCst);
+            let delay = self
+                .delay_node_gets_ms
+                .load(Ordering::SeqCst)
+                .max(self.delay_node_lists_ms.load(Ordering::SeqCst));
             if delay > 0 {
                 let listing = self.inner.list(prefix);
                 return futures_util::stream::once(async move {

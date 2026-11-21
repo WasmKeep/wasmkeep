@@ -340,9 +340,11 @@ enum ClusterCommand {
     /// from now.
     Fence(NodeArgs),
     /// Remove a retired node's heartbeat in the format from before node
-    /// leases, once it is older than 25 s (its horizon plus a lease's ttl
-    /// and grace). Refuses a recent one (that node may still run) and a
-    /// node lease (never deleted: fence it instead).
+    /// leases, or a released node lease no ownership record names, once it
+    /// is older than 25 s (its horizon plus a lease's ttl and grace).
+    /// Refuses a recent one (that node may still run), a released lease a
+    /// record still names (it is what frees that record), and a live or
+    /// fenced node lease (never deleted: fence a live one instead).
     Forget(NodeArgs),
     /// Move the actor state of a bucket prefix written by a version before
     /// 0.4.0 into each app's own root, once, while every node is stopped
@@ -2819,37 +2821,21 @@ fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
 
 /// `wasmkeep cluster forget` (ADR 0020, section 2).
 fn cluster_forget(args: &NodeArgs) -> anyhow::Result<()> {
-    use wasmkeep_cluster::control::Keys as _;
-    use wasmkeep_cluster::lease::Bucket as _;
     wasmkeep_cluster::membership::validate_node_id(&args.node)
         .map_err(|e| anyhow::anyhow!("invalid node id {:?}: {e}", args.node))?;
     let (store, prefix) = open_bucket(&args.bucket)?;
-    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let key = format!("nodes/{}", args.node);
-    let Some((body, _)) = rt
-        .block_on(bucket.get(&key))
-        .map_err(|e| anyhow::anyhow!("reading {key}: {e:?}"))?
-    else {
-        println!("{} has no heartbeat object: nothing to forget.", args.node);
-        return Ok(());
-    };
-    status::may_forget(&body, status::now_ms()).map_err(|why| anyhow::anyhow!("{why}"))?;
-    // Read again right before the delete (a store's DELETE takes no
-    // condition): a new node's first write over the stale heartbeat in
-    // between must not be deleted. The window left is the time between the
-    // two requests.
-    let again = rt
-        .block_on(bucket.get(&key))
-        .map_err(|e| anyhow::anyhow!("reading {key}: {e:?}"))?
-        .map(|(b, _)| b);
-    if again.as_deref() != Some(body.as_slice()) {
-        anyhow::bail!("{key} changed while it was checked: left alone; run the command again");
-    }
-    rt.block_on(bucket.delete(&key))?;
-    println!("Removed {}'s retired heartbeat.", args.node);
+    let done = rt
+        .block_on(status::forget_on(
+            &store,
+            &prefix,
+            &args.node,
+            status::now_ms(),
+        ))
+        .map_err(|why| anyhow::anyhow!("{why}"))?;
+    println!("{done}");
     Ok(())
 }
 

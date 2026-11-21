@@ -164,18 +164,14 @@ impl Log {
     }
 
     /// Waits until `id`'s node has refreshed its view `periods` more
-    /// times (its reads of its own heartbeat, one a refresh); the log
-    /// index then.
+    /// times (its reads of its own heartbeat, one a round; the one each
+    /// listing of `nodes/` makes, on the listing's own task since ADR
+    /// 0020's amendment of 2026-11-20, is not a round); the log index then.
     async fn periods(&self, id: &str, periods: usize) -> usize {
-        let own = format!("nodes/{id}");
         let from = self.len();
         let started = std::time::Instant::now();
         loop {
-            let seen = self
-                .since(from)
-                .iter()
-                .filter(|l| l.op == Op::Get && l.key == own)
-                .count();
+            let seen = rates(id, &self.since(from)).periods;
             if seen >= periods {
                 return self.len();
             }
@@ -204,9 +200,14 @@ struct Rates {
 fn rates(id: &str, entries: &[Logged]) -> Rates {
     let own = format!("nodes/{id}");
     let mut r = Rates::default();
+    // Reads of the own object a listing of `nodes/` makes, still to come.
+    let mut listed_own = 0;
     for l in entries {
         match l.op {
-            Op::List if l.key.starts_with("nodes") => r.list_nodes += 1,
+            Op::List if l.key.starts_with("nodes") => {
+                r.list_nodes += 1;
+                listed_own += 1;
+            }
             Op::List
                 if l.key.starts_with("control")
                     || l.key.contains("/moves")
@@ -218,7 +219,11 @@ fn rates(id: &str, entries: &[Logged]) -> Rates {
             Op::List if l.key.contains("alarms") => r.list_alarms += 1,
             Op::List => r.list_other += 1,
             Op::Get if l.key == own => {
-                r.periods += 1;
+                if listed_own > 0 {
+                    listed_own -= 1;
+                } else {
+                    r.periods += 1;
+                }
                 r.get_nodes += 1;
             }
             Op::Get if l.key.starts_with("nodes/") => r.get_nodes += 1,
@@ -269,14 +274,15 @@ async fn an_idle_node_lists_and_reads_what_its_cadences_say() {
         let periods = r.periods.max(1);
         let per = |n: usize| n as f64 / periods as f64;
         // `nodes/` every 10 periods (0.1 a period), and three heartbeats
-        // read a period, listed or not.
+        // read a period, plus the listing's three every ten periods (on
+        // its own task since ADR 0020's amendment of 2026-11-20).
         assert!(
             (0.05..=0.2).contains(&per(r.list_nodes)),
             "{id} listed nodes/ {} times in {periods} periods",
             r.list_nodes
         );
         assert!(
-            (2.7..=3.3).contains(&per(r.get_nodes)),
+            (2.7..=3.6).contains(&per(r.get_nodes)),
             "{id} read {} heartbeats in {periods} periods",
             r.get_nodes
         );

@@ -32,21 +32,45 @@ impl wasmkeep_cluster::lease::Clock for Wall {
     }
 }
 
+/// What `wasmkeep cluster forget` may delete, once checked.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Forgettable {
+    /// A heartbeat in the format from before node leases.
+    OldFormat,
+    /// A `released` node lease: deleted only if no ownership record names
+    /// its node ([`records_naming`]).
+    Released,
+}
+
 /// Whether `wasmkeep cluster forget` may delete a heartbeat object with this
-/// body at `now_ms`: only one in the format from before node leases, older
-/// than its horizon plus a lease's ttl and grace (the defaults, 25 s), so a
-/// retired node's. A node lease is never deleted (records may name it, and
-/// a fence is what revokes a node); a recent old one may still run.
-pub(crate) fn may_forget(body: &[u8], now_ms: u64) -> Result<(), String> {
+/// body at `now_ms`, older than its horizon plus a lease's ttl and grace
+/// (the defaults, 25 s): one in the format from before node leases (a
+/// retired node's), or a `released` node lease (ADR 0020, amendment of
+/// 2026-11-20: its instance never writes again; deleted only if no record
+/// names its node). A `live` one is never deleted (fence it to revoke the
+/// node), nor a `fenced` one: its process did not stop cleanly, so records
+/// likely still name it, and the fence is the evidence that frees them and
+/// that ends that instance. A recent one may still run.
+pub(crate) fn may_forget(body: &[u8], now_ms: u64) -> Result<Forgettable, String> {
     let Some(info) = NodeInfo::decode(body) else {
         return Err("this heartbeat is in a format this version cannot read: left alone".into());
     };
-    if info.lease.is_some() {
-        return Err(format!(
-            "{} has a node lease (ADR 0020), never deleted: ownership records may name it. To revoke the node, `wasmkeep cluster fence {}`",
-            info.id, info.id
-        ));
-    }
+    let what = match info.lease {
+        None => Forgettable::OldFormat,
+        Some(NodeState::Released) => Forgettable::Released,
+        Some(NodeState::Live) => {
+            return Err(format!(
+                "{} has a live node lease (ADR 0020), never deleted: its node may run. To revoke it, `wasmkeep cluster fence {}`",
+                info.id, info.id
+            ));
+        }
+        Some(NodeState::Fenced) => {
+            return Err(format!(
+                "{} is fenced (ADR 0020), never deleted: the fence is what frees the actors its process held and ends that process",
+                info.id
+            ));
+        }
+    };
     let lease = wasmkeep_cluster::lease::LeaseConfig::default_safe();
     let window = wasmkeep_server::heartbeat_horizon_ms(wasmkeep_server::DEFAULT_HEARTBEAT, &lease)
         .saturating_add(lease.ttl_ms())
@@ -58,7 +82,115 @@ pub(crate) fn may_forget(body: &[u8], now_ms: u64) -> Result<(), String> {
             window / 1000
         ));
     }
-    Ok(())
+    Ok(what)
+}
+
+/// How many ownership records of the apps under `prefix`
+/// (`state/<tenant>/<app>/owners/...`) name `node`, any instance; a record
+/// that cannot be read counts, to be safe. One listing per tenant and per
+/// app, and one read per record.
+pub(crate) async fn records_naming(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    node: &str,
+) -> Result<usize, String> {
+    use futures_util::TryStreamExt as _;
+    use object_store::ObjectStoreExt as _;
+    let prefix = prefix.trim_matches('/');
+    let base = if prefix.is_empty() {
+        StorePath::from("state")
+    } else {
+        StorePath::from(format!("{prefix}/state"))
+    };
+    let listed = |p: StorePath| async move {
+        store
+            .list_with_delimiter(Some(&p))
+            .await
+            .map(|l| l.common_prefixes)
+            .map_err(|e| format!("listing {p}: {e}"))
+    };
+    let mut named = 0;
+    for tenant in listed(base).await? {
+        for app in listed(tenant).await? {
+            let owners = app.clone().join("owners");
+            let records: Vec<_> = store
+                .list(Some(&owners))
+                .try_collect()
+                .await
+                .map_err(|e| format!("listing {owners}: {e}"))?;
+            for meta in records {
+                let body = match store.get(&meta.location).await {
+                    Ok(r) => r.bytes().await.map_err(|e| e.to_string())?,
+                    Err(object_store::Error::NotFound { .. }) => continue,
+                    Err(e) => return Err(format!("reading {}: {e}", meta.location)),
+                };
+                let names = wasmkeep_cluster::node_lease::OwnerRecord::decode(&body)
+                    .is_none_or(|r| r.holder.is_some_and(|(n, _)| n == node));
+                if names {
+                    named += 1;
+                }
+            }
+        }
+    }
+    Ok(named)
+}
+
+/// `wasmkeep cluster forget <node>` on `store` under `prefix` at `now_ms`:
+/// deletes `nodes/<node>` if [`may_forget`] allows it. What it did, or why
+/// it refused.
+pub(crate) async fn forget_on(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    node: &str,
+    now_ms: u64,
+) -> Result<String, String> {
+    use wasmkeep_cluster::control::Keys as _;
+    use wasmkeep_cluster::lease::Bucket as _;
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(store), prefix);
+    let key = format!("nodes/{node}");
+    let Some((body, _)) = bucket
+        .get(&key)
+        .await
+        .map_err(|e| format!("reading {key}: {e:?}"))?
+    else {
+        return Ok(format!(
+            "{node} has no heartbeat object: nothing to forget."
+        ));
+    };
+    let what = may_forget(&body, now_ms)?;
+    if what == Forgettable::Released {
+        // No new record can name it: only its own process writes records
+        // naming it, and that process released. A new process under the
+        // id would replace the object first, which the read below sees.
+        let named = records_naming(store, prefix, node).await?;
+        if named > 0 {
+            return Err(format!(
+                "{node}'s released lease is kept: {named} ownership record(s) still name it, and it is what frees them. Each is taken over by the next request for its actor; run the command again later"
+            ));
+        }
+    }
+    // Read again right before the delete (a store's DELETE takes no
+    // condition): a new node's first write over the stale heartbeat in
+    // between must not be deleted. The window left is the time between the
+    // two requests.
+    let again = bucket
+        .get(&key)
+        .await
+        .map_err(|e| format!("reading {key}: {e:?}"))?
+        .map(|(b, _)| b);
+    if again.as_deref() != Some(body.as_slice()) {
+        return Err(format!(
+            "{key} changed while it was checked: left alone; run the command again"
+        ));
+    }
+    bucket
+        .delete(&key)
+        .await
+        .map_err(|e| format!("deleting {key}: {e:?}"))?;
+    Ok(match what {
+        Forgettable::OldFormat => format!("Removed {node}'s retired heartbeat."),
+        Forgettable::Released => format!("Removed {node}'s released node lease."),
+    })
 }
 
 /// One heartbeat, as seen at the time of reading.
@@ -955,7 +1087,10 @@ mod tests {
     #[test]
     fn only_a_stale_old_format_heartbeat_may_be_forgotten() {
         let old = |at: u64| format!("wasmkeep-node 2\nb\nhttp://b\n0.0.0\n{at}\nt/\n");
-        assert_eq!(may_forget(old(NOW - 60_000).as_bytes(), NOW), Ok(()));
+        assert_eq!(
+            may_forget(old(NOW - 60_000).as_bytes(), NOW),
+            Ok(Forgettable::OldFormat)
+        );
         let recent = may_forget(old(NOW - 1_000).as_bytes(), NOW).unwrap_err();
         assert!(recent.contains("may still run"), "{recent}");
         assert!(may_forget(old(NOW + 5_000).as_bytes(), NOW).is_err());
@@ -966,6 +1101,92 @@ mod tests {
         let why = may_forget(lease.as_bytes(), NOW).unwrap_err();
         assert!(why.contains("never deleted"), "{why}");
         assert!(may_forget(b"junk", NOW).is_err());
+    }
+
+    /// A `released` node lease ([ADR 0020](../../docs/adr/0020-one-lease-per-node.md),
+    /// amendment of 2026-11-20): its instance never writes again, so
+    /// `cluster forget` deletes it once it is as old as a retired
+    /// heartbeat must be, unless an ownership record of any app on the
+    /// prefix still names that node (the released object is what frees
+    /// such a record; deleted, the record would stay held). A fenced or
+    /// live one is never deleted.
+    #[test]
+    fn a_released_lease_no_record_names_may_be_forgotten() {
+        use wasmkeep_cluster::node_lease::OwnerRecord;
+        use wasmkeep_cluster::state_root::{Family, StateRoot};
+        let lease = |state: &str, at: u64| {
+            format!(
+                "wasmkeep-node 3\n{state} beef\n{at}\nb\nhttp://b\n0.0.0\nt/\n\n\nserving\n\ntake\n"
+            )
+        };
+        let put = |store: &Arc<dyn ObjectStore>, key: String, body: Vec<u8>| {
+            block_on(store.put(&StorePath::from(key), body.into())).unwrap();
+        };
+        let exists = |store: &Arc<dyn ObjectStore>| {
+            block_on(store.head(&StorePath::from("nodes/b"))).is_ok()
+        };
+        // Released long ago, no record names it: removed.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(
+            &store,
+            "nodes/b".into(),
+            lease("released", NOW - 600_000).into_bytes(),
+        );
+        let done = block_on(forget_on(&store, "", "b", NOW));
+        assert!(done.is_ok(), "{done:?}");
+        assert!(!exists(&store));
+        // A record of an app on the prefix still names it: kept.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(
+            &store,
+            "nodes/b".into(),
+            lease("released", NOW - 600_000).into_bytes(),
+        );
+        let root = StateRoot::new("", "acme", "shop");
+        let record = OwnerRecord {
+            holder: Some(("b".to_owned(), "beef".to_owned())),
+            generation: 3,
+            recorded: None,
+        };
+        put(
+            &store,
+            root.key(Family::Owners, "counter/alice"),
+            record.encode(),
+        );
+        let other = OwnerRecord {
+            holder: Some(("c".to_owned(), "cafe".to_owned())),
+            generation: 1,
+            recorded: None,
+        };
+        put(
+            &store,
+            root.key(Family::Owners, "counter/bob"),
+            other.encode(),
+        );
+        let why = block_on(forget_on(&store, "", "b", NOW)).unwrap_err();
+        assert!(why.contains("1 ownership record"), "{why}");
+        assert!(exists(&store));
+        // Recent: its node may have released moments ago; kept.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(
+            &store,
+            "nodes/b".into(),
+            lease("released", NOW - 1_000).into_bytes(),
+        );
+        assert!(block_on(forget_on(&store, "", "b", NOW)).is_err());
+        assert!(exists(&store));
+        // Fenced, or live: never.
+        for state in ["fenced", "live"] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            put(
+                &store,
+                "nodes/b".into(),
+                lease(state, NOW - 600_000).into_bytes(),
+            );
+            let why = block_on(forget_on(&store, "", "b", NOW)).unwrap_err();
+            assert!(why.contains("never deleted"), "{state}: {why}");
+            assert!(exists(&store));
+        }
     }
 
     /// ADR 0038, M6: node ids of one process are grouped by the process

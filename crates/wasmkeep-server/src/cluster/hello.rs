@@ -152,6 +152,11 @@ impl Cluster {
             return StatusCode::FORBIDDEN;
         }
         crate::metrics::inc(&crate::metrics::METRICS.hellos_received);
+        // Its heartbeat by key at once (a slow LIST must not delay a
+        // join), and a listing as before.
+        if let Some(sender) = &signed.sender {
+            self.read_soon(sender);
+        }
         self.want_listing();
         StatusCode::OK
     }

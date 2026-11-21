@@ -520,6 +520,13 @@ pub(crate) struct Cluster {
     /// the `written_at` of the heartbeat it comes from: what an early read
     /// is planned on.
     trust_ends: Mutex<HashMap<String, (u64, u64)>>,
+    /// The nodes whose heartbeat, as last read, is `released` or `fenced`:
+    /// their instance never writes again, so rounds do not read them (the
+    /// listings do).
+    stopped_nodes: Mutex<std::collections::HashSet<String>>,
+    /// Node ids a signed call named that this node holds no live heartbeat
+    /// of, for [`view::join_read_loop`].
+    reads_wanted: tokio::sync::mpsc::UnboundedSender<String>,
     /// How long one read of a heartbeat may take
     /// ([`heartbeat_read_attempt`]); a listing gets two.
     heartbeat_read_attempt: Duration,
@@ -733,6 +740,7 @@ impl Cluster {
         // heartbeats, alarms, replication), counted for the metrics page.
         let store = crate::counted_store::counted(Arc::clone(&config.store));
         let (fences_due, fences_due_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reads_wanted, reads_wanted_rx) = tokio::sync::mpsc::unbounded_channel();
         let bucket = ObjectStoreBucket::new(Arc::clone(&store), config.prefix.clone());
         // Three tries to renew the node lease before it runs out (ADR 0020).
         if config.heartbeat > Duration::from_millis(config.lease.ttl_ms() / 3) {
@@ -863,6 +871,8 @@ impl Cluster {
             follows_app: config.follows_app,
             known_nodes: Mutex::new(Vec::new()),
             trust_ends: Mutex::new(HashMap::new()),
+            stopped_nodes: Mutex::default(),
+            reads_wanted,
             heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),
             slowest_read_ms: std::sync::atomic::AtomicU64::new(0),
             listing_wanted: std::sync::atomic::AtomicBool::new(false),
@@ -883,6 +893,8 @@ impl Cluster {
         tokio::spawn(pending_loop(Arc::downgrade(&cluster)));
         tokio::spawn(heartbeat_loop(Arc::downgrade(&cluster), config.heartbeat));
         tokio::spawn(control_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(listing_loop(Arc::downgrade(&cluster), config.heartbeat));
+        tokio::spawn(join_read_loop(Arc::downgrade(&cluster), reads_wanted_rx));
         tokio::spawn(fence_loop(Arc::downgrade(&cluster), fences_due_rx));
         Ok(cluster)
     }
@@ -1609,6 +1621,7 @@ impl Cluster {
             Some(_) => Err("hop's sender is a node of another app"),
             None if on_cluster_port || self.refuse_plaintext => {
                 self.want_listing();
+                self.read_soon(&sender);
                 Err("hop's sender is not a live node")
             }
             None => Ok(Some(sender)),

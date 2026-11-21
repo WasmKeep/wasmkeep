@@ -29,6 +29,20 @@ The text under a version's heading is its GitHub release text
   `wasmkeep_heartbeat_age_milliseconds`,
   `wasmkeep_heartbeat_read_failures_total` and
   `wasmkeep_heartbeat_early_reads_total`.
+- **Listing `nodes/` no longer holds up the heartbeat reads** (ADR 0020,
+  amendment of 2026-11-20). A node listed `nodes/` inline every ten
+  periods, and after a failed listing every period, so a slow LIST
+  stalled its reads. Listing now runs on a task of its own, for
+  discovery only, with a longer limit and a backoff; every period reads
+  the known nodes by key. Nodes whose lease is `released` or `fenced` are
+  read only when listing, not every period: a prefix holding many leases
+  left by earlier clusters costs nothing per period any more. A node that
+  says hello, or sends a signed hop, before it was listed is read by key
+  at once, so a join does not wait for a slow LIST (over TLS it still
+  waits for the listing its refused handshake asks for).
+- **`wasmkeep cluster forget` removes a released node lease** that no
+  ownership record names and that is older than 25 s. It still refuses
+  a live or fenced node lease, and a released one a record still names.
 - **An edge woken from hibernation delivers its first push to the sockets
   it kept, and answers every ping** (ADR 0040, sections 5 and 6). The edge
   used to place those sockets at the push's `head` before applying it, so

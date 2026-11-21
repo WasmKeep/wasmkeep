@@ -40,8 +40,11 @@
   last read, trusted until its own horizon; a peer whose trust would end
   before the next round lands is read early; the intents are read on a
   task of their own; a heartbeat dated ahead counts from its first read.
-  The horizon (10 s) is unchanged. See "Amendment of 2026-11-20: a slow
-  bucket" at the end.
+  The horizon (10 s) is unchanged. Listing `nodes/` moved to a task of its
+  own, for discovery only; rounds no longer read stopped (released or
+  fenced) nodes; a hello reads its sender by key; `cluster forget` may
+  delete a released lease no record names. See "Amendment of 2026-11-20:
+  a slow bucket" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -1003,3 +1006,97 @@ suite, plain and over TLS, with a bucket slow for one node:
   200 ms, under the attempt, five of them past two attempts together).
 - `membership::tests`: `a_trust_about_to_end_before_the_next_round_lands_is_read_early`
   and `a_heartbeat_dated_ahead_counts_from_its_first_read`.
+
+### Second part (same amendment): listing off the read path
+
+The first part left two costs on a slow bucket: every
+tenth round still listed `nodes/` inline and waited for the LIST and its
+reads (up to two attempts) before reading by key, and a listing that
+failed left the next one due, so with a steadily slow LIST every round
+listed again, back to back. And a prefix that holds many `released`
+node leases left by earlier clusters had every round read them all by
+key, beside the few live nodes.
+
+- **Listing is discovery only, on a task of its own** (`listing_loop`):
+  new node ids, nodes whose object is gone, and the objects of stopped
+  nodes. The first period's round still lists (within two attempts), to
+  find the peers before saying hello; from then on every round reads the
+  known nodes by key. The listing task lists every ten periods and when
+  asked (a hello, a record naming an unknown node, an unknown pin, a first
+  listing that failed), at once but at most once a period; an ask that
+  arrives while it lists is kept for its next listing (an ask is no
+  longer lost when the period ends). Each listing gets the longest of two
+  attempts, the scheduled interval and 30 s, since nothing waits for it;
+  one that fails or runs out is tried again after one period, then two,
+  four, at most the interval. Its results are applied like any read's,
+  ordered by when they were issued, so a listing landing late changes
+  nothing a later read saw.
+- **Stopped nodes are not read every round.** A node whose heartbeat as
+  last read is `released` or `fenced` for an instance cannot come back
+  as that instance (instances change only through conditional writes, and
+  a new process has a new one), so rounds leave it out; the listings
+  still read it, so a new process under that id is found by the next
+  listing, or sooner by its hello. Its object stays as last read for the
+  free rule (section 3) and the failover wait, as before. With 90
+  released leases and three live nodes a round makes four reads, not 94.
+- **A join is not held up by a slow LIST.** A hello, or a hop whose
+  signed sender this node holds no live heartbeat of, makes this node
+  read that node's object by key at once, on a task of its own, at most
+  once a period per node (`join_read_loop`). Over TLS the first hello of a
+  new process is refused at the handshake (its pin is not known yet),
+  which asks for a listing as before: such a join waits for that listing,
+  which now lands however slow the LIST, where a listing given two
+  attempts never did. Reading the certificate's name at the handshake
+  would avoid that wait; not done (it would need a certificate parser).
+- **The dead-peer bound is unchanged**: rounds by key renew a peer's
+  trust, so a slow LIST changes nothing about when a dead one lapses.
+
+#### Long-released node leases: `cluster forget`
+
+A `released` node lease can now be deleted by `wasmkeep cluster forget`,
+by the operator, under three conditions: it is older than its horizon
+plus a lease's ttl and grace (25 s at the defaults, the window already
+used for old-format heartbeats); no ownership record of any app under the
+prefix names that node, any instance (one listing per tenant and app of
+`state/`, one read per record; a record that cannot be read counts as
+naming it); and the object is unchanged when read again right before the
+delete. Why that is safe: the released object is what frees a record
+still naming the node (section 3; an absent object frees nothing), so it
+must stay while any does; no new record can name it, since only its own
+process writes records naming itself and that process released; and a
+new process under the id replaces the object first, which the second
+read sees. A `fenced` lease stays: its process did not stop cleanly, so
+records likely still name it, and the fence is the evidence that frees
+them and that ends that instance. A `live` one stays (fence it to revoke
+the node).
+
+The other option, nodes removing long-released leases on their own, was
+not taken: every node would delete lease state, racing a process starting
+under that id (its start check reads that object) and each other, to save
+what is now nothing per period (rounds no longer read stopped nodes). An
+operator command, run when wanted, with the record check, is the
+conservative choice.
+
+#### Tests (second part)
+
+- `tests/cluster/slow_bucket.rs`:
+  `a_slow_listing_holds_up_no_read_and_a_dead_peer_still_expires` (every
+  LIST from one node 1.5 s late, three times what an inline listing had:
+  its trust in a writing peer never lapses over 3 s of samples, every
+  forwarded request is answered, and a peer that dies is distrusted
+  within the horizon of its last write; before, the trust lapsed in 81 of
+  271 samples) and
+  `a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello`
+  (LIST 3 s late: plain, the joining node is trusted within 2 s through
+  its hello's read by key; over TLS within 10 s, through the listing its
+  refused handshake asks for; before, never).
+- `cluster::tests::a_round_reads_only_the_nodes_that_may_still_write`
+  (90 released leases and three live nodes: four reads a round, 94
+  before).
+- `status::tests::a_released_lease_no_record_names_may_be_forgotten`
+  (wasmkeep-cli: removed when no record names it; kept when one does,
+  when recent, and when fenced or live).
+- `tests/cluster/listings.rs`: a listing's read of a node's own object is
+  no longer one of its rounds, and a node now reads three heartbeats a
+  period plus a listing's three every ten periods; the counts follow.
+

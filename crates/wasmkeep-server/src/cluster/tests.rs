@@ -4720,6 +4720,8 @@ struct SlowNodeReads {
     /// Every other read and listing (`control/`, the app's intents) waits
     /// this long first (ms): a slow bucket that still answers.
     others_delay_ms: std::sync::atomic::AtomicU64,
+    /// Reads of `nodes/` objects, counted.
+    node_gets: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Display for SlowNodeReads {
@@ -4754,6 +4756,8 @@ impl ObjectStore for SlowNodeReads {
     ) -> object_store::Result<object_store::GetResult> {
         let key = location.as_ref();
         if key.starts_with("nodes/") {
+            self.node_gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -5154,4 +5158,47 @@ async fn a_live_body_read_late_never_undoes_a_fence_of_its_instance() {
         |_, _, f| f.to_vec(),
     );
     assert_eq!(fresh, ["b"]);
+}
+
+/// ADR 0020, amendment of 2026-11-20: a node whose heartbeat is `released`
+/// or `fenced` for an instance cannot come back as that instance (a new
+/// process under that id has a new instance, found by the next listing or
+/// a hello), so a round reads only the nodes that may still write: with 90
+/// released node leases left by earlier clusters on the prefix and three
+/// live nodes, a round reads four objects (this node's own included), not
+/// 94.
+#[tokio::test]
+async fn a_round_reads_only_the_nodes_that_may_still_write() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    for i in 0..90 {
+        let id = format!("old-{i}");
+        let body = format!(
+            "wasmkeep-node 3\nreleased i{i}\n{}\n{id}\nhttp://{id}\n0.0.0\nt/\n\n\nserving\n\ntake\n",
+            now_ms() - 86_400_000
+        );
+        store
+            .inner
+            .put(
+                &StorePath::from(format!("nodes/{id}")),
+                body.into_bytes().into(),
+            )
+            .await
+            .unwrap();
+    }
+    for (i, id) in ["b", "c", "d"].into_iter().enumerate() {
+        publish_tls(&store, id, now_ms(), u8::try_from(i + 1).unwrap()).await;
+    }
+    assert!(a.refresh_view(true).await);
+    let gets = || store.node_gets.load(std::sync::atomic::Ordering::SeqCst);
+    let before = gets();
+    a.refresh_view(false).await;
+    assert_eq!(
+        gets() - before,
+        4,
+        "a round read the released node leases too"
+    );
+    // The listing still sees them all (discovery, and the free rule's
+    // evidence for whatever records name them).
+    assert_eq!(a.known_nodes.lock().unwrap().len(), 93);
 }

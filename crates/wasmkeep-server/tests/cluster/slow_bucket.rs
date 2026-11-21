@@ -151,3 +151,119 @@ async fn a_hung_control_read_does_not_hold_up_the_view() {
     assert_eq!(r.status, 200, "{}", r.body);
     drop(b);
 }
+
+/// A listing of `nodes/` that takes 1.5 s from a (three times the two read
+/// attempts a listing had, inline in a round, before the amendment's
+/// second part): the listing runs on a task of its own, for discovery
+/// only, and every round reads the known peers by key, so the trust in a
+/// peer that keeps writing never lapses and forwarding stays up, while a
+/// peer that dies still lapses within the horizon of its last write.
+/// Before, every round listed again (the failed listing left it due),
+/// waited out the listing's limit, then read by key: rounds of more than
+/// half a second against a 400 ms horizon.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_listing_holds_up_no_read_and_a_dead_peer_still_expires() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let down_c = Arc::new(AtomicBool::new(false));
+    let seen_by_c: Arc<dyn ObjectStore> =
+        Arc::new(Flaky::new(Arc::clone(&shared), Arc::clone(&down_c)));
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let c = node_unplaced("c", dc.path(), &seen_by_c, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    let r = send(b.addr, "GET", "/actor/t/x/fired", "").await;
+    assert_eq!((r.status, r.node.as_deref()), (200, Some("b")));
+    reaches_all(&a.service, &["b", "c"]).await;
+
+    flaky_a.delay_node_lists_ms.store(1_500, Ordering::SeqCst);
+    let addr = a.addr;
+    let traffic = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut failed = Vec::new();
+        let mut sent = 0;
+        while started.elapsed() < Duration::from_secs(3) {
+            sent += 1;
+            let r = send(addr, "GET", "/actor/t/x/fired", "").await;
+            if (r.status, r.node.as_deref()) != (200, Some("b")) {
+                failed.push((r.status, r.body));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (sent, failed)
+    });
+    let (missed, taken) = unreached(&a.service, "b", Duration::from_secs(3)).await;
+    let (sent, failed) = traffic.await.unwrap();
+    assert_eq!(
+        missed, 0,
+        "a's trust in b lapsed in {missed} of {taken} samples while listings were slow"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {sent} forwarded requests failed: {failed:?}",
+        failed.len()
+    );
+
+    down_c.store(true, Ordering::SeqCst);
+    let died = std::time::Instant::now();
+    stop_listening(c).await;
+    while a.service.reaches_node("c") {
+        assert!(
+            died.elapsed() < Duration::from_secs(5),
+            "a still trusts c 5 s after it died"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    let lapsed = died.elapsed();
+    assert!(
+        lapsed < Duration::from_millis(900),
+        "a trusted c for {lapsed:?} after it died"
+    );
+}
+
+/// A node that joins while a's listings take 3 s: its hello (a signed
+/// node call naming it) makes a read its heartbeat by key at once, so a
+/// trusts it within about a period rather than after a listing. Over TLS
+/// its first hello is refused at the handshake (a does not know its pin
+/// yet), which asks for a listing: it is trusted once that slow listing
+/// lands, which a listing given only two read attempts never did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    reaches_all(&a.service, &["b"]).await;
+    flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
+    let joined = std::time::Instant::now();
+    let c = node_unplaced("c", dc.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let limit = if over_tls() {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(2)
+    };
+    while !a.service.reaches_node("c") {
+        assert!(
+            joined.elapsed() < limit,
+            "a did not trust c within {limit:?} of its start while listings took 3 s"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    eprintln!("a trusted c {:?} after it started", joined.elapsed());
+    drop((b, c));
+}
