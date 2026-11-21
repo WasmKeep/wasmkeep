@@ -443,6 +443,13 @@ operation: slow `put` (the node's lease and segment writes) and slow `get`
 (heartbeat reads) together, with `wasmkeep_segment_upload_seconds` rising,
 is a slow bucket or link.
 
+These three histograms (`wasmkeep_segment_upload_seconds`,
+`wasmkeep_bucket_request_seconds`, `wasmkeep_runtime_schedule_lag_seconds`)
+have the bounds 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms
+and 1, 2, 2.5, 5 and 30 s (the other duration histograms stop at 0.25, 1,
+5 and 30 s above 100 ms), so a p99 between 0.25 s and 30 s, or a shift
+across 1 s or 2 s, reads from a bound and not from an interpolation.
+
 ### Reading scheduling lag
 
 `wasmkeep_runtime_schedule_lag_seconds` is how much later than 100 ms a

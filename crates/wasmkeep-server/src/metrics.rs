@@ -66,18 +66,59 @@ const BUCKETS: [f64; 14] = [
     0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 30.0,
 ];
 
-/// A cumulative-bucket histogram of durations.
-#[derive(Debug, Default)]
-pub(crate) struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
-    count: AtomicU64,
-    sum_ns: AtomicU64,
+/// [`BUCKETS`] with 0.5, 2 and 2.5 s added, for the histograms that must
+/// read a shift between 0.25 s and 30 s (segment uploads, bucket requests,
+/// scheduling lag). Kept apart from [`BUCKETS`] because the per-class and
+/// per-app histograms share that one, and each added bound is a series per
+/// label set.
+const WIDE_BUCKETS: [f64; 17] = [
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
+    2.5, 5.0, 30.0,
+];
+
+/// The upper bounds, in seconds, of a [`Histogram`].
+pub(crate) trait Bounds {
+    const SECONDS: &'static [f64];
 }
 
-impl Histogram {
+/// [`BUCKETS`]: the bounds of most histograms.
+#[derive(Debug)]
+pub(crate) struct Standard;
+impl Bounds for Standard {
+    const SECONDS: &'static [f64] = &BUCKETS;
+}
+
+/// [`WIDE_BUCKETS`].
+#[derive(Debug)]
+pub(crate) struct Wide;
+impl Bounds for Wide {
+    const SECONDS: &'static [f64] = &WIDE_BUCKETS;
+}
+
+/// A cumulative-bucket histogram of durations.
+#[derive(Debug)]
+pub(crate) struct Histogram<B: Bounds = Standard> {
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    bounds: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B: Bounds> Default for Histogram<B> {
+    fn default() -> Self {
+        Self {
+            buckets: B::SECONDS.iter().map(|_| AtomicU64::new(0)).collect(),
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            bounds: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<B: Bounds> Histogram<B> {
     pub(crate) fn observe(&self, d: Duration) {
         let secs = d.as_secs_f64();
-        for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
+        for (bound, bucket) in B::SECONDS.iter().zip(&self.buckets) {
             if secs <= *bound {
                 bucket.fetch_add(1, Ordering::Relaxed);
             }
@@ -95,7 +136,7 @@ impl Histogram {
 
     fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
-        for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
+        for (bound, bucket) in B::SECONDS.iter().zip(&self.buckets) {
             let n = bucket.load(Ordering::Relaxed);
             let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{bound}\"}} {n}");
         }
@@ -503,9 +544,9 @@ pub(crate) struct Metrics {
     pub(crate) bucket_requests: Family<AtomicU64>,
     /// How long each bucket request took, by operation and status
     /// (the labels of `bucket_requests`).
-    pub(crate) bucket_request_seconds: Family<Histogram>,
+    pub(crate) bucket_request_seconds: Family<Histogram<Wide>>,
     /// How much later than asked the runtime woke the probe task.
-    pub(crate) runtime_schedule_lag_seconds: Histogram,
+    pub(crate) runtime_schedule_lag_seconds: Histogram<Wide>,
     /// Actors this node acquired whose ownership record still named another
     /// node, found free because that node's process was fenced, released or
     /// replaced (see `Hold::previous`, ADR 0020).
@@ -586,7 +627,7 @@ pub(crate) struct Metrics {
     pub(crate) segment_bytes: SegmentBytes,
     /// Segment uploads acknowledged, first PUT to acknowledgement,
     /// resends included.
-    pub(crate) segment_upload_seconds: Histogram,
+    pub(crate) segment_upload_seconds: Histogram<Wide>,
     /// PUTs of a segment sent again after a failure, a stall or a race.
     pub(crate) segment_upload_retries: AtomicU64,
     /// Segment uploads given up (not acknowledged).
@@ -2199,7 +2240,7 @@ mod tests {
 
     #[test]
     fn histograms_are_cumulative_and_labels_escaped() {
-        let h = Histogram::default();
+        let h = Histogram::<Standard>::default();
         h.observe(Duration::from_micros(50));
         h.observe(Duration::from_millis(3));
         h.observe(Duration::from_secs(60));
@@ -2696,6 +2737,32 @@ mod tests {
             "# TYPE wasmkeep_upload_budget_bytes_in_use gauge",
         ] {
             assert!(page.contains(want), "{want}:\n{page}");
+        }
+    }
+
+    /// The wide histograms have 0.5, 2 and 2.5 s bounds; the standard one
+    /// does not.
+    #[test]
+    fn wide_histograms_have_the_half_two_and_two_and_a_half_second_bounds() {
+        let wide = Histogram::<Wide>::default();
+        wide.observe(Duration::from_millis(700));
+        wide.observe(Duration::from_millis(2_200));
+        let mut out = String::new();
+        wide.render(&mut out, "w", "");
+        for want in [
+            "w_bucket{le=\"0.5\"} 0\n",
+            "w_bucket{le=\"1\"} 1\n",
+            "w_bucket{le=\"2\"} 1\n",
+            "w_bucket{le=\"2.5\"} 2\n",
+            "w_bucket{le=\"+Inf\"} 2\n",
+        ] {
+            assert!(out.contains(want), "{want} in\n{out}");
+        }
+        let standard = Histogram::<Standard>::default();
+        let mut out = String::new();
+        standard.render(&mut out, "s", "");
+        for gone in ["le=\"0.5\"", "le=\"2\"", "le=\"2.5\""] {
+            assert!(!out.contains(gone), "{gone} in\n{out}");
         }
     }
 
