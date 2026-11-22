@@ -21,13 +21,13 @@ the [changelog](CHANGELOG.md).
 
 ## Next
 
-What 0.7.0 left of its list, in this order.
+What comes after 0.7.0, in this order.
 
-1. **A room's edges on several nodes** (M): today a room's tree stays
+1. **A room and its pusher kept apart at wake-up** (S/M): placement
+   considers load only, so an operator moves the pusher of a large room
+   by hand ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
+2. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
-2. **A room and its pusher kept apart** (S/M): placement considers load
-   only, so an operator moves the pusher of a large room by hand
-   ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
 3. **Compacting idle actors' histories** (M), the other half of a
    faster change feed: listing is parallel in 0.7.0, but a poll still
    lists every object of a long history.
