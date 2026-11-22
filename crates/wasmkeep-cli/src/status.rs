@@ -850,7 +850,7 @@ fn or_dash(s: &str) -> String {
 }
 
 /// `850ms`, `4.2s`, `12m`, `3h`, `5d`.
-fn age(ms: u64) -> String {
+pub(crate) fn age(ms: u64) -> String {
     match ms {
         0..1_000 => format!("{ms}ms"),
         1_000..60_000 => format!("{:.1}s", ms as f64 / 1_000.0),
@@ -861,7 +861,7 @@ fn age(ms: u64) -> String {
 }
 
 /// Left-aligned columns, two spaces apart.
-fn table<const N: usize>(out: &mut String, header: [&str; N], rows: &[[String; N]]) {
+pub(crate) fn table<const N: usize>(out: &mut String, header: [&str; N], rows: &[[String; N]]) {
     let mut width = header.map(str::len);
     for row in rows {
         for (w, cell) in width.iter_mut().zip(row) {

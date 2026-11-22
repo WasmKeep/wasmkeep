@@ -1302,6 +1302,34 @@ never an actor is not created.
   target that does not answer) is tried again on every heartbeat until it
   works or the request expires (5 minutes).
 
+## Seeing where an actor runs
+
+```bash
+wasmkeep actor where --app acme/shop room/lobby cart/u-1842 --bucket s3://acme-wasmkeep/prod
+```
+
+```text
+ACTOR         OWNER       LIVE  SINCE
+room/lobby    node-b      yes   14m ago
+cart/u-1842   not placed  -     -
+```
+
+The actors are named as for `actor move` (one or more `CLASS/NAME`). For
+each, the command reads its ownership record and the heartbeats, and prints
+the node that owns it, whether that node is live (as `cluster status`
+counts it), and how long ago the record was written, which is when that
+node took the actor. An actor with no record, or one released by its
+owner (idle), is `not placed`: its next event claims it wherever it lands.
+Use it to check that two actors, a busy room and the pusher that feeds it,
+run on different nodes before and after an `actor move`. `--json` prints
+the same for scripts (`actor`, `app`, `placed`, `owner`, `live`,
+`since_ms`).
+
+It is read-only: it writes nothing, claims nothing and wakes no actor, and
+read access to the bucket is enough. The answer is the bucket's at that
+moment; an actor may move right after. The `x-wasmkeep-node` response
+header names the node that served one request.
+
 ## Deleting one actor
 
 ```bash

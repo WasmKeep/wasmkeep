@@ -18,6 +18,11 @@ The text under a version's heading is its GitHub release text
   `wasmkeep_bucket_request_seconds{operation,status}` times every bucket
   request, and `wasmkeep_runtime_schedule_lag_seconds` records how late the
   async runtime wakes a task that sleeps 100 ms.
+- **`wasmkeep actor where`: which node an actor runs on.** It reads the
+  ownership record of each actor it names and the heartbeats, and prints
+  the owning node, whether that node is live and since when it has owned
+  the actor (`not placed` for an idle actor with no owner), in columns or
+  with `--json`. Read-only: nothing is written, claimed or woken.
 - **A slow bucket no longer makes nodes distrust healthy peers** (ADR 0020
   and ADR 0011, amendments of 2026-11-20). A node read its peers'
   heartbeats one after the other, with no time limit, and read

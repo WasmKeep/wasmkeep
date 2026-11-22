@@ -4,6 +4,7 @@
 
 mod actor_read;
 mod actor_restore;
+mod actor_where;
 mod app_delete;
 mod app_format_cmd;
 mod inspect;
@@ -220,6 +221,11 @@ enum ActorCommand {
     Delete(DeleteArgs),
     /// Restore historical state as a new write by the current owner.
     Restore(actor_restore::RestoreArgs),
+    /// Show which node owns each actor, whether that node is live and since
+    /// when (read from the actor's ownership record and the heartbeats; an
+    /// actor with no owner is "not placed"). Read-only: it claims nothing
+    /// and wakes no actor.
+    Where(actor_where::WhereArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1443,6 +1449,7 @@ fn main() -> anyhow::Result<()> {
         Command::Actor(ActorCommand::Move(args)) => actor_move(&args),
         Command::Actor(ActorCommand::Delete(args)) => actor_delete(&args),
         Command::Actor(ActorCommand::Restore(args)) => actor_restore::run(&args),
+        Command::Actor(ActorCommand::Where(args)) => actor_where::run(&args),
         Command::App(AppCommand::Delete(args)) => app_delete::run(&args),
         Command::App(AppCommand::Format(args)) => app_format_cmd::run(&args),
         Command::Secrets(command) => secrets_cmd::run(command),
