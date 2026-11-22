@@ -70,7 +70,7 @@ types TypeScript needs for React; there is no UI library:
 
 <!-- test: install -->
 ```bash
-npm install --save-exact @wasmkeep/sdk@0.6.0 react@19.3.1 react-dom@19.3.1
+npm install --save-exact @wasmkeep/sdk@0.7.0 react@19.3.1 react-dom@19.3.1
 npm install --save-dev --save-exact typescript@5.9.3 vite@8.3.8 \
   @vitejs/plugin-react@6.3.0 @types/react@19.3.0 @types/react-dom@19.3.0
 ```

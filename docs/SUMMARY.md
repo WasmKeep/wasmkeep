@@ -44,6 +44,7 @@
 - [Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)
 - [Upgrade a cluster to 0.5.0](deploy/upgrading-to-0.5.md)
 - [Upgrade a cluster to 0.6.0](deploy/upgrading-to-0.6.md)
+- [Upgrade a cluster to 0.7.0](deploy/upgrading-to-0.7.md)
 - [Monitoring](monitoring.md)
 
 # Reference

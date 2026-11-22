@@ -10,9 +10,9 @@ the page that covers it in depth.
 This follows [From one node to three](one-node-to-three.md). Applies to:
 WasmKeep `0.4.0` and later. Steps or flags that `0.3.0` does not have
 are marked **0.4.0 and later**. A build from a git checkout reports the
-release it follows and its commit, such as `0.6.0+4f1c2a9e7b3d`
+release it follows and its commit, such as `0.7.0+4f1c2a9e7b3d`
 (`wasmkeep --version`, and the VERSION column of `cluster status`); the
-release reports `0.6.0` alone.
+release reports `0.7.0` alone.
 
 > **Pre-alpha.** The cluster is tested in simulation, with real processes
 > against an S3 API, and against real buckets with nodes killed under load
@@ -153,14 +153,14 @@ wasmkeep cluster status --bucket "$BUCKET"
 Cluster s3://demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE   STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  VERSION             APP        ADDRESS                CLUSTER ADDRESS         TLS     WORDS
-a     yes   2.0s  serving  1       0        -       -          0.6.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
-b     yes   2.0s  serving  0       0        -       -          0.6.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
-c     yes   2.0s  serving  0       0        -       -          0.6.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+a     yes   2.0s  serving  1       0        -       -          0.7.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8081  https://127.0.0.1:7481  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+b     yes   2.0s  serving  0       0        -       -          0.7.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8082  https://127.0.0.1:7482  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+c     yes   2.0s  serving  0       0        -       -          0.7.0+4f1c2a9e7b3d  demo/shop  http://127.0.0.1:8083  https://127.0.0.1:7483  pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
 
 APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT
 demo/shop  7973128b9d723db8  1    1       no     1
 
-3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.6.0+4f1c2a9e7b3d
+3 of 3 nodes live; TLS: 3 with a cluster listener, 0 plain; version: 0.7.0+4f1c2a9e7b3d
 ```
 
 Each node is live, has a `CLUSTER ADDRESS` and shows `pinned` under TLS;
