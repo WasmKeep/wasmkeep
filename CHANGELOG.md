@@ -26,10 +26,11 @@ allocator pages once activity drops. Still a **pre-alpha pre-release**.
 
 **Big rooms are no longer a preview.** In 0.6.0 they were, with no
 supported client count: the room's publish path held delivery back. 0.7.0
-takes delivery off that path, to the pusher: under heavy load, a room
-whose pusher runs on another node delivered within its target. No
-measurement of 0.7.0 at that scale is published, so no client count is
-stated, and a large room needs the placement below.
+takes delivery off that path, to the pusher. On three 4-vCPU nodes, 4,500
+clients at 10 messages/s got delivery p99 under 1 s, with no message lost
+or repeated, the room and its pusher on different nodes; 6,000 is the
+measured edge, where p99 passed 1 s
+([measured](bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)). Keeping them apart is the operator's for now (below).
 
 What changes in behaviour: inside `on-alarm`, `get-alarm` returns none
 until the handler sets or clears the alarm, and whatever it sets stands,
@@ -53,6 +54,9 @@ Known limitations:
   ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
   A move does not pin: once idle, the pusher's next event may place it
   anywhere, so check again after a restart or a deploy.
+- **With the default placement the tail is longer.** Where the room and
+  its pusher share a node, delivery waits on that node's uploads for
+  both; the figures above are with them apart.
 - **At high client counts the pusher becomes the busiest actor**: it
   runs every delivery round of the room's group.
 - **Released node leases accumulate on a reused prefix** until removed

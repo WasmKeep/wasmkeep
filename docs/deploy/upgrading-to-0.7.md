@@ -11,7 +11,10 @@ binary: its ports, routes, exit codes and the package
 
 Upgrade the binary as [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)
 says: stop every node, upgrade them all, start them all. 0.7.0 documents no
-exception for one node at a time. Use the 0.7.0 CLI afterwards: `actor
+exception for one node at a time. No bucket or node-to-node format changes
+between 0.6.0 and 0.7.0 (the one new stored item, an actor's
+`alarm_touched` meta row, is ignored by 0.6.0), but a cluster of 0.6.0
+and 0.7.0 nodes is untested. Use the 0.7.0 CLI afterwards: `actor
 where`, `cluster forget` of a released node lease and the shorter restore
 are its own.
 

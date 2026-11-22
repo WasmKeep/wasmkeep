@@ -21,7 +21,7 @@ the [changelog](CHANGELOG.md).
 
 ## Next
 
-What 0.7.0 left of its list, then the numbers, in this order.
+What 0.7.0 left of its list, in this order.
 
 1. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
@@ -31,9 +31,6 @@ What 0.7.0 left of its list, then the numbers, in this order.
 3. **Compacting idle actors' histories** (M), the other half of a
    faster change feed: listing is parallel in 0.7.0, but a poll still
    lists every object of a long history.
-4. **A published measurement of a big room on 0.7.0**: delivery, acknowledged rate and
-   node memory after clients leave, on several nodes and a real bucket,
-   so that a client count can be stated.
 
 ## After that
 
@@ -323,6 +320,10 @@ Started alongside M3; what is left of it is under [Now](#now) and
   ([monitoring](docs/monitoring.md)), the idle node's GETs modelled
   ([measured](docs/benchmarks.md#bucket-requests-at-rest)), and
   `wasmkeep actor where` ([cluster](docs/cluster.md)).
+- In `0.7.0`, a big room measured on three nodes and a real bucket, the
+  room and its pusher on different nodes: 4,500 clients at 10 messages/s
+  with delivery p99 under 1 s, 6,000 the measured edge
+  ([measured](bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)).
 
 ## Stretch goal: the benchmark showdown
 
