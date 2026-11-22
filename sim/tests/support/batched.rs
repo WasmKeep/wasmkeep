@@ -1298,6 +1298,8 @@ impl World {
                 {
                     break;
                 }
+                // `to_barrier` awaits `landed` and applies it itself.
+                self.apply_landed(actor);
                 self.advance(1).await;
             }
             if kind != 4
@@ -1778,6 +1780,24 @@ impl World {
     }
 
     fn poll_operation(&mut self, actor: usize, operation: Operation) -> Option<Operation> {
+        // A flush, a barrier (handover, reset) and a cleanup's flush await
+        // the upload in flight (`landed`) and apply its outcome themselves,
+        // then capture what is pending (`flush_through`, `to_barrier`): a
+        // delayed completion job does not keep them from it. Applying a
+        // failed outcome ends the hold, and the operation with it.
+        if matches!(
+            operation,
+            Operation::Flush(..)
+                | Operation::Handover(..)
+                | Operation::ResetBarrier
+                | Operation::CleanupFlush(..)
+        ) {
+            let generation = self.actors[actor].hold.as_ref().map(|h| h.generation);
+            self.apply_landed(actor);
+            if self.actors[actor].hold.as_ref().map(|h| h.generation) != generation {
+                return None;
+            }
+        }
         match operation {
             Operation::Event(at, alarm) if self.now >= at => {
                 self.commit(actor, alarm);
@@ -3534,4 +3554,89 @@ pub(crate) fn snapshots_caught(rule: Switch, expected: Violation) {
         "caught: {rule:?} seed={seed} expected={expected:?}: {:?}",
         outcome.violations
     );
+}
+
+/// The waits of the random workload's operations that await the upload
+/// in flight in the real hold: a handover's and a reset's barrier
+/// (`to_barrier`), a flush (`flush_through`) and a cleanup's flush.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Wait {
+    Handover,
+    Flush,
+    Reset,
+    Cleanup,
+}
+
+/// Seed 11246's sequence, directed (no `random_faults`, no seed search):
+/// a commit is captured; a second commits while that segment is in
+/// flight; a wait that awaits `landed` starts, as the random workload
+/// starts it; the first PUT returns, and its completion job is delayed
+/// past the end. The real hold's wait applies that outcome itself and
+/// captures the second commit (`to_barrier`, `flush_through`: `landed`,
+/// then `pump`). A wait that only waited for the completion job left it
+/// uncaptured, and a crash one tick past its healthy bound (`2r + e`,
+/// with `r` from the first upload's own round trip) lost it: `LossBound`.
+pub(crate) fn wait_applies_its_own_landed_outcome(wait: Wait) -> Outcome {
+    Runtime::with_seed_and_config(0, madsim::Config::default()).block_on(async {
+        let mut w = World::new(0, Switch::Safe, true);
+        let actor = 0;
+        w.commit(actor, None);
+        w.advance(1).await;
+        let h = w.actors[actor].hold.as_ref().unwrap();
+        assert_eq!(h.flights.len(), 1, "the first commit is in flight");
+        let first = h.flights[0];
+        w.commit(actor, None);
+        let h = w.actors[actor].hold.as_ref().unwrap();
+        let (second, committed) = *h.commits.last().unwrap();
+        assert_eq!(h.pending.len(), 1, "the second commit waits uncaptured");
+        let generation = h.generation;
+        let (rows, local) = (h.local.rows.clone(), h.local.clone());
+        let operation = match wait {
+            Wait::Handover => Operation::Handover(0, w.now, rows),
+            Wait::Flush => {
+                w.request_flush(actor);
+                Operation::Flush(w.now + 100, local)
+            }
+            Wait::Reset => {
+                w.request_flush(actor);
+                Operation::ResetBarrier
+            }
+            Wait::Cleanup => {
+                w.request_flush(actor);
+                Operation::CleanupFlush(false, false)
+            }
+        };
+        let mut task = Some(operation);
+        let mut crash_at = None;
+        while crash_at.is_none_or(|at| w.now < at) {
+            if crash_at.is_none()
+                && let Some(returned) = w.uploads[first].returned_at
+            {
+                // The PUT returned: its completion job is not due before
+                // the crash.
+                assert!(matches!(w.uploads[first].stage, Stage::Completion));
+                w.uploads[first].due = u64::MAX;
+                let r = returned - w.uploads[first].captured_at + 3;
+                crash_at = Some(committed + 2 * r + EVENT_MAX + 1);
+            }
+            assert!(w.now < 100, "{wait:?}: the first PUT never returned");
+            let held = w.actors[actor]
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.generation == generation);
+            if held && let Some(operation) = task.take() {
+                task = w.poll_operation(actor, operation);
+            }
+            w.advance(1).await;
+        }
+        w.crash_node(actor);
+        let (_, restored) = w.restore(actor).unwrap();
+        assert!(
+            restored.rows.contains(&second)
+                || restored.erased.contains(&second)
+                || !w.outcome.violations.is_empty(),
+            "{wait:?}: the second commit is lost, and nothing says so"
+        );
+        w.outcome
+    })
 }

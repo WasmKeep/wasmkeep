@@ -8,7 +8,7 @@
 
 #[path = "support/batched.rs"]
 mod batched;
-use batched::{Switch, Violation, caught};
+use batched::{Switch, Violation, Wait, caught};
 
 #[test]
 fn batched_invariants_and_non_vacuity() {
@@ -76,6 +76,18 @@ fn removing_event_start_rule_breaks_loss_bound() {
 #[test]
 fn acknowledging_late_batched_uploads_is_caught() {
     caught(Switch::AckLate, Violation::DurableLost);
+}
+
+#[test]
+fn waits_apply_their_own_landed_outcome() {
+    // Seed 11246 of the random workload (scenario 21) was the handover's.
+    let failed: Vec<_> = [Wait::Handover, Wait::Flush, Wait::Reset, Wait::Cleanup]
+        .into_iter()
+        .map(|wait| (wait, batched::wait_applies_its_own_landed_outcome(wait)))
+        .filter(|(_, out)| !out.violations.is_empty())
+        .map(|(wait, out)| (wait, out.violations))
+        .collect();
+    assert!(failed.is_empty(), "{failed:?}");
 }
 
 #[test]
