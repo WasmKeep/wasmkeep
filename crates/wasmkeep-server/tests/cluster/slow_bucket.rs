@@ -250,8 +250,11 @@ async fn a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello() {
     settle().await;
     reaches_all(&a.service, &["b"]).await;
     flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
-    let joined = std::time::Instant::now();
     let c = node_unplaced("c", dc.path(), &shared, idle, "t", test_actor_wasm()).await;
+    // Counted from c's start, not from before it: on a loaded runner, c's
+    // own start-up took most of the 2 s. The limit stays below the 3 s
+    // listing delay, so trust within it still comes from c's hello.
+    let joined = std::time::Instant::now();
     let limit = if over_tls() {
         Duration::from_secs(10)
     } else {
