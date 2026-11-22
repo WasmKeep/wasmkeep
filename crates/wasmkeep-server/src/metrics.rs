@@ -66,18 +66,59 @@ const BUCKETS: [f64; 14] = [
     0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0, 30.0,
 ];
 
-/// A cumulative-bucket histogram of durations.
-#[derive(Debug, Default)]
-pub(crate) struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
-    count: AtomicU64,
-    sum_ns: AtomicU64,
+/// [`BUCKETS`] with 0.5, 2 and 2.5 s added, for the histograms that must
+/// read a shift between 0.25 s and 30 s (segment uploads, bucket requests,
+/// scheduling lag). Kept apart from [`BUCKETS`] because the per-class and
+/// per-app histograms share that one, and each added bound is a series per
+/// label set.
+const WIDE_BUCKETS: [f64; 17] = [
+    0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
+    2.5, 5.0, 30.0,
+];
+
+/// The upper bounds, in seconds, of a [`Histogram`].
+pub(crate) trait Bounds {
+    const SECONDS: &'static [f64];
 }
 
-impl Histogram {
+/// [`BUCKETS`]: the bounds of most histograms.
+#[derive(Debug)]
+pub(crate) struct Standard;
+impl Bounds for Standard {
+    const SECONDS: &'static [f64] = &BUCKETS;
+}
+
+/// [`WIDE_BUCKETS`].
+#[derive(Debug)]
+pub(crate) struct Wide;
+impl Bounds for Wide {
+    const SECONDS: &'static [f64] = &WIDE_BUCKETS;
+}
+
+/// A cumulative-bucket histogram of durations.
+#[derive(Debug)]
+pub(crate) struct Histogram<B: Bounds = Standard> {
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    bounds: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B: Bounds> Default for Histogram<B> {
+    fn default() -> Self {
+        Self {
+            buckets: B::SECONDS.iter().map(|_| AtomicU64::new(0)).collect(),
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            bounds: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<B: Bounds> Histogram<B> {
     pub(crate) fn observe(&self, d: Duration) {
         let secs = d.as_secs_f64();
-        for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
+        for (bound, bucket) in B::SECONDS.iter().zip(&self.buckets) {
             if secs <= *bound {
                 bucket.fetch_add(1, Ordering::Relaxed);
             }
@@ -95,7 +136,7 @@ impl Histogram {
 
     fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
-        for (bound, bucket) in BUCKETS.iter().zip(&self.buckets) {
+        for (bound, bucket) in B::SECONDS.iter().zip(&self.buckets) {
             let n = bucket.load(Ordering::Relaxed);
             let _ = writeln!(out, "{name}_bucket{{{labels}{sep}le=\"{bound}\"}} {n}");
         }
@@ -501,6 +542,11 @@ pub(crate) struct Metrics {
     /// `list`, `copy`, `rename`, `multipart`) and status (`ok`,
     /// `not_found`, `precondition`, `error`).
     pub(crate) bucket_requests: Family<AtomicU64>,
+    /// How long each bucket request took, by operation and status
+    /// (the labels of `bucket_requests`).
+    pub(crate) bucket_request_seconds: Family<Histogram<Wide>>,
+    /// How much later than asked the runtime woke the probe task.
+    pub(crate) runtime_schedule_lag_seconds: Histogram<Wide>,
     /// Actors this node acquired whose ownership record still named another
     /// node, found free because that node's process was fenced, released or
     /// replaced (see `Hold::previous`, ADR 0020).
@@ -579,6 +625,13 @@ pub(crate) struct Metrics {
     pub(crate) segment_events: SegmentEvents,
     /// Encoded bytes per batched segment.
     pub(crate) segment_bytes: SegmentBytes,
+    /// Segment uploads acknowledged, first PUT to acknowledgement,
+    /// resends included.
+    pub(crate) segment_upload_seconds: Histogram<Wide>,
+    /// PUTs of a segment sent again after a failure, a stall or a race.
+    pub(crate) segment_upload_retries: AtomicU64,
+    /// Segment uploads given up (not acknowledged).
+    pub(crate) segment_upload_failures: AtomicU64,
     /// The event-start rule acting, by `reason` ([`BATCHED_WAIT_REASONS`]).
     pub(crate) batched_waits: Family<AtomicU64>,
     /// How long a batched `flush` (or `exec-durable`'s flush) took.
@@ -1079,6 +1132,47 @@ impl Metrics {
 pub(crate) static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::seeded);
 
 /// Adds one to a counter.
+/// One segment upload ended: its time (acknowledged ones only), the
+/// PUTs it sent again, and whether it failed.
+pub(crate) fn segment_upload(elapsed: Duration, resends: u64, ok: bool) {
+    let m = &METRICS;
+    m.segment_upload_retries
+        .fetch_add(resends, Ordering::Relaxed);
+    if ok {
+        m.segment_upload_seconds.observe(elapsed);
+    } else {
+        inc(&m.segment_upload_failures);
+    }
+}
+
+/// The interval the scheduling probe sleeps.
+const LAG_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A task that sleeps [`LAG_PROBE_INTERVAL`] over and over and records how
+/// much later than that it woke, in `wasmkeep_runtime_schedule_lag_seconds`.
+/// One timer and one wake-up every 100 ms; stopped when dropped.
+pub(crate) struct LagProbe(tokio::task::JoinHandle<()>);
+
+impl LagProbe {
+    pub(crate) fn start() -> Self {
+        Self(tokio::spawn(async {
+            loop {
+                let asked = tokio::time::Instant::now() + LAG_PROBE_INTERVAL;
+                tokio::time::sleep_until(asked).await;
+                METRICS
+                    .runtime_schedule_lag_seconds
+                    .observe(tokio::time::Instant::now().saturating_duration_since(asked));
+            }
+        }))
+    }
+}
+
+impl Drop for LagProbe {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
@@ -1505,6 +1599,23 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Requests to the bucket, by operation and status.",
         &m.bucket_requests,
     );
+    head(
+        &mut out,
+        "wasmkeep_bucket_request_seconds",
+        "histogram",
+        "How long a bucket request took, by operation and status; a listing counts to its end or drop.",
+    );
+    m.bucket_request_seconds.each(|labels, h| {
+        h.render(&mut out, "wasmkeep_bucket_request_seconds", labels);
+    });
+    head(
+        &mut out,
+        "wasmkeep_runtime_schedule_lag_seconds",
+        "histogram",
+        "How much later than asked a task sleeping 100 ms woke: the async runtime's scheduling delay.",
+    );
+    m.runtime_schedule_lag_seconds
+        .render(&mut out, "wasmkeep_runtime_schedule_lag_seconds", "");
     counter(
         &mut out,
         "wasmkeep_failovers_total",
@@ -1634,6 +1745,26 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "Encoded bytes per batched segment.",
     );
     m.segment_bytes.render(&mut out, "wasmkeep_segment_bytes");
+    head(
+        &mut out,
+        "wasmkeep_segment_upload_seconds",
+        "histogram",
+        "A segment's upload, from its first PUT to the bucket's acknowledgement, resends included; failed uploads are not observed.",
+    );
+    m.segment_upload_seconds
+        .render(&mut out, "wasmkeep_segment_upload_seconds", "");
+    counter(
+        &mut out,
+        "wasmkeep_segment_upload_retries_total",
+        "PUTs of a segment sent again after an error, a stall or a race with an earlier attempt.",
+        m.segment_upload_retries.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_segment_upload_failures_total",
+        "Segment uploads given up without an acknowledgement.",
+        m.segment_upload_failures.load(Ordering::Relaxed),
+    );
     family(
         &mut out,
         "wasmkeep_batched_waits_total",
@@ -2109,7 +2240,7 @@ mod tests {
 
     #[test]
     fn histograms_are_cumulative_and_labels_escaped() {
-        let h = Histogram::default();
+        let h = Histogram::<Standard>::default();
         h.observe(Duration::from_micros(50));
         h.observe(Duration::from_millis(3));
         h.observe(Duration::from_secs(60));
@@ -2585,6 +2716,9 @@ mod tests {
         m.segment_bytes.observe(5_000);
         crate::metrics::inc(&m.batched_waits.get(&[("reason", "age")]));
         m.flush_seconds.observe(Duration::from_millis(60));
+        m.segment_upload_seconds.observe(Duration::from_millis(40));
+        m.segment_upload_retries.store(2, Ordering::Relaxed);
+        m.segment_upload_failures.store(1, Ordering::Relaxed);
         let page = render_with(&m, Gauges::default(), &[Identity::default()]);
         for want in [
             "wasmkeep_unsent_age_seconds_count 1",
@@ -2596,10 +2730,88 @@ mod tests {
             "wasmkeep_batched_waits_total{reason=\"bytes\"} 0",
             "wasmkeep_batched_waits_total{reason=\"budget\"} 0",
             "wasmkeep_flush_seconds_count 1",
+            "wasmkeep_segment_upload_seconds_bucket{le=\"0.05\"} 1",
+            "wasmkeep_segment_upload_seconds_count 1",
+            "wasmkeep_segment_upload_retries_total 2",
+            "wasmkeep_segment_upload_failures_total 1",
             "# TYPE wasmkeep_upload_budget_bytes_in_use gauge",
         ] {
             assert!(page.contains(want), "{want}:\n{page}");
         }
+    }
+
+    /// The wide histograms have 0.5, 2 and 2.5 s bounds; the standard one
+    /// does not.
+    #[test]
+    fn wide_histograms_have_the_half_two_and_two_and_a_half_second_bounds() {
+        let wide = Histogram::<Wide>::default();
+        wide.observe(Duration::from_millis(700));
+        wide.observe(Duration::from_millis(2_200));
+        let mut out = String::new();
+        wide.render(&mut out, "w", "");
+        for want in [
+            "w_bucket{le=\"0.5\"} 0\n",
+            "w_bucket{le=\"1\"} 1\n",
+            "w_bucket{le=\"2\"} 1\n",
+            "w_bucket{le=\"2.5\"} 2\n",
+            "w_bucket{le=\"+Inf\"} 2\n",
+        ] {
+            assert!(out.contains(want), "{want} in\n{out}");
+        }
+        let standard = Histogram::<Standard>::default();
+        let mut out = String::new();
+        standard.render(&mut out, "s", "");
+        for gone in ["le=\"0.5\"", "le=\"2\"", "le=\"2.5\""] {
+            assert!(!out.contains(gone), "{gone} in\n{out}");
+        }
+    }
+
+    /// A segment upload recorded by `segment_upload` (what the replica
+    /// calls when an upload ends) is on the page: its time when
+    /// acknowledged, its resends, and a failure.
+    #[test]
+    fn a_recorded_segment_upload_shows_on_the_page() {
+        let m = &METRICS;
+        let (seen, resent, failed) = (
+            m.segment_upload_seconds.count(),
+            m.segment_upload_retries.load(Ordering::Relaxed),
+            m.segment_upload_failures.load(Ordering::Relaxed),
+        );
+        segment_upload(Duration::from_millis(30), 1, true);
+        segment_upload(Duration::from_secs(2), 2, false);
+        assert_eq!(m.segment_upload_seconds.count(), seen + 1);
+        assert_eq!(m.segment_upload_retries.load(Ordering::Relaxed), resent + 3);
+        assert_eq!(
+            m.segment_upload_failures.load(Ordering::Relaxed),
+            failed + 1
+        );
+        let page = render_with(m, Gauges::default(), &[Identity::default()]);
+        for want in [
+            "# TYPE wasmkeep_segment_upload_seconds histogram",
+            "wasmkeep_segment_upload_seconds_bucket{le=\"+Inf\"}",
+            "# TYPE wasmkeep_segment_upload_retries_total counter",
+            "# TYPE wasmkeep_segment_upload_failures_total counter",
+        ] {
+            assert!(page.contains(want), "{want}:\n{page}");
+        }
+    }
+
+    /// The scheduling probe's wake-ups reach the page.
+    #[tokio::test(start_paused = true)]
+    async fn the_schedule_lag_probe_reaches_the_page() {
+        let probe = LagProbe::start();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        drop(probe);
+        assert!(METRICS.runtime_schedule_lag_seconds.count() >= 3);
+        let page = render(Gauges::default());
+        assert!(
+            page.contains("# TYPE wasmkeep_runtime_schedule_lag_seconds histogram"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("wasmkeep_runtime_schedule_lag_seconds_count 0\n"),
+            "{page}"
+        );
     }
 
     /// The label values seeded at 0 are the ones the code counts: a value

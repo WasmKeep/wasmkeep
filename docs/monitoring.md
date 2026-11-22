@@ -181,7 +181,7 @@ included), `wasmkeep_admission_refused_total`,
 `wasmkeep_websocket_sweep_unreadable_total`,
 `wasmkeep_parked_releases_total`, `wasmkeep_plain_events_dropped_total`,
 `wasmkeep_batched_waits_total` and the front's two counters. The batched
-metrics (`wasmkeep_segment_*`, `wasmkeep_unsent_age_seconds`,
+metrics (`wasmkeep_segment_events`, `wasmkeep_segment_bytes`, `wasmkeep_unsent_age_seconds`,
 `wasmkeep_flush_seconds`, `wasmkeep_upload_budget_bytes_in_use`) are on
 every node's page; they stay empty while no class is batched (strict is
 the default). So a
@@ -271,6 +271,11 @@ its first request.
 | `wasmkeep_unsent_age_seconds` | histogram | For batched classes: the oldest uncaptured commit's age at each capture, what `--max-unsent-age` bounds ([ADR 0034](adr/0034-batched-plain-writes.md), section 3). |
 | `wasmkeep_segment_events` | histogram | Events per batched segment (buckets 1 to 1,000). |
 | `wasmkeep_segment_bytes` | histogram | Encoded bytes per batched segment (buckets 4 KiB to 256 MiB). |
+| `wasmkeep_segment_upload_seconds` | histogram | One segment's upload, from its first PUT to the bucket's acknowledgement, resends included (batched and strict classes). Only acknowledged uploads are observed. Compare with `wasmkeep_event_start_rule_wait_seconds` and `wasmkeep_batched_waits_total{reason="age"}`: holds with slow uploads point at the bucket; holds with fast uploads point at the node (capture, budget, CPU). |
+| `wasmkeep_segment_upload_retries_total` | counter | PUTs of a segment sent again after an error, a stall or a race with an earlier attempt. Rising with a healthy node: the bucket or the link is flaky. |
+| `wasmkeep_segment_upload_failures_total` | counter | Segment uploads given up without an acknowledgement (the actor's replication fails or the event errs, as for any failed upload). |
+| `wasmkeep_bucket_request_seconds{operation,status}` | histogram | How long each bucket request took, with the labels of `wasmkeep_bucket_requests_total`; series appear at their first request. A listing counts to its last item or its drop, and a streamed delete's items from the one before. Slow `put` and `get` here with slow lease writes and heartbeat reads is the bucket; compare with `wasmkeep_segment_upload_seconds`, which is one segment from its first PUT to its acknowledgement, resends included. |
+| `wasmkeep_runtime_schedule_lag_seconds` | histogram | A task sleeps 100 ms in a loop and records how much later than that it woke: the delay before the node's async runtime ran a ready task. Near zero on a healthy node. See [reading scheduling lag](#reading-scheduling-lag). |
 | `wasmkeep_batched_waits_total{reason}` | counter | Times a batched actor's next event waited at the end of the one before (the event-start rule), by `reason`: `age` (a commit waited unsent past `--max-unsent-age`), `bytes` (the next segment was full, an event was over the cap, or the WAL asked for a checkpoint) and `budget` (the node's budget of segments in flight was full). |
 | `wasmkeep_flush_seconds` | histogram | How long a batched `storage.flush` (or `exec-durable`'s flush) took, answered `ok` or not. |
 | `wasmkeep_upload_budget_bytes_in_use` | gauge | Bytes of the node's 256 MiB budget of batched segments in flight in use now. |
@@ -432,6 +437,36 @@ Watch `status="error"`; the other two are part of normal operation. A
 listing counts once per call, however many pages it took: S3 and R2 return
 1,000 keys a page, so a restore of an actor with 10,000 objects in the
 bucket counts 2 `list` requests here but bills about 22.
+
+`wasmkeep_bucket_request_seconds` times the same calls. Read it by
+operation: slow `put` (the node's lease and segment writes) and slow `get`
+(heartbeat reads) together, with `wasmkeep_segment_upload_seconds` rising,
+is a slow bucket or link.
+
+These three histograms (`wasmkeep_segment_upload_seconds`,
+`wasmkeep_bucket_request_seconds`, `wasmkeep_runtime_schedule_lag_seconds`)
+have the bounds 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms
+and 1, 2, 2.5, 5 and 30 s (the other duration histograms stop at 0.25, 1,
+5 and 30 s above 100 ms), so a p99 between 0.25 s and 30 s, or a shift
+across 1 s or 2 s, reads from a bound and not from an interpolation.
+
+### Reading scheduling lag
+
+`wasmkeep_runtime_schedule_lag_seconds` is how much later than 100 ms a
+sleeping task woke. It measures the node, not the bucket: a runtime with
+every worker busy (CPU-bound guest work, blocking calls, a starved host)
+runs ready tasks late, and this histogram shows it. Read it next to
+`wasmkeep_node_lease_write_milliseconds` and
+`wasmkeep_bucket_request_seconds{operation="put"}`:
+
+- Lease writes slow and scheduling lag high: the node is slow; the bucket
+  may be fine. Look at CPU, steal and the events running.
+- Lease writes slow and scheduling lag near zero: the bucket or the link is
+  slow.
+- Scheduling lag high alone: the node is overloaded, and the next lease
+  write or heartbeat will be late with it.
+
+The lag is a lower bound on what a request or write waits for the runtime.
 
 ### Placement at wake-up
 

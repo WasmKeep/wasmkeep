@@ -1016,6 +1016,8 @@ pub(crate) async fn serve_metrics_of(
 ) -> Result<(), Error> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut shutdown = std::pin::pin!(shutdown);
+    // The page is served, so the scheduling probe runs for as long.
+    let _lag = crate::metrics::LagProbe::start();
     loop {
         let slot = tokio::select! {
             slot = Arc::clone(&slots).acquire_owned() => match slot {

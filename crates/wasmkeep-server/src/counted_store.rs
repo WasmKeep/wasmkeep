@@ -10,6 +10,7 @@
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -55,14 +56,15 @@ fn status<T>(result: &Result<T>) -> &'static str {
     }
 }
 
-fn count(operation: &str, status: &str) {
-    inc(&METRICS
-        .bucket_requests
-        .get(&[("operation", operation), ("status", status)]));
+fn count(operation: &str, status: &str, took: Duration) {
+    let labels = [("operation", operation), ("status", status)];
+    inc(&METRICS.bucket_requests.get(&labels));
+    METRICS.bucket_request_seconds.get(&labels).observe(took);
 }
 
-fn record<T>(operation: &str, result: Result<T>) -> Result<T> {
-    count(operation, status(&result));
+/// Counts and times the call that began at `started`.
+fn record<T>(operation: &str, started: Instant, result: Result<T>) -> Result<T> {
+    count(operation, status(&result), started.elapsed());
     result
 }
 
@@ -71,13 +73,13 @@ fn record<T>(operation: &str, result: Result<T>) -> Result<T> {
 fn counted_listing<T: Send + 'static>(
     stream: BoxStream<'static, Result<T>>,
 ) -> BoxStream<'static, Result<T>> {
-    struct Once(Option<&'static str>);
+    struct Once(Option<&'static str>, Instant);
     impl Drop for Once {
         fn drop(&mut self) {
-            count("list", self.0.unwrap_or("ok"));
+            count("list", self.0.unwrap_or("ok"), self.1.elapsed());
         }
     }
-    let mut once = Once(None);
+    let mut once = Once(None, Instant::now());
     stream
         .map(move |item| {
             if once.0.is_none()
@@ -99,7 +101,12 @@ impl ObjectStore for Counted {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        record("put", self.inner.put_opts(location, payload, opts).await)
+        let started = Instant::now();
+        record(
+            "put",
+            started,
+            self.inner.put_opts(location, payload, opts).await,
+        )
     }
 
     async fn put_multipart_opts(
@@ -107,28 +114,46 @@ impl ObjectStore for Counted {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let started = Instant::now();
         record(
             "multipart",
+            started,
             self.inner.put_multipart_opts(location, opts).await,
         )
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let operation = if options.head { "head" } else { "get" };
-        record(operation, self.inner.get_opts(location, options).await)
+        let started = Instant::now();
+        record(
+            operation,
+            started,
+            self.inner.get_opts(location, options).await,
+        )
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        record("get", self.inner.get_ranges(location, ranges).await)
+        let started = Instant::now();
+        record(
+            "get",
+            started,
+            self.inner.get_ranges(location, ranges).await,
+        )
     }
 
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        // Each item is timed from the one before it (the first from the
+        // call), so a batched delete's time is shared out, not repeated.
+        let mut last = Instant::now();
         self.inner
             .delete_stream(locations)
-            .map(|r| record("delete", r))
+            .map(move |r| {
+                let started = std::mem::replace(&mut last, Instant::now());
+                record("delete", started, r)
+            })
             .boxed()
     }
 
@@ -145,15 +170,30 @@ impl ObjectStore for Counted {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        record("list", self.inner.list_with_delimiter(prefix).await)
+        let started = Instant::now();
+        record(
+            "list",
+            started,
+            self.inner.list_with_delimiter(prefix).await,
+        )
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        record("copy", self.inner.copy_opts(from, to, options).await)
+        let started = Instant::now();
+        record(
+            "copy",
+            started,
+            self.inner.copy_opts(from, to, options).await,
+        )
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        record("rename", self.inner.rename_opts(from, to, options).await)
+        let started = Instant::now();
+        record(
+            "rename",
+            started,
+            self.inner.rename_opts(from, to, options).await,
+        )
     }
 }
 
@@ -209,6 +249,26 @@ mod tests {
             ("operation=\"delete\",status=\"ok\"", 1),
         ] {
             assert_eq!(line(&page, labels), n, "{labels} in\n{page}");
+        }
+    }
+
+    /// Each request's time reaches the page, by operation and status.
+    #[tokio::test]
+    async fn request_latency_reaches_the_page() {
+        let store = counted(Arc::new(InMemory::new()));
+        let key = Path::from("lat/b");
+        store.put(&key, PutPayload::from("x")).await.unwrap();
+        assert!(store.get(&Path::from("lat/missing")).await.is_err());
+        let page = render(Gauges::default());
+        assert!(
+            page.contains("# TYPE wasmkeep_bucket_request_seconds histogram\n"),
+            "{page}"
+        );
+        for want in [
+            "wasmkeep_bucket_request_seconds_count{operation=\"put\",status=\"ok\"} 1",
+            "wasmkeep_bucket_request_seconds_count{operation=\"get\",status=\"not_found\"} 1",
+        ] {
+            assert!(page.contains(want), "{want} in\n{page}");
         }
     }
 }
