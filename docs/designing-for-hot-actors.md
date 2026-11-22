@@ -77,9 +77,10 @@ its pusher on one node delivered worse in our testing: that node's
 segment uploads to the bucket developed a long tail, and the room's
 events waited on uploads older than `--max-unsent-age` (the event-start
 rule, [ADR 0034 section 3](adr/0034-batched-plain-writes.md#3-when-an-event-may-start-and-the-loss-bound)).
-With the pusher on another node, the same load delivered within its
-target. This is an observation, not a measured threshold: no client count
-or rate is claimed here. Treat a room as large when its node shows upload
+With the pusher on another node, on three 4-vCPU nodes and a real
+bucket, 4,500 clients at 10 messages/s got every message with delivery
+p99 under 1 s, none lost or repeated; 6,000 is the measured edge, where
+p99 passed 1 s ([measured](../bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)). Treat a room as large when its node shows upload
 tails near `--max-unsent-age`.
 
 **Move the pusher.** The room is the sequencer and the edges follow it,
@@ -308,7 +309,10 @@ The [reconnecting-room harness](benchmarks.md#reconnecting-room-harness)
 records delivery and reconnect latency, recovery and topology on a deployed
 cluster. Its small smoke check is correctness evidence only. The real-bucket
 growth and slow-client benchmark at 3,000 to 10,000 clients is
-[measured](benchmarks.md#a-big-room-on-three-nodes-preview): the pattern is a
-preview in 0.6.0, with delivery p99 of 5 to 15 s and no supported client
-count yet; node loss is not measured. The older single-actor room trial above is a
+[measured on 0.6.0](benchmarks.md#a-big-room-on-three-nodes-preview), where
+the pattern was a preview: delivery p99 of 5 to 15 s, held by the room's
+publish path. 0.7.0 moves delivery off that path, to the pusher: with the
+pusher on another node, 4,500 clients got delivery p99 under 1 s
+([above](#place-a-large-rooms-pusher-on-another-node),
+[measured](../bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)). Node loss is not measured. The older single-actor room trial above is a
 separate workload, not evidence for this pattern's capacity.

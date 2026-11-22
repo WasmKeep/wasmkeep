@@ -9,6 +9,65 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+## 0.7.0
+
+**Big rooms, a cluster that keeps its peers on a slow bucket, and the
+metrics to see why.** A room's delivery moves to a fifth class, the
+pusher, so publishes and history no longer wait on delivery rounds; a
+woken edge delivers to the sockets it kept, a pusher round is bounded in
+work, and the room renders the browser's history page itself. A slow
+bucket no longer makes nodes distrust healthy peers. New metrics show
+where an actor's time goes, what an event and a front request cost, and
+how long segment uploads and bucket requests take; the CLI gains
+`wasmkeep actor where`, and `cluster forget` removes released node
+leases. Change-feed listing runs in parallel, a restore waits on the
+bucket's clock instead of two fixed periods, and a node returns unused
+allocator pages once activity drops. Still a **pre-alpha pre-release**.
+
+**Big rooms are no longer a preview.** In 0.6.0 they were, with no
+supported client count: the room's publish path held delivery back. 0.7.0
+takes delivery off that path, to the pusher. On three 4-vCPU nodes, 4,500
+clients at 10 messages/s got delivery p99 under 1 s, with no message lost
+or repeated, the room and its pusher on different nodes; 6,000 is the
+measured edge, where p99 passed 1 s
+([measured](bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)). Keeping them apart is the operator's for now (below).
+
+What changes in behaviour: inside `on-alarm`, `get-alarm` returns none
+until the handler sets or clears the alarm, and whatever it sets stands,
+even the delivered time; `wasmkeep_event_duration_seconds` gains a `kind`
+label; `serve` trims idle allocator memory by default and caps glibc's
+arenas. The package stays `wasmkeep:actor@0.2.0`.
+
+Upgrade the binary on every node together. A room deployed with 0.6.0
+needs its five classes deployed together with the front, the pusher
+batched; see [upgrading to 0.7.0](docs/deploy/upgrading-to-0.7.md).
+
+Known limitations:
+
+- **A large room's delivery tail depends on segment-upload latency from
+  the room's node.** Uploads slower than `--max-unsent-age` hold the room
+  and its pusher at the event-start rule, and delivery waits with them.
+  `wasmkeep_segment_upload_seconds` shows it.
+- **Placement does not keep a room and its pusher apart.** For a large
+  room, keep them on different nodes with `wasmkeep actor move`, and
+  check with `wasmkeep actor where`
+  ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
+  A move does not pin: once idle, the pusher's next event may place it
+  anywhere, so check again after a restart or a deploy.
+- **With the default placement the tail is longer.** Where the room and
+  its pusher share a node, delivery waits on that node's uploads for
+  both; the figures above are with them apart.
+- **At high client counts the pusher becomes the busiest actor**: it
+  runs every delivery round of the room's group.
+- **Released node leases accumulate on a reused prefix** until removed
+  with `wasmkeep cluster forget <node>`.
+- **`cluster forget` has no conditional delete.** A store's DELETE takes
+  no condition, so the command reads the lease twice and deletes it only
+  if it did not change; a process starting under that id whose first
+  write lands between the second read and the delete loses its lease,
+  exits and is restarted by its service manager: availability only,
+  nothing is taken from another node ([cluster](docs/cluster.md)).
+
 - **Segment upload metrics** tell a slow bucket from a slow node:
   `wasmkeep_segment_upload_seconds` (first PUT to acknowledgement),
   `wasmkeep_segment_upload_retries_total` and
@@ -303,7 +362,7 @@ The text under a version's heading is its GitHub release text
   default/environment policy. Both controls are no-ops elsewhere.
   `wasmkeep_allocator_trim_seconds` and
   `wasmkeep_allocator_trims_total{released="true|false"}` expose actual calls.
-  Fleet RSS measurement is pending; patched workstation runs paged.
+  Memory after a big room is not yet measured with them on several nodes.
 
 - **One delivery per alarm round.** An event that ended while its actor's
   alarm delivery waited in the mailbox queued another delivery of the same

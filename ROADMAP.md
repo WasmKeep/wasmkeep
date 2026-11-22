@@ -6,40 +6,31 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1` and `0.6.0`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0` and `0.7.0`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.6.0`: **several apps, files, analytics and larger rooms.** Several
-trusted apps per process, files and static assets, the change feed, a
-room past one actor, placement at wake-up, an inspector and typed Rust
-clients. What each brings is under [Built](#built); what was measured,
-and the limits found, are in the [changelog](CHANGELOG.md) and
-[benchmarks](docs/benchmarks.md).
+`0.7.0`: **big rooms, and the limits 0.6.0 measured.** A room's delivery
+moves to a pusher, off the publish path; a slow bucket no longer makes
+nodes distrust healthy peers; parallel change-feed listing, shorter
+restores, allocator trimming after a big room, metrics of where an
+actor's time and a node's bucket requests go, and `actor where`. What
+each brings is under [Built](#built); the limits known at release are in
+the [changelog](CHANGELOG.md).
 
 ## Next
 
-`0.7.0`: **the limits 0.6.0 measured.** Features first, then the
-numbers, in this order.
+What comes after 0.7.0, in this order.
 
-1. **A faster room publish** (M): a publish took about 2.3 s to be
-   acknowledged with thousands of clients, which caps a room's message
-   rate and delivery latency; the sockets and edges were not the limit.
+1. **A room and its pusher kept apart at wake-up** (S/M): placement
+   considers load only, so an operator moves the pusher of a large room
+   by hand ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
 2. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
-3. **A StarlingMonkey room on a starved CPU** (S/M): find why the
-   room's heap outgrows its collector on one core, and fix it.
-4. **Node memory after a big room** (S/M): memory taken by a room of
-   thousands of sockets is not given back once they leave.
-5. **A faster change feed** (M): list an app's history in parallel,
-   and compact idle actors' histories, so a poll of a large app takes
-   seconds rather than minutes ([measured](docs/benchmarks.md#the-change-feed-at-100000-actors)).
-6. **Shorter restores** (S): most of a restore's 90 s are two fixed
-   40 s waits ([backup and restore](docs/deploy/backup-and-restore.md)).
-7. **Fewer requests from an idle node** (S): idle nodes send about 40%
-   more GETs than modeled
-   ([measured](docs/benchmarks.md#bucket-requests-at-rest)).
+3. **Compacting idle actors' histories** (M), the other half of a
+   faster change feed: listing is parallel in 0.7.0, but a poll still
+   lists every object of a long history.
 
 ## After that
 
@@ -76,7 +67,7 @@ Not before the releases above.
 
 ## Later, on demand
 
-These do not block `0.7.0`. Each needs a concrete workload
+These do not block the releases above. Each needs a concrete workload
 or an explicit owner decision.
 
 - **The rest of the scaling family**: aggregation trees (M/L), and
@@ -313,6 +304,26 @@ Started alongside M3; what is left of it is under [Now](#now) and
   [measured](docs/benchmarks.md#a-node-coming-back-with-and-without-placement)).
 - In `0.6.0`, a read-only [inspector](docs/inspector.md), typed Rust
   clients ([guide](docs/typed-clients.md)) and a React quickstart.
+- In `0.7.0`, a room's delivery in a pusher of its own, so publishes and
+  history no longer wait on delivery rounds
+  ([ADR 0040, section 13](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20),
+  [upgrading](docs/deploy/upgrading-to-0.7.md)).
+- In `0.7.0`, heartbeat reads that keep trusting healthy peers on a slow
+  bucket (ADR 0020 and ADR 0011, amendments of 2026-11-20).
+- In `0.7.0`, parallel change-feed listing ([guide](docs/change-feed.md)),
+  restores that wait on the bucket's clock instead of fixed periods
+  ([backup and restore](docs/deploy/backup-and-restore.md)), and
+  allocator trimming once activity drops
+  ([socket limits](docs/reference/socket-limits.md#room-memory-after-clients-leave)).
+- In `0.7.0`, metrics of mailbox wait, event and front work, alarm
+  deliveries, segment uploads and bucket requests
+  ([monitoring](docs/monitoring.md)), the idle node's GETs modelled
+  ([measured](docs/benchmarks.md#bucket-requests-at-rest)), and
+  `wasmkeep actor where` ([cluster](docs/cluster.md)).
+- In `0.7.0`, a big room measured on three nodes and a real bucket, the
+  room and its pusher on different nodes: 4,500 clients at 10 messages/s
+  with delivery p99 under 1 s, 6,000 the measured edge
+  ([measured](bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)).
 
 ## Stretch goal: the benchmark showdown
 
