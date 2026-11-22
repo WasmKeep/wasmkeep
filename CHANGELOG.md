@@ -21,14 +21,15 @@ where an actor's time goes, what an event and a front request cost, and
 how long segment uploads and bucket requests take; the CLI gains
 `wasmkeep actor where`, and `cluster forget` removes released node
 leases. Change-feed listing runs in parallel, a restore waits on the
-bucket's clock instead of two fixed periods, and a node gives allocator
-memory back after a big room. Still a **pre-alpha pre-release**.
+bucket's clock instead of two fixed periods, and a node returns unused
+allocator pages once activity drops. Still a **pre-alpha pre-release**.
 
 **Big rooms are no longer a preview.** In 0.6.0 they were, with no
 supported client count: the room's publish path held delivery back. 0.7.0
-takes delivery off that path, to the pusher. There is still no supported
-client count: 0.7.0 is not yet measured at that scale, and a large room
-needs the placement below.
+takes delivery off that path, to the pusher: under heavy load, a room
+whose pusher runs on another node delivered within its target. No
+measurement of 0.7.0 at that scale is published, so no client count is
+stated, and a large room needs the placement below.
 
 What changes in behaviour: inside `on-alarm`, `get-alarm` returns none
 until the handler sets or clears the alarm, and whatever it sets stands,

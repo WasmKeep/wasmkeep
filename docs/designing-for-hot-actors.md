@@ -310,7 +310,9 @@ cluster. Its small smoke check is correctness evidence only. The real-bucket
 growth and slow-client benchmark at 3,000 to 10,000 clients is
 [measured on 0.6.0](benchmarks.md#a-big-room-on-three-nodes-preview), where
 the pattern was a preview: delivery p99 of 5 to 15 s, held by the room's
-publish path. 0.7.0 moves delivery off that path, to the pusher; it is not
-measured at that scale yet, so there is still no supported client count,
-and node loss is not measured. The older single-actor room trial above is a
+publish path. 0.7.0 moves delivery off that path, to the pusher, and a
+room whose pusher runs on another node delivered within its target under
+heavy load ([above](#place-a-large-rooms-pusher-on-another-node)). No
+measurement of 0.7.0 at that scale is published, so no client count is
+stated, and node loss is not measured. The older single-actor room trial above is a
 separate workload, not evidence for this pattern's capacity.

@@ -31,7 +31,7 @@ What 0.7.0 left of its list, then the numbers, in this order.
 3. **Compacting idle actors' histories** (M), the other half of a
    faster change feed: listing is parallel in 0.7.0, but a poll still
    lists every object of a long history.
-4. **A big room measured on 0.7.0**: delivery, acknowledged rate and
+4. **A published measurement of a big room on 0.7.0**: delivery, acknowledged rate and
    node memory after clients leave, on several nodes and a real bucket,
    so that a client count can be stated.
 
