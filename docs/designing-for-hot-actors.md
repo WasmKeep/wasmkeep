@@ -99,19 +99,23 @@ event may place it again, on any node. So:
 - after a node restart or a deploy, check and repeat the move;
 - do not read one successful move as a standing rule.
 
-**Check where each actor runs.** A response from an actor carries
-`x-wasmkeep-node: <id>`; request the room and the pusher through the front
-or `/actor/` and compare the two ids. `wasmkeep cluster status` lists
-only a count of resident actors per node (`ACTORS`), not which ones, so
-use it to confirm the target is live and serving, and to see the load
-beside it ([Checking a cluster](cluster.md#checking-a-cluster)).
+**Check where each actor runs** with `wasmkeep actor where`, which only
+reads ([Seeing where an actor runs](cluster.md#seeing-where-an-actor-runs)):
+
+```bash
+wasmkeep actor where --app acme/chat room/lobby pusher/lobby --bucket s3://acme-wasmkeep/prod
+```
+
+The two `OWNER` columns should name different nodes, both live. `wasmkeep
+cluster status` confirms the target is live and serving, and shows the
+load beside it ([Checking a cluster](cluster.md#checking-a-cluster)).
 
 **What to watch** ([Monitoring](monitoring.md)), on the room's node and on
 the pusher's node:
 
 - `wasmkeep_segment_upload_seconds`: the time of each segment upload to
-  the bucket. It is **upcoming**, added in a separate change, and may not
-  be in your build; until it is, use `wasmkeep_unsent_age_seconds`.
+  the bucket, with `wasmkeep_bucket_request_seconds{operation="put"}` for
+  every PUT the node sends.
 - The start-rule waits: `wasmkeep_event_start_rule_wait_seconds` and
   `wasmkeep_batched_waits_total{reason="age"}`. Growth in either means the
   room's events are waiting at the boundary on uploads.
