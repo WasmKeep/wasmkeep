@@ -23,6 +23,13 @@ The text under a version's heading is its GitHub release text
   the owning node, whether that node is live and since when it has owned
   the actor (`not placed` for an idle actor with no owner), in columns or
   with `--json`. Read-only: nothing is written, claimed or woken.
+- **Docs: where to place a big room's pusher.** For a large room, keep
+  the room actor and its pusher on different nodes: together they delivered
+  worse under heavy load, with a long tail of segment uploads on their node.
+  [Designing for hot actors](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)
+  gives the `actor move` command, says a move does not pin, and lists what
+  to watch; placement does not yet keep them apart.
+
 - **A slow bucket no longer makes nodes distrust healthy peers** (ADR 0020
   and ADR 0011, amendments of 2026-11-20). A node read its peers'
   heartbeats one after the other, with no time limit, and read

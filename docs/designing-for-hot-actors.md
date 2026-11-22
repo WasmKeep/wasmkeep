@@ -69,6 +69,65 @@ Choose durability based on what the application promises, not as a
 throughput switch. [What saved means](what-saved-means.md) explains
 when an answer may safely say "saved".
 
+## Place a large room's pusher on another node
+
+For a large room, keep the room actor and its pusher
+(`pusher/<room name>`) on different nodes. Under heavy load, a room and
+its pusher on one node delivered worse in our testing: that node's
+segment uploads to the bucket developed a long tail, and the room's
+events waited on uploads older than `--max-unsent-age` (the event-start
+rule, [ADR 0034 section 3](adr/0034-batched-plain-writes.md#3-when-an-event-may-start-and-the-loss-bound)).
+With the pusher on another node, the same load delivered within its
+target. This is an observation, not a measured threshold: no client count
+or rate is claimed here. Treat a room as large when its node shows upload
+tails near `--max-unsent-age`.
+
+**Move the pusher.** The room is the sequencer and the edges follow it,
+so move the pusher alone ([ADR 0017](adr/0017-moving-one-actor.md)):
+
+```bash
+wasmkeep actor move --app acme/chat pusher/lobby --to node-b --bucket s3://acme-wasmkeep/prod
+```
+
+The target must be a live node of the same app that is not draining
+([Moving one actor](cluster.md#moving-one-actor)).
+
+**A move does not pin.** The pusher hibernates when idle, and its next
+event may place it again, on any node. So:
+
+- move it while it is busy, so it is not about to go idle;
+- after a node restart or a deploy, check and repeat the move;
+- do not read one successful move as a standing rule.
+
+**Check where each actor runs** with `wasmkeep actor where`, which only
+reads ([Seeing where an actor runs](cluster.md#seeing-where-an-actor-runs)):
+
+```bash
+wasmkeep actor where --app acme/chat room/lobby pusher/lobby --bucket s3://acme-wasmkeep/prod
+```
+
+The two `OWNER` columns should name different nodes, both live. `wasmkeep
+cluster status` confirms the target is live and serving, and shows the
+load beside it ([Checking a cluster](cluster.md#checking-a-cluster)).
+
+**What to watch** ([Monitoring](monitoring.md)), on the room's node and on
+the pusher's node:
+
+- `wasmkeep_segment_upload_seconds`: the time of each segment upload to
+  the bucket, with `wasmkeep_bucket_request_seconds{operation="put"}` for
+  every PUT the node sends.
+- The start-rule waits: `wasmkeep_event_start_rule_wait_seconds` and
+  `wasmkeep_batched_waits_total{reason="age"}`. Growth in either means the
+  room's events are waiting at the boundary on uploads.
+- `wasmkeep_node_lease_write_milliseconds`: how long the node's own
+  heartbeat write takes. A rising tail there shows the node's bucket
+  writes are slow, and can accompany slow segment uploads.
+
+**Known limitation.** Placement does not yet keep a room and its pusher
+apart ([ADR 0041](adr/0041-placement-at-wake-up.md)): it considers load
+only, so they can land together again after any wake-up. Until it does,
+the move above is the operator's to repeat.
+
 ## Split independent state
 
 Choose actor names around the smallest useful owner of state:
