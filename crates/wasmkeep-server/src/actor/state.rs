@@ -539,10 +539,13 @@ impl ActorState {
             .collect()
     }
 
-    /// The nodes that hold this actor's companions now: this one from
-    /// memory, the others from their record (one read each, bounded).
-    /// Read only while this node drains an actor kept apart.
-    async fn companion_owners(companions: Vec<ActorAddress>, cluster: &Cluster) -> Vec<String> {
+    /// The nodes that hold these companions now: this one from memory, the
+    /// others from their record (one read each, bounded). Read only while
+    /// this node drains an actor kept apart.
+    pub(super) async fn companion_owners(
+        companions: Vec<ActorAddress>,
+        cluster: &Cluster,
+    ) -> Vec<String> {
         let mut owners = Vec::new();
         for companion in companions {
             if cluster.holds_here(&companion) {
@@ -638,7 +641,13 @@ impl ActorState {
         // of 2026-11-22): a wake-up of this node's own goes to a peer, as
         // a drain sends it. No peer (one node alive, every peer draining
         // or suspected): acquired here, as without the rule.
-        if self.apart_wake && listed.is_none() && !self.class.apart.is_empty() {
+        // Not for an actor parked here (ADR 0024): its record names this
+        // node, so a peer would find it held.
+        if self.apart_wake
+            && listed.is_none()
+            && !self.class.apart.is_empty()
+            && !cluster.is_parked(&self.address)
+        {
             let here = self.companions().iter().any(|c| cluster.holds_here(c));
             if here {
                 match cluster.apart_peer(&self.address, true) {

@@ -285,7 +285,10 @@ impl ActorService {
                         let sent = !crate::cluster::never_forward(&req);
                         let response = cluster.forward(&node, req).await;
                         if response.status().is_server_error() {
-                            if elsewhere && sent {
+                            // A 5xx its actor answered is the actor's, not
+                            // the node's.
+                            let served = response.headers().contains_key(SERVED_BY);
+                            if elsewhere && sent && !served {
                                 // Down, unreachable, or draining itself: not
                                 // chosen again for a while (ADR 0014).
                                 cluster.suspect(&node);
@@ -472,7 +475,9 @@ impl ActorService {
                 let response = cluster.forward_buffered(&node, req).await;
                 if response.status().is_server_error() {
                     if elsewhere {
-                        cluster.suspect(&node);
+                        if !response.headers().contains_key(SERVED_BY) {
+                            cluster.suspect(&node);
+                        }
                     } else {
                         self.inner.forget_owner(address);
                     }

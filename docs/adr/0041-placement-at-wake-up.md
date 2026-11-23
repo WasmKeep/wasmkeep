@@ -738,10 +738,23 @@ that holds a companion (`wasmkeep_placements_received_total{outcome="apart"}`):
 its sender runs it, or sends it apart by the rule. Never under the rule:
 an event another node sent (it would be answered `503`), a take (an
 operator's move wins; the next cold wake-up applies the rule), a
-WebSocket upgrade (section 1), and the operator passes.
+WebSocket upgrade (section 1), an actor parked here (ADR 0024: its
+record names this node), and the operator passes.
+
+**When the hop fails.** It fails as a drain's forward does: a peer that
+dies between its heartbeat and the hop answers the request `503` (a call
+`failed`), and is suspected for a heartbeat horizon, so the next wake-up
+chooses another peer or, with none, wakes here. A `5xx` the actor itself
+answered on the peer (it carries `x-wasmkeep-node`) no longer suspects
+that peer, for this rule and for a drain alike: an actor's error says
+nothing of its node. A record read that failed (routing's "try here")
+reaches the rule too; the peer then reads the record itself, and a holder
+it finds answers the forwarded event `503`, as during a drain.
 
 **What it is not.** It is not a pin and it moves nothing running: a pair
-that is together stays together until one of them hibernates. Two
+that is together stays together until one of them hibernates, which a
+busy pusher never does, so such a pair stays together until an
+operator moves one (ADR 0017). Two
 wake-ups of a pair at the same moment on one node can both acquire
 there, as can a pair on nodes of an older version. It does not depend on
 load or on placement being on: `--no-placement` turns off the load rule,
@@ -765,10 +778,16 @@ this version), as format 5 waits for `flush`. A 0.7 CLI refuses a
 
 **Tests.** The pure rule (`placement::companions`, `apart`,
 `peer_apart`); the manifest line and the deploy gate; the key in the
-project file; three nodes where a room and its pusher, woken through one
-node by a request and by a call, land on different nodes, and a
-draining pusher's node hands it to the node without the room; one node
-where both wake; the default turned off. The simulation
+project file; three nodes, default placement, where a room and its
+pusher woken through one node by a request and by a call land on
+different nodes; a draining pusher's node handing its alarm and its next
+wake-up to the node without the room, for names whose plain drain choice
+is the room's node; a placed hop refused by the room's node and run on
+its sender; one node where both wake; the default turned off; and the
+SDK's own room and pusher on three nodes, clients joining and
+publishing through one node, ending on different nodes
+(`tests/room_cluster.rs`). The other room cluster tests lay their actors
+out themselves and turn the default off. The simulation
 `sim/tests/madsim_apart.rs` runs the rule over drains, restarts and
 hibernations: one hop at most, never refused, and a pair shares a node
 only when the deciding node had no peer without a companion; routing

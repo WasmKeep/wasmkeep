@@ -2387,6 +2387,10 @@ pub struct Diff {
     /// changed, or an added class's when it is not strict (ADR 0034,
     /// section 15).
     pub writes: Vec<String>,
+    /// `"class: apart from room -> -"` and the like: a class's `apart`
+    /// entry changed (ADR 0041, amendment of 2026-11-22); `default` for
+    /// none.
+    pub apart: Vec<String>,
     /// Policy additions, changes and removals, without client values.
     pub limits: Vec<String>,
 }
@@ -2545,6 +2549,12 @@ impl Diff {
                     format!("{class}: {}", wa.as_str())
                 });
             }
+            let (b, a) = (bm.apart.get(class), am.apart.get(class));
+            if class != FRONT && a != b {
+                let entry = |e: Option<&String>| e.map_or("default", String::as_str).to_owned();
+                diff.apart
+                    .push(format!("{class}: apart from {} -> {}", entry(b), entry(a)));
+            }
             let (b, a) = (bm.expire.get(class), am.expire.get(class));
             if class != FRONT && a != b && (a.is_some() || bm.classes.contains_key(class)) {
                 diff.expire.push(format!(
@@ -2589,6 +2599,7 @@ impl Diff {
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(self.expire.iter().cloned());
         out.extend(self.writes.iter().map(|l| format!("writes {l}")));
+        out.extend(self.apart.iter().cloned());
         out.extend(
             self.open_past_front.iter().map(|c| {
                 format!("class {c}: open, reachable at /actor/{c}/<name>, past the front")
@@ -3580,6 +3591,15 @@ mod tests {
         m.apart.insert("chat".into(), "counter".into());
         m.apart.clear();
         assert_eq!((m.format(), m.version_id()), before);
+        // The deploy's plan says it.
+        let mut after = two_classes();
+        after.apart.insert("chat".into(), "counter".into());
+        let settings = Settings::default();
+        let lines = Diff::between(Some((&two_classes(), &settings)), (&after, &settings)).lines();
+        assert!(
+            lines.contains(&"chat: apart from default -> counter".to_owned()),
+            "{lines:?}"
+        );
     }
 
     #[test]

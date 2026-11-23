@@ -129,13 +129,23 @@ impl ServiceInner {
     /// 0041, amendment of 2026-11-22), by the class it takes now: from
     /// memory, no read.
     pub(super) fn companion_here(&self, cluster: &Cluster, address: &ActorAddress) -> bool {
+        self.companions_of(address)
+            .iter()
+            .any(|c| cluster.holds_here(c))
+    }
+
+    /// The actors `address` is kept apart from, by the class it takes now
+    /// (ADR 0041, amendment of 2026-11-22): the same name in each
+    /// companion class.
+    pub(super) fn companions_of(&self, address: &ActorAddress) -> Vec<ActorAddress> {
         let Some(class) = read(&self.classes).get(address.class()).cloned() else {
-            return false;
+            return Vec::new();
         };
-        class.apart.iter().any(|companion| {
-            ActorAddress::new(address.tenant(), companion, address.name())
-                .is_ok_and(|c| cluster.holds_here(&c))
-        })
+        class
+            .apart
+            .iter()
+            .filter_map(|c| ActorAddress::new(address.tenant(), c, address.name()).ok())
+            .collect()
     }
 
     pub(super) fn owner_hints(

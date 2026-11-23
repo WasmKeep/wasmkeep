@@ -22,7 +22,9 @@ now the fallback
 [ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
 New metric `wasmkeep_placement_apart_total{outcome}`; a placed wake-up
 refused by a node holding the actor's companion counts as
-`outcome="apart"` in `wasmkeep_placements_received_total`.
+`outcome="apart"` in `wasmkeep_placements_received_total`. A request
+sent on by a drain (or by this rule) that the actor itself answers with
+a 5xx no longer marks the peer suspect.
 
 Upgrading: the default needs no deploy, and nodes of 0.7.0 keep what they
 wake. A version with an `apart-from` key is manifest format 8: a deploy of

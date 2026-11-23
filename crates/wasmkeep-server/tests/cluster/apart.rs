@@ -51,18 +51,25 @@ async fn wake(node: &Node, class: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("{class}/{name}: no x-wasmkeep-node"))
 }
 
-/// Three nodes with placement's load rule off (`--no-placement`), so
-/// only this rule moves anything: it does not depend on load. Each
-/// wake-up lands on `a`, which holds the companion first:
-/// a request from outside, a call from the companion itself (the pusher's
-/// pull wakes the room on the pusher's node), and the reverse pair.
+/// A node with room for many residents: placement at wake-up stays on, as
+/// by default, and its load rule keeps the few actors of these tests below
+/// its floor (a fifth of the process's 16 instances), so only the rule
+/// keeping a pair apart moves anything.
+fn roomy(config: &mut ActorConfig) {
+    config.mailbox.max_resident = 1000;
+}
+
+/// Three nodes, default placement. Each wake-up lands on `a`, which holds
+/// the companion first: a request from outside, a call from the companion
+/// itself (the pusher's pull wakes the room on the pusher's node), and the
+/// reverse pair.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_room_and_its_pusher_wake_on_different_nodes() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let a = pair_node("a", dirs[0].path(), &store, no_placement).await;
-    let _b = pair_node("b", dirs[1].path(), &store, no_placement).await;
-    let _c = pair_node("c", dirs[2].path(), &store, no_placement).await;
+    let a = pair_node("a", dirs[0].path(), &store, roomy).await;
+    let _b = pair_node("b", dirs[1].path(), &store, roomy).await;
+    let _c = pair_node("c", dirs[2].path(), &store, roomy).await;
     for id in ["a", "b", "c"] {
         wait_drain_line(&store, id, "serving").await;
     }
@@ -89,9 +96,6 @@ async fn a_room_and_its_pusher_wake_on_different_nodes() {
     assert!(r.body.starts_with("200:"), "{}", r.body);
     let room = holder(&store, "room", "deck").await;
     assert!(room.is_some() && room.as_deref() != Some("a"), "{room:?}");
-
-    // Another name is nobody's companion: it wakes where it lands.
-    assert_eq!(wake(&a, "pusher", "alone").await, "a");
 }
 
 /// The fallback: with one node alive, a room and its pusher wake there,
@@ -109,7 +113,7 @@ async fn alone_or_turned_off_the_pair_wakes_where_it_lands() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let off = |config: &mut ActorConfig| {
-        no_placement(config);
+        roomy(config);
         config.apart.insert(
             "pusher".into(),
             wasmkeep_cluster::placement::APART_NONE.into(),
@@ -149,55 +153,168 @@ fn rendezvous<'a>(key: &str, nodes: &[&'a str]) -> &'a str {
         .unwrap()
 }
 
-/// A rolling restart's first step: the pusher's node drains. Its next
-/// wake-up goes to the third node, not to the room's, though the drain's
-/// plain choice for this name is the room's node.
+/// A rolling restart's first step: the pusher's node drains. Its alarm
+/// (handed off by the drain) and its next wake-up (sent on by the
+/// draining node) go to the third node, not to the room's, though the
+/// drain's plain choice for these names is the room's node.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_draining_pushers_node_hands_it_to_the_node_without_its_room() {
-    // The pusher wakes apart from a on rendezvous({b, c}); from there the
-    // drain's plain choice among {a, the other} must be a.
-    let name = (0..)
+    // Names whose pusher wakes apart from a on b (rendezvous over {b, c}),
+    // and for which the drain's plain choice from b, over {a, c}, is a.
+    let names: Vec<String> = (0..)
         .map(|i| format!("lobby{i}"))
-        .find(|n| {
+        .filter(|n| {
             let key = format!("default/pusher/{n}");
-            let first = rendezvous(&key, &["b", "c"]);
-            let other = if first == "b" { "c" } else { "b" };
-            rendezvous(&key, &["a", other]) == "a"
+            rendezvous(&key, &["b", "c"]) == "b" && rendezvous(&key, &["a", "c"]) == "a"
         })
-        .unwrap();
+        .take(2)
+        .collect();
+    let (alarmed, woken) = (&names[0], &names[1]);
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let a = pair_node("a", dirs[0].path(), &store, |_| {}).await;
-    let b = pair_node("b", dirs[1].path(), &store, |_| {}).await;
-    let c = pair_node("c", dirs[2].path(), &store, |_| {}).await;
+    let a = pair_node("a", dirs[0].path(), &store, roomy).await;
+    let b = pair_node("b", dirs[1].path(), &store, roomy).await;
+    let c = pair_node("c", dirs[2].path(), &store, roomy).await;
     for id in ["a", "b", "c"] {
         wait_drain_line(&store, id, "serving").await;
     }
     settle().await;
-    assert_eq!(wake(&a, "room", &name).await, "a");
-    let first = wake(&a, "pusher", &name).await;
-    let (draining, other) = match first.as_str() {
-        "b" => (&b, "c"),
-        "c" => (&c, "b"),
-        n => panic!("the pusher woke on {n}"),
+    for name in [alarmed, woken] {
+        assert_eq!(wake(&a, "room", name).await, "a");
+        assert_eq!(wake(&a, "pusher", name).await, "b");
+    }
+    // The first pusher's alarm, due after the drain.
+    let path = format!("/actor/pusher/{alarmed}/alarm?in=2000");
+    let r = send_reachable(a.addr, "POST", &path, "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    drain(&store, "b").await;
+    wait_drain_line(&store, "b", "drained").await;
+    // The alarm was handed to c, which fires it there.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let fired_on = loop {
+        if let Some(node) = holder(&store, "pusher", alarmed).await {
+            break node;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the alarm never fired"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    drain(&store, &first).await;
-    wait_drain_line(&store, &first, "drained").await;
-    assert_eq!(holder(&store, "pusher", &name).await, None);
-    // The next wake-up reaches the draining node: sent to the node without
-    // the room.
-    let r = send(
-        draining.addr,
-        "GET",
-        &format!("/actor/pusher/{name}/fired"),
-        "",
-    )
-    .await;
+    assert_eq!(fired_on, "c");
+    let path = format!("/actor/pusher/{alarmed}/fired");
+    let r = send_reachable(c.addr, "GET", &path, "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.head);
+    // The next wake-up reaches the draining node: sent to c.
+    assert_eq!(holder(&store, "pusher", woken).await, None);
+    let r = send(b.addr, "GET", &format!("/actor/pusher/{woken}/fired"), "").await;
     assert_eq!(
         (r.status, r.node.as_deref()),
-        (200, Some(other)),
+        (200, Some("c")),
         "{}",
         r.body
     );
-    assert_eq!(holder(&store, "room", &name).await.as_deref(), Some("a"));
+    for name in [alarmed, woken] {
+        assert_eq!(holder(&store, "room", name).await.as_deref(), Some("a"));
+    }
+}
+
+/// The count of one series of this process's metrics page (0 if absent).
+fn metric(series: &str) -> u64 {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A placed wake-up (the load rule, ADR 0041 section 6) of a pusher to the
+/// node that holds its room is refused there, and runs on its sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_hop_to_the_rooms_node_is_refused_and_runs_on_the_sender() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ten = |config: &mut ActorConfig| config.mailbox.max_resident = 10;
+    // a alone first: its wake-ups are kept, to six of ten (600).
+    let a = pair_node("a", dirs.0.path(), &store, ten).await;
+    for i in 0..6 {
+        assert_eq!(wake(&a, "room", &format!("fill{i}")).await, "a");
+    }
+    // b holds the room, one of ten (100).
+    let b = pair_node("b", dirs.1.path(), &store, ten).await;
+    assert_eq!(wake(&b, "room", "lobby").await, "b");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while wake(&a, "room", "lobby").await != "b" {
+        assert!(std::time::Instant::now() < deadline, "a never saw b");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    settle().await;
+    // a at 600, b at 100: the load rule sends the pusher to b, which holds
+    // its room and refuses; a runs it.
+    let apart =
+        r#"wasmkeep_placements_received_total{tenant="default",app="default",outcome="apart"}"#;
+    assert_eq!(wake(&a, "pusher", "lobby").await, "a");
+    assert_eq!(metric(apart), 1);
+    assert_eq!(
+        holder(&store, "pusher", "lobby").await.as_deref(),
+        Some("a")
+    );
+}
+
+/// `apart-from` from a deploy to running nodes: two classes the default
+/// pair does not name (`fan`, `feed`) wake where they land, until a
+/// version naming them reaches the nodes that follow the app; then they
+/// wake apart. The manifest is format 8.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deployed_apart_entry_reaches_the_nodes_that_follow_the_app() {
+    use wasmkeep_server::apps::Changes;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let classes = || {
+        Some(vec![
+            ("fan".to_owned(), test_actor_wasm().to_vec()),
+            ("feed".to_owned(), test_actor_wasm().to_vec()),
+        ])
+    };
+    let rt = deploy_runtime();
+    let first = Changes {
+        classes: classes(),
+        ..Changes::default()
+    };
+    app.deploy_changes(&rt, first).await.unwrap();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (id, dir) in ["a", "b", "c"].into_iter().zip(&dirs) {
+        let node = super::app_delete::app_node_following(id, dir.path(), &store).await;
+        nodes.push(node.unwrap());
+    }
+    for id in ["a", "b", "c"] {
+        wait_drain_line(&store, id, "serving").await;
+    }
+    settle().await;
+    let a = &nodes[0].0;
+    assert_eq!(wake(a, "feed", "one").await, "a");
+    assert_eq!(wake(a, "fan", "one").await, "a");
+
+    let second = Changes {
+        classes: classes(),
+        apart: vec![("fan".into(), Some("feed".into()))],
+        ..Changes::default()
+    };
+    let deployed = app.deploy_changes(&rt, second).await.unwrap();
+    let manifest = app.manifest(&deployed.current.version).await.unwrap();
+    assert_eq!(manifest.format_number(), 8);
+    assert_eq!(manifest.apart.get("fan").map(String::as_str), Some("feed"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while nodes
+        .iter()
+        .any(|(n, _)| n.service.deploy_seq() < deployed.current.seq)
+    {
+        assert!(std::time::Instant::now() < deadline, "nodes never followed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(wake(a, "feed", "two").await, "a");
+    assert_ne!(wake(a, "fan", "two").await, "a");
+    for (_, follow) in nodes {
+        follow.abort();
+    }
 }

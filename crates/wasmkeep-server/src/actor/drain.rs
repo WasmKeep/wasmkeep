@@ -346,7 +346,15 @@ async fn hand_off(
     address: &ActorAddress,
     at: u64,
 ) -> bool {
-    let Some(peer) = cluster.chosen_peer(address) else {
+    // An actor kept apart from a companion goes to a peer that does not
+    // hold it, if there is one (ADR 0041, amendment of 2026-11-22).
+    let companions = inner.companions_of(address);
+    let avoid = if companions.is_empty() {
+        Vec::new()
+    } else {
+        ActorState::companion_owners(companions, cluster).await
+    };
+    let Some(peer) = cluster.chosen_peer_apart(address, &avoid) else {
         inner.alarms.set_if_earlier(address.clone(), at);
         return false;
     };

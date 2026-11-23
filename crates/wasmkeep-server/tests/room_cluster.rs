@@ -58,6 +58,19 @@ async fn node_with(
     front: Vec<u8>,
     batched: bool,
 ) -> Node {
+    node_opts(id, store, wasm, front, batched, false).await
+}
+/// [`node_with`]; `apart`: the room and its pusher kept apart, the
+/// default (ADR 0041, amendment of 2026-11-22), instead of waking where
+/// the test sends them.
+async fn node_opts(
+    id: &'static str,
+    store: Arc<dyn ObjectStore>,
+    wasm: Vec<u8>,
+    front: Vec<u8>,
+    batched: bool,
+    apart: bool,
+) -> Node {
     let data = tempfile::tempdir().unwrap();
     let path = data.path().to_owned();
     let (started, ready) = tokio::sync::oneshot::channel();
@@ -110,10 +123,12 @@ async fn node_with(
             // before the rule keeping them apart (ADR 0041, amendment of
             // 2026-11-22): a test that kills an edge's node assumes the room
             // is not on it. `tests/cluster/apart.rs` tests the rule.
-            config.apart.insert(
-                "pusher".into(),
-                wasmkeep_cluster::placement::APART_NONE.into(),
-            );
+            if !apart {
+                config.apart.insert(
+                    "pusher".into(),
+                    wasmkeep_cluster::placement::APART_NONE.into(),
+                );
+            }
             config.cluster = Some(cluster);
             let service = ActorService::new(
                 runtime,
@@ -768,6 +783,77 @@ async fn room_cluster_publish_acknowledged_while_a_round_is_held_by_a_slow_edge(
     );
     task.abort();
 }
+/// The node `class/name`'s ownership record names, if any.
+async fn holder(store: &Arc<dyn ObjectStore>, class: &str, name: &str) -> Option<String> {
+    use object_store::ObjectStoreExt as _;
+    let key = wasmkeep_cluster::state_root::StateRoot::new("", "default", "default").key(
+        wasmkeep_cluster::state_root::Family::Owners,
+        &format!("{class}/{name}"),
+    );
+    let body = store.get(&key.into()).await.ok()?.bytes().await.ok()?;
+    wasmkeep_cluster::node_lease::OwnerRecord::decode(&body)?
+        .holder
+        .map(|(node, _)| node)
+}
+
+/// The SDK's own room and pusher, the default rule on, every request
+/// through one node: clients join, messages are published, and the room and
+/// its pusher end up on different nodes while every client catches up. The
+/// history read wakes the room on that node; the first join's poke then
+/// wakes the pusher, which goes to a peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_cluster_room_and_pusher_wake_apart_by_default() {
+    let wasm = guests::build_guest("tests/guests/room-scaling", "room_scaling_guest");
+    let front = guests::build_guest("tests/guests/room-scaling-front", "room_scaling_front");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = node_opts("a", store.clone(), wasm.clone(), front.clone(), true, true).await;
+    let _b = node_opts("b", store.clone(), wasm.clone(), front.clone(), true, true).await;
+    let _c = node_opts("c", store.clone(), wasm, front, true, true).await;
+    // A name the test front accepts; its pusher keeps a 3 s idle alarm.
+    let room = "quiet";
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    get(a.addr, "/r6/map?room=quiet").await;
+    assert_eq!(get(a.addr, "/r6/warm?room=quiet&edge=1").await.0, 200);
+    assert_eq!(get(a.addr, "/r6/history?room=quiet&n=0").await.0, 200);
+    let mut clients = vec![];
+    for i in 0..3 {
+        let p = Arc::new(Progress::default());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(client(
+            a.addr,
+            room,
+            format!("apart{i}"),
+            p.clone(),
+            stopped,
+        ));
+        clients.push((p, stop, task));
+    }
+    let mut head = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while clients.iter().any(|(p, _, _)| {
+        p.ready.load(Ordering::SeqCst) == 0 || p.last.load(Ordering::SeqCst) < head.max(1)
+    }) {
+        assert!(Instant::now() < deadline, "joins");
+        head = publish(a.addr, room, false).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    for _ in 0..5 {
+        head = publish(a.addr, room, false).await;
+    }
+    caught_up(&clients, head).await;
+    let (r, p) = (
+        holder(&store, "room", room).await,
+        holder(&store, "pusher", room).await,
+    );
+    assert_eq!(r.as_deref(), Some("a"), "the room");
+    assert!(p.is_some() && r != p, "room on {r:?}, pusher on {p:?}");
+    for (p, stop, task) in clients {
+        assert_eq!(p.last.load(Ordering::SeqCst), head);
+        let _ = stop.send(());
+        task.await.unwrap();
+    }
+}
+
 /// A quiet room loses its pusher's node; one publish comes during the
 /// takeover and nothing after it. Its poke fails, yet the message is
 /// delivered: an idle pusher whose group holds sockets keeps a durable
