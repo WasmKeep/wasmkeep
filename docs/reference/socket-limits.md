@@ -10,7 +10,7 @@
 
 Zero refuses every WebSocket at that scope. These are concurrent session limits,
 not request rates. An upgrade over capacity receives HTTP 503 with
-`Retry-After`; a slot is reserved before 101 or an outbound relay connection.
+`Retry-After: 5`; a slot is reserved before 101 or an outbound relay connection.
 Closing sockets retain their slot through transport and close-event cleanup.
 Failover-held upgrades reserve only after the hold ends and admission probes
 complete. Relays allow 250 ms for the reverse stream after either direction

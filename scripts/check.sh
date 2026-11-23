@@ -44,6 +44,9 @@ step 'publication paths'
 python3 -I scripts/check-benchmark-paths.py
 python3 -I scripts/check-benchmark-paths.py --range "$base..HEAD"
 python3 -I scripts/check-docs.py "${changed[@]}"
+# Every metric the server serves is on the metrics reference, and none else.
+step 'metrics reference'
+python3 -I scripts/check-metrics-reference.py
 # The TypeScript SDK ships a copy of the WIT; a world changed in one place
 # only would build guests against another world than the host's.
 if [ -d crates/wasmkeep-wit/wit ] && [ -d sdks/typescript/wit ]; then
@@ -265,6 +268,7 @@ if $full; then
   msrv=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
   step MSRV; cargo +"$msrv" check --workspace --all-targets --locked
   step dependencies; cargo deny check; ./scripts/licenses.sh >/dev/null
+  step 'CLI reference'; ./scripts/cli-reference.sh --check
   step 'docs site'; ./scripts/docs-site.sh >/dev/null
 fi
 # Never covered here: other operating systems and architectures, the LTX

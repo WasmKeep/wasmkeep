@@ -47,13 +47,17 @@
 - [Upgrade a cluster to 0.7.0](deploy/upgrading-to-0.7.md)
 - [Upgrade a cluster to 0.8.0 (unreleased)](deploy/upgrading-to-0.8.md)
 - [Monitoring](monitoring.md)
+- [Troubleshooting](troubleshooting.md)
 - [Resuming destructive operations](operations.md)
 
 # Reference
 
 - [API reference](reference/api.md)
+- [CLI reference](reference/cli.md)
+- [Metrics reference](reference/metrics.md)
 - [The node file](reference/node-file.md)
 - [Socket admission options](reference/socket-limits.md)
+- [Glossary](glossary.md)
 - [Benchmarks](benchmarks.md)
 - [Security model](security.md)
 - [Licensing and compliance](legal.md)

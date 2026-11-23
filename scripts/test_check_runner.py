@@ -19,7 +19,7 @@ class Runner(unittest.TestCase):
         for name in ('check.sh', 'doctor.sh', 'release-notes.sh'):
             shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
         self.write('CHANGELOG.md', '# Changelog\n\n## 1.2.3\n\nNotes.\n')
-        for name in ('docs-site.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh',
+        for name in ('docs-site.sh', 'cli-reference.sh', 'licenses.sh', 's3-suites.sh', 'languages.sh',
                      'package-rust-sdk.sh'):
             self.write('scripts/' + name, '#!/bin/sh\necho "' + name + '" >> "$CALLS"\n', executable=True)
         for name in ('test_check_benchmark_paths.py', 'test_check_runner.py'):
@@ -235,7 +235,7 @@ esac
         for expected in ('test_check_runner.py', 'test_check_benchmark_paths.py',
                          'check-benchmark-paths.py --range ', 'flags=--cfg madsim seeds=200',
                          'cargo +1.97 check --workspace --all-targets --locked',
-                         'cargo deny check', 'licenses.sh', 'docs-site.sh',
+                         'cargo deny check', 'licenses.sh', 'cli-reference.sh', 'docs-site.sh',
                          'npm test --silent', 'python-sdk-tests', 'c-sdk-tests', 'go vet ./...', 'go test ./...'):
             self.assertIn(expected, calls)
         # Everything, the cluster suite over TLS included; the S3 suites and

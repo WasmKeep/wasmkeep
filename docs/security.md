@@ -91,7 +91,7 @@ under `crates/`). Per-node and per-app limits are local to a node's process.
   descriptor budget; zero refuses every WebSocket at that scope. Per-app
   isolation requires `--max-sockets-per-app` (or `SocketLimits::per_app`)
   below the effective node cap; its default alone does not isolate apps.
-  Over capacity: HTTP 503 with `Retry-After`. Opening and closing sessions
+  Over capacity: HTTP 503 with `Retry-After: 5`. Opening and closing sessions
   retain capacity; idle clients are pinged then closed.
   A socket is invisible to the actor's other events until
   `on-websocket-open` accepts it. Close reasons never carry host errors.
