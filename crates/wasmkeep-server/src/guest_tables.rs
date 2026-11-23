@@ -3,8 +3,18 @@
 //! holds, `wasi:http` `fields` among them) and the size of one `fields`
 //! the guest builds. The actors' stores and the front's are built with
 //! these.
+//!
+//! What a store can hold outside linear memory is then bounded by
+//! entries: each holds at most a `fields` (64 KiB), a response head from
+//! the network (`egress::MAX_RESPONSE_HEAD_BYTES`, 64 KiB) or a request's
+//! (the server's parser, about 400 KiB, one per event unless the guest
+//! keeps it), and an unsent body's queue (`egress::MAX_UNSENT_BODY_BYTES`,
+//! 64 KiB). A guest that fills the table with requests it never sends,
+//! each with full headers and a full queue, holds about 4,096 × 128 KiB,
+//! 512 MiB. One that keeps the requests it was sent instead holds what
+//! their clients sent, up to the parser's limit each.
 
-use wasmtime::component::ResourceTable;
+use wasmtime::component::{ResourceTable, ResourceTableError};
 use wasmtime_wasi_http::WasiHttpCtx;
 
 /// Host resources one store may hold at once (wasmtime's default is
@@ -27,6 +37,15 @@ pub const MAX_GUEST_RESOURCES: usize = 4096;
 /// (a request, a fetched response) are bounded by the HTTP parser instead;
 /// a guest that copies those to change them is held to this size.
 pub const MAX_GUEST_FIELDS_BYTES: usize = 64 * 1024;
+
+/// Whether `e` is a trap for a full resource table: the guest held
+/// [`MAX_GUEST_RESOURCES`], which the log says apart from a guest's bug.
+pub(crate) fn is_table_full(e: &wasmtime::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ResourceTableError>(),
+        Some(ResourceTableError::Full)
+    )
+}
 
 /// A resource table capped at [`MAX_GUEST_RESOURCES`].
 pub(crate) fn resource_table() -> ResourceTable {
@@ -57,5 +76,15 @@ mod tests {
         assert!(table.push(0usize).is_err(), "one past the cap");
         table.delete(held.pop().unwrap()).unwrap();
         assert!(table.push(0usize).is_ok(), "room again once one is dropped");
+    }
+
+    #[test]
+    fn a_full_table_is_told_apart_from_other_traps() {
+        let full =
+            wasmtime::Error::new(ResourceTableError::Full).context("[new_fields] pushing fields");
+        assert!(is_table_full(&full));
+        let other = wasmtime::Error::new(ResourceTableError::NotPresent);
+        assert!(!is_table_full(&other));
+        assert!(!is_table_full(&wasmtime::format_err!("guest panicked")));
     }
 }
