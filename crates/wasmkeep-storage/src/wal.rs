@@ -517,7 +517,31 @@ impl Restorer {
     /// # Errors
     /// The file exists or cannot be created.
     pub fn create(path: &Path, max_bytes: u64) -> Result<Self, RestoreError> {
-        let file = std::fs::OpenOptions::new()
+        Self::create_with(path, max_bytes, std::fs::OpenOptions::new())
+    }
+
+    /// [`Restorer::create`], readable and writable by this account alone
+    /// (0600 on Unix) from the moment the file exists.
+    ///
+    /// # Errors
+    /// The file exists or cannot be created.
+    pub fn create_private(path: &Path, max_bytes: u64) -> Result<Self, RestoreError> {
+        #[allow(unused_mut)] // only Unix sets a mode
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Self::create_with(path, max_bytes, options)
+    }
+
+    fn create_with(
+        path: &Path,
+        max_bytes: u64,
+        mut options: std::fs::OpenOptions,
+    ) -> Result<Self, RestoreError> {
+        let file = options
             .read(true)
             .write(true)
             .create_new(true)
@@ -785,5 +809,18 @@ mod tests {
         assert_eq!(checksum(false, (0, 0), &data), (1, 3));
         let data = [0, 0, 0, 1, 0, 0, 0, 2];
         assert_eq!(checksum(true, (0, 0), &data), (1, 3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)] // test code
+    fn a_private_restore_is_owner_only_when_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actor.db");
+        let _restorer = Restorer::create_private(&path, 1 << 20).unwrap();
+        // Read before anything else touches it: no chmod after the fact.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

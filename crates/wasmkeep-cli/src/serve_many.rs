@@ -227,6 +227,7 @@ async fn start_runtime(
     let app_ref = AppRef::new(Arc::clone(&shared.store), &shared.prefix, &tenant, &name);
     // A deleted app is never served, and this node's files of it go
     // (ADR 0028).
+    wasmkeep_cli::prepare_data_root(&args.data_dir)?;
     let local = wasmkeep_server::local_app_dir(&args.data_dir, &tenant, &name);
     let blob_epoch = app_ref
         .prepare_local(&local)

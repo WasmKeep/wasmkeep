@@ -107,7 +107,7 @@ async fn execute(
             .is_empty(),
         "no such actor"
     );
-    let temp = tempfile::tempdir()?;
+    let temp = wasmkeep_cli::private_tempdir()?;
     let storage = wasmkeep_storage::Storage::new(
         wasmkeep_storage::StorageConfig::new(temp.path()),
         wasmkeep_storage::StateDir {

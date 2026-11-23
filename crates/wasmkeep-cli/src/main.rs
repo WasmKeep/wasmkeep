@@ -1776,6 +1776,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             let (component, wasm) = load(path)?;
             classes.push((class.clone(), component, wasm));
         }
+        wasmkeep_cli::prepare_data_root(&args.data_dir)?;
         let mut config = ActorConfig::new(&args.data_dir);
         config.max_blob_bytes = args.max_blob_bytes;
         config.max_app_blob_bytes = args.max_app_blob_bytes;

@@ -347,17 +347,17 @@ async fn attempt_from_objects(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let scratch = tempfile::Builder::new()
-        .prefix(".wasmkeep-export-")
-        .tempdir_in(parent)?;
-    let path = scratch.path().join("actor.db");
-    let mut restorer =
-        wal::Restorer::create(&path, max).map_err(|e| Error::Corrupt(e.to_string()))?;
+    let mut scratch = tempfile::Builder::new();
+    scratch.prefix(".wasmkeep-export-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        scratch.permissions(std::fs::Permissions::from_mode(0o700));
     }
+    let scratch = scratch.tempdir_in(parent)?;
+    let path = scratch.path().join("actor.db");
+    let mut restorer =
+        wal::Restorer::create_private(&path, max).map_err(|e| Error::Corrupt(e.to_string()))?;
     let mut keys = Vec::new();
     if let Some(id) = plan.snapshot {
         keys.push((snapshot_key(id), id, true));

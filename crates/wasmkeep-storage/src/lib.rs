@@ -21,7 +21,10 @@ pub mod readonly;
 mod value;
 pub mod wal;
 
-pub use db::{ActorDb, CaptureHold, PendingAlarms, StateDir, Storage, StorageConfig};
+pub use db::{
+    ActorDb, CaptureHold, DataRoot, PendingAlarms, StateDir, Storage, StorageConfig,
+    prepare_data_root,
+};
 pub use error::{SqlError, SqlErrorKind, StorageError};
 pub use local::local_is_at;
 pub use path::{decode_segment, encode_segment};
