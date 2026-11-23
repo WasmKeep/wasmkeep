@@ -175,6 +175,10 @@ async fn a_signed_call_whose_body_was_changed_is_refused() {
     // swaps its body: the receiving node refuses it.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     let a = node_configured(
         "a",
         dir.path(),
@@ -274,4 +278,14 @@ async fn a_signed_call_whose_body_was_changed_is_refused() {
         let (status, body) = post(signed_with(b"", ts, nonce), "").await;
         assert_eq!(status, 200, "nonce {nonce}: {body}");
     }
+    // Signed before this node started (its previous process may have
+    // used it): 503, for the sender to sign again, never a 403 the
+    // sending guest would take for the callee's answer; the actor did
+    // not run.
+    let (status, body) = post(signed(b"pay 10", started - 5_000), "pay 10").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("before this node started"), "{body}");
+    let (status, body) = post(signed(b"pay 10", now() + 4), "pay 10").await;
+    // Four calls ran before it: this is the fifth.
+    assert_eq!((status, body.trim()), (200, "5"), "the refused call ran");
 }
