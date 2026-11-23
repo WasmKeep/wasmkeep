@@ -13,6 +13,7 @@ publish.workspace = true
 wasmtime.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

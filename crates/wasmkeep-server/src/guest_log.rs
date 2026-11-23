@@ -8,12 +8,19 @@
 //! and the next line logged says how many were.
 //!
 //! Limits: lines per second per instance (the operator's rate, with a burst
-//! of twice that), [`NODE_RATE`] for the whole node, and [`MAX_LINE`] bytes
-//! a line. Control characters are escaped, so a guest cannot start a line
-//! of its own in the node's log or colour a terminal.
+//! of twice that), [`APP_RATE`] for each app of the process, [`NODE_RATE`]
+//! for the whole process, and [`MAX_LINE`] bytes a line, escapes included.
+//!
+//! The text is the line's last field, `line="..."`, after a fixed message
+//! and the real fields; quotes and backslashes in it are escaped, and so
+//! are controls, format characters (bidi, zero-width) and line separators
+//! ([`crate::logging::push_escaped`]). So a guest cannot start a line of
+//! its own in the node's log, add fields to its own line, reorder what a
+//! terminal shows or colour it.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -22,42 +29,115 @@ use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 
 /// Lines a second per instance unless the operator says otherwise.
 pub const DEFAULT_RATE: u32 = 50;
-/// Lines a second for every guest on the node together.
-pub const NODE_RATE: u32 = 1_000;
-/// Longest line logged, in bytes; the rest of a longer one is cut.
+/// Lines a second for every guest of one app together: each app of the
+/// process has its own, so a chatty app cannot use up another's.
+pub const APP_RATE: u32 = 1_000;
+/// Lines a second for every guest of the process together, over the
+/// apps' own budgets.
+pub const NODE_RATE: u32 = 5 * APP_RATE;
+/// Longest line logged, in bytes, quoted and escaped; the rest of a longer
+/// one is cut.
 pub const MAX_LINE: usize = 4_096;
 
+type Shared = Arc<Mutex<Bucket>>;
+
 /// How much of what guests print reaches the node's log. Cheap to clone:
-/// clones share the node-wide budget.
+/// clones share the budgets.
 #[derive(Debug, Clone)]
 pub struct GuestLog {
     rate: u32,
-    node: Arc<Mutex<Bucket>>,
+    budgets: Arc<Budgets>,
+    /// The budget of the app this clone was made for, `(app, budget)`.
+    held: Option<Arc<(String, Shared)>>,
+}
+
+/// What every clone shares.
+#[derive(Debug)]
+struct Budgets {
+    node: Shared,
+    /// Each app's budget (`tenant/app`). The app's runtime holds it
+    /// ([`GuestLog::for_app`]); it goes when that runtime does.
+    apps: Mutex<HashMap<String, Weak<Mutex<Bucket>>>>,
 }
 
 impl GuestLog {
     /// At most `rate` lines a second per instance (bursts of twice that),
-    /// and [`NODE_RATE`] for the node; 0 discards everything, as WasmKeep
-    /// did before guest output was logged.
+    /// [`APP_RATE`] for each app and [`NODE_RATE`] for the process; 0
+    /// discards everything, as WasmKeep did before guest output was logged.
     pub fn new(rate: u32) -> Self {
         Self {
             rate,
-            node: Arc::new(Mutex::new(Bucket::new(NODE_RATE))),
+            budgets: Arc::new(Budgets {
+                node: Arc::new(Mutex::new(Bucket::new(NODE_RATE))),
+                apps: Mutex::default(),
+            }),
+            held: None,
         }
     }
 
+    /// This log for the runtime of `app` (`tenant/app`): the clone holds
+    /// the app's budget, so its instances share one budget for as long as
+    /// the runtime lives, however short-lived they are.
+    pub(crate) fn for_app(&self, app: &str) -> Self {
+        let bucket = self.app_bucket(app);
+        Self {
+            held: Some(Arc::new((app.to_owned(), bucket))),
+            ..self.clone()
+        }
+    }
+
+    /// The budgets an instance of `app` takes from.
+    fn budget(&self, app: &str) -> Budget {
+        Budget {
+            app: self.app_bucket(app),
+            node: Arc::clone(&self.budgets.node),
+        }
+    }
+
+    /// The budget every instance of `app` shares, while something holds it.
+    fn app_bucket(&self, app: &str) -> Shared {
+        if let Some(held) = &self.held
+            && held.0 == app
+        {
+            return Arc::clone(&held.1);
+        }
+        let mut apps = self
+            .budgets
+            .apps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bucket) = apps.get(app).and_then(Weak::upgrade) {
+            return bucket;
+        }
+        // The apps that went with their runtimes.
+        apps.retain(|_, bucket| bucket.strong_count() > 0);
+        let bucket = Arc::new(Mutex::new(Bucket::new(APP_RATE)));
+        apps.insert(app.to_owned(), Arc::downgrade(&bucket));
+        bucket
+    }
+
+    /// How many apps have a budget (for tests).
+    #[cfg(test)]
+    fn apps_known(&self) -> usize {
+        let mut apps = self.budgets.apps.lock().unwrap();
+        apps.retain(|_, bucket| bucket.strong_count() > 0);
+        apps.len()
+    }
+
     /// The WASI context for one instance of `who` (an actor as its app
-    /// names it, `class/name`, or `_front`) of `app` (`tenant/app`):
-    /// [`crate::egress::guest_wasi`]'s, with its stdout and stderr logged.
+    /// names it, `class/name` as [`crate::logging::actor`] shows it, or
+    /// `_front`) of `app` (`tenant/app`): [`crate::egress::guest_wasi`]'s,
+    /// with its stdout and stderr logged.
     pub(crate) fn wasi(&self, app: String, who: String) -> wasmtime_wasi::WasiCtx {
         let mut builder = crate::egress::guest_wasi_builder();
         if self.rate > 0 {
+            let shared = self.budget(&app);
             let output = Arc::new(Mutex::new(Output {
                 app,
                 who,
                 pending: [Vec::new(), Vec::new()],
                 bucket: Bucket::new(self.rate),
-                node: Arc::clone(&self.node),
+                shared,
                 dropped: 0,
             }));
             builder
@@ -122,8 +202,28 @@ struct Output {
     who: String,
     pending: [Vec<u8>; 2],
     bucket: Bucket,
-    node: Arc<Mutex<Bucket>>,
+    shared: Budget,
     dropped: u64,
+}
+
+/// The budgets an instance shares with others: its app's, then the
+/// process's. In that order, so an app over its own budget never takes
+/// from the others' share of the process's.
+struct Budget {
+    app: Shared,
+    node: Shared,
+}
+
+impl Budget {
+    fn take(&self) -> bool {
+        let take = |bucket: &Shared| {
+            bucket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        };
+        take(&self.app) && take(&self.node)
+    }
 }
 
 impl Output {
@@ -141,12 +241,7 @@ impl Output {
     }
 
     fn emit(&mut self, which: usize, line: &[u8]) {
-        let allowed = self.bucket.take()
-            && self
-                .node
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+        let allowed = self.bucket.take() && self.shared.take();
         if !allowed {
             self.dropped += 1;
             crate::metrics::inc(&crate::metrics::METRICS.guest_log_dropped);
@@ -164,7 +259,14 @@ impl Output {
         }
         crate::metrics::inc(&crate::metrics::METRICS.guest_log_lines);
         let text = clean(line);
-        tracing::info!(target: "wasmkeep::guest", app = %self.app, actor = %self.who, stream = NAMES[which], "{text}");
+        tracing::info!(
+            target: "wasmkeep::guest",
+            app = %self.app,
+            actor = %self.who,
+            stream = NAMES[which],
+            line = %text,
+            "guest output"
+        );
     }
 }
 
@@ -189,20 +291,28 @@ impl Drop for Output {
     }
 }
 
-/// `line` as text for the log: invalid UTF-8 replaced, a trailing `\r`
-/// dropped, control characters other than tab escaped (`\u{1b}`), and cut
-/// at [`MAX_LINE`] bytes.
+/// `line` as the log's quoted value: invalid UTF-8 replaced, a trailing
+/// `\r` dropped, escaped ([`crate::logging::push_escaped`]: `\u{1b}`,
+/// `\"`), and cut so that the whole value, quotes included, is at most
+/// [`MAX_LINE`] bytes; the cut falls between characters, never inside an
+/// escape.
 fn clean(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // Escaping never shortens text: nothing past this is shown.
     let line = &line[..line.len().min(MAX_LINE)];
-    let mut out = String::with_capacity(line.len());
+    let room = MAX_LINE - 1; // the closing quote
+    let mut out = String::with_capacity(line.len() + 2);
+    out.push('"');
+    let mut one = String::new();
     for c in String::from_utf8_lossy(line).chars() {
-        if c.is_control() && c != '\t' {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
+        one.clear();
+        crate::logging::push_escaped(&mut one, c);
+        if out.len() + one.len() > room {
+            break;
         }
+        out.push_str(&one);
     }
+    out.push('"');
     out
 }
 
@@ -262,11 +372,92 @@ mod tests {
 
     #[test]
     fn control_characters_are_escaped_and_lines_cut() {
-        assert_eq!(clean(b"plain\ttab"), "plain\ttab");
-        assert_eq!(clean(b"line\r"), "line");
-        assert_eq!(clean(b"a\rb\x1b[31mc"), "a\\rb\\u{1b}[31mc");
+        assert_eq!(clean(b"plain\ttab"), "\"plain\\ttab\"");
+        assert_eq!(clean(b"line\r"), "\"line\"");
+        assert_eq!(clean(b"a\rb\x1b[31mc"), "\"a\\rb\\u001b[31mc\"");
         assert_eq!(clean(&[b'x'; MAX_LINE + 10]).len(), MAX_LINE);
-        assert_eq!(clean(b"bad \xff byte"), "bad \u{fffd} byte");
+        assert_eq!(clean(b"bad \xff byte"), "\"bad \u{fffd} byte\"");
+    }
+
+    #[test]
+    fn format_characters_and_line_separators_are_escaped() {
+        let text = clean("a\u{202e}b\u{2066}c\u{2028}d\u{2029}e\u{200b}f\u{ad}g".as_bytes());
+        for c in [
+            '\u{202e}', '\u{2066}', '\u{2028}', '\u{2029}', '\u{200b}', '\u{ad}',
+        ] {
+            assert!(!text.contains(c), "{c:?} passed through: {text:?}");
+        }
+        assert!(
+            text.contains("\\u202e") && text.contains("\\u2028"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_escaped_line_fits_the_limit() {
+        // Each byte of these escapes to several: the limit is on the output.
+        let escapes = clean(&[0x1b; MAX_LINE]);
+        assert!(escapes.len() <= MAX_LINE, "{}", escapes.len());
+        let bidi = clean("\u{202e}".repeat(MAX_LINE).as_bytes());
+        assert!(bidi.len() <= MAX_LINE, "{}", bidi.len());
+        // Cut between characters and escapes, never inside one.
+        assert!(escapes.ends_with("\\u001b\""), "{escapes}");
+        assert!(bidi.ends_with("\\u202e\""), "{bidi}");
+        let wide = clean("\u{e9}".repeat(MAX_LINE).as_bytes());
+        assert!(wide.len() <= MAX_LINE, "{}", wide.len());
+        // Above U+FFFF, a surrogate pair, never half of one.
+        let tag = clean("\u{e0001}".repeat(MAX_LINE).as_bytes());
+        assert!(tag.len() <= MAX_LINE, "{}", tag.len());
+        assert!(tag.ends_with("\\udb40\\udc01\""), "{tag}");
+    }
+
+    #[test]
+    fn the_text_cannot_close_its_quotes() {
+        assert_eq!(
+            clean(br#"hi" level=error x=\"#),
+            r#""hi\" level=error x=\\""#
+        );
+    }
+
+    #[test]
+    fn each_app_has_its_own_budget() {
+        let log = GuestLog::new(1);
+        let (a, b) = (log.for_app("t/a"), log.for_app("t/b"));
+        let first = a.budget("t/a");
+        let taken = (0..10_000).filter(|_| first.take()).count();
+        assert_eq!(taken, APP_RATE as usize * 2);
+        // A later instance of the app, or its front, shares that budget.
+        assert!(!a.budget("t/a").take());
+        assert!(!log.budget("t/a").take());
+        assert!(b.budget("t/b").take());
+    }
+
+    #[test]
+    fn the_node_caps_every_app_together() {
+        let log = GuestLog::new(1);
+        let apps: Vec<_> = (0..10).map(|i| log.for_app(&format!("t/a{i}"))).collect();
+        let taken: usize = apps
+            .iter()
+            .enumerate()
+            .map(|(i, app)| {
+                let budget = app.budget(&format!("t/a{i}"));
+                (0..10_000).filter(|_| budget.take()).count()
+            })
+            .sum();
+        // The node's burst, and what it refilled while the loop ran: far
+        // under the ten apps' own budgets together.
+        let burst = NODE_RATE as usize * 2;
+        assert!((burst..burst + 500).contains(&taken), "{taken}");
+    }
+
+    #[test]
+    fn an_apps_budget_goes_with_its_runtime() {
+        let log = GuestLog::new(1);
+        let app = log.for_app("t/gone");
+        let instance = app.budget("t/gone");
+        assert_eq!(log.apps_known(), 1);
+        drop((app, instance));
+        assert_eq!(log.apps_known(), 0);
     }
 
     #[test]

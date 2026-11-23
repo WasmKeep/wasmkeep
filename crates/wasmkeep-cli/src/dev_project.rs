@@ -62,10 +62,10 @@ fn local_values(project: &Project) -> anyhow::Result<wasmkeep_server::env::Vars>
     if !project.dev.env_named && !project.dev.env.exists() {
         return Ok(wasmkeep_server::env::Vars::new());
     }
-    let (vars, warnings) = wasmkeep_server::env::read_file(&project.dev.env)
+    let (vars, warning) = wasmkeep_server::env::read_local_file(&project.dev.env)
         .map_err(|e| anyhow::anyhow!("[dev] env: {e}"))?;
-    for w in warnings {
-        tracing::warn!("{w}");
+    if let Some(warning) = warning {
+        tracing::warn!("[dev] env: {warning}");
     }
     tracing::info!(file = %project.dev.env.display(), values = vars.len(), "local values loaded");
     Ok(vars)

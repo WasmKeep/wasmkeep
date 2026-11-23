@@ -835,7 +835,7 @@ pub(crate) fn read_parts(project: &Project, warn: &mut dyn FnMut(String)) -> any
     let mut read_config = |scope: &str, item: &Item, what: &str| -> anyhow::Result<()> {
         if let Some(path) = &item.config {
             not_local_values(project, what, path)?;
-            let (vars, _) = wasmkeep_server::env::read_file(path)
+            let vars = wasmkeep_server::env::read_config_file(path)
                 .map_err(|e| anyhow::anyhow!("{what}'s config: {e}"))?;
             for w in crate::secret_looking(scope, &vars) {
                 warn(w.replacen(

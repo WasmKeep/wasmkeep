@@ -77,7 +77,10 @@ for line in 'running the project file app=acme/todo file=wasmkeep.toml' \
   printf '%s\n' "$dev_log" | grep -Eq "$line" || fail "dev.log has no '$line'"
   echo "  ok: dev.log: $line"
 done
-if printf '%s\n' "$dev_log" | grep -q 'readable by every user'; then fail "dev warned about .env.local"; fi
+printf '%s\n' "$dev_log" | grep -Eq 'local values loaded file=[^ ]*\.env\.local values=1' \
+  || fail "dev.log does not say it loaded .env.local's one value"
+if printf '%s\n' "$dev_log" | grep -q '\[dev\] env:'; then fail "dev warned about .env.local"; fi
+echo "  ok: dev.log: .env.local loaded, without a warning"
 run page
 expect '^<h1>Todos</h1>$'
 

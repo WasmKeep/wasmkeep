@@ -804,7 +804,7 @@ impl ActorService {
                 }))
             }
             Ok(Outcome::Failed(e)) => {
-                tracing::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %e, "event failed");
+                tracing::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %crate::logging::text(&e), "event failed");
                 Ok(text_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "actor error\n",

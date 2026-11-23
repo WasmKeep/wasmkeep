@@ -126,7 +126,8 @@ chmod 600 .env.local
 ```
 
 `wasmkeep dev` reads its local values from `.env.local` (also in
-`.gitignore`), and warns if other users can read the file. Start it:
+`.gitignore`), and refuses to start if other users can open the file or
+your group can read it: it must be yours alone. Start it:
 
 <!-- test: dev -->
 ```bash

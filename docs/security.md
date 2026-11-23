@@ -108,10 +108,14 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   `--allow-outbound-port` opens one. 16 requests in flight per actor, 256
   per node.
 - What a guest prints reaches the node's log within a line rate per
-  instance and per node (`--guest-log-rate`; past it, lines are dropped
-  and counted), cut at 4 KB a line, with control characters escaped: a
-  guest cannot flood the log, forge entries of its own or send terminal
-  escapes. What it prints is its choice, secrets included, so the node's
+  instance, per app and per process (`--guest-log-rate`; past it, lines are dropped
+  and counted), as the last field of its line (`line="..."`, after the
+  app, the actor and the stream), cut at 4 KB a line once escaped.
+  Quotes and backslashes are escaped, and so are controls, format
+  characters (bidi controls, zero-width ones) and line separators, in
+  the text and in actor names (a name with a space or `=` is quoted): a
+  guest cannot flood the log, start a line of its own, add fields to its
+  line, reorder what a terminal shows or send terminal escapes. What it prints is its choice, secrets included, so the node's
   log is as sensitive as the actors make it.
 
 **SQLite sandbox** (`crates/wasmkeep-storage/src/db.rs`)
@@ -267,7 +271,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 
 ## Configuration and secrets
 
-`--env CLASS=FILE` (`NAME=value` files, readable only by the server's user).
+`--env CLASS=FILE` (`NAME=value` files, readable only by the server: on
+Unix a file is refused at start if other users can open it, if its group
+can write it, or if its group can read it while it is the server's user's
+own. So `0600` the server's user's, or `0640` root's with the server's
+group, which the service cannot rewrite. The same holds for `--front-env`
+files and for `wasmkeep dev`'s local values, which are read with a
+warning on a filesystem that keeps no file modes).
 Values never reach the data directory, the bucket or the logs; parse errors
 name the file and line, never the value.
 

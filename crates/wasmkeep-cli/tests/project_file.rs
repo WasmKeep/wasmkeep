@@ -279,11 +279,10 @@ fn dev_on_the_example() -> support::Dev {
         dir.path().join("wasmkeep.toml"),
     )
     .unwrap();
-    std::fs::write(
-        dir.path().join(".env.local"),
-        format!("TOKENS=alice:{ALICE}\n"),
-    )
-    .unwrap();
+    let local = dir.path().join(".env.local");
+    std::fs::write(&local, format!("TOKENS=alice:{ALICE}\n")).unwrap();
+    // Local values are refused unless they are the user's alone.
+    std::fs::set_permissions(&local, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     // Builds both crates first: a cold build takes minutes.
     let path = dir.path().to_path_buf();
     support::start_dev(dir, path, 100, Duration::from_secs(600))

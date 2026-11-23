@@ -66,7 +66,7 @@ Ollama listens on loopback, which actors cannot reach unless
 ```bash
 ollama pull llama3.2
 (cd examples/agent && cargo build --release --target wasm32-wasip2)
-printf 'MODEL_URL=http://127.0.0.1:11434/v1\nMODEL=llama3.2\n' > agent.env
+printf 'MODEL_URL=http://127.0.0.1:11434/v1\nMODEL=llama3.2\n' > agent.env && chmod 600 agent.env
 cargo run -p wasmkeep-cli -- serve --env agent=agent.env \
   --allow-outbound 127.0.0.1 \
   --actor agent=examples/agent/target/wasm32-wasip2/release/agent.wasm

@@ -148,6 +148,60 @@ async fn control_characters_cannot_forge_log_lines() {
     assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
 }
 
+/// The guest's text is the last field, quoted: what it prints cannot add
+/// fields of its own to its line, or leave the quotes.
+#[tokio::test(flavor = "multi_thread")]
+async fn printed_fields_stay_inside_the_line_field() {
+    let captured = Captured::install();
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _service) = start(data.path(), |_| {}).await;
+    print(
+        addr,
+        "mallory",
+        "SPOOF level=error app=other/app actor=x/y\" stream=\"stderr\u{202e}\n",
+    )
+    .await;
+    logged(&captured, "SPOOF").await;
+    let text = captured.text();
+    let line = text.lines().find(|l| l.contains("SPOOF")).unwrap();
+    assert!(line.contains(" INFO "), "{line}");
+    let (fields, guest) = line.split_once(" line=").unwrap();
+    assert!(!fields.contains("SPOOF"), "{line}");
+    assert!(
+        fields.contains("app=default/default actor=t/mallory"),
+        "{line}"
+    );
+    assert_eq!(
+        guest, r#""SPOOF level=error app=other/app actor=x/y\" stream=\"stderr\u202e""#,
+        "{line}"
+    );
+}
+
+/// A trap's message is the guest's text too: it is one quoted field, so
+/// its lines (a backtrace) cannot pass for lines of the node's log.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trap_is_logged_as_one_quoted_field() {
+    let captured = Captured::install();
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _service) = start(data.path(), |_| {}).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = "POST /actor/t/trapper/trap HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    logged(&captured, "guest trapped").await;
+    let text = captured.text();
+    let line = text.lines().find(|l| l.contains("guest trapped")).unwrap();
+    assert!(line.contains("error=\""), "{line}");
+    assert!(line.contains("backtrace:\\n"), "{line}");
+    for l in text.lines() {
+        assert!(
+            l.starts_with("20"),
+            "a line that is not an entry: {l:?}\n{text}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chatty_actor_is_limited_and_the_drops_are_reported() {
     let captured = Captured::install();
@@ -163,7 +217,7 @@ async fn a_chatty_actor_is_limited_and_the_drops_are_reported() {
     // A burst of twice the rate, then the rest dropped and counted.
     let kept = text
         .lines()
-        .filter(|l| l.contains("stream=\"stdout\"") && l.contains(": line "))
+        .filter(|l| l.contains("stream=\"stdout\"") && l.contains("line=\"line "))
         .count();
     assert!((10..=11).contains(&kept), "{kept} kept:\n{text}");
     assert!(text.contains("dropped=190"), "{text}");

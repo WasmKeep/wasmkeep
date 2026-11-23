@@ -108,6 +108,9 @@ fn start_front(front: PathBuf, tokens: Option<&str>) -> Server {
     if let Some(tokens) = tokens {
         let env = dir.path().join("front.env");
         std::fs::write(&env, format!("TOKENS={tokens}\n")).unwrap();
+        // Refused unless it is the server's user's alone.
+        std::fs::set_permissions(&env, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         cmd.arg("--front-env").arg(env);
     }
     let mut child = cmd.spawn().unwrap();

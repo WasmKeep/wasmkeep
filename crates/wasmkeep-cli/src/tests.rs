@@ -477,6 +477,8 @@ fn env_files_must_name_a_served_class() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("hub.env");
     std::fs::write(&file, "TOKEN=t\n").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let env = load_env(&[("hub".into(), file.clone())], &["hub", "monitor"], true).unwrap();
     assert_eq!(env.for_class("hub").get("TOKEN").unwrap(), "t");
     let e = load_env(&[("hbu".into(), file.clone())], &["hub", "monitor"], true).unwrap_err();

@@ -53,6 +53,27 @@ async fn get(addr: SocketAddr, path: &str) -> String {
     body.trim_end().to_owned()
 }
 
+/// The service's settings show which names are set, never a value.
+#[test]
+fn the_settings_debug_shows_names_not_values() {
+    let mut config = ActorConfig::new("data");
+    config
+        .env
+        .extend("t", env::parse("NODE_TOKEN=node-value-1").unwrap());
+    config
+        .config
+        .insert("t".into(), env::parse("DEPLOYED=deployed-value-2").unwrap());
+    config.front_env = env::parse("FRONT_TOKEN=front-value-3").unwrap();
+    let shown = format!("{config:?}");
+    for value in ["node-value-1", "deployed-value-2", "front-value-3"] {
+        assert!(!shown.contains(value), "{value} shown: {shown}");
+    }
+    assert!(
+        shown.contains("DEPLOYED") && shown.contains("FRONT_TOKEN"),
+        "{shown}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn each_class_reads_its_own_values_and_nothing_reaches_wasi() {
     let dir = tempfile::tempdir().unwrap();
@@ -62,7 +83,9 @@ async fn each_class_reads_its_own_values_and_nothing_reaches_wasi() {
         "# the t class\nexport TOKEN=\"s3cret value\"\nURL=https://example.com/?a=b\n",
     )
     .unwrap();
-    let (vars, _) = env::read_file(&file).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let vars = env::read_file(&file).unwrap();
     let mut actor_env = ActorEnv::default();
     actor_env.extend("t", vars);
 

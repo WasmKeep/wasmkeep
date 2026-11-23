@@ -169,7 +169,9 @@ impl ActorService {
         let moves: drain::Moves = Arc::default();
         let factory_moves_outer = Arc::clone(&moves);
         let factory_egress = Arc::new(config.egress.clone());
-        let factory_guest_log = config.guest_log.clone();
+        // Holds the app's line budget while the service lives (its front,
+        // with the same label, shares it).
+        let factory_guest_log = config.guest_log.for_app(&app_name);
         // Resident actors stay under the instance pool, with room for the
         // front's short-lived instances (ADR 0023): past it, the least
         // recently active idle actor hibernates to make room.
