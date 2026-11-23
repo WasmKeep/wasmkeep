@@ -21,8 +21,12 @@ pusher on different nodes is still the operator's. In this order:
    the fallback ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node));
    its fleet measure, with default placement and after a rolling
    restart, is still to run.
-2. **A room's edges on several nodes** (M): today a room's tree stays
-   on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
+2. **A room's edges on several nodes** (M): built, by default for the
+   SDKs' class names: each edge wakes on the rendezvous choice over the
+   live nodes ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22));
+   its fleet measure (`actor where` showing edges on two nodes or more,
+   20 s into a 4,500-client hold and after one rolling restart) is still
+   to run.
 3. **The upload tail** (M): a large room's delivery tail depends on
    segment-upload latency from the room's node.
 4. **Compacting idle actors' histories** (M), last, the other half of a

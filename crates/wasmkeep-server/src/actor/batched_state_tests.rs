@@ -55,6 +55,7 @@ fn state(
         warned: Arc::default(),
         writes: crate::apps::Writes::Batched,
         apart: None,
+        spread: false,
     });
     ActorState {
         timing: super::timing::Timing::new(

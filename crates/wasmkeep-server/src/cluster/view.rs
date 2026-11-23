@@ -535,6 +535,17 @@ impl Cluster {
             .map(str::to_owned)
     }
 
+    /// Where a wake-up of a spread actor (ADR 0040, amendment of 2026-11-22)
+    /// goes instead of here: the rendezvous choice for `address` over this
+    /// node and the peers [`Self::chosen_peer`] chooses from. `None`: wake
+    /// here (this node is the choice, or no peer can take it).
+    pub(crate) fn spread_peer(&self, address: &ActorAddress) -> Option<String> {
+        let eligible = self.eligible_peers();
+        let eligible: Vec<&str> = eligible.iter().map(String::as_str).collect();
+        wasmkeep_cluster::placement::spread(&self.node_id, &eligible, &encode_address(address))
+            .map(str::to_owned)
+    }
+
     /// [`Self::chosen_peer`] for an actor kept apart from companions that
     /// the nodes `avoid` hold: another eligible peer if there is one.
     pub(crate) fn chosen_peer_apart(
