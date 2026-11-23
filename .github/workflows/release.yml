@@ -6,6 +6,9 @@ name: release
 # taken from the version's section of CHANGELOG.md; a maintainer reviews and
 # publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
+# A run by hand starts only on a `v*` tag or on `main` (the `ci` job refuses
+# any other ref), since it signs and pushes images with this workflow's
+# identity.
 # A pull request that changes the packaging runs the build jobs alone
 # (binaries, example components, SDK archives, images): nothing is signed
 # or pushed.
@@ -22,8 +25,9 @@ name: release
 # and wasmkeep-zig-sdk-<version>.tar.gz (the `sdks` job,
 # scripts/package-c-sdk.sh). SHA256SUMS lists every file, and each file has a
 # Sigstore bundle (<file>.sigstore.json) from keyless cosign signing: the
-# certificate names this workflow and the ref it ran on. docs/deploy/single-node.md
-# says how to verify.
+# certificate names this workflow and the ref it ran on (docs/deploy/single-node.md
+# says how to verify), and a build provenance attestation (GitHub's) covers
+# the same files.
 #
 # The container image (deploy/Dockerfile, with the third-party notices) is
 # built for linux/amd64 and linux/arm64 on native runners, pushed to
@@ -61,6 +65,7 @@ on:
       - deploy/tarball/README.md
       - scripts/package-c-sdk.sh
       - scripts/componentize-core.sh
+      - scripts/requirements/**
       - scripts/runtime-notices.sh
       - deploy/notices/**
 
@@ -92,6 +97,25 @@ jobs:
     permissions:
       actions: read
     steps:
+      # A run by hand signs files and pushes images (`dev`) with this
+      # workflow's identity, whatever ref it is started on: a copy of this
+      # file on a branch would do the same. Refuse every ref but a release
+      # tag and main; the tag ruleset and main's protection (docs/releasing.md)
+      # are what keep those two from being created or changed freely.
+      - name: A run by hand is on a release tag or on main
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          [ "$EVENT" = workflow_dispatch ] || exit 0
+          if [ "$REF_TYPE" = tag ]; then
+            [[ $REF =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] && exit 0
+          elif [ "$REF" = refs/heads/main ]; then
+            exit 0
+          fi
+          echo "::error::run by hand on $REF: start this workflow on a release tag (vX.Y.Z) or on main"
+          exit 1
       - name: Wait for CI on the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -155,7 +179,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld wasi-libc libclang-rt-18-dev-wasm32
-          pip install ziglang==0.17.1 componentize-py==0.25.1
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/languages.txt
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.7"
@@ -266,7 +290,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld wasi-libc libclang-rt-18-dev-wasm32
-          pip install ziglang==0.17.1
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/languages.txt
       - name: Package and build the counter from each archive
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -403,7 +427,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      id-token: write   # keyless signing: the workflow's OIDC identity
+      id-token: write       # keyless signing and attestation: the workflow's OIDC identity
+      attestations: write   # the build provenance of the files
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -438,6 +463,12 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$f"
           done
           sha256sum --check SHA256SUMS
+      # A GitHub build provenance attestation for every file SHA256SUMS lists,
+      # beside the Sigstore bundles: `gh attestation verify <file> --repo
+      # WasmKeep/wasmkeep` checks it.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release
