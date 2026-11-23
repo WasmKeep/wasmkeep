@@ -95,25 +95,14 @@ impl Cluster {
         let secret = self.secret().await?.to_owned();
         let headers = req.headers_mut();
         headers.insert(APP, self.app_header()?);
-        let ts = now_ms();
-        let nonce = self.nonce();
-        let body_hash = body_sha256(&[]);
-        let mac = signing::signature(
+        self.sign_call(
+            headers,
             &secret,
-            ts,
-            &nonce,
             peer,
             &hyper::Method::POST,
             HELLO_PATH,
-            &body_hash,
-            headers,
-        );
-        headers.insert(
-            INTERNAL,
-            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
-                .map_err(|e| e.to_string())?,
-        );
-        self.add_sender(headers, &secret, "internal", &mac);
+            &body_sha256(&[]),
+        )?;
         self.check_tls_target(&base)
             .map_err(|e| format!("node {peer}: {e}"))?;
         // A connection of its own, closed after the answer: a hello's must
@@ -145,11 +134,11 @@ impl Cluster {
         let Some(signed) = self.is_internal(method, HELLO_PATH, headers, on_cluster_port) else {
             return StatusCode::FORBIDDEN;
         };
-        if *method != hyper::Method::POST
-            || signed.body != body_sha256(body)
-            || !self.first_use(&signed, false)
-        {
+        if *method != hyper::Method::POST || signed.body != body_sha256(body) {
             return StatusCode::FORBIDDEN;
+        }
+        if let Err(why) = self.first_use(&signed, false) {
+            return why.status();
         }
         crate::metrics::inc(&crate::metrics::METRICS.hellos_received);
         // Its heartbeat by key at once (a slow LIST must not delay a
