@@ -63,11 +63,12 @@ leave the chat lines out to serve the counter alone.
 
 Configuration and secrets for a class (API keys, webhook URLs: see
 [Configuration and secrets](../concepts.md#configuration-and-secrets)) go in
-a file only the service can read:
+a file only the service can read (the server refuses one its group or
+other users can open):
 
 ```bash
 sudo install -d -m 750 -o root -g wasmkeep /etc/wasmkeep
-sudo install -m 640 -o root -g wasmkeep /dev/null /etc/wasmkeep/chat.env
+sudo install -m 600 -o wasmkeep -g wasmkeep /dev/null /etc/wasmkeep/chat.env
 sudoedit /etc/wasmkeep/chat.env       # NAME=value lines
 ```
 
@@ -120,7 +121,10 @@ curl -X POST localhost:8080/actor/counter/hello
 ```
 
 The first start compiles each component and caches the result in
-`--cache-dir`; later starts take a fraction of a second.
+`--cache-dir`; later starts take a fraction of a second. What is cached
+there runs as native code, so the server loads it only while the directory
+and the file belong to its user and no one else can write to them;
+otherwise it compiles again and logs a warning.
 
 ## 3. Put a reverse proxy in front
 

@@ -156,3 +156,66 @@ fn fuel_instrumentation_has_a_distinct_component_cache_key() {
     }
     assert_ne!(keys[0], keys[1]);
 }
+
+/// A cached artefact is native code: one that others could have written
+/// (group- or world-writable) is not loaded; the component is compiled
+/// again and the entry replaced.
+#[cfg(unix)]
+#[test]
+fn a_group_writable_cache_file_is_not_loaded() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = small_runtime();
+    let cache = ComponentCache::new(runtime.clone(), dir.path().join("cache")).unwrap();
+    let answer = answer_wasm();
+    let other = wat::parse_str(ANSWER_WAT.replace("i32.const 42", "i32.const 7")).unwrap();
+    // A valid artefact, of another component, where `answer`'s would be.
+    let planted = cache.get_or_compile(&other).unwrap();
+    assert_eq!(call_run(&runtime, &planted), 7);
+    let path = cache.path_for(&answer);
+    std::fs::rename(cache.path_for(&other), &path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+    let component = cache.get_or_compile(&answer).unwrap();
+    assert_eq!(call_run(&runtime, &component), 42);
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "replaced, the owner's alone: {mode:o}");
+    let again = cache.get_or_compile(&answer).unwrap();
+    assert_eq!(call_run(&runtime, &again), 42);
+}
+
+/// In a directory others can write to, nothing is loaded from the cache
+/// or written to it.
+#[cfg(unix)]
+#[test]
+fn a_group_writable_cache_directory_is_not_used() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = small_runtime();
+    let cache = ComponentCache::new(runtime.clone(), dir.path().join("cache")).unwrap();
+    let answer = answer_wasm();
+    let other = wat::parse_str(ANSWER_WAT.replace("i32.const 42", "i32.const 7")).unwrap();
+    cache.get_or_compile(&other).unwrap();
+    let path = cache.path_for(&answer);
+    std::fs::rename(cache.path_for(&other), &path).unwrap();
+    std::fs::set_permissions(cache.dir(), std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    let component = cache.get_or_compile(&answer).unwrap();
+    assert_eq!(call_run(&runtime, &component), 42);
+    let fresh = wat::parse_str(ANSWER_WAT.replace("i32.const 42", "i32.const 9")).unwrap();
+    let compiled = cache.get_or_compile(&fresh).unwrap();
+    assert_eq!(call_run(&runtime, &compiled), 9);
+    assert!(!cache.path_for(&fresh).exists(), "nothing written there");
+}
+
+/// The directory is made the owner's alone, at an absolute path.
+#[cfg(unix)]
+#[test]
+fn the_cache_directory_is_created_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ComponentCache::new(small_runtime(), dir.path().join("a/cache")).unwrap();
+    assert!(cache.dir().is_absolute());
+    let mode = std::fs::metadata(cache.dir()).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+}

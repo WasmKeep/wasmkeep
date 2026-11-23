@@ -62,34 +62,63 @@ impl ActorEnv {
     }
 }
 
-/// Reads an env file. On Unix, a file anyone can read is accepted with a
-/// warning in the returned list.
+/// Reads an env file of configuration and secrets (`--env`,
+/// `--front-env`, `wasmkeep dev`'s local values). On Unix, a file its group
+/// or others can read or write is refused, as the secrets key is: it must
+/// be the server's user's alone (`chmod 600`). Symlinks are followed (the
+/// target's mode counts), and the file is checked and read through one
+/// handle, so the path cannot be swapped in between.
+///
+/// # Errors
+/// The file cannot be read, is too large, is open to others, or has a
+/// malformed line.
+pub fn read_file(path: &Path) -> Result<Vars, String> {
+    read(path, true)
+}
+
+/// Reads a file of plain deployed configuration (`wasmkeep deploy
+/// --config`, a project's `config`): the same format as [`read_file`], but
+/// its mode is not checked, since it is stored in the clear by design.
 ///
 /// # Errors
 /// The file cannot be read, is too large, or has a malformed line.
-pub fn read_file(path: &Path) -> Result<(Vars, Vec<String>), String> {
+pub fn read_config_file(path: &Path) -> Result<Vars, String> {
+    read(path, false)
+}
+
+fn read(path: &Path, private: bool) -> Result<Vars, String> {
+    use std::io::Read as _;
     let shown = path.display();
-    let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("{shown}: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("{shown}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{shown}: not a file"));
     }
     if meta.len() > MAX_FILE {
         return Err(format!("{shown}: larger than {MAX_FILE} bytes"));
     }
-    let mut warnings = Vec::new();
     #[cfg(unix)]
-    {
+    if private {
         use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o004 != 0 {
-            warnings.push(format!(
-                "{shown} is readable by every user on this machine; it may hold secrets \
-                 (chmod o-r)"
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{shown}: its group or other users can open it (mode {:o}); it may hold \
+                 secrets, so it must be the server's user's alone (chmod 600)",
+                mode & 0o777
             ));
         }
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{shown}: {e}"))?;
-    let vars = parse(&text).map_err(|e| format!("{shown}:{e}"))?;
-    Ok((vars, warnings))
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut text = String::new();
+    file.take(MAX_FILE + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{shown}: {e}"))?;
+    if text.len() as u64 > MAX_FILE {
+        return Err(format!("{shown}: larger than {MAX_FILE} bytes"));
+    }
+    parse(&text).map_err(|e| format!("{shown}:{e}"))
 }
 
 /// Parses `NAME=value` lines, as systemd's `EnvironmentFile=` and most
@@ -219,19 +248,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn files_anyone_can_read_are_flagged() {
+    fn files_others_can_read_are_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hub.env");
-        std::fs::write(&path, "TOKEN=t\n").unwrap();
+        std::fs::write(&path, "TOKEN=secret-value\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let (vars, warnings) = read_file(&path).unwrap();
-        assert_eq!(vars.get("TOKEN").unwrap(), "t");
-        assert!(warnings.is_empty());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(read_file(&path).unwrap().1.len(), 1);
+        let vars = read_file(&path).unwrap();
+        assert_eq!(vars.get("TOKEN").unwrap(), "secret-value");
+        for mode in [0o640, 0o604, 0o644, 0o620] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = read_file(&path).unwrap_err();
+            assert!(e.contains("chmod 600"), "{mode:o}: {e}");
+            assert!(!e.contains("secret-value"), "{e}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&path, "BAD LINE\n").unwrap();
         let e = read_file(&path).unwrap_err();
         assert!(e.ends_with(":1: expected NAME=value"), "{e}");
+    }
+
+    /// Deployed configuration is plain by design (it goes to the bucket in
+    /// the clear): its files are not checked.
+    #[cfg(unix)]
+    #[test]
+    fn config_files_may_be_shared() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.conf");
+        std::fs::write(&path, "MODEL=small\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_config_file(&path).unwrap().get("MODEL").unwrap(),
+            "small"
+        );
     }
 }

@@ -8,10 +8,17 @@
 //! and the next line logged says how many were.
 //!
 //! Limits: lines per second per instance (the operator's rate, with a burst
-//! of twice that), [`NODE_RATE`] for the whole node, and [`MAX_LINE`] bytes
-//! a line. Control characters are escaped, so a guest cannot start a line
-//! of its own in the node's log or colour a terminal.
+//! of twice that), [`APP_RATE`] for each app of the process, and
+//! [`MAX_LINE`] bytes a line, escapes included.
+//!
+//! The text is the line's last field, `line="..."`, after a fixed message
+//! and the real fields; quotes and backslashes in it are escaped, and so
+//! are controls, format characters (bidi, zero-width) and line separators
+//! ([`crate::logging::push_escaped`]). So a guest cannot start a line of
+//! its own in the node's log, add fields to its own line, reorder what a
+//! terminal shows or colour it.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -22,42 +29,61 @@ use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 
 /// Lines a second per instance unless the operator says otherwise.
 pub const DEFAULT_RATE: u32 = 50;
-/// Lines a second for every guest on the node together.
-pub const NODE_RATE: u32 = 1_000;
-/// Longest line logged, in bytes; the rest of a longer one is cut.
+/// Lines a second for every guest of one app together: each app of the
+/// process has its own, so a chatty app cannot use up another's.
+pub const APP_RATE: u32 = 1_000;
+/// Longest line logged, in bytes, quoted and escaped; the rest of a longer
+/// one is cut.
 pub const MAX_LINE: usize = 4_096;
 
 /// How much of what guests print reaches the node's log. Cheap to clone:
-/// clones share the node-wide budget.
+/// clones share the apps' budgets.
 #[derive(Debug, Clone)]
 pub struct GuestLog {
     rate: u32,
-    node: Arc<Mutex<Bucket>>,
+    /// Each app's budget (`tenant/app`), made on its first instance.
+    apps: Arc<Mutex<HashMap<String, Arc<Mutex<Bucket>>>>>,
 }
 
 impl GuestLog {
     /// At most `rate` lines a second per instance (bursts of twice that),
-    /// and [`NODE_RATE`] for the node; 0 discards everything, as WasmKeep
+    /// and [`APP_RATE`] for each app; 0 discards everything, as WasmKeep
     /// did before guest output was logged.
     pub fn new(rate: u32) -> Self {
         Self {
             rate,
-            node: Arc::new(Mutex::new(Bucket::new(NODE_RATE))),
+            apps: Arc::default(),
         }
     }
 
+    /// The budget every instance of `app` shares.
+    fn app_bucket(&self, app: &str) -> Arc<Mutex<Bucket>> {
+        let mut apps = self
+            .apps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bucket) = apps.get(app) {
+            return Arc::clone(bucket);
+        }
+        let bucket = Arc::new(Mutex::new(Bucket::new(APP_RATE)));
+        apps.insert(app.to_owned(), Arc::clone(&bucket));
+        bucket
+    }
+
     /// The WASI context for one instance of `who` (an actor as its app
-    /// names it, `class/name`, or `_front`) of `app` (`tenant/app`):
-    /// [`crate::egress::guest_wasi`]'s, with its stdout and stderr logged.
+    /// names it, `class/name` as [`crate::logging::actor`] shows it, or
+    /// `_front`) of `app` (`tenant/app`): [`crate::egress::guest_wasi`]'s,
+    /// with its stdout and stderr logged.
     pub(crate) fn wasi(&self, app: String, who: String) -> wasmtime_wasi::WasiCtx {
         let mut builder = crate::egress::guest_wasi_builder();
         if self.rate > 0 {
+            let node = self.app_bucket(&app);
             let output = Arc::new(Mutex::new(Output {
                 app,
                 who,
                 pending: [Vec::new(), Vec::new()],
                 bucket: Bucket::new(self.rate),
-                node: Arc::clone(&self.node),
+                node,
                 dropped: 0,
             }));
             builder
@@ -164,7 +190,14 @@ impl Output {
         }
         crate::metrics::inc(&crate::metrics::METRICS.guest_log_lines);
         let text = clean(line);
-        tracing::info!(target: "wasmkeep::guest", app = %self.app, actor = %self.who, stream = NAMES[which], "{text}");
+        tracing::info!(
+            target: "wasmkeep::guest",
+            app = %self.app,
+            actor = %self.who,
+            stream = NAMES[which],
+            line = %text,
+            "guest output"
+        );
     }
 }
 
@@ -189,20 +222,28 @@ impl Drop for Output {
     }
 }
 
-/// `line` as text for the log: invalid UTF-8 replaced, a trailing `\r`
-/// dropped, control characters other than tab escaped (`\u{1b}`), and cut
-/// at [`MAX_LINE`] bytes.
+/// `line` as the log's quoted value: invalid UTF-8 replaced, a trailing
+/// `\r` dropped, escaped ([`crate::logging::push_escaped`]: `\u{1b}`,
+/// `\"`), and cut so that the whole value, quotes included, is at most
+/// [`MAX_LINE`] bytes; the cut falls between characters, never inside an
+/// escape.
 fn clean(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // Escaping never shortens text: nothing past this is shown.
     let line = &line[..line.len().min(MAX_LINE)];
-    let mut out = String::with_capacity(line.len());
+    let room = MAX_LINE - 1; // the closing quote
+    let mut out = String::with_capacity(line.len() + 2);
+    out.push('"');
+    let mut one = String::new();
     for c in String::from_utf8_lossy(line).chars() {
-        if c.is_control() && c != '\t' {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
+        one.clear();
+        crate::logging::push_escaped(&mut one, c);
+        if out.len() + one.len() > room {
+            break;
         }
+        out.push_str(&one);
     }
+    out.push('"');
     out
 }
 
@@ -262,11 +303,57 @@ mod tests {
 
     #[test]
     fn control_characters_are_escaped_and_lines_cut() {
-        assert_eq!(clean(b"plain\ttab"), "plain\ttab");
-        assert_eq!(clean(b"line\r"), "line");
-        assert_eq!(clean(b"a\rb\x1b[31mc"), "a\\rb\\u{1b}[31mc");
+        assert_eq!(clean(b"plain\ttab"), "\"plain\ttab\"");
+        assert_eq!(clean(b"line\r"), "\"line\"");
+        assert_eq!(clean(b"a\rb\x1b[31mc"), "\"a\\rb\\u{1b}[31mc\"");
         assert_eq!(clean(&[b'x'; MAX_LINE + 10]).len(), MAX_LINE);
-        assert_eq!(clean(b"bad \xff byte"), "bad \u{fffd} byte");
+        assert_eq!(clean(b"bad \xff byte"), "\"bad \u{fffd} byte\"");
+    }
+
+    #[test]
+    fn format_characters_and_line_separators_are_escaped() {
+        let text = clean("a\u{202e}b\u{2066}c\u{2028}d\u{2029}e\u{200b}f\u{ad}g".as_bytes());
+        for c in [
+            '\u{202e}', '\u{2066}', '\u{2028}', '\u{2029}', '\u{200b}', '\u{ad}',
+        ] {
+            assert!(!text.contains(c), "{c:?} passed through: {text:?}");
+        }
+        assert!(
+            text.contains("\\u{202e}") && text.contains("\\u{2028}"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_escaped_line_fits_the_limit() {
+        // Each byte of these escapes to several: the limit is on the output.
+        let escapes = clean(&[0x1b; MAX_LINE]);
+        assert!(escapes.len() <= MAX_LINE, "{}", escapes.len());
+        let bidi = clean("\u{202e}".repeat(MAX_LINE).as_bytes());
+        assert!(bidi.len() <= MAX_LINE, "{}", bidi.len());
+        // Cut between characters and escapes, never inside one.
+        assert!(escapes.ends_with("\\u{1b}\""), "{escapes}");
+        assert!(bidi.ends_with("\\u{202e}\""), "{bidi}");
+        let wide = clean("\u{e9}".repeat(MAX_LINE).as_bytes());
+        assert!(wide.len() <= MAX_LINE, "{}", wide.len());
+    }
+
+    #[test]
+    fn the_text_cannot_close_its_quotes() {
+        assert_eq!(
+            clean(br#"hi" level=error x=\"#),
+            r#""hi\" level=error x=\\""#
+        );
+    }
+
+    #[test]
+    fn each_app_has_its_own_budget() {
+        let log = GuestLog::new(1);
+        let a = log.app_bucket("t/a");
+        let taken = (0..10_000).filter(|_| a.lock().unwrap().take()).count();
+        assert_eq!(taken, APP_RATE as usize * 2);
+        assert!(!log.app_bucket("t/a").lock().unwrap().take());
+        assert!(log.app_bucket("t/b").lock().unwrap().take());
     }
 
     #[test]

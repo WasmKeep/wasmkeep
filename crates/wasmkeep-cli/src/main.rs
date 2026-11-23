@@ -1050,11 +1050,8 @@ pub(crate) fn load_env(
             );
             tracing::warn!(%class, "--env names a class the deployed version does not have");
         }
-        let (vars, warnings) =
+        let vars =
             wasmkeep_server::env::read_file(path).map_err(|e| anyhow::anyhow!("--env: {e}"))?;
-        for w in warnings {
-            tracing::warn!("{w}");
-        }
         env.extend(class, vars);
     }
     for (class, n) in env.summary() {
@@ -1067,11 +1064,8 @@ pub(crate) fn load_env(
 fn load_front_env(files: &[PathBuf]) -> anyhow::Result<wasmkeep_server::env::Vars> {
     let mut vars = wasmkeep_server::env::Vars::new();
     for path in files {
-        let (more, warnings) = wasmkeep_server::env::read_file(path)
+        let more = wasmkeep_server::env::read_file(path)
             .map_err(|e| anyhow::anyhow!("--front-env: {e}"))?;
-        for w in warnings {
-            tracing::warn!("{w}");
-        }
         vars.extend(more);
     }
     if !files.is_empty() {
@@ -1742,7 +1736,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
         Some(name) => wasmkeep_server::Supervisor::named(name),
         None => wasmkeep_server::Supervisor::new(),
     };
-    // One for the node: guests share its node-wide line budget.
+    // One for the node: each app's guests share that app's line budget.
     let guest_log = wasmkeep_server::GuestLog::new(args.guest_log_rate);
     let front_env = load_front_env(&args.front_env)?;
     if let Some(path) = &args.component {
@@ -2458,7 +2452,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 config.push((class.clone(), None));
                 continue;
             }
-            let (vars, _) = wasmkeep_server::env::read_file(path)
+            let vars = wasmkeep_server::env::read_config_file(path)
                 .map_err(|e| anyhow::anyhow!("--config: {e}"))?;
             for warning in secret_looking(class, &vars) {
                 eprintln!("warning: {warning}");
@@ -2476,7 +2470,7 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             None => None,
             Some(path) if path.as_os_str().is_empty() => Some(None),
             Some(path) => {
-                let (vars, _) = wasmkeep_server::env::read_file(path)
+                let vars = wasmkeep_server::env::read_config_file(path)
                     .map_err(|e| anyhow::anyhow!("--front-config: {e}"))?;
                 for warning in secret_looking(FRONT_SCOPE, &vars) {
                     let warning =

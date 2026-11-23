@@ -116,8 +116,9 @@ struct Published {
     replaced: Option<Entry>,
 }
 
-/// Settings for the actor service.
-#[derive(Debug, Clone)]
+/// Settings for the actor service. Its `Debug` shows the names of the
+/// configuration and secrets it holds, never a value.
+#[derive(Clone)]
 pub struct ActorConfig {
     /// Owner and application socket limits.
     pub socket_limits: crate::SocketLimits,
@@ -252,6 +253,105 @@ pub struct ActorConfig {
     /// frame before it is dropped: 5 s. Until then it delivers nothing and
     /// keeps its slot. Tests shorten it.
     pub websocket_close_wait: Duration,
+}
+
+impl std::fmt::Debug for ActorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field named, so a new one is a compile error here until
+        // someone decides whether its values may be shown.
+        let Self {
+            socket_limits,
+            socket_budget,
+            tenant,
+            app,
+            storage,
+            mailbox,
+            idle_memory_trim,
+            wall_per_event,
+            alarm_retry_initial,
+            alarm_retry_max,
+            no_alarms,
+            resident_pool,
+            min_resident,
+            egress,
+            guest_log,
+            env,
+            config,
+            secrets,
+            requires,
+            expire_after_idle,
+            batched,
+            limits,
+            max_unsent_age,
+            access,
+            flag_access,
+            deploy_seq,
+            max_front_requests,
+            front_env,
+            front,
+            assets,
+            local_assets,
+            assets_cache,
+            cluster,
+            blob_epoch,
+            blob_links,
+            max_blob_bytes,
+            max_app_blob_bytes,
+            blob_count_every,
+            websocket_ping_after,
+            websocket_close_wait,
+        } = self;
+        let names = |vars: &crate::env::Vars| vars.keys().cloned().collect::<Vec<_>>();
+        let config: std::collections::BTreeMap<_, _> = config
+            .iter()
+            .map(|(class, vars)| (class, names(vars)))
+            .collect();
+        f.debug_struct("ActorConfig")
+            .field("socket_limits", socket_limits)
+            .field("socket_budget", socket_budget)
+            .field("tenant", tenant)
+            .field("app", app)
+            .field("storage", storage)
+            .field("mailbox", mailbox)
+            .field("idle_memory_trim", idle_memory_trim)
+            .field("wall_per_event", wall_per_event)
+            .field("alarm_retry_initial", alarm_retry_initial)
+            .field("alarm_retry_max", alarm_retry_max)
+            .field("no_alarms", no_alarms)
+            .field("resident_pool", resident_pool)
+            .field("min_resident", min_resident)
+            .field("egress", egress)
+            .field("guest_log", guest_log)
+            // Counts per class only.
+            .field("env", env)
+            .field("config", &config)
+            // Names per class only.
+            .field("secrets", secrets)
+            .field("requires", requires)
+            .field("expire_after_idle", expire_after_idle)
+            .field("batched", batched)
+            .field("limits", limits)
+            .field("max_unsent_age", max_unsent_age)
+            .field("access", access)
+            .field("flag_access", flag_access)
+            .field("deploy_seq", deploy_seq)
+            .field("max_front_requests", max_front_requests)
+            .field("front_env", &names(front_env))
+            // Its configuration's names only.
+            .field("front", front)
+            .field("assets", assets)
+            .field("local_assets", local_assets)
+            .field("assets_cache", assets_cache)
+            .field("cluster", cluster)
+            .field("blob_epoch", blob_epoch)
+            .field("blob_links", blob_links)
+            .field("max_blob_bytes", max_blob_bytes)
+            .field("max_app_blob_bytes", max_app_blob_bytes)
+            .field("blob_count_every", blob_count_every)
+            .field("websocket_ping_after", websocket_ping_after)
+            .field("websocket_close_wait", websocket_close_wait)
+            .finish()
+    }
 }
 
 impl ActorConfig {

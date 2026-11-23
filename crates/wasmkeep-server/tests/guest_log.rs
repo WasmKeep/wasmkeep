@@ -148,6 +148,35 @@ async fn control_characters_cannot_forge_log_lines() {
     assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
 }
 
+/// The guest's text is the last field, quoted: what it prints cannot add
+/// fields of its own to its line, or leave the quotes.
+#[tokio::test(flavor = "multi_thread")]
+async fn printed_fields_stay_inside_the_line_field() {
+    let captured = Captured::install();
+    let data = tempfile::tempdir().unwrap();
+    let (addr, _service) = start(data.path(), |_| {}).await;
+    print(
+        addr,
+        "mallory",
+        "SPOOF level=error app=other/app actor=x/y\" stream=\"stderr\u{202e}\n",
+    )
+    .await;
+    logged(&captured, "SPOOF").await;
+    let text = captured.text();
+    let line = text.lines().find(|l| l.contains("SPOOF")).unwrap();
+    assert!(line.contains(" INFO "), "{line}");
+    let (fields, guest) = line.split_once(" line=").unwrap();
+    assert!(!fields.contains("SPOOF"), "{line}");
+    assert!(
+        fields.contains("app=default/default actor=t/mallory"),
+        "{line}"
+    );
+    assert_eq!(
+        guest, r#""SPOOF level=error app=other/app actor=x/y\" stream=\"stderr\u{202e}""#,
+        "{line}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chatty_actor_is_limited_and_the_drops_are_reported() {
     let captured = Captured::install();
@@ -163,7 +192,7 @@ async fn a_chatty_actor_is_limited_and_the_drops_are_reported() {
     // A burst of twice the rate, then the rest dropped and counted.
     let kept = text
         .lines()
-        .filter(|l| l.contains("stream=\"stdout\"") && l.contains(": line "))
+        .filter(|l| l.contains("stream=\"stdout\"") && l.contains("line=\"line "))
         .count();
     assert!((10..=11).contains(&kept), "{kept} kept:\n{text}");
     assert!(text.contains("dropped=190"), "{text}");

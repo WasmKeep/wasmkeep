@@ -28,6 +28,7 @@ mkdir -p .wasmkeep
 cp -r examples/todo-front .wasmkeep/todo
 token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 echo "TOKENS=alice:$token" > .wasmkeep/todo/.env.local
+chmod 600 .wasmkeep/todo/.env.local
 (cd .wasmkeep/todo && exec wasmkeep dev --listen 127.0.0.1:18080 > dev.log 2>&1) &
 dev=$!
 up=false

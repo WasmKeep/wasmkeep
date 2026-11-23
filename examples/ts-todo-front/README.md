@@ -24,7 +24,7 @@ the repository root:
 (cd examples/ts-todo-front && npm ci && npm run build)  # writes examples/ts-todo-front/front.wasm
 (cd examples/ts-todo-front && npm run build:starlingmonkey)  # or on StarlingMonkey: front-starlingmonkey.wasm
 (cd examples/todo-front/todos && cargo build --release --target wasm32-wasip2)
-printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > front.env
+printf 'TOKENS=alice:%s\n' "$(openssl rand -hex 32)" > front.env && chmod 600 front.env
 cargo run -p wasmkeep-cli -- serve examples/ts-todo-front/front.wasm \
   --actor todos=examples/todo-front/todos/target/wasm32-wasip2/release/todo_todos.wasm \
   --access todos=internal --front-env front.env

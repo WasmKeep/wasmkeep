@@ -89,10 +89,14 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   `--allow-outbound-port` opens one. 16 requests in flight per actor, 256
   per node.
 - What a guest prints reaches the node's log within a line rate per
-  instance and per node (`--guest-log-rate`; past it, lines are dropped
-  and counted), cut at 4 KB a line, with control characters escaped: a
-  guest cannot flood the log, forge entries of its own or send terminal
-  escapes. What it prints is its choice, secrets included, so the node's
+  instance and per app (`--guest-log-rate`; past it, lines are dropped
+  and counted), as the last field of its line (`line="..."`, after the
+  app, the actor and the stream), cut at 4 KB a line once escaped.
+  Quotes and backslashes are escaped, and so are controls, format
+  characters (bidi controls, zero-width ones) and line separators, in
+  the text and in actor names (a name with a space or `=` is quoted): a
+  guest cannot flood the log, start a line of its own, add fields to its
+  line, reorder what a terminal shows or send terminal escapes. What it prints is its choice, secrets included, so the node's
   log is as sensitive as the actors make it.
 
 **SQLite sandbox** (`crates/wasmkeep-storage/src/db.rs`)
@@ -248,7 +252,10 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 
 ## Configuration and secrets
 
-`--env CLASS=FILE` (`NAME=value` files, readable only by the server's user).
+`--env CLASS=FILE` (`NAME=value` files, readable only by the server's user:
+on Unix, a file its group or others can read or write is refused at start,
+as the secrets key is, and so are `--front-env` files and `wasmkeep dev`'s
+local values; `chmod 600` fixes it).
 Values never reach the data directory, the bucket or the logs; parse errors
 name the file and line, never the value.
 
