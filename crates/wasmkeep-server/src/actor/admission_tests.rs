@@ -731,6 +731,7 @@ async fn activation_deadline(lease_lapse: bool) {
             requires: Arc::default(),
             warned: Arc::default(),
             writes: crate::apps::Writes::Strict,
+            apart: Arc::default(),
         }),
     );
     let address = ActorAddress::new("default", "test", "timer").unwrap();
@@ -900,6 +901,7 @@ async fn activation_deadline_drains_write_before_releasing_hold() {
             requires: Arc::default(),
             warned: Arc::default(),
             writes: crate::apps::Writes::Strict,
+            apart: Arc::default(),
         }),
     );
     let address = ActorAddress::new("default", "test", "write").unwrap();
@@ -1092,7 +1094,7 @@ async fn timing_host_work_fetch_sums_to_job() {
                 .body(http_body_util::Full::new(bytes::Bytes::new()))
                 .unwrap();
             state
-                .owned_request(req, tx, Arc::from(Vec::new()), false)
+                .owned_request(req, tx, Arc::from(Vec::new()), false, false)
                 .await;
             started.elapsed().as_secs_f64()
         })

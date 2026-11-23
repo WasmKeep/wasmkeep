@@ -119,6 +119,19 @@ pub enum DeployError {
         /// What needs it: the classes importing it, or the format.
         what: String,
     },
+    /// Live nodes of the app do not announce the capability word `apart`
+    /// (ADR 0041, amendment of 2026-11-22): they cannot read a version
+    /// with an `apart` line (manifest format 8). There is no `--force`.
+    #[error(
+        "live nodes of {app} cannot read a version that names a class to keep apart \
+         (manifest format 8) ({nodes}): upgrade every node of the app first, then deploy"
+    )]
+    NodesWithoutApart {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+    },
     /// Live nodes of the app do not announce the capability word `blobs`
     /// (ADR 0030, section 11) while a class or the front imports
     /// `wasmkeep:actor/blobs`: they cannot link it, nor end an actor's
@@ -321,6 +334,26 @@ impl AppRef {
     /// needs `flush` (ADR 0034), and every format inherits the checks of
     /// those below it (4 needs `ends`, 3 needs `front`).
     async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        if manifest.format_number() >= 8 {
+            let nodes = live_nodes(
+                Arc::clone(&self.store),
+                &self.prefix,
+                &self.tenant,
+                &self.app,
+            )
+            .await?;
+            let lacking: Vec<_> = nodes
+                .iter()
+                .filter(|n| !n.can_apart)
+                .map(|n| n.id.as_str())
+                .collect();
+            if !lacking.is_empty() {
+                return Err(DeployError::NodesWithoutApart {
+                    app: self.name(),
+                    nodes: lacking.join(", "),
+                });
+            }
+        }
         if manifest.assets.is_some() {
             let nodes = live_nodes(
                 Arc::clone(&self.store),
@@ -982,6 +1015,7 @@ impl AppRef {
             requires,
             expire: manifest.expire.clone(),
             batched: manifest.batched.clone(),
+            apart: manifest.apart.clone(),
             limits: manifest.limits.clone(),
             front,
         })
@@ -1460,6 +1494,47 @@ impl AppRef {
                 }
             }
         }
+        // Classes kept apart (ADR 0041, amendment of 2026-11-22): kept for
+        // the classes still there, naming a class still there, unless the
+        // whole set is given, with the changes applied.
+        let mut apart: BTreeMap<String, String> = match (keep_requires, &base) {
+            (true, Some((_, m, _))) => m
+                .apart
+                .iter()
+                .filter(|(c, o)| {
+                    table.contains_key(*c)
+                        && (o.as_str() == wasmkeep_cluster::placement::APART_NONE
+                            || table.contains_key(*o))
+                })
+                .map(|(c, o)| (c.clone(), o.clone()))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        for (class, entry) in changes.apart {
+            if !table.contains_key(&class) {
+                return Err(DeployError::Invalid(
+                    class,
+                    "a class to keep apart from, for a class this version does not have".into(),
+                ));
+            }
+            match entry {
+                Some(other)
+                    if other != wasmkeep_cluster::placement::APART_NONE
+                        && (other == class || !table.contains_key(&other)) =>
+                {
+                    return Err(DeployError::Invalid(
+                        class,
+                        format!("apart from {other:?}: not another class of this version"),
+                    ));
+                }
+                Some(other) => {
+                    apart.insert(class, other);
+                }
+                None => {
+                    apart.remove(&class);
+                }
+            }
+        }
         let mut manifest = Manifest {
             assets,
             previous: None,
@@ -1470,6 +1545,7 @@ impl AppRef {
             requires,
             expire,
             batched,
+            apart,
             limits: changes.limits.clone().unwrap_or_else(|| {
                 base.as_ref()
                     .map(|(_, m, _)| m.limits.clone())
@@ -1874,6 +1950,7 @@ impl AppRef {
             requires,
             expire,
             batched,
+            apart,
             limits,
             front,
         } = self
@@ -1901,6 +1978,7 @@ impl AppRef {
                 &config,
                 &requires,
                 &batched,
+                &apart,
                 front.as_ref(),
                 &limits,
             )
@@ -2095,6 +2173,11 @@ pub struct Changes {
     /// `(class, mode)`: sets how the class's plain writes reach the bucket
     /// (ADR 0034). Classes not named keep theirs.
     pub writes: Vec<(String, Writes)>,
+    /// `(class, entry)`: sets the class's `apart` entry (ADR 0041,
+    /// amendment of 2026-11-22): another class, or
+    /// [`wasmkeep_cluster::placement::APART_NONE`]; `None` removes it, so
+    /// the class takes the default pair. Classes not named keep theirs.
+    pub apart: Vec<(String, Option<String>)>,
     /// None preserves policies; Some replaces the complete policy set.
     pub limits: Option<limits::Policies>,
     /// The front (ADR 0023): kept by default.
@@ -2125,6 +2208,10 @@ pub struct Part {
     /// How a class's plain writes reach the bucket (ADR 0034). Ignored for
     /// the front.
     pub writes: Writes,
+    /// The class's `apart` entry (ADR 0041, amendment of 2026-11-22):
+    /// another class, or [`wasmkeep_cluster::placement::APART_NONE`];
+    /// `None`: the default pair. Ignored for the front.
+    pub apart: Option<String>,
 }
 
 impl std::fmt::Debug for Part {
@@ -2138,6 +2225,7 @@ impl std::fmt::Debug for Part {
             .field("requires", &self.requires)
             .field("expire", &self.expire)
             .field("writes", &self.writes)
+            .field("apart", &self.apart)
             .finish()
     }
 }
@@ -2162,6 +2250,7 @@ impl Changes {
             changes.requires.push((name.clone(), part.requires));
             changes.expire.push((name.clone(), part.expire));
             changes.writes.push((name.clone(), part.writes));
+            changes.apart.push((name.clone(), part.apart));
             if let Some(table) = changes.classes.as_mut() {
                 table.push((name, part.wasm));
             }
@@ -2320,6 +2409,7 @@ impl Diff {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            apart: BTreeMap::new(),
             limits: Default::default(),
         };
         let empty = Settings::default();
@@ -2558,6 +2648,11 @@ pub struct Version {
     /// The classes whose writes are batched (ADR 0034; every other class
     /// is strict).
     pub batched: std::collections::BTreeSet<String>,
+    /// Each class's `apart` entry (ADR 0041, amendment of 2026-11-22): the
+    /// class whose actor of the same name it wakes apart from, or
+    /// [`wasmkeep_cluster::placement::APART_NONE`]. Classes not listed take
+    /// the default pair.
+    pub apart: BTreeMap<String, String>,
     /// Node-local ingress policies (ADR 0036).
     pub limits: limits::Policies,
     /// The version's front (ADR 0023), if it has one. Its values are not
@@ -2667,6 +2762,12 @@ pub struct Manifest {
     /// is written as absence, said or not, so a version of strict classes
     /// keeps its format, bytes and id.
     pub batched: std::collections::BTreeSet<String>,
+    /// Classes kept apart from another class's actor of the same name at
+    /// wake-up (`apart <class> <other>`, `-` for none; ADR 0041, amendment
+    /// of 2026-11-22): written in format 8 only. A class without a line
+    /// takes the default pair, so a version that says nothing keeps its
+    /// format, bytes and id.
+    pub apart: BTreeMap<String, String>,
     /// Node-local ingress policies (ADR 0036).
     pub limits: limits::Policies,
 }
@@ -2707,6 +2808,9 @@ impl Manifest {
         for class in &self.batched {
             out.push_str(&format!("writes {class} batched\n"));
         }
+        for (class, other) in &self.apart {
+            out.push_str(&format!("apart {class} {other}\n"));
+        }
         for (name, policy) in &self.limits {
             out.push_str(&policy.line(name));
         }
@@ -2731,7 +2835,9 @@ impl Manifest {
     /// ADR 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if self.assets.is_some() {
+        if !self.apart.is_empty() {
+            8
+        } else if self.assets.is_some() {
             7
         } else if !self.limits.is_empty() {
             6
@@ -2768,6 +2874,7 @@ impl Manifest {
             "wasmkeep-manifest 5" => 5,
             "wasmkeep-manifest 6" => 6,
             "wasmkeep-manifest 7" => 7,
+            "wasmkeep-manifest 8" => 8,
             _ => return None,
         };
         let mut manifest = Self {
@@ -2780,6 +2887,7 @@ impl Manifest {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            apart: BTreeMap::new(),
             limits: Default::default(),
         };
         for line in lines {
@@ -2816,7 +2924,7 @@ impl Manifest {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some("assets"), Some(d), None, None)
-                    if format == 7
+                    if format >= 7
                         && manifest.assets.is_none()
                         && crate::assets::valid_digest(d) =>
                 {
@@ -2857,6 +2965,13 @@ impl Manifest {
                 {
                     manifest.batched.insert(n.to_owned());
                 }
+                // A class kept apart (ADR 0041, amendment of 2026-11-22),
+                // once per class: another class, or `-`.
+                (Some("apart"), Some(n), Some(o), None)
+                    if format >= 8 && n != o && !manifest.apart.contains_key(n) =>
+                {
+                    manifest.apart.insert(n.to_owned(), o.to_owned());
+                }
                 (Some("requires"), Some(n), Some(name), None)
                     if format >= 2 && crate::env::valid_name(name) =>
                 {
@@ -2872,6 +2987,11 @@ impl Manifest {
         if format == 7 && manifest.assets.is_none() {
             return None;
         }
+        // Format 8 says it because of an `apart` line (ADR 0041,
+        // amendment of 2026-11-22).
+        if format == 8 && manifest.apart.is_empty() {
+            return None;
+        }
         let known = |c: &String| manifest.classes.contains_key(c);
         // The front's scope holds values and required names, never a rule,
         // and only beside a `front` line.
@@ -2879,6 +2999,11 @@ impl Manifest {
         if !manifest.access.keys().all(known)
             || !manifest.expire.keys().all(known)
             || !manifest.batched.iter().all(known)
+            || !manifest.apart.keys().all(known)
+            || !manifest
+                .apart
+                .values()
+                .all(|o| o == wasmkeep_cluster::placement::APART_NONE || known(o))
             || !manifest.config.keys().all(scoped)
             || !manifest.requires.keys().all(scoped)
         {
@@ -3104,6 +3229,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            apart: BTreeMap::new(),
             limits: Default::default(),
         }
     }
@@ -3286,6 +3412,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            apart: BTreeMap::new(),
             limits: Default::default(),
             front: None,
         };
@@ -3415,7 +3542,7 @@ mod tests {
             "wasmkeep-manifest 4\nclass chat 11\nwrites chat batched\n",
             "wasmkeep-manifest 1\nclass chat 11\nwrites chat batched\n",
             // A format this version does not know.
-            "wasmkeep-manifest 8\nclass chat 11\n",
+            "wasmkeep-manifest 9\nclass chat 11\n",
         ] {
             assert_eq!(Manifest::parse(bad), None, "{bad}");
         }
@@ -3426,6 +3553,80 @@ mod tests {
         ] {
             assert_eq!(Manifest::parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn an_apart_line_makes_format_8_and_reads_back() {
+        // ADR 0041, amendment of 2026-11-22: without one, the version keeps
+        // its format, bytes and id (the default pair is the absence).
+        let mut m = two_classes();
+        let before = (m.format(), m.version_id());
+        m.apart.insert("chat".into(), "counter".into());
+        assert_eq!(m.format_number(), 8);
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+        assert!(text.ends_with("apart chat counter\n"), "{text}");
+        assert_ne!(m.version_id(), before.1);
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        // `-`: apart from nothing. With everything the formats below carry.
+        m.apart.insert("counter".into(), "-".into());
+        m.batched.insert("chat".into());
+        m.expire.insert("chat".into(), 7 * 86_400);
+        m.assets = Some("a".repeat(64));
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+        assert_eq!(Manifest::parse(&text), Some(m.clone()));
+        let mut m = two_classes();
+        m.apart.insert("chat".into(), "counter".into());
+        m.apart.clear();
+        assert_eq!((m.format(), m.version_id()), before);
+    }
+
+    #[test]
+    fn apart_lines_are_refused_where_they_do_not_belong() {
+        let ok = "wasmkeep-manifest 8\nclass chat 11\nclass room 22\napart chat room\n";
+        assert!(Manifest::parse(ok).is_some());
+        assert!(Manifest::parse("wasmkeep-manifest 8\nclass chat 11\napart chat -\n").is_some());
+        for bad in [
+            // Another class of the version, or `-`; once per class.
+            "wasmkeep-manifest 8\nclass chat 11\napart chat chat\n",
+            "wasmkeep-manifest 8\nclass chat 11\napart chat nope\n",
+            "wasmkeep-manifest 8\nclass chat 11\napart nope chat\n",
+            "wasmkeep-manifest 8\nclass chat 11\napart chat\n",
+            "wasmkeep-manifest 8\nclass chat 11\nclass room 22\napart chat room x\n",
+            "wasmkeep-manifest 8\nclass chat 11\napart chat -\napart chat -\n",
+            // Not before format 8: an older reader never meets one.
+            "wasmkeep-manifest 5\nclass chat 11\napart chat -\n",
+            // Format 8 says it for an `apart` line.
+            "wasmkeep-manifest 8\nclass chat 11\n",
+        ] {
+            assert_eq!(Manifest::parse(bad), None, "{bad}");
+        }
+        let assets = format!("assets {}\n", "a".repeat(64));
+        let seven = format!("wasmkeep-manifest 7\nclass chat 11\n{assets}apart chat -\n");
+        assert_eq!(Manifest::parse(&seven), None);
+        assert!(Manifest::parse(&seven.replace("manifest 7", "manifest 8")).is_some());
+    }
+
+    /// Format 8 needs `apart` on every live node of the app.
+    #[tokio::test]
+    async fn format_8_needs_apart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let mut m = two_classes();
+        m.apart.insert("chat".into(), "counter".into());
+        let every = "take front handoff ends flush rate_limits assets blobs";
+        heartbeat(&store, "n", &format!("{every} apart")).await;
+        app.check_readers(&m).await.unwrap();
+        heartbeat(&store, "n", every).await;
+        let e = app.check_readers(&m).await.unwrap_err();
+        assert!(
+            matches!(&e, DeployError::NodesWithoutApart { nodes, .. } if nodes == "n"),
+            "{e}"
+        );
+        assert!(e.to_string().contains("manifest format 8"), "{e}");
+        // Without the line, the same node reads it as before.
+        app.check_readers(&two_classes()).await.unwrap();
     }
 
     /// A live heartbeat of a node serving `default/shop` with these words.
@@ -3612,6 +3813,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            apart: BTreeMap::new(),
             limits: Default::default(),
         };
         assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");

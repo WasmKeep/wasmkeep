@@ -99,6 +99,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     let nodes = [
@@ -2771,6 +2772,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     a.note_future_leases(&[lease(now_ms())]);
@@ -2895,6 +2897,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     }
 }
@@ -4639,6 +4642,7 @@ async fn a_peer_load_is_fresh_for_three_periods_from_its_first_sighting() {
             ..Default::default()
         }),
         can_place: true,
+        can_apart: false,
         written_at_ms,
         instance: Some("beef".into()),
         ..node_info("p")
@@ -4668,6 +4672,7 @@ async fn a_peer_load_is_fresh_for_three_periods_from_its_first_sighting() {
     let old = NodeInfo {
         load: Some(wasmkeep_cluster::membership::Load::default()),
         can_place: false,
+        can_apart: false,
         ..node_info("p")
     };
     let peer = Peer::of(&old).unwrap();
@@ -4702,6 +4707,7 @@ fn node_info(id: &str) -> NodeInfo {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     }
 }

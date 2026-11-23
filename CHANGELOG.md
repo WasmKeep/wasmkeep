@@ -9,6 +9,27 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+**A room and its pusher wake on different nodes, by default.** A
+wake-up of `pusher/<name>` on the node that holds `room/<name>`, or the
+other way round, goes to another node: by a request, a call, an alarm or
+a drain's hand-over. Nothing to configure for the broadcast SDKs' class
+names (`room`, `pusher`); other names take `apart-from = "<class>"` under
+`[classes.<name>]` in `wasmkeep.toml`, and `apart-from = false` turns the
+default off. With one node alive, or every other node draining, both wake
+where they land: a wake-up is never refused. Moving the pusher by hand is
+now the fallback
+([designing for hot actors](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node),
+[ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
+New metric `wasmkeep_placement_apart_total{outcome}`; a placed wake-up
+refused by a node holding the actor's companion counts as
+`outcome="apart"` in `wasmkeep_placements_received_total`.
+
+Upgrading: the default needs no deploy, and nodes of 0.7.0 keep what they
+wake. A version with an `apart-from` key is manifest format 8: a deploy of
+one is refused while a live node of the app is older (it lacks the
+capability word `apart`), and a CLI of 0.7.0 refuses the key in
+`wasmkeep.toml`.
+
 ## 0.7.0
 
 **Big rooms, a cluster that keeps its peers on a slow bucket, and the

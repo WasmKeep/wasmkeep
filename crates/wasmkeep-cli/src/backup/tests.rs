@@ -2461,6 +2461,7 @@ fn node_lease_of(
         can_recorded_head: true,
         can_multi_app: true,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     wasmkeep_cluster::node_lease::NodeLeaseObject {

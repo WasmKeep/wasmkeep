@@ -29,6 +29,10 @@ pub(super) struct ActorClass {
     /// deployed. A hold takes it when it is acquired and changes it only
     /// at a `Flushed` barrier ([`super::held::Held::switch_writes`]).
     pub(super) writes: crate::apps::Writes,
+    /// The classes whose actor of the same name this class's actor wakes
+    /// apart from (ADR 0041, amendment of 2026-11-22), as deployed, the
+    /// default pair included ([`wasmkeep_cluster::placement::companions`]).
+    pub(super) apart: Arc<Vec<String>>,
 }
 
 impl ActorClass {
@@ -132,6 +136,7 @@ pub(super) fn build_class(
         requires: Arc::default(),
         warned: Arc::default(),
         writes: crate::apps::Writes::Strict,
+        apart: Arc::default(),
     })
 }
 

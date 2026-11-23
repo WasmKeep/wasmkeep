@@ -256,6 +256,81 @@ pub fn receive(
     }
 }
 
+/// The pair kept apart by default (ADR 0041, amendment of 2026-11-22):
+/// the broadcast SDKs' pusher and room, under their default class names
+/// (ADR 0040, section 13). The room `room/lobby` has the pusher
+/// `pusher/lobby`.
+pub const DEFAULT_APART: (&str, &str) = ("pusher", "room");
+
+/// An `apart` entry naming no class: the class is kept apart from nothing,
+/// which also turns the default pair off. Never a class name (a class
+/// starts with a letter).
+pub const APART_NONE: &str = "-";
+
+/// The classes whose actor of the same name `class`'s actor is kept apart
+/// from (ADR 0041, amendment of 2026-11-22), sorted. `declared` is the
+/// version's `apart` entries (a class, then the class it names, or
+/// [`APART_NONE`]); `classes` the version's classes. The relation is
+/// symmetric: `pusher` apart from `room` keeps `room/x` apart from
+/// `pusher/x` too. An entry naming a class the version lacks, or itself,
+/// names nothing. Without an entry for either class, [`DEFAULT_APART`]
+/// applies when the version has both.
+pub fn companions(
+    declared: &BTreeMap<String, String>,
+    classes: &[&str],
+    class: &str,
+) -> Vec<String> {
+    let has = |c: &str| classes.contains(&c);
+    let mut pairs: Vec<(&str, &str)> = declared
+        .iter()
+        .filter(|(c, o)| *c != *o && o.as_str() != APART_NONE && has(c) && has(o))
+        .map(|(c, o)| (c.as_str(), o.as_str()))
+        .collect();
+    let (a, b) = DEFAULT_APART;
+    if has(a) && has(b) && !declared.contains_key(a) && !declared.contains_key(b) {
+        pairs.push((a, b));
+    }
+    let mut out: Vec<String> = pairs
+        .into_iter()
+        .filter_map(|(c, o)| match () {
+            () if c == class => Some(o.to_owned()),
+            () if o == class => Some(c.to_owned()),
+            () => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Where a wake-up of an actor kept apart from a companion goes instead
+/// of here (ADR 0041, amendment of 2026-11-22). `companion_here`: this
+/// node holds the companion now. `eligible`: the peers a drain chooses
+/// from (ADR 0014; never this node). `None` means wake here as usual: the
+/// companion is not held here, or no peer can take it (one node alive,
+/// every peer draining or suspected). It never refuses a wake-up.
+pub fn apart<'a>(companion_here: bool, eligible: &[&'a str], key: &str) -> Option<&'a str> {
+    if !companion_here {
+        return None;
+    }
+    best(key, eligible.iter().copied())
+}
+
+/// The drain's choice (ADR 0014) for an actor kept apart from companions
+/// held by the nodes `avoid`: the rendezvous choice among `eligible`
+/// without them, or among all of them when that leaves none (fall back,
+/// never refuse). With nothing to avoid, the drain's plain choice.
+pub fn peer_apart<'a>(eligible: &[&'a str], key: &str, avoid: &[&str]) -> Option<&'a str> {
+    best(key, eligible.iter().copied().filter(|p| !avoid.contains(p)))
+        .or_else(|| best(key, eligible.iter().copied()))
+}
+
+/// The highest rendezvous weight, ties by node id: server
+/// `cluster.rs::rendezvous`'s choice.
+fn best<'a>(key: &str, nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    nodes.max_by_key(|node| (weight(key, node), *node))
+}
+
 fn capacity(count: u64, room: u64) -> u128 {
     u128::from(count) + u128::from(room)
 }
@@ -635,5 +710,89 @@ mod tests {
             decide(local(900), &huge, "k", PERIOD, &Budget::default()),
             forward("a")
         );
+    }
+
+    fn declared(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(c, o)| ((*c).to_owned(), (*o).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_room_and_its_pusher_are_apart_by_default_both_ways() {
+        let classes = ["directory", "edge", "pusher", "relay", "room"];
+        let none = BTreeMap::new();
+        assert_eq!(companions(&none, &classes, "pusher"), ["room"]);
+        assert_eq!(companions(&none, &classes, "room"), ["pusher"]);
+        assert!(companions(&none, &classes, "edge").is_empty());
+        // Only with both classes in the version.
+        assert!(companions(&none, &["room", "edge"], "room").is_empty());
+        assert!(companions(&none, &["pusher"], "pusher").is_empty());
+    }
+
+    #[test]
+    fn a_declared_entry_names_the_pair_or_turns_the_default_off() {
+        let classes = ["feed", "fan", "pusher", "room"];
+        // Renamed classes: the entry keeps them apart, both ways; the
+        // default pair still holds for the classes nobody declared.
+        let named = declared(&[("fan", "feed")]);
+        assert_eq!(companions(&named, &classes, "fan"), ["feed"]);
+        assert_eq!(companions(&named, &classes, "feed"), ["fan"]);
+        assert_eq!(companions(&named, &classes, "pusher"), ["room"]);
+        // `-` on either class of the default pair turns it off.
+        for off in ["pusher", "room"] {
+            let off = declared(&[(off, APART_NONE)]);
+            assert!(companions(&off, &classes, "pusher").is_empty());
+            assert!(companions(&off, &classes, "room").is_empty());
+        }
+        // An entry on one of them replaces the default for both.
+        let other = declared(&[("pusher", "feed")]);
+        assert_eq!(companions(&other, &classes, "pusher"), ["feed"]);
+        assert!(companions(&other, &classes, "room").is_empty());
+        assert_eq!(companions(&other, &classes, "feed"), ["pusher"]);
+        // A class the version lacks, or the class itself, names nothing.
+        let odd = declared(&[("fan", "gone"), ("feed", "feed")]);
+        assert!(companions(&odd, &classes, "fan").is_empty());
+        assert!(companions(&odd, &classes, "feed").is_empty());
+        // Several classes may name one: each is apart from it, sorted,
+        // beside the default pair (neither of its classes declared).
+        let two = declared(&[("fan", "room"), ("feed", "room")]);
+        assert_eq!(
+            companions(&two, &classes, "room"),
+            ["fan", "feed", "pusher"]
+        );
+    }
+
+    #[test]
+    fn apart_sends_only_when_the_companion_is_here_and_never_refuses() {
+        let key = "default/pusher/lobby";
+        // Not held here: wake here, as without the rule.
+        assert_eq!(apart(false, &["a", "b"], key), None);
+        // Held here: the rendezvous choice among the eligible peers, the
+        // same one on every node and on every try.
+        let chosen = apart(true, &["a", "b"], key).unwrap();
+        assert_eq!(chosen, best(key, ["b", "a"].into_iter()).unwrap());
+        assert_eq!(apart(true, &["b", "a"], key), Some(chosen));
+        // One node alive, or every peer excluded: wake here (fallback).
+        assert_eq!(apart(true, &[], key), None);
+    }
+
+    #[test]
+    fn a_drain_avoids_the_companions_node_unless_it_is_the_only_one() {
+        let key = "default/pusher/lobby";
+        for avoid in ["a", "b", "c"] {
+            let chosen = peer_apart(&["a", "b", "c"], key, &[avoid]).unwrap();
+            assert_ne!(chosen, avoid);
+        }
+        assert_eq!(peer_apart(&["a", "b", "c"], key, &["a", "b"]), Some("c"));
+        // Without a companion's node, the plain rendezvous choice.
+        assert_eq!(
+            peer_apart(&["a", "b", "c"], key, &[]),
+            best(key, ["a", "b", "c"].into_iter())
+        );
+        // Every peer holds a companion: still taken, by the plain choice.
+        assert_eq!(peer_apart(&["a"], key, &["a"]), Some("a"));
+        assert_eq!(peer_apart(&[], key, &["a"]), None);
     }
 }

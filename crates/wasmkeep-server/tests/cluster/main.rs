@@ -45,6 +45,8 @@ mod guests;
 // The tests, by theme; this file keeps what they share.
 #[path = "alarms.rs"]
 mod alarms;
+#[path = "apart.rs"]
+mod apart;
 #[path = "app_delete.rs"]
 mod app_delete;
 #[path = "apps.rs"]

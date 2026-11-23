@@ -106,6 +106,14 @@ async fn node_with(
             // may send an edge that wakes again on a loaded runner to a
             // lighter node, and the sockets then miss a node.
             cluster.placement = false;
+            // The room and its pusher wake where these tests send them, as
+            // before the rule keeping them apart (ADR 0041, amendment of
+            // 2026-11-22): a test that kills an edge's node assumes the room
+            // is not on it. `tests/cluster/apart.rs` tests the rule.
+            config.apart.insert(
+                "pusher".into(),
+                wasmkeep_cluster::placement::APART_NONE.into(),
+            );
             config.cluster = Some(cluster);
             let service = ActorService::new(
                 runtime,

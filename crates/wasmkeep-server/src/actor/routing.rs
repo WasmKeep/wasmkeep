@@ -125,6 +125,19 @@ impl ServiceInner {
         }
     }
 
+    /// Whether this node holds an actor `address` is kept apart from (ADR
+    /// 0041, amendment of 2026-11-22), by the class it takes now: from
+    /// memory, no read.
+    pub(super) fn companion_here(&self, cluster: &Cluster, address: &ActorAddress) -> bool {
+        let Some(class) = read(&self.classes).get(address.class()).cloned() else {
+            return false;
+        };
+        class.apart.iter().any(|companion| {
+            ActorAddress::new(address.tenant(), companion, address.name())
+                .is_ok_and(|c| cluster.holds_here(&c))
+        })
+    }
+
     pub(super) fn owner_hints(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<ActorAddress, (String, u64)>> {
@@ -266,9 +279,11 @@ impl ServiceInner {
                 ADMISSION_WAIT,
                 move |state: &mut ActorState, waited| {
                     state.record_mailbox_wait(waited);
-                    Box::pin(
-                        async move { state.owned_request(req, response_tx, chain, false).await },
-                    )
+                    Box::pin(async move {
+                        state
+                            .owned_request(req, response_tx, chain, false, true)
+                            .await
+                    })
                 },
             );
             let event = tokio::spawn(event);

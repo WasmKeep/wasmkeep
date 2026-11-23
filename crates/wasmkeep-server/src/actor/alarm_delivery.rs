@@ -27,7 +27,10 @@ impl ActorState {
             self.timing.delivered(Delivered::Deferred);
             return;
         }
-        match self.ensure_owner().await {
+        // This node's own wake-up: an actor kept apart from a companion
+        // held here is handed to a peer as a drain hands it (ADR 0041,
+        // amendment of 2026-11-22).
+        match self.ensure_owner_waking().await {
             Ok(()) => {}
             // Another node owns the actor: it fires the alarm (it is in the
             // owner's committed state and the bucket's index).
@@ -36,8 +39,9 @@ impl ActorState {
                 self.timing.delivered(Delivered::Deferred);
                 return;
             }
-            // This node is draining (ADR 0014): the chosen peer arms the
-            // alarm and fires it, from its own timer. If it does not take
+            // This node is draining (ADR 0014), or holds the actor's
+            // companion (ADR 0041, amendment of 2026-11-22): the chosen
+            // peer arms the alarm and fires it, from its own timer. If it does not take
             // it, this node's timer tries again soon: then another peer, or
             // with none left, this node claims.
             Err(OwnershipError::Elsewhere { peer }) => {

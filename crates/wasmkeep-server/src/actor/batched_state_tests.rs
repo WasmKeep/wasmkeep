@@ -54,6 +54,7 @@ fn state(
         requires: Arc::default(),
         warned: Arc::default(),
         writes: crate::apps::Writes::Batched,
+        apart: Arc::default(),
     });
     ActorState {
         timing: super::timing::Timing::new(
@@ -85,6 +86,7 @@ fn state(
         cluster: Some(cluster),
         held: None,
         owner_hint: None,
+        apart_wake: false,
         behind_deploy: false,
         activation_interrupted: false,
         egress: Arc::default(),

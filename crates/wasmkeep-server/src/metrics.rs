@@ -484,6 +484,9 @@ pub(crate) struct Metrics {
     pub(crate) placements_received: Family<AtomicU64>,
     /// Placeable wake-ups kept here, by `reason`.
     pub(crate) placement_kept: Family<AtomicU64>,
+    /// Wake-ups of an actor kept apart from a companion held here (ADR
+    /// 0041, amendment of 2026-11-22), by `outcome`.
+    pub(crate) placement_apart: Family<AtomicU64>,
     /// This node id's fill in thousandths, by `kind` (a gauge).
     pub(crate) placement_fill: Family<AtomicU64>,
     /// Requests kept until a dead node's actor could be taken over, by
@@ -995,6 +998,11 @@ pub(crate) fn placement_received(app: &str, outcome: &str) {
 /// A placeable wake-up kept here for `reason`.
 pub(crate) fn placement_kept(app: &str, reason: &str) {
     inc(&METRICS.placement_kept.get_in(app, &[("reason", reason)]));
+}
+/// A wake-up of an actor whose companion this node holds: `sent` to a
+/// peer, or woken here, `alone`, with no peer to take it.
+pub(crate) fn placement_apart(app: &str, outcome: &str) {
+    inc(&METRICS.placement_apart.get_in(app, &[("outcome", outcome)]));
 }
 /// This node id's fills, in thousandths.
 pub(crate) fn placement_fill(app: &str, residents: u64, sockets: u64) {
@@ -1892,6 +1900,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
             "counter",
             "Placeable wake-ups kept on this node, by tenant, app and reason.",
             &m.placement_kept,
+        ),
+        (
+            "wasmkeep_placement_apart_total",
+            "counter",
+            "Wake-ups of an actor whose companion this node held (ADR 0041), by tenant, app and outcome.",
+            &m.placement_apart,
         ),
         (
             "wasmkeep_placement_fill",

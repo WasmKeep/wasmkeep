@@ -1826,6 +1826,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             config.config = deployed.config;
             config.requires = deployed.requires;
             config.batched = deployed.batched;
+            config.apart = deployed.apart;
             config.limits = deployed.limits;
             config.assets = deployed.assets;
             config.assets_cache = wasmkeep_server::assets::Cache::new(args.assets_cache_bytes);
@@ -2527,6 +2528,8 @@ fn deploy(args: DeployArgs) -> anyhow::Result<()> {
                 }
                 args.writes.clone()
             },
+            // Kept: the project file sets it (`apart-from`).
+            apart: Vec::new(),
             every_rule: false,
         };
         rt.block_on(app_ref.deploy_changes_with(&runtime, changes, |diff| {

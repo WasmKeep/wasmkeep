@@ -59,6 +59,11 @@ pub(super) struct EventLimits {
     pub(super) max_unsent_age: Duration,
 }
 
+/// The longest a draining node waits for the record of an actor's
+/// companion before choosing its peer without it (ADR 0041, amendment of
+/// 2026-11-22).
+const COMPANION_READ: Duration = Duration::from_secs(1);
+
 /// Per-actor state owned by its mailbox task.
 pub(super) struct ActorState {
     pub(super) timing: Arc<super::timing::Timing>,
@@ -105,6 +110,8 @@ pub(super) struct ActorState {
     pub(super) held: Option<Held>,
     /// Another node's lease seen on the bucket: (owner, expiry in ms).
     pub(super) owner_hint: Option<(String, u64)>,
+    /// Set for the length of [`Self::ensure_owner_waking`].
+    pub(super) apart_wake: bool,
     /// The last `ensure_ready` failed because the actor already ran a newer
     /// deploy than this node has: a temporary refusal (503), not an error.
     pub(super) behind_deploy: bool,
@@ -346,6 +353,7 @@ impl ActorState {
         response_tx: oneshot::Sender<Outcome<B>>,
         chain: Chain,
         outside: bool,
+        own: bool,
     ) where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
@@ -378,7 +386,13 @@ impl ActorState {
                 return;
             }
         }
-        let ownership = self.ensure_owner().await;
+        // `own`: a wake-up of this node's own (ADR 0041, amendment of
+        // 2026-11-22); an event another node sent is acquired here.
+        let ownership = if own {
+            self.ensure_owner_waking().await
+        } else {
+            self.ensure_owner().await
+        };
         match ownership {
             // Asked again after the wait for ownership (a takeover's restore
             // can be long): whoever sent it may have gone meanwhile.
@@ -498,6 +512,53 @@ impl ActorState {
         self.ensure_owner_with(None).await
     }
 
+    /// [`Self::ensure_owner`] for a wake-up that is this node's own: a
+    /// request that reached it unforwarded, a call from an actor or the
+    /// front here, an alarm. An actor kept apart from a companion (ADR
+    /// 0041, amendment of 2026-11-22) that this node holds is not acquired
+    /// here while a peer can take it: `Elsewhere`, as a drain of this one
+    /// actor, and the peer acquires the forwarded event (it never sends it
+    /// on). Never for an event another node sent, a take, an upgrade, or
+    /// the operator passes.
+    pub(super) async fn ensure_owner_waking(&mut self) -> Result<(), OwnershipError> {
+        self.apart_wake = true;
+        let owned = self.ensure_owner_with(None).await;
+        self.apart_wake = false;
+        owned
+    }
+
+    /// The actors this one is kept apart from (ADR 0041, amendment of
+    /// 2026-11-22): the same name in each companion class.
+    fn companions(&self) -> Vec<ActorAddress> {
+        self.class
+            .apart
+            .iter()
+            .filter_map(|class| {
+                ActorAddress::new(self.address.tenant(), class, self.address.name()).ok()
+            })
+            .collect()
+    }
+
+    /// The nodes that hold this actor's companions now: this one from
+    /// memory, the others from their record (one read each, bounded).
+    /// Read only while this node drains an actor kept apart.
+    async fn companion_owners(companions: Vec<ActorAddress>, cluster: &Cluster) -> Vec<String> {
+        let mut owners = Vec::new();
+        for companion in companions {
+            if cluster.holds_here(&companion) {
+                owners.push(cluster.node_id.clone());
+                continue;
+            }
+            use wasmkeep_cluster::node_lease::Route;
+            if let Ok(Ok(Route::Owner(owner))) =
+                tokio::time::timeout(COMPANION_READ, cluster.route(&companion)).await
+            {
+                owners.push(owner);
+            }
+        }
+        owners
+    }
+
     /// [`Self::ensure_owner`]; with `listed` (an idle expiry, ADR 0028), the
     /// acquisition takes the record only if it names nobody and is still
     /// the version the listing showed, and a hold already here or a learned
@@ -555,8 +616,15 @@ impl ActorState {
         // the close above, so a lapsed hold is released, not kept renewing.
         // With no eligible peer it claims as usual: draining never makes an
         // actor unreachable.
+        // An actor kept apart from a companion goes to a peer that does
+        // not hold it, if there is one (ADR 0041, amendment of 2026-11-22).
+        let avoid = if cluster.draining() && !self.class.apart.is_empty() {
+            Self::companion_owners(self.companions(), &cluster).await
+        } else {
+            Vec::new()
+        };
         if cluster.draining()
-            && let Some(peer) = cluster.chosen_peer(&self.address)
+            && let Some(peer) = cluster.chosen_peer_apart(&self.address, &avoid)
         {
             // Parked here (ADR 0024): released now, so the peer can take it
             // instead of finding it held by this node until the drain's
@@ -565,6 +633,23 @@ impl ActorState {
                 cluster.release_parked(&self.address, "drain").await;
             }
             return Err(OwnershipError::Elsewhere { peer });
+        }
+        // Kept apart from a companion this node holds (ADR 0041, amendment
+        // of 2026-11-22): a wake-up of this node's own goes to a peer, as
+        // a drain sends it. No peer (one node alive, every peer draining
+        // or suspected): acquired here, as without the rule.
+        if self.apart_wake && listed.is_none() && !self.class.apart.is_empty() {
+            let here = self.companions().iter().any(|c| cluster.holds_here(c));
+            if here {
+                match cluster.apart_peer(&self.address, true) {
+                    Some(peer) => {
+                        crate::metrics::placement_apart(&self.app_labels, "sent");
+                        tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %peer, "wake-up sent apart from its companion");
+                        return Err(OwnershipError::Elsewhere { peer });
+                    }
+                    None => crate::metrics::placement_apart(&self.app_labels, "alone"),
+                }
+            }
         }
         // A drain claims when no peer can take the actor; a node that
         // cannot open the secrets refuses instead (ADR 0016).

@@ -83,22 +83,39 @@ p99 under 1 s, none lost or repeated; 6,000 is the measured edge, where
 p99 passed 1 s ([measured](../bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)). Treat a room as large when its node shows upload
 tails near `--max-unsent-age`.
 
-**Move the pusher.** The room is the sequencer and the edges follow it,
-so move the pusher alone ([ADR 0017](adr/0017-moving-one-actor.md)):
+**It happens by default.** A node keeps the classes `room` and `pusher`
+apart at wake-up, the broadcast SDKs' default class names: a wake-up of
+`pusher/lobby` on the node that holds `room/lobby` goes to another node,
+and the other way round, by a request, a call, an alarm or a drain
+([ADR 0041, amendment](adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
+Nothing to configure. With other class names, name the pair in
+`wasmkeep.toml` ([project file](project-file.md#keys)):
+
+```toml
+[classes.fanout]
+component = "dist/pusher.wasm"
+apart-from = "chatroom"
+```
+
+With one node alive, or every other node draining, both wake where they
+land: the rule never refuses a wake-up. It does not move a running actor:
+an older version, or two wake-ups at the same moment on one node, can
+leave the pair together until one of them hibernates.
+
+**Move the pusher as a fallback.** If `actor where` (below) shows them
+together and the room is busy, move the pusher alone
+([ADR 0017](adr/0017-moving-one-actor.md)):
 
 ```bash
 wasmkeep actor move --app acme/chat pusher/lobby --to node-b --bucket s3://acme-wasmkeep/prod
 ```
 
 The target must be a live node of the same app that is not draining
-([Moving one actor](cluster.md#moving-one-actor)).
-
-**A move does not pin.** The pusher hibernates when idle, and its next
-event may place it again, on any node. So:
-
-- move it while it is busy, so it is not about to go idle;
-- after a node restart or a deploy, check and repeat the move;
-- do not read one successful move as a standing rule.
+([Moving one actor](cluster.md#moving-one-actor)). A move does not pin:
+the pusher's next cold wake-up is placed again, by the rule above. A move
+can also land elsewhere: when an event reaches a third node between the
+owner's release and the target's take, that node acquires the actor, and
+the move counts as done (ADR 0017, "another node claimed first").
 
 **Check where each actor runs** with `wasmkeep actor where`, which only
 reads ([Seeing where an actor runs](cluster.md#seeing-where-an-actor-runs)):
@@ -123,11 +140,6 @@ the pusher's node:
 - `wasmkeep_node_lease_write_milliseconds`: how long the node's own
   heartbeat write takes. A rising tail there shows the node's bucket
   writes are slow, and can accompany slow segment uploads.
-
-**Known limitation.** Placement does not yet keep a room and its pusher
-apart ([ADR 0041](adr/0041-placement-at-wake-up.md)): it considers load
-only, so they can land together again after any wake-up. Until it does,
-the move above is the operator's to repeat.
 
 ## Split independent state
 

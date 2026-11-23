@@ -519,6 +519,36 @@ impl Cluster {
         .map(str::to_owned)
     }
 
+    /// Where a wake-up of `address`, kept apart from companions (ADR 0041,
+    /// amendment of 2026-11-22), goes instead of here: `companion_here`
+    /// says whether this node holds one of them now. Among the peers
+    /// [`Self::chosen_peer`] chooses from, by the same rendezvous. `None`:
+    /// wake here, as without the rule (no companion here, or no peer).
+    pub(crate) fn apart_peer(
+        &self,
+        address: &ActorAddress,
+        companion_here: bool,
+    ) -> Option<String> {
+        let eligible = self.eligible_peers();
+        let eligible: Vec<&str> = eligible.iter().map(String::as_str).collect();
+        wasmkeep_cluster::placement::apart(companion_here, &eligible, &encode_address(address))
+            .map(str::to_owned)
+    }
+
+    /// [`Self::chosen_peer`] for an actor kept apart from companions that
+    /// the nodes `avoid` hold: another eligible peer if there is one.
+    pub(crate) fn chosen_peer_apart(
+        &self,
+        address: &ActorAddress,
+        avoid: &[String],
+    ) -> Option<String> {
+        let eligible = self.eligible_peers();
+        let eligible: Vec<&str> = eligible.iter().map(String::as_str).collect();
+        let avoid: Vec<&str> = avoid.iter().map(String::as_str).collect();
+        wasmkeep_cluster::placement::peer_apart(&eligible, &encode_address(address), &avoid)
+            .map(str::to_owned)
+    }
+
     /// Whether any peer could take an actor now (eligibility does not
     /// depend on the actor).
     pub(crate) fn has_eligible_peer(&self) -> bool {

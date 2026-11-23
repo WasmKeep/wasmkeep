@@ -22,6 +22,8 @@ impl ActorService {
 
         let mut map = HashMap::new();
         let rules = Arc::new(config.access.clone());
+        let all: Vec<String> = classes.iter().map(|(name, _, _)| name.clone()).collect();
+        let names: Vec<&str> = all.iter().map(String::as_str).collect();
         for (name, component, bytes) in classes {
             let class = build_class(&runtime, &linker, &config.tenant, &name, &component, &bytes)?;
             let seq = config.deploy_seq;
@@ -34,6 +36,11 @@ impl ActorService {
             let rules = Arc::clone(&rules);
             let requires = Arc::new(config.requires.get(&name).cloned().unwrap_or_default());
             let writes = writes_of(&config.batched, &name);
+            let apart = Arc::new(wasmkeep_cluster::placement::companions(
+                &config.apart,
+                &names,
+                &name,
+            ));
             map.insert(
                 name,
                 Arc::new(ActorClass {
@@ -42,6 +49,7 @@ impl ActorService {
                     env,
                     requires,
                     writes,
+                    apart,
                     ..class
                 }),
             );
@@ -226,6 +234,7 @@ impl ActorService {
                         cluster,
                         held: None,
                         owner_hint: None,
+                        apart_wake: false,
                         behind_deploy: false,
                         activation_interrupted: false,
                         egress: Arc::clone(&egress),

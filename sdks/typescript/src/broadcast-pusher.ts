@@ -81,7 +81,8 @@ export class Pulled implements Source {
 }
 export interface PusherOptions {
     /** The room's class: the pusher `pusher/lobby` pulls from `<room>/lobby`.
-     * Default `room`. */
+     * Default `room`. Nodes keep the classes `room` and `pusher` apart at
+     * wake-up; with other names, set `apart-from` in `wasmkeep.toml`. */
     room?: string;
     /** Fixed edges (ADR 0040, R3), or */
     edges?: string[];

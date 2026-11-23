@@ -228,6 +228,7 @@ impl ActorService {
                 routed = Some(route);
             }
             loop {
+                let own = !crate::cluster::never_forward(&req);
                 let handback = match self
                     .dispatch_routed(
                         address.clone(),
@@ -235,6 +236,7 @@ impl ActorService {
                         Arc::clone(&chain),
                         outside,
                         routed.take(),
+                        own,
                     )
                     .await
                 {
@@ -455,7 +457,7 @@ impl ActorService {
         );
         let req = Request::from_parts(parts, full);
         match self
-            .dispatch(address.clone(), req, Arc::clone(chain), outside)
+            .dispatch_routed(address.clone(), req, Arc::clone(chain), outside, None, true)
             .await
         {
             Ok(response) => response,
@@ -504,6 +506,11 @@ impl ActorService {
         };
         if cluster.draining() || cluster.secrets_blocked() || cluster.move_names(&address) {
             return refuse("refused", "this node does not take this actor now; retry\n");
+        }
+        // Kept apart from a companion this node holds (ADR 0041, amendment
+        // of 2026-11-22): its sender runs it, or sends it apart.
+        if self.inner.companion_here(cluster, &address) {
+            return refuse("apart", "this node holds the actor's companion\n");
         }
         let reservation = match cluster.arrive(mark, || super::load::rooms(&self.inner)) {
             Ok(reservation) => reservation,
@@ -614,12 +621,15 @@ impl ActorService {
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
     {
-        self.dispatch_routed(address, req, chain, outside, None)
+        self.dispatch_routed(address, req, chain, outside, None, false)
             .await
     }
 
     /// [`Self::dispatch`], with the route already read for this request
     /// (`routed`), so that a placement's decision costs no second read.
+    /// `own`: a wake-up of this node's own, which an actor kept apart from
+    /// a companion held here does not take (ADR 0041, amendment of
+    /// 2026-11-22); `false` for an event another node sent.
     pub(super) async fn dispatch_routed<B>(
         &self,
         address: ActorAddress,
@@ -627,6 +637,7 @@ impl ActorService {
         chain: Chain,
         outside: bool,
         routed: Option<Cold>,
+        own: bool,
     ) -> Result<Response<HyperOutgoingBody>, Box<Handback<B>>>
     where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
@@ -653,7 +664,9 @@ impl ActorService {
             move |state: &mut ActorState, waited| {
                 state.record_mailbox_wait(waited);
                 Box::pin(async move {
-                    state.owned_request(req, response_tx, chain, outside).await;
+                    state
+                        .owned_request(req, response_tx, chain, outside, own)
+                        .await;
                 })
             },
         );

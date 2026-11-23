@@ -63,6 +63,11 @@ pub(crate) struct Class {
     pub(crate) expire_after_idle: Option<u64>,
     /// `writes` (ADR 0034): `strict` when the file says nothing.
     pub(crate) writes: wasmkeep_server::apps::Writes,
+    /// `apart-from` (ADR 0041, amendment of 2026-11-22): the class whose
+    /// actor of the same name this class's actor wakes apart from, or
+    /// `-` for none (`apart-from = false`); `None` when the file says
+    /// nothing: the default pair.
+    pub(crate) apart: Option<String>,
 }
 
 /// `[dev]`: for `wasmkeep dev` only.
@@ -88,6 +93,7 @@ const CLASS: &[&str] = &[
     "watch",
     "expire-after-idle",
     "writes",
+    "apart-from",
 ];
 const DEV: &[&str] = &["port", "data-dir", "env"];
 
@@ -489,6 +495,35 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     }
                 },
             };
+            // ADR 0041, amendment of 2026-11-22: another class of the file
+            // (its actor of the same name), or `false` for none, which also
+            // turns the default pair off.
+            let off = matches!(
+                get(ct, "apart-from").map(|(_, v)| v.get_ref()),
+                Some(DeValue::Boolean(false))
+            );
+            let apart = if off {
+                Some(wasmkeep_cluster::placement::APART_NONE.to_owned())
+            } else {
+                match string(&src, ct, "apart-from", &what)? {
+                    None => None,
+                    Some(other) => {
+                        let another = other != name_str
+                            && t.keys().any(|k| k.get_ref().as_ref() == other.as_str());
+                        if !another {
+                            let span = get(ct, "apart-from").map(|(_, v)| v.span()).unwrap_or(0..0);
+                            return src.err(
+                                span,
+                                format!(
+                                    "{what} apart-from {other:?}: not another class of this \
+                                     file (name one, or false for none)"
+                                ),
+                            );
+                        }
+                        Some(other)
+                    }
+                }
+            };
             classes.insert(
                 name_str.to_owned(),
                 Class {
@@ -496,6 +531,7 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     access,
                     expire_after_idle,
                     writes,
+                    apart,
                 },
             );
         }
@@ -888,6 +924,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
                 requires: class.item.requires.clone(),
                 expire: class.expire_after_idle,
                 writes: class.writes,
+                apart: class.apart.clone(),
             };
             Some((name, class.access.clone(), part))
         })
@@ -899,6 +936,7 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
             requires: item.requires.clone(),
             expire: None,
             writes: wasmkeep_server::apps::Writes::Strict,
+            apart: None,
         }),
         _ => None,
     };
@@ -1074,6 +1112,52 @@ env = ".env.dev"
             "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\nwrites = \"strict\"\n",
         );
         assert!(err.contains("writes"), "{err}");
+    }
+
+    #[test]
+    fn apart_from_is_a_class_key_naming_another_class() {
+        // ADR 0041, amendment of 2026-11-22: another class of the file, or
+        // false for none (`-` in the version); classes only. Absent: the
+        // default pair, decided by the node.
+        let base = "[app]\ntenant = \"acme\"\nname = \"shop\"\n\
+                    [classes.feed]\ncomponent = \"f.wasm\"\n\
+                    [classes.fan]\ncomponent = \"g.wasm\"\n";
+        assert_eq!(parse_ok(base).classes["fan"].apart, None);
+        for (line, want) in [
+            ("apart-from = \"feed\"\n", "feed"),
+            ("apart-from = false\n", "-"),
+        ] {
+            let p = parse_ok(&format!("{base}{line}"));
+            assert_eq!(p.classes["fan"].apart.as_deref(), Some(want), "{line}");
+            assert_eq!(p.classes["feed"].apart, None);
+        }
+        // Into the deploy, as the version's `apart` entry.
+        let p = parse_ok(&format!("{base}apart-from = \"feed\"\n"));
+        let parts = Parts {
+            front: None,
+            classes: vec![("fan".into(), vec![]), ("feed".into(), vec![])],
+            config: BTreeMap::new(),
+        };
+        let changes = to_changes(&p, parts);
+        assert!(
+            changes
+                .apart
+                .contains(&("fan".to_owned(), Some("feed".to_owned())))
+        );
+        assert!(changes.apart.contains(&("feed".to_owned(), None)));
+        for (bad, why) in [
+            ("apart-from = \"fan\"\n", "not another class"),
+            ("apart-from = \"nope\"\n", "not another class"),
+            ("apart-from = true\n", "apart-from"),
+            ("apart-from = \"\"\n", "must not be empty"),
+        ] {
+            let err = parse_err(&format!("{base}{bad}"));
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        let err = parse_err(
+            "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\napart-from = \"x\"\n",
+        );
+        assert!(err.contains("apart-from"), "{err}");
     }
 
     #[test]
