@@ -325,6 +325,75 @@ async fn tidy(store: &SecretStore) {
     }
 }
 
+/// `rotate-key --finish`: retires every key but `key` in `app`, or in
+/// every app with secrets. An app refused or with objects left does not
+/// stop the others; the run fails at the end.
+async fn finish(
+    store: &Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    app: Option<(String, String)>,
+    key: &SecretsKey,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    let apps = match app {
+        Some(one) => vec![one],
+        None => secret_store::apps_with_secrets(store, prefix).await?,
+    };
+    let mut unfinished = 0;
+    for (tenant, app) in &apps {
+        let one = SecretStore::new(Arc::clone(store), prefix, tenant, app);
+        let retired = match one
+            .retire_other_keys(
+                key,
+                now_ms,
+                secret_store::RETENTION,
+                secret_store::STALE_AFTER,
+            )
+            .await
+        {
+            Ok(retired) => retired,
+            Err(e @ secret_store::SecretStoreError::Sealed(..)) => {
+                eprintln!(
+                    "error: {tenant}/{app}: {e}. --finish deletes nothing unless the current \
+                     set opens with --new-key: run rotate-key without --finish first."
+                );
+                unfinished += 1;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("error: {tenant}/{app}: {e}");
+                unfinished += 1;
+                continue;
+            }
+        };
+        println!(
+            "{tenant}/{app}: deleted {} object(s) sealed with another key.",
+            retired.deleted
+        );
+        if retired.left == 0 {
+            println!("{tenant}/{app}: only key {} opens what is left.", key.id());
+        } else {
+            eprintln!(
+                "warning: {tenant}/{app}: left {} object(s): sealed with another key and \
+                 still possibly in use (the one before a set made current less than {} s \
+                 ago, or one above it written less than {} min ago by a secrets command \
+                 that may still be running), unreadable, or too large. Run --finish again \
+                 later.",
+                retired.left,
+                secret_store::STALE_AFTER.as_secs(),
+                secret_store::RETENTION.as_secs() / 60,
+            );
+            unfinished += 1;
+        }
+    }
+    anyhow::ensure!(
+        unfinished == 0,
+        "{unfinished} of {} app(s) did not finish; see above",
+        apps.len()
+    );
+    Ok(())
+}
+
 pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
     match command {
         SecretsCommand::NewKey { out } => {
@@ -435,53 +504,7 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
         SecretsCommand::RotateKey(args) if args.finish => {
             let new = SecretsKey::load(&args.new_key)?;
             let (store, prefix) = crate::open_bucket(&args.bucket)?;
-            let rt = runtime()?;
-            let apps = match &args.app {
-                Some(one) => vec![one.clone()],
-                None => rt.block_on(secret_store::apps_with_secrets(&store, &prefix))?,
-            };
-            let mut unfinished = false;
-            for (tenant, app) in apps {
-                let one = SecretStore::new(Arc::clone(&store), &prefix, &tenant, &app);
-                let retired = rt
-                    .block_on(one.retire_other_keys(&new))
-                    .map_err(|e| match e {
-                        secret_store::SecretStoreError::Sealed(..) => anyhow::anyhow!(
-                            "{tenant}/{app}: {e} (--finish deletes nothing unless the \
-                             current set opens with --new-key: run rotate-key without \
-                             --finish first)"
-                        ),
-                        e => anyhow::anyhow!("{tenant}/{app}: {e}"),
-                    })?;
-                if retired.left == 0 {
-                    println!(
-                        "{tenant}/{app}: deleted {} object(s) sealed with another key; \
-                         only key {} opens what is left.",
-                        retired.deleted,
-                        new.id()
-                    );
-                } else {
-                    println!(
-                        "{tenant}/{app}: deleted {} object(s) sealed with another key.",
-                        retired.deleted
-                    );
-                    eprintln!(
-                        "warning: {tenant}/{app}: left {} object(s) that are unreadable, or \
-                         sealed with another key above the current set (a secrets command \
-                         still running, or one that stopped before moving it). Run --finish \
-                         again once no other secrets command is running; an object a \
-                         stopped command left goes with the next secrets change an hour \
-                         after it was written.",
-                        retired.left
-                    );
-                    unfinished = true;
-                }
-            }
-            anyhow::ensure!(
-                !unfinished,
-                "some objects sealed with another key are still in the bucket"
-            );
-            Ok(())
+            runtime()?.block_on(finish(&store, &prefix, args.app.clone(), &new, now_ms()))
         }
         SecretsCommand::RotateKey(args) => {
             nodes_have_new_key(args.nodes_have_new_key, "rotate-key")?;
@@ -561,6 +584,99 @@ mod tests {
 
     use super::{refuse_front, value_from};
     use wasmkeep_server::secrets::SecretSet;
+
+    mod finish {
+        use std::sync::Arc;
+
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStore, ObjectStoreExt as _};
+        use wasmkeep_server::secret_store::SecretStore;
+        use wasmkeep_server::secrets::{SecretSet, SecretsKey};
+
+        use super::super::finish;
+
+        async fn seal(store: &Arc<dyn ObjectStore>, app: &str, keys: &[SecretsKey]) {
+            let one = SecretStore::new(Arc::clone(store), "p", "acme", app);
+            for with in keys {
+                let opens = [keys[0].clone(), with.clone()];
+                one.change(&opens, with, |s: &mut SecretSet| s.set("api", "A", "v"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+
+        fn ids(store: &Arc<dyn ObjectStore>, app: &str) -> impl Future<Output = Vec<String>> {
+            let one = SecretStore::new(Arc::clone(store), "p", "acme", app);
+            let store = Arc::clone(store);
+            async move {
+                let mut out = Vec::new();
+                for l in one.list().await.unwrap() {
+                    let path = object_store::path::Path::from(format!(
+                        "p/apps/acme/{app}/secrets/{}",
+                        wasmkeep_server::secrets::object_name(l.seq)
+                    ));
+                    let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+                    out.push(wasmkeep_server::secrets::sealed_with(&bytes).unwrap());
+                }
+                out
+            }
+        }
+
+        const LATER: u64 = 60_000;
+
+        fn now() -> u64 {
+            super::super::now_ms() + LATER
+        }
+
+        /// `--all`: an app sealed with another key is refused, the others
+        /// still finish, and the run fails at the end.
+        #[tokio::test]
+        async fn all_goes_on_past_a_refused_app_and_fails_at_the_end() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let (old, new, other) = (
+                SecretsKey::generate().unwrap(),
+                SecretsKey::generate().unwrap(),
+                SecretsKey::generate().unwrap(),
+            );
+            seal(&store, "a-other", std::slice::from_ref(&other)).await;
+            seal(&store, "b-rotated", &[old.clone(), new.clone()]).await;
+            let e = finish(&store, "p", None, &new, now()).await.unwrap_err();
+            assert!(e.to_string().contains("1 of 2"), "{e}");
+            assert_eq!(ids(&store, "b-rotated").await, [new.id()]);
+            assert_eq!(ids(&store, "a-other").await, [other.id()]);
+            let one = Some(("acme".to_owned(), "b-rotated".to_owned()));
+            finish(&store, "p", one, &new, now()).await.unwrap();
+        }
+
+        /// An object left in place fails the run.
+        #[tokio::test]
+        async fn objects_left_fail_the_run() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let (old, new) = (
+                SecretsKey::generate().unwrap(),
+                SecretsKey::generate().unwrap(),
+            );
+            seal(&store, "shop", &[old.clone(), new.clone()]).await;
+            let junk = object_store::path::Path::from(format!(
+                "p/apps/acme/shop/secrets/{}",
+                wasmkeep_server::secrets::object_name(9)
+            ));
+            store.put(&junk, b"junk\n".to_vec().into()).await.unwrap();
+            let app = Some(("acme".to_owned(), "shop".to_owned()));
+            let e = finish(&store, "p", app, &new, now()).await.unwrap_err();
+            assert!(e.to_string().contains("1 of 1"), "{e}");
+            assert_eq!(ids_count(&store).await, 2);
+        }
+
+        async fn ids_count(store: &Arc<dyn ObjectStore>) -> usize {
+            SecretStore::new(Arc::clone(store), "p", "acme", "shop")
+                .list()
+                .await
+                .unwrap()
+                .len()
+        }
+    }
 
     #[test]
     fn a_set_with_the_front_is_refused_while_a_node_cannot_read_it() {

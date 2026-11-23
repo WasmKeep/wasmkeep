@@ -151,9 +151,11 @@ they changed, not their names or values.
   3. remove the old key from every node;
   4. run `wasmkeep secrets rotate-key --finish --new-key FILE` (same
      `--app` or `--all`): it deletes every object below `current` sealed
-     with another key, the one before `current` included, and refuses an
-     app whose current set does not open with the new key. It is a
-     separate step because step 2 keeps the one before `current` for a
+     with another key, the one before `current` included once `current`
+     is 30 s old, and another key's objects above `current` once they
+     are past the retention window; it refuses an app whose current set
+     does not open with the new key, and fails while it leaves any. It is
+     a separate step because step 2 keeps the one before `current` for a
      node that read `current` just before it moved.
 
   Rotating the key does not change the values, and does not protect

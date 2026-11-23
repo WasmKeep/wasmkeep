@@ -1089,13 +1089,21 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   `current`, sealed with the old key, for a node that read `current` just
   before it moved. Once the old key is removed from every node, run
   `wasmkeep secrets rotate-key --new-key new.key --app acme/shop --finish`
-  (or `--all`): it deletes every object below `current` that another key
-  sealed, and refuses an app whose current set does not open with
-  `--new-key`. Run it while no other `secrets` command is running for the
-  app: an object above `current` sealed with another key (a command still
-  running, or one that stopped before moving `current`) is left, and
-  `--finish` warns and exits with an error. On a bucket with object versioning, the deleted objects stay as
-  noncurrent versions until a lifecycle rule removes them.
+  (or `--all`). It never deletes `current`, refuses an app whose current
+  set does not open with `--new-key`, and deletes the objects another key
+  sealed:
+  - below `current`, all of them, except the one just before it during
+    the first 30 s after `current` moved (a node starting, a backup or a
+    command may still read it);
+  - above `current` (written by a `secrets` command still running, or one
+    that stopped before moving `current`), once they are an hour old.
+
+  Anything it leaves (those, and objects it cannot parse or that are too
+  large) is counted: it warns and exits with an error, and a later run
+  finishes. With `--all`, an app refused or left unfinished does not stop
+  the others; the run fails at the end. On a bucket with object
+  versioning, the deleted objects stay as noncurrent versions until a
+  lifecycle rule removes them.
 - **Rotating the key does not change the values.** The new key seals the
   same values. A value the old key could open (a leaked key, an old
   backup of the bucket, a noncurrent version) is exposed for good: after a
