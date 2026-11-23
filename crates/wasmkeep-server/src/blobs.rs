@@ -40,6 +40,22 @@ pub const DEFAULT_MAX_FILE: u64 = 1024 * 1024 * 1024;
 pub const MAX_FILE_CEILING: u64 = 5 * 1024 * 1024 * 1024;
 /// A listing page's longest.
 pub(crate) const MAX_PAGE: u32 = 1_000;
+/// Bytes all spool files of the process may hold at once (streamed writes
+/// and upload links before they become files): 4 GiB, or one file of the
+/// largest `--max-blob-bytes` if that is more.
+pub(crate) const NODE_SPOOL: u64 = 4 * 1024 * 1024 * 1024;
+/// Bytes one app's spool files may hold at once: 1 GiB, or one file of
+/// its `--max-blob-bytes` if that is more.
+pub(crate) const APP_SPOOL: u64 = 1024 * 1024 * 1024;
+/// Streamed writes one instance may have open at once.
+pub(crate) const MAX_OPEN_WRITES: usize = 16;
+
+/// The process's spool budget, shared by every app runtime.
+fn node_spool() -> Arc<streams::Budget> {
+    static NODE: std::sync::OnceLock<Arc<streams::Budget>> = std::sync::OnceLock::new();
+    Arc::clone(NODE.get_or_init(|| Arc::new(streams::Budget::new(NODE_SPOOL))))
+}
+
 /// A bucket prefix longer than this leaves no room for the longest key
 /// under S3's 1,024 bytes (ADR 0030, section 2).
 pub(crate) const MAX_BUCKET_PREFIX: usize = 200;
@@ -56,6 +72,27 @@ pub(crate) struct Blobs {
     usage: usage::Usage,
     /// The app's metric labels ([`crate::metrics::app_labels`]).
     labels: Arc<str>,
+    /// What the app's spool files may hold at once, and the node's.
+    spool_app: Arc<streams::Budget>,
+    spool_node: Arc<streams::Budget>,
+    /// Upload links being received on this node, by namespace and key.
+    uploading: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+}
+
+/// One upload link being received, its key released when dropped.
+pub(crate) struct Receiving<'a> {
+    blobs: &'a Blobs,
+    claim: (String, String),
+}
+
+impl Drop for Receiving<'_> {
+    fn drop(&mut self) {
+        self.blobs
+            .uploading
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.claim);
+    }
 }
 
 #[derive(Debug)]
@@ -96,24 +133,55 @@ impl Blobs {
                 Err(e) => Backend::Off(e),
             }
         };
+        Self::new(backend, max_file)
+    }
+
+    fn new(backend: Backend, max_file: u64) -> Self {
+        let max_file = max_file.min(MAX_FILE_CEILING);
+        let spool_node = node_spool();
+        spool_node.raise_to(max_file);
         Self {
             backend,
-            max_file: max_file.min(MAX_FILE_CEILING),
+            max_file,
             links: None,
             usage: usage::Usage::default(),
             labels: Arc::from(""),
+            spool_app: Arc::new(streams::Budget::new(APP_SPOOL.max(max_file))),
+            spool_node,
+            uploading: std::sync::Mutex::default(),
         }
     }
 
     /// Files on disk, under `app_dir` (`<data_dir>/state/<t>/<a>`).
     pub(crate) fn on_disk(app_dir: &std::path::Path, epoch: &str, max_file: u64) -> Self {
-        Self {
-            backend: Backend::Disk(disk::Disk::new(app_dir.join("blobs").join(epoch))),
-            max_file: max_file.min(MAX_FILE_CEILING),
-            links: None,
-            usage: usage::Usage::default(),
-            labels: Arc::from(""),
+        Self::new(
+            Backend::Disk(disk::Disk::new(app_dir.join("blobs").join(epoch))),
+            max_file,
+        )
+    }
+
+    /// The same files, spooling under `app` and `node` rather than the
+    /// app's own share and the process's.
+    #[cfg(test)]
+    pub(crate) fn with_spool_budgets(
+        mut self,
+        app: Arc<streams::Budget>,
+        node: Arc<streams::Budget>,
+    ) -> Self {
+        self.spool_app = app;
+        self.spool_node = node;
+        self
+    }
+
+    /// Claims `ns`'s `key` for one upload link's body; `None` while
+    /// another is being received on this node.
+    pub(crate) fn receive(&self, ns: &Namespace, key: &str) -> Option<Receiving<'_>> {
+        let claim = (ns.rel().to_owned(), key.to_owned());
+        let mut uploading = self.uploading.lock().unwrap_or_else(|p| p.into_inner());
+        if !uploading.insert(claim.clone()) {
+            return None;
         }
+        Some(Receiving { blobs: self, claim })
     }
 
     /// The same files, with links made and checked by `links`.
@@ -343,18 +411,34 @@ impl Blobs {
         r
     }
 
-    /// A file to spool a streamed write to, until [`Self::commit`].
-    pub(crate) async fn spool(&self, ns: &Namespace) -> Result<streams::Spool, BlobError> {
+    /// A file to spool a streamed write to, until [`Self::commit`]: with
+    /// `reserve`, that many bytes of the spool budgets are held first (an
+    /// upload link's size), else each byte is charged as it is written.
+    pub(crate) async fn spool(
+        &self,
+        ns: &Namespace,
+        reserve: Option<u64>,
+    ) -> Result<streams::Spool, BlobError> {
         if let Err(e) = self.quota() {
             self.count_op("write", "quota");
             return Err(e);
+        }
+        let mut held =
+            streams::Held::none(Arc::clone(&self.spool_app), Arc::clone(&self.spool_node));
+        if let Some(n) = reserve
+            && !held.hold(n)
+        {
+            self.count_op("write", "unavailable");
+            return Err(BlobError::Unavailable(
+                "the node has no spool space for this write now; retry later".into(),
+            ));
         }
         let path = match &self.backend {
             Backend::Bucket(b) => b.spool_path(),
             Backend::Disk(d) => d.spool_path(ns).await?,
             Backend::Off(why) => return Err(BlobError::Unavailable(why.clone())),
         };
-        streams::Spool::create(path, self.max_file).await
+        streams::Spool::create(path, self.max_file, held).await
     }
 
     /// Makes a spooled write the file at `key`, with its condition.

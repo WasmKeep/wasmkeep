@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use http_body_util::{BodyExt, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::Frame;
 use hyper::{Request, Response, StatusCode};
 use wasmkeep_wit::wasmkeep::actor::blobs::{BlobError, Condition};
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -21,6 +21,8 @@ use crate::http::text_response;
 
 /// How long past its expiry an upload that started in time may run.
 const UPLOAD_GRACE_MS: u64 = 60 * 60 * 1_000;
+/// How long an upload's body may send nothing before it is aborted.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn refuse(status: StatusCode, text: &str) -> Response<HyperOutgoingBody> {
     let mut r = text_response(status, text);
@@ -54,11 +56,14 @@ fn over_quota() -> Response<HyperOutgoingBody> {
 
 /// Answers a node link. `deleted`: the app's tombstone was seen, and every
 /// token is refused.
-pub(crate) async fn serve(
+pub(crate) async fn serve<B>(
     blobs: &Blobs,
     deleted: bool,
-    req: Request<Incoming>,
-) -> Response<HyperOutgoingBody> {
+    req: Request<B>,
+) -> Response<HyperOutgoingBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let Some(links) = blobs.links() else {
         return refuse(StatusCode::NOT_FOUND, "not found\n");
     };
@@ -220,14 +225,17 @@ fn body_of(
     }
 }
 
-async fn upload(
+async fn upload<B>(
     blobs: &Blobs,
     ns: &Namespace,
     token: &Token,
     size: u64,
     content_type: &str,
-    req: Request<Incoming>,
-) -> Response<HyperOutgoingBody> {
+    req: Request<B>,
+) -> Response<HyperOutgoingBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
     let h = req.headers();
     // Refused before any byte of the body is read.
     if h.contains_key(hyper::header::TRANSFER_ENCODING) {
@@ -256,6 +264,15 @@ async fn upload(
             "this link takes another Content-Type\n",
         );
     }
+    // One body at a time for a key on this node: a link sent again while
+    // its first body is still arriving is refused, not spooled twice.
+    let Some(_receiving) = blobs.receive(ns, &token.key) else {
+        crate::metrics::blob_node_link(blobs.labels(), "busy");
+        return refuse(
+            StatusCode::CONFLICT,
+            "an upload to this link is already under way\n",
+        );
+    };
     match blobs.head(ns, &token.key).await {
         Ok(None) => {}
         Ok(Some(_)) => {
@@ -269,7 +286,9 @@ async fn upload(
             );
         }
     }
-    let spool = match blobs.spool(ns).await {
+    // The whole body's size is held from the spool budgets before any of
+    // it is read.
+    let spool = match blobs.spool(ns, Some(size)).await {
         Ok(s) => s,
         Err(BlobError::QuotaExceeded) => return over_quota(),
         Err(_) => {
@@ -284,7 +303,13 @@ async fn upload(
     let received = tokio::time::timeout(std::time::Duration::from_millis(left_ms), async {
         let mut body = req.into_body();
         let mut got = 0u64;
-        while let Some(frame) = body.frame().await {
+        loop {
+            let Ok(frame) = tokio::time::timeout(UPLOAD_IDLE, body.frame()).await else {
+                return Err(StatusCode::REQUEST_TIMEOUT);
+            };
+            let Some(frame) = frame else {
+                break;
+            };
             let Ok(frame) = frame else {
                 return Err(StatusCode::BAD_REQUEST);
             };
@@ -309,6 +334,13 @@ async fn upload(
     .await;
     match received {
         Ok(Ok(())) => {}
+        Ok(Err(StatusCode::REQUEST_TIMEOUT)) => {
+            spool.abandon();
+            return refuse(
+                StatusCode::REQUEST_TIMEOUT,
+                "the upload's body stopped arriving\n",
+            );
+        }
         Ok(Err(status)) => {
             if status == StatusCode::BAD_REQUEST {
                 crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
