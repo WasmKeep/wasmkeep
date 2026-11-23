@@ -936,7 +936,10 @@ a dead node).
 and hands each edge to the drain's rendezvous choice over the other
 nodes, edge by edge; the edges on the other nodes stay. When the node
 comes back, nothing moves to it until an edge wakes cold again. So on
-three nodes the tree stays on at least two through each step. With two
+three nodes the edges of the drained node split, by name, between the
+other two, which keep their own: the tree stays on two nodes unless every
+edge's choice is the same one (likely with many edges, not guaranteed
+with few). With two
 nodes, every edge is on the remaining node while the other restarts, and
 stays there until it wakes cold again.
 

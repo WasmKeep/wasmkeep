@@ -221,8 +221,12 @@ async fn a_rooms_edges_wake_spread_and_stay_put() {
     let mut after = std::collections::BTreeSet::new();
     for (e, before) in edges.iter().zip(&held) {
         let now = holder(&store, "edge", e).await.unwrap();
-        assert_ne!(now, third, "{e}");
-        if before != third {
+        if before == third {
+            // On the spread choice over the two others or, when that node
+            // answered that it did not run the call while the record was
+            // still changing hands, where it was called, once.
+            assert_ne!(now, third, "{e}");
+        } else {
             assert_eq!(&now, before, "{e} moved off a node that is not draining");
         }
         after.insert(now);

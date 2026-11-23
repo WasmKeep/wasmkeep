@@ -294,7 +294,7 @@ with hysteresis. Movement closes affected sockets with **4801**. If a slow
 client falls behind the edge buffer, it fetches history; if the edge cannot
 even queue the behind notification, it closes that socket with **4802**.
 A room's edges wake spread over the live nodes
-([above](#place-a-large-rooms-pusher-on-another-node)); the relays stay
+([above](#place-a-large-rooms-pusher-on-another-node)); the relays wake
 beside the pusher. Spreading moves only fan-out CPU: the room remains the
 sequencer. Running edges are not rebalanced when a node joins; they move
 only through a drain, a split or merge, or a cold wake.
