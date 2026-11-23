@@ -198,6 +198,44 @@ pub fn collectable(listing: &Listing, owner_generation: u64, snapshot: SegmentId
     segments.chain(snapshots).collect()
 }
 
+/// The idle pass's deletion rule (ADR 0042, section 3): for a holder that
+/// acquired a *released* ownership record of generation
+/// `released_generation` unchanged, and uploads nothing, the snapshot it
+/// may compact from and the keys it may delete, relative to the prefix.
+///
+/// The snapshot `S` is the newest one of generation `released_generation`
+/// whose segment (at the same position `P`) is also listed; the keys are
+/// [`collectable`]`(listing, released_generation, S)`, so `S` and the
+/// segment at `P` are always kept, and every object of a generation above
+/// `released_generation`, or at a txid above `P`'s, too. `None` if there
+/// is no such snapshot: nothing to do.
+///
+/// Why the released generation and not any snapshot at the head: a
+/// snapshot key names the position's generation, not its uploader. A hold
+/// that restored and wrote nothing can upload a snapshot at a previous
+/// owner's head, and collecting from it can break a restore (ADR 0012,
+/// condition 2). With the record still naming `released_generation`, no
+/// hold existed after it, so only that generation can have uploaded a
+/// snapshot keyed with it, and it snapshots only at its acknowledged
+/// head. The caller is responsible for that precondition (the record
+/// acquired unchanged since the release) and for the retention window.
+pub fn idle_collectable(
+    listing: &Listing,
+    released_generation: u64,
+) -> Option<(SegmentId, Vec<String>)> {
+    let snapshot = listing
+        .snapshots
+        .iter()
+        .filter(|s| s.generation == released_generation)
+        .filter(|&&s| listing.segments.iter().any(|seg| seg.id == s))
+        .max_by_key(|s| s.txid)
+        .copied()?;
+    Some((
+        snapshot,
+        collectable(listing, released_generation, snapshot),
+    ))
+}
+
 fn hex16(s: &str) -> Option<u64> {
     (s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
         .then(|| u64::from_str_radix(s, 16).ok())
@@ -594,5 +632,156 @@ mod tests {
         segments.push((2, 7, 1));
         let uncollected = listing(&segments, &[(1, 7)]);
         assert_eq!(plan_restore(&uncollected).unwrap().head(), id(2, 7));
+    }
+
+    /// `listing` without `gone`.
+    fn without(listing: &Listing, gone: &[String]) -> Listing {
+        let keys: Vec<String> = listing
+            .segments
+            .iter()
+            .map(segment_key)
+            .chain(listing.snapshots.iter().map(|&s| snapshot_key(s)))
+            .filter(|k| !gone.contains(k))
+            .collect();
+        Listing::from_keys(keys.iter().map(String::as_str))
+    }
+
+    /// The key of the object `plan_restore` takes as the head: the newest
+    /// segment of the highest generation, or the newest snapshot if there
+    /// is no segment (what the change feed compares, with the position).
+    fn head_key(listing: &Listing) -> Option<String> {
+        match listing
+            .segments
+            .iter()
+            .max_by_key(|s| (s.id.generation, s.id.txid))
+        {
+            Some(s) => Some(segment_key(s)),
+            None => listing
+                .snapshots
+                .iter()
+                .max_by_key(|s| (s.generation, s.txid))
+                .map(|&s| snapshot_key(s)),
+        }
+    }
+
+    #[test]
+    fn an_idle_pass_keeps_the_snapshot_at_the_head_and_the_segment_under_it() {
+        // Generation 1 wrote 1 to 4 (a periodic snapshot at 3); generation
+        // 2 restored it and wrote 5 to 12 (a periodic snapshot at 8, then
+        // its idle snapshot at 12) and released. Leftovers of generation 1
+        // landed late: a segment at 5 on its own 4, a snapshot at 4.
+        let mut segments = chain(1, 1, 4, 0);
+        segments.extend(chain(2, 5, 12, 1));
+        segments.push((1, 5, 1));
+        let before = listing(&segments, &[(1, 3), (1, 4), (2, 8), (2, 12)]);
+        let (snapshot, gone) = idle_collectable(&before, 2).unwrap();
+        assert_eq!(snapshot, id(2, 12));
+        let after = without(&before, &gone);
+        assert_eq!(after, listing(&[(2, 12, 2)], &[(2, 12)]), "{gone:?}");
+        assert_eq!(gone.len(), segments.len() - 1 + 3);
+        // The head and the head object are the ones before, and the plan
+        // is the snapshot alone: no gap.
+        let (was, plan) = (
+            plan_restore(&before).unwrap(),
+            plan_restore(&after).unwrap(),
+        );
+        assert_eq!(plan.head(), was.head());
+        assert_eq!(head_key(&after), head_key(&before));
+        assert_eq!(
+            plan,
+            Plan {
+                snapshot: Some(id(2, 12)),
+                segments: vec![]
+            }
+        );
+        // Run again on what it left: the same snapshot, nothing to delete.
+        assert_eq!(idle_collectable(&after, 2), Some((id(2, 12), vec![])));
+    }
+
+    #[test]
+    fn an_idle_pass_needs_a_snapshot_of_the_released_generation() {
+        // Generation 1 wrote 1 to 7; generation 3 restored it, snapshotted
+        // at 1's head without writing, and released. A snapshot of
+        // generation 2 at 5 is off the chain. Nothing is of generation 3.
+        let before = listing(&chain(1, 1, 7, 0), &[(1, 7), (2, 5)]);
+        assert_eq!(idle_collectable(&before, 3), None);
+        // Nor with no snapshot at all.
+        assert_eq!(idle_collectable(&listing(&chain(3, 1, 4, 0), &[]), 3), None);
+    }
+
+    #[test]
+    fn an_idle_pass_needs_the_segment_under_its_snapshot() {
+        // Generation 2's snapshot at 6 is listed without its segment (not a
+        // shape the server leaves: a listing taken while something else
+        // deleted): not chosen.
+        let segments = chain(2, 1, 5, 0);
+        let alone = listing(&segments, &[(2, 6)]);
+        assert_eq!(idle_collectable(&alone, 2), None);
+        // An older snapshot of that generation with its segment is chosen
+        // instead, and everything from it up is kept.
+        let both = listing(&segments, &[(2, 3), (2, 6)]);
+        let (snapshot, gone) = idle_collectable(&both, 2).unwrap();
+        assert_eq!(snapshot, id(2, 3));
+        let after = without(&both, &gone);
+        let kept: Vec<u64> = after.segments.iter().map(|s| s.id.txid).collect();
+        assert_eq!(kept, vec![3, 4, 5]);
+        assert_eq!(after.snapshots, vec![id(2, 3), id(2, 6)]);
+    }
+
+    #[test]
+    fn an_idle_pass_leaves_a_later_generations_objects_alone() {
+        // Generation 2 wrote 1 to 6, snapshotted at 6 and released.
+        // Generation 3 then woke it (the record changed, which the pass's
+        // unchanged acquisition excludes; scripted here) and wrote 7 and 8
+        // on 2's head, with a snapshot at 8. Built on `P`, every object of
+        // a later generation is above its txid, and none is deleted.
+        let mut segments = chain(2, 1, 6, 0);
+        segments.extend(chain(3, 7, 8, 2));
+        let before = listing(&segments, &[(2, 4), (2, 6), (3, 8)]);
+        let (snapshot, gone) = idle_collectable(&before, 2).unwrap();
+        assert_eq!(snapshot, id(2, 6));
+        let after = without(&before, &gone);
+        let kept: Vec<(u64, u64)> = after
+            .segments
+            .iter()
+            .map(|s| (s.id.generation, s.id.txid))
+            .collect();
+        assert_eq!(kept, vec![(2, 6), (3, 7), (3, 8)], "{gone:?}");
+        assert_eq!(after.snapshots, vec![id(2, 6), id(3, 8)]);
+        assert_eq!(plan_restore(&after).unwrap().head(), id(3, 8));
+    }
+
+    #[test]
+    fn an_idle_pass_from_any_snapshot_at_the_head_would_break_a_restore() {
+        // ADR 0012, condition 2, then a release. Generation 1 wrote 1 to 6;
+        // its upload of 7 is held. Generation 2 restores to 6 and uploads 7
+        // on top of it, also held; its hold ends. 1's 7 lands. Generation 3
+        // restores to (1, 7), snapshots there without writing (a read-only
+        // wake that restored many segments), and hibernates: the record
+        // says generation 3, released.
+        let before = listing(&chain(1, 1, 7, 0), &[(1, 7)]);
+        // The rule, with the released generation: nothing to do.
+        assert_eq!(idle_collectable(&before, 3), None);
+        // The unsafe choice: any snapshot at the head, whoever's.
+        let head = plan_restore(&before).unwrap().head();
+        assert!(before.snapshots.contains(&head));
+        let gone = collectable(&before, head.generation, head);
+        assert_eq!(gone.len(), 6);
+        let late = Segment {
+            id: id(2, 7),
+            parent_generation: 1,
+        };
+        // Then generation 2's upload lands: a legal late commit, the head,
+        // built on (1, 6), which is gone.
+        let mut after = without(&before, &gone);
+        after.segments.push(late);
+        assert_eq!(
+            plan_restore(&after),
+            Err(PlanError::Missing { missing: id(1, 6) })
+        );
+        // Without the pass, that late commit restores.
+        let mut untouched = before;
+        untouched.segments.push(late);
+        assert_eq!(plan_restore(&untouched).unwrap().head(), id(2, 7));
     }
 }
