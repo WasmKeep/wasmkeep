@@ -164,7 +164,19 @@ curl 127.0.0.1:9100/metrics
 ```
 
 Off by default. The page names classes and counts events, so bind it to
-loopback or a private address that only your Prometheus reaches. Labels are
+loopback or a private address that only your Prometheus reaches.
+
+The listener answers a request only when its `Host` is an IP address (any
+address and port: it may be bound to `0.0.0.0` or reached through a mapped
+port), `localhost` or a name under it, or a single-label name such as a
+Compose service (`wasmkeep:9100`); any other name gets 421. This stops a web
+page from pointing a name of its own at the listener and reading the page
+from a browser. Scrape by IP address (Kubernetes pod discovery does), or
+through a single-label name; a dotted name such as `node1.internal` is
+refused. Up to 16 scrapers are served at once; one has 5 s to send its
+request headers (also between requests on a kept-alive connection), a write
+that waits 10 s for a scraper that stopped reading closes the connection,
+and a connection lasts at most 60 s. Labels are
 the node's tenant and app, class names, event kinds and fixed reasons, never
 actor names. Every series with a `class` label, and the front's counters
 and histogram, also have `tenant` and `app`:

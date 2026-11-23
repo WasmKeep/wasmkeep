@@ -45,8 +45,16 @@ node a     node b     node c       any node takes any request;
   its connection to the node open after its own client left, the node
   cannot know, and runs the request for nobody once the actor is taken
   over.
+- **Request heads up to 64 KiB.** A node answers 431 to a request whose
+  head (request line and headers) is larger, or has more than 100 header
+  fields. A load balancer that adds headers should leave room for them.
+- **A client that stops reading is let go.** A response write that waits
+  60 s with nothing taken closes the connection; a load balancer that
+  buffers responses, or a client that keeps reading slowly, is never cut.
 - **Never expose** the metrics listener (`--metrics-listen`) or the
-  node-to-node traffic to the internet.
+  node-to-node traffic to the internet. Scrape it by IP address, or by a
+  single-label name such as a Compose service; a dotted name gets 421
+  ([monitoring](../monitoring.md#metrics)).
 
 ## Readiness with several apps
 

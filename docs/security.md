@@ -21,6 +21,14 @@ limits below are enforced by the code (each has a test), not aspirations.
 
 **Front door** (`crates/wasmkeep-server/src/http.rs`)
 - 30 s to send request headers, and idle limit between kept-alive requests.
+- Request heads: 64 KiB (request line and headers, the size a guest's
+  header fields may reach) and 100 header fields; over either, 431. The
+  cluster port allows 16 KiB and 32 fields more, for the headers a hop adds.
+- A response write that waits 60 s with no byte taken by the client (one
+  that stopped reading) closes the connection. Only a waiting write counts:
+  kept-alive connections, idle WebSockets and slow readers that keep
+  reading are not cut. There is no per-address connection cap: behind a
+  proxy or load balancer every client shares its address.
 - 10,000 connections per node (`--max-connections`); more wait in the
   kernel backlog. Accept errors back off instead of spinning.
 - Request bodies: 16 MB (413 when declared larger; a failed read past it).
