@@ -351,6 +351,14 @@ pub struct ActorDb {
     /// Set by the authorizer when a guest statement it is preparing is a
     /// `ROLLBACK` (of the whole transaction).
     rollback_seen: Arc<AtomicBool>,
+    /// Set by the authorizer when a guest statement it is preparing changes
+    /// the schema (creates or alters something).
+    ddl_seen: Arc<AtomicBool>,
+    /// While a guest statement that writes runs during capture, the WAL's
+    /// cap, checked by the progress handler (0: none).
+    wal_cap: Arc<AtomicU64>,
+    /// Set by the progress handler when it stopped a statement for the WAL.
+    wal_stopped: Arc<AtomicBool>,
     /// `synchronous` is FULL from an `exec-durable` whose restore to NORMAL
     /// failed: `end_event` restores it.
     sync_full: bool,
@@ -371,6 +379,11 @@ pub struct ActorDb {
     cpu_deadline: Arc<AtomicU64>,
     /// Change capture for replication, once started.
     capture: Option<WalCapture>,
+    /// A checkpoint was blocked (a reader still on the WAL) after moving
+    /// every frame, all of them captured, into the main file. SQLite then
+    /// restarts the WAL at the next write once the reader leaves, which
+    /// loses nothing: the next capture starts over on the new WAL.
+    wal_restart_ok: bool,
     batch_hold: Option<std::sync::Weak<()>>,
     segment_byte_cap: u64,
     /// Last, so it is released after the connection has closed.
@@ -405,17 +418,71 @@ fn refuse_writes_if(
     stmt: rusqlite::Statement<'_>,
 ) -> Result<rusqlite::Statement<'_>, SqlError> {
     if !stmt.readonly() && wal_full() {
+        return Err(wal_full_error(batched));
+    }
+    Ok(stmt)
+}
+
+fn wal_full_error(batched: bool) -> SqlError {
+    SqlError::new(
+        crate::SqlErrorKind::QuotaExceeded,
+        if batched {
+            "the write-ahead log is full; hold new events until batched capture drains and checkpoints"
+        } else {
+            "too many writes in one event: the write-ahead log is full until the \
+             event ends; split the work across events"
+        },
+    )
+}
+
+/// Prepares a guest statement. Schema changes that name the reserved prefix
+/// anywhere (a foreign key to a host table, a rename onto a reserved name)
+/// are refused: the authorizer sees neither foreign key parents nor rename
+/// targets, so the statement's text is checked.
+fn prepare_guest<'c>(
+    conn: &'c Connection,
+    sql: &str,
+    ddl_seen: &AtomicBool,
+) -> Result<rusqlite::Statement<'c>, SqlError> {
+    ddl_seen.store(false, Ordering::Relaxed);
+    let stmt = conn.prepare(sql)?;
+    if ddl_seen.load(Ordering::Relaxed) && names_reserved(sql) {
         return Err(SqlError::new(
-            crate::SqlErrorKind::QuotaExceeded,
-            if batched {
-                "the write-ahead log is full; hold new events until batched capture drains and checkpoints"
-            } else {
-                "too many writes in one event: the write-ahead log is full until the \
-                 event ends; split the work across events"
-            },
+            crate::SqlErrorKind::NotAllowed,
+            "names starting with _wasmkeep_ are reserved for the host; a schema change \
+             may not name one",
         ));
     }
     Ok(stmt)
+}
+
+/// Whether an identifier in `sql` starts with the reserved prefix (in any
+/// case; quoted or not). A name that only contains it is the guest's.
+fn names_reserved(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let prefix = RESERVED_PREFIX.as_bytes();
+    // SQLite's identifier characters: ASCII letters and digits, `_`, `$`,
+    // and every byte of a non-ASCII character.
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    bytes
+        .windows(prefix.len())
+        .enumerate()
+        .any(|(i, w)| w.eq_ignore_ascii_case(prefix) && (i == 0 || !ident(bytes[i - 1])))
+}
+
+fn is_reserved(name: &str) -> bool {
+    name.get(..RESERVED_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_PREFIX))
+}
+
+/// Has the progress handler watch the WAL while `stmt` runs, if it may
+/// write and the WAL is capped; [`ActorDb::guest`] clears it afterwards.
+fn watch_wal(stmt: &rusqlite::Statement<'_>, limit: Option<&(Arc<Path>, u64)>, cap: &AtomicU64) {
+    if let Some((_, max)) = limit
+        && !stmt.readonly()
+    {
+        cap.store((*max).max(1), Ordering::Relaxed);
+    }
 }
 
 /// Whether the WAL file is over its cap (only checked for statements that
@@ -519,7 +586,27 @@ impl ActorDb {
         conn.pragma_update(None, "trusted_schema", "OFF")
             .map_err(open_err)?;
         let value_limit = i32::try_from(config.max_value_bytes).unwrap_or(i32::MAX);
-        conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, value_limit)
+        {
+            use rusqlite::limits::Limit as L;
+            for (limit, value) in [
+                (L::SQLITE_LIMIT_LENGTH, value_limit),
+                (L::SQLITE_LIMIT_COLUMN, GUEST_MAX_COLUMNS),
+                (L::SQLITE_LIMIT_FUNCTION_ARG, GUEST_MAX_FUNCTION_ARGS),
+                (L::SQLITE_LIMIT_EXPR_DEPTH, GUEST_MAX_EXPR_DEPTH),
+                (L::SQLITE_LIMIT_COMPOUND_SELECT, GUEST_MAX_COMPOUND_SELECT),
+                (L::SQLITE_LIMIT_VDBE_OP, GUEST_MAX_VDBE_OPS),
+                (L::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, GUEST_MAX_LIKE_PATTERN),
+            ] {
+                conn.set_limit(limit, value).map_err(open_err)?;
+            }
+        }
+        // Sorter and materialisation spill stays in memory, under the heap
+        // cap below, not in the system's temporary directory outside the
+        // database's size cap.
+        conn.pragma_update(None, "temp_store", "MEMORY")
+            .map_err(open_err)?;
+        // Process-wide, and it only ever lowers the cap: the lowest set wins.
+        conn.pragma_update(None, "hard_heap_limit", SQLITE_HEAP_LIMIT_BYTES)
             .map_err(open_err)?;
         let page_size: i64 = conn
             .pragma_query_value(None, "page_size", |r| r.get(0))
@@ -549,9 +636,24 @@ impl ActorDb {
         let control = Arc::clone(&tx_seen);
         let rollback_seen = Arc::new(AtomicBool::new(false));
         let rollback = Arc::clone(&rollback_seen);
+        let ddl_seen = Arc::new(AtomicBool::new(false));
+        let ddl = Arc::clone(&ddl_seen);
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
             if flag.load(Ordering::Relaxed) {
+                // Host statements run with triggers and foreign keys off
+                // (`internal`): nothing of the guest's runs in one.
                 return Authorization::Allow;
+            }
+            if matches!(
+                ctx.action,
+                AuthAction::CreateTable { .. }
+                    | AuthAction::CreateIndex { .. }
+                    | AuthAction::CreateTrigger { .. }
+                    | AuthAction::CreateView { .. }
+                    | AuthAction::CreateVtable { .. }
+                    | AuthAction::AlterTable { .. }
+            ) {
+                ddl.store(true, Ordering::Relaxed);
             }
             if matches!(
                 ctx.action,
@@ -583,14 +685,33 @@ impl ActorDb {
         // the thread's CPU clock is its time.
         let deadline = Arc::new(AtomicU64::new(0));
         let cpu_deadline = Arc::new(AtomicU64::new(0));
-        let due = Arc::clone(&deadline);
-        let cpu_due = Arc::clone(&cpu_deadline);
+        let budget = crate::guest_functions::Budget {
+            deadline: Arc::clone(&deadline),
+            cpu_deadline: Arc::clone(&cpu_deadline),
+        };
+        crate::guest_functions::register(&conn, &budget, config.max_value_bytes)
+            .map_err(open_err)?;
+        // While a writing guest statement runs during capture, the WAL is
+        // checked too: one statement must not grow it far past its cap.
+        let wal_cap = Arc::new(AtomicU64::new(0));
+        let wal_stopped = Arc::new(AtomicBool::new(false));
+        let cap = Arc::clone(&wal_cap);
+        let stopped = Arc::clone(&wal_stopped);
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
         conn.progress_handler(
             PROGRESS_STEPS,
             Some(move || {
-                let at = due.load(Ordering::Relaxed);
-                let cpu_at = cpu_due.load(Ordering::Relaxed);
-                (at != 0 && clock_ms() > at) || (cpu_at != 0 && thread_cpu_ns() > cpu_at)
+                if budget.spent() {
+                    return true;
+                }
+                let max = cap.load(Ordering::Relaxed);
+                if max != 0 && std::fs::metadata(&wal_path).is_ok_and(|m| m.len() > max) {
+                    stopped.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                false
             }),
         )
         .map_err(open_err)?;
@@ -602,6 +723,9 @@ impl ActorDb {
             commit_seen,
             tx_seen,
             rollback_seen,
+            ddl_seen,
+            wal_cap,
+            wal_stopped,
             sync_full: false,
             transaction_aborted: false,
             deadline,
@@ -612,6 +736,7 @@ impl ActorDb {
             max_sql_cpu: config.max_sql_cpu_per_event,
             cpu_deadline,
             capture: None,
+            wal_restart_ok: false,
             batch_hold: None,
             segment_byte_cap: crate::wal::DEFAULT_SEGMENT_BYTES,
             open_guard: None,
@@ -639,6 +764,7 @@ impl ActorDb {
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         let page_size = u32::try_from(page_size).unwrap_or(4096);
         self.capture = Some(WalCapture::start(&self.path, page_size)?);
+        self.wal_restart_ok = false;
         if self.batch_hold.take().is_some() {
             self.conn
                 .set_db_config(
@@ -668,6 +794,8 @@ impl ActorDb {
             )
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         self.batch_hold = Some(Arc::downgrade(&hold.0));
+        // Boundary capture does not keep `wal_restart_ok` up to date.
+        self.wal_restart_ok = false;
         Ok(())
     }
 
@@ -815,21 +943,28 @@ impl ActorDb {
         if self.batch_hold.is_some() {
             return Err(CaptureError::BoundariesPending);
         }
-        let Some(capture) = self.capture.as_mut() else {
+        if self.capture.is_none() {
+            return Ok(None);
+        }
+        let changes = self.capture_pending()?;
+        let Some(capture) = self.capture.as_ref() else {
             return Ok(None);
         };
-        let changes = capture.capture()?;
         // A checkpoint cannot run inside an open transaction; try later.
         let threshold = CHECKPOINT_AFTER_BYTES.min(self.max_wal_bytes);
         // The file, not just what was captured: a rolled-back transaction
         // that spilled leaves frames no capture consumes, and a WAL left
         // over the cap would refuse every later write.
         let size = capture.wal_bytes().max(capture.wal_len());
-        if size >= threshold && self.conn.is_autocommit() {
-            self.checkpoint()?;
-            if let Some(c) = self.capture.as_mut() {
-                c.wal_truncated();
-            }
+        // Checkpointing is maintenance: once consumed, the changes are
+        // returned even if it fails (a reader still on the WAL, say). The
+        // WAL stays over the threshold, so the next call tries again.
+        if size >= threshold
+            && self.conn.is_autocommit()
+            && self.checkpoint().is_ok()
+            && let Some(c) = self.capture.as_mut()
+        {
+            c.wal_truncated();
         }
         Ok(changes)
     }
@@ -839,10 +974,7 @@ impl ActorDb {
     /// [`CaptureError::Pending`] (ship them, then snapshot again).
     pub fn snapshot(&mut self) -> Result<Changes, CaptureError> {
         self.check_batched_checkpoint()?;
-        let Some(capture) = self.capture.as_mut() else {
-            return Err(CaptureError::Sql("capture not started".into()));
-        };
-        if let Some(pending) = capture.capture()? {
+        if let Some(pending) = self.capture_pending()? {
             // Hand them back: they must be shipped before the snapshot.
             return Err(CaptureError::Pending(Box::new(pending)));
         }
@@ -870,20 +1002,40 @@ impl ActorDb {
             .snapshot_at_captured()
     }
 
-    /// WAL position as of the last capture, if capturing.
-    pub fn captured_wal_bytes(&self) -> Option<u64> {
-        self.capture.as_ref().map(WalCapture::wal_bytes)
-    }
-
     /// The database checksum as of the last capture, if capturing.
     pub fn captured_checksum(&self) -> Option<crate::ltx::DbChecksum> {
         self.capture.as_ref().map(WalCapture::checksum)
     }
 
-    /// Moves everything into the main file and empties the WAL.
+    /// What was committed since the last capture (strict mode), across a
+    /// WAL restart that `wal_restart_ok` allows.
+    fn capture_pending(&mut self) -> Result<Option<Changes>, CaptureError> {
+        let restart_ok = self.wal_restart_ok;
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or(CaptureError::Sql("capture not started".into()))?;
+        let changes = match capture.capture() {
+            Err(CaptureError::Lost(_)) if restart_ok => {
+                capture.wal_truncated();
+                self.wal_restart_ok = false;
+                capture.capture()?
+            }
+            other => other?,
+        };
+        // A commit after the blocked checkpoint went to the same WAL, which
+        // SQLite cannot restart again before another checkpoint.
+        if changes.is_some() {
+            self.wal_restart_ok = false;
+        }
+        Ok(changes)
+    }
+
+    /// Moves everything into the main file and empties the WAL. Call with
+    /// every commit captured.
     fn checkpoint(&mut self) -> Result<(), CaptureError> {
         self.check_batched_checkpoint()?;
-        let (busy, _, _): (i64, i64, i64) = self
+        let (busy, log, moved): (i64, i64, i64) = self
             .internal(|conn| {
                 conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -891,8 +1043,12 @@ impl ActorDb {
             })
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         if busy != 0 {
+            // Strict capture only: boundary capture holds events until a
+            // checkpoint succeeds, and does not keep this flag up to date.
+            self.wal_restart_ok = log >= 0 && log == moved && self.batch_hold.is_none();
             return Err(CaptureError::Sql("checkpoint blocked".into()));
         }
+        self.wal_restart_ok = false;
         Ok(())
     }
 
@@ -916,9 +1072,12 @@ impl ActorDb {
         }
         let wal = self.wal_limit();
         let batched = self.batch_hold.is_some();
+        let ddl_seen = Arc::clone(&self.ddl_seen);
+        let wal_cap = Arc::clone(&self.wal_cap);
         self.guest(|conn| {
-            let stmt = conn.prepare(sql)?;
+            let stmt = prepare_guest(conn, sql, &ddl_seen)?;
             let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
+            watch_wal(&stmt, wal.as_ref(), &wal_cap);
             let changed = stmt.execute(bind(params))?;
             Ok(u64::try_from(changed).unwrap_or(u64::MAX))
         })
@@ -964,9 +1123,11 @@ impl ActorDb {
         let cpu_left = u64::try_from(cpu_left.as_nanos()).unwrap_or(u64::MAX);
         self.cpu_deadline
             .store(cpu_start.saturating_add(cpu_left).max(1), Ordering::Relaxed);
+        self.wal_stopped.store(false, Ordering::Relaxed);
         let result = f(&self.conn);
         self.cpu_deadline.store(0, Ordering::Relaxed);
         self.deadline.store(0, Ordering::Relaxed);
+        self.wal_cap.store(0, Ordering::Relaxed);
         // SQLite rolls an explicit transaction back on some errors (an
         // interrupt, a full disk): the connection is back in autocommit
         // with the transaction gone, while the guest believes it open.
@@ -974,8 +1135,17 @@ impl ActorDb {
             self.transaction_aborted = true;
         }
         self.sql_cpu_used += Duration::from_nanos(thread_cpu_ns().saturating_sub(cpu_start));
+        let wal_stopped = self.wal_stopped.swap(false, Ordering::Relaxed);
         result.map_err(|e| {
-            if e.message.contains("interrupted") && self.sql_cpu_used >= self.max_sql_cpu {
+            if wal_stopped && e.message.contains("interrupted") {
+                wal_full_error(self.batch_hold.is_some())
+            } else if e.message.contains("out of memory") {
+                SqlError::new(
+                    crate::SqlErrorKind::QuotaExceeded,
+                    "the statement needs more memory than SQLite may use on this node; \
+                     work on less at once",
+                )
+            } else if e.message.contains("interrupted") && self.sql_cpu_used >= self.max_sql_cpu {
                 self.sql_cpu_spent()
             } else if e.message.contains("interrupted") {
                 SqlError::new(
@@ -1165,9 +1335,12 @@ impl ActorDb {
         let max = self.max_result_bytes;
         let wal = self.wal_limit();
         let batched = self.batch_hold.is_some();
+        let ddl_seen = Arc::clone(&self.ddl_seen);
+        let wal_cap = Arc::clone(&self.wal_cap);
         self.guest(|conn| {
-            let stmt = conn.prepare(sql)?;
+            let stmt = prepare_guest(conn, sql, &ddl_seen)?;
             let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
+            watch_wal(&stmt, wal.as_ref(), &wal_cap);
             let mut remaining = max;
             let mut charge = |bytes: usize| {
                 remaining = remaining.checked_sub(bytes).ok_or_else(|| {
@@ -1355,14 +1528,49 @@ impl ActorDb {
         self.internal(|conn| conn.pragma_update(None, name, value))
     }
 
+    /// Runs a host statement: past the sandbox, but with triggers and
+    /// foreign key enforcement off, so it runs nothing the guest wrote (a
+    /// trigger, or a cascade from a host table into a guest's), and under
+    /// the statement deadline.
     fn internal<T>(
         &mut self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, SqlError> {
+        use rusqlite::config::DbConfig;
+        // `PRAGMA foreign_keys` cannot change inside a transaction (host
+        // statements run in the guest's); the connection setting can.
+        let fkeys = self.conn.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+        let triggers = self
+            .conn
+            .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
+        self.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)?;
+        let off = self
+            .conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false);
+        let in_transaction = !self.conn.is_autocommit();
+        let limit = u64::try_from(self.max_statement_time.as_millis()).unwrap_or(u64::MAX);
         self.internal.store(true, Ordering::Relaxed);
-        let result = f(&self.conn);
+        self.deadline
+            .store(clock_ms().saturating_add(limit).max(1), Ordering::Relaxed);
+        let result = off.and_then(|_| f(&self.conn));
+        self.deadline.store(0, Ordering::Relaxed);
         self.internal.store(false, Ordering::Relaxed);
-        result.map_err(SqlError::from)
+        // As for a guest statement: an interrupted host statement rolls the
+        // guest's transaction back.
+        if result.is_err() && in_transaction && self.conn.is_autocommit() {
+            self.transaction_aborted = true;
+        }
+        let restored = self
+            .conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers)
+            .and_then(|_| {
+                self.conn
+                    .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, fkeys)
+            });
+        let value = result?;
+        restored?;
+        Ok(value)
     }
 }
 
@@ -1381,6 +1589,29 @@ const RESERVED_PREFIX: &str = "_wasmkeep_";
 /// SQLite virtual machine steps between deadline checks.
 const PROGRESS_STEPS: std::ffi::c_int = 10_000;
 
+// SQLite limits on guest connections, below SQLite's defaults: each bounds
+// what one statement can make SQLite allocate or compute.
+/// Columns in a table, index or result (SQLite: 2000).
+const GUEST_MAX_COLUMNS: i32 = 500;
+/// Arguments to one function call (SQLite: 1000).
+const GUEST_MAX_FUNCTION_ARGS: i32 = 64;
+/// Depth of an expression tree (SQLite: 1000).
+const GUEST_MAX_EXPR_DEPTH: i32 = 256;
+/// Terms of a compound `SELECT` (SQLite: 500).
+const GUEST_MAX_COMPOUND_SELECT: i32 = 100;
+/// Instructions in one compiled statement (SQLite: 250,000,000).
+const GUEST_MAX_VDBE_OPS: i32 = 250_000;
+/// Bytes in a `LIKE` or `GLOB` pattern (SQLite: 50,000). A match costs up
+/// to the value's length times the pattern's, in one step the progress
+/// handler cannot interrupt: about a second on a 16 MiB value at this cap.
+const GUEST_MAX_LIKE_PATTERN: i32 = 100;
+/// SQLite's heap, for the whole process (`PRAGMA hard_heap_limit`): past it
+/// an allocation fails and the statement with it, instead of the process
+/// running out of memory. Room for the default 1,000 resident actors' page
+/// caches (about 2 MiB each) and for statements holding 16 MiB values and
+/// sorting in memory (`temp_store = MEMORY`).
+const SQLITE_HEAP_LIMIT_BYTES: i64 = 4 << 30;
+
 /// Virtual table modules guests may use; others (and `fts3_tokenizer`,
 /// which takes a raw function pointer) could reach into the host.
 const ALLOWED_MODULES: &[&str] = &["fts3", "fts4", "fts5", "rtree", "rtree_i32"];
@@ -1392,7 +1623,7 @@ const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
 /// CPU time the calling thread has used, in ns from an arbitrary origin.
 /// Only readings on one thread are compared.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn thread_cpu_ns() -> u64 {
+pub(crate) fn thread_cpu_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
     u64::try_from(t.tv_sec)
         .unwrap_or(0)
@@ -1402,12 +1633,12 @@ fn thread_cpu_ns() -> u64 {
 
 /// Elsewhere, wall time (a preempted statement is charged its wait too).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_cpu_ns() -> u64 {
+pub(crate) fn thread_cpu_ns() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn clock_ms() -> u64 {
+pub(crate) fn clock_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     u64::try_from(start.elapsed().as_millis())
@@ -1442,21 +1673,53 @@ fn table_name<'a>(action: &AuthAction<'a>) -> Option<&'a str> {
     }
 }
 
+/// The name of the index, trigger or view an action creates, drops or
+/// rebuilds.
+fn object_name<'a>(action: &AuthAction<'a>) -> Option<&'a str> {
+    use AuthAction as A;
+    match *action {
+        A::CreateIndex { index_name, .. }
+        | A::DropIndex { index_name, .. }
+        | A::Reindex { index_name } => Some(index_name),
+        A::CreateTrigger { trigger_name, .. } | A::DropTrigger { trigger_name, .. } => {
+            Some(trigger_name)
+        }
+        A::CreateView { view_name } | A::DropView { view_name } => Some(view_name),
+        _ => None,
+    }
+}
+
+/// The guest's sandbox: what a guest statement may do. Anything not named
+/// here is refused, including actions a later SQLite adds. Rename targets
+/// and foreign key parents are not reported to an authorizer; see
+/// [`prepare_guest`].
 fn authorize(ctx: &AuthContext<'_>) -> Authorization {
-    if table_name(&ctx.action).is_some_and(|t| {
-        t.get(..RESERVED_PREFIX.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_PREFIX))
-    }) {
+    use AuthAction as A;
+    if table_name(&ctx.action).is_some_and(is_reserved)
+        || object_name(&ctx.action).is_some_and(is_reserved)
+    {
         return Authorization::Deny;
     }
     match ctx.action {
-        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
-        // No temp schema: temp objects are not under the size cap, and a
-        // temp table renamed onto a host table's name would shadow it.
-        AuthAction::CreateTempTable { .. }
-        | AuthAction::CreateTempIndex { .. }
-        | AuthAction::CreateTempTrigger { .. }
-        | AuthAction::CreateTempView { .. } => Authorization::Deny,
+        A::Select
+        | A::Recursive
+        | A::Read { .. }
+        | A::Insert { .. }
+        | A::Update { .. }
+        | A::Delete { .. }
+        | A::CreateTable { .. }
+        | A::CreateIndex { .. }
+        | A::CreateTrigger { .. }
+        | A::CreateView { .. }
+        | A::DropTable { .. }
+        | A::DropIndex { .. }
+        | A::DropTrigger { .. }
+        | A::DropView { .. }
+        | A::AlterTable { .. }
+        | A::Reindex { .. }
+        | A::Analyze { .. }
+        | A::Transaction { .. }
+        | A::Savepoint { .. } => Authorization::Allow,
         AuthAction::CreateVtable { module_name, .. }
         | AuthAction::DropVtable { module_name, .. } => {
             if ALLOWED_MODULES
@@ -1490,7 +1753,10 @@ fn authorize(ctx: &AuthContext<'_>) -> Authorization {
                 Authorization::Allow
             }
         }
-        _ => Authorization::Allow,
+        // `ATTACH`, `DETACH`; temporary tables, views, triggers and indexes
+        // (the temp schema is not under the size cap, and a temp table
+        // renamed onto a host table's name would shadow it); anything else.
+        _ => Authorization::Deny,
     }
 }
 
@@ -1523,5 +1789,84 @@ mod tests {
         assert!(db.exec_durable("BEGIN", &[]).is_err());
         assert!(!db.in_transaction());
         assert_eq!(level(&mut db), 1, "left at FULL");
+    }
+
+    fn open(config: crate::StorageConfig) -> ActorDb {
+        let state = crate::StateDir {
+            dir: "actors/t".into(),
+            scratch: ".deleting".into(),
+            tenant: "t".into(),
+        };
+        crate::Storage::new(config, state).open("c", "a").unwrap()
+    }
+
+    /// Sorter and materialisation spill stays in memory (2: MEMORY), not
+    /// in files of the system's temporary directory.
+    #[test]
+    fn temporary_data_stays_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(crate::StorageConfig::new(dir.path()));
+        let store: i64 = db
+            .internal(|conn| conn.pragma_query_value(None, "temp_store", |r| r.get(0)))
+            .unwrap();
+        assert_eq!(store, 2);
+    }
+
+    /// A host statement has a deadline too, and stopping one inside a
+    /// guest transaction ends the event's statements like a guest's.
+    #[test]
+    fn host_statements_stop_at_the_statement_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::StorageConfig::new(dir.path());
+        config.max_statement_time = Duration::from_millis(200);
+        let mut db = open(config);
+        db.exec("CREATE TABLE t (x)", &[]).unwrap();
+        db.exec("BEGIN", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+        let started = Instant::now();
+        let err = db
+            .internal(|conn| {
+                // A write: SQLite rolls the transaction back when it stops one.
+                conn.execute(
+                    "INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+                     SELECT x + 1 FROM c) SELECT x FROM c",
+                    [],
+                )
+            })
+            .unwrap_err();
+        assert!(err.message.contains("interrupted"), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            db.query("SELECT 1", &[]).is_err(),
+            "the event's transaction is gone"
+        );
+        db.end_event().unwrap();
+        db.set_meta("k", "v").unwrap();
+        let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(rows.values, vec![vec![SqlValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn reserved_identifiers_are_found_in_statement_text() {
+        for sql in [
+            "_wasmkeep_x",
+            "ALTER TABLE t RENAME TO _WASMKEEP_x",
+            "CREATE TABLE g (a REFERENCES \"_wasmkeep_alarm\")",
+            "CREATE TABLE g (a REFERENCES [_wasmkeep_alarm])",
+            "CREATE TABLE g (a REFERENCES `_wasmkeep_alarm`)",
+            "CREATE TABLE g (a REFERENCES main._wasmkeep_alarm)",
+            "CREATE TABLE g (a REFERENCES\n_wasmkeep_alarm)",
+            "CREATE TABLE g (a REFERENCES/**/_wasmkeep_alarm)",
+        ] {
+            assert!(names_reserved(sql), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE app_wasmkeep_state (x)",
+            "x__wasmkeep_",
+            "é_wasmkeep_",
+            "$_wasmkeep_",
+        ] {
+            assert!(!names_reserved(sql), "{sql}");
+        }
     }
 }

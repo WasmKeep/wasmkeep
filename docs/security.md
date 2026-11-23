@@ -83,15 +83,35 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 - No `ATTACH`, `VACUUM`, extensions, `fts3_tokenizer`, or temporary
   tables, views, triggers or indexes (ordinary ones are allowed, but not on
   host tables); virtual tables limited to fts3/fts4/fts5/rtree;
-  pragmas from an allow-list; defensive mode; `trusted_schema=OFF`.
-- Host tables (`_wasmkeep_*`) invisible to guests.
+  pragmas from an allow-list; defensive mode; `trusted_schema=OFF`. Any
+  other authorizer action is refused.
+- Host tables (`_wasmkeep_*`) invisible to guests: a guest can neither read
+  nor write them, nor give a table, view, index or trigger such a name,
+  rename onto one, or declare a foreign key to a host table. Their names and
+  schema (not their rows) show in `sqlite_master`. Host statements run with
+  triggers and foreign key enforcement off, so they run nothing a guest
+  wrote.
 - 1 GB per database; 16 MiB per value and per query result. The result
   budget counts text/blob payloads after UTF-8 replacement, column names
   once, and conservative result/row/cell, allocation and vector-capacity
   overhead, including empty values ([details](concepts.md#storage)). A statement
-  is stopped at the event's wall clock.
+  is stopped at the event's wall clock and SQL CPU budget, checked every
+  10,000 steps of SQLite's virtual machine and inside `instr`, `replace`
+  and `trim`. Other steps on large values are slow too (a `LIKE` on a
+  16 MiB value takes about a second), so a statement built to repeat them
+  between two checks can still run past both. Host statements have the
+  same wall-clock limit.
+- SQLite limits on guest connections: 500 columns, 64 function arguments,
+  an expression depth of 256, 100 terms in a compound `SELECT`, 250,000
+  instructions per statement, 100 bytes per `LIKE` or `GLOB` pattern.
+  SQLite's heap is capped at 4 GiB for the whole process, temporary data
+  (sorts, materialised subqueries) included, as it stays in memory: a
+  statement that needs more fails with `quota-exceeded`. The cap is shared,
+  so while one statement holds most of it, others can fail too.
 - 256 MB of write-ahead log between two captures: past it, statements that
   write fail until the event ends (reads, commit and rollback still run).
+  Checked before a statement that writes and while it runs; one statement
+  can still pass it by what it writes between two checks.
   Capture reads the log frame by frame and holds only the newest version of
   each changed page, so rewriting the same rows costs no memory (a
   transaction touching many distinct pages still holds them all).

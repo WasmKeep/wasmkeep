@@ -153,6 +153,45 @@ fn what_was_committed_is_what_is_restored() {
     assert_eq!((v.as_str(), rows), ("changed", 21 + 6 - 8));
 }
 
+/// A checkpoint that cannot run (another connection still reads the WAL)
+/// does not cost the changes the capture already consumed: they are
+/// returned, and the checkpoint is left for a later capture.
+#[test]
+fn a_blocked_checkpoint_does_not_drop_captured_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open(dir.path());
+    let mut shipped = Shipped::start(&mut db);
+    exec(
+        &mut db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)",
+        &[],
+    );
+    // Past the checkpoint threshold, so the capture tries to checkpoint.
+    exec(&mut db, "INSERT INTO t (b) VALUES (zeroblob(5000000))", &[]);
+    let reader = rusqlite::Connection::open(db.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM t;")
+        .unwrap();
+    // The checkpoint waits for the reader (the busy timeout), then gives up.
+    let changes = db
+        .take_changes()
+        .expect("changes returned although the checkpoint was blocked")
+        .expect("the insert was captured");
+    shipped.ship(&changes);
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+
+    exec(&mut db, "INSERT INTO t (b) VALUES (x'01')", &[]);
+    assert!(shipped.capture(&mut db));
+    let source_sum = db.captured_checksum().unwrap();
+    let source = db.path().to_owned();
+    assert_eq!(db.snapshot().unwrap().post_apply, source_sum);
+    drop(db);
+    let restored = dir.path().join("restored.db");
+    assert_eq!(shipped.restore_to(&restored), source_sum);
+    assert_eq!(dump(&restored), dump(&source));
+}
+
 #[test]
 fn a_snapshot_with_changes_pending_hands_them_back() {
     let dir = tempfile::tempdir().unwrap();

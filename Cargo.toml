@@ -63,7 +63,7 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"]
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-rusqlite = { version = "=0.41.1", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "functions", "hooks", "limits"] }
 # Parses the WIT package to generate the API reference (tests only); already in the tree via wasmtime.
 wit-parser = { version = "=0.262.0", default-features = false, features = ["std"] }
 wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc"] }
