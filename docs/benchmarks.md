@@ -1770,7 +1770,71 @@ room's node 357-362 MB.
 - **4,500 clients met the target; 6,000 is the measured edge**, where
   delivery p99 passed 1 s and 12 publishes failed.
 - **The figures are with the room and its pusher apart.** Not measured:
-  the default placement (both on one node), a killed node, 10,000 clients.
+  the default placement (both on one node), a killed node, 10,000 clients
+  (0.8.0 places them apart by default: see [below](#a-big-room-on-three-nodes-080)).
+
+
+## A big room on three nodes, 0.8.0
+
+The same lobby on 0.8.0's release candidate (`28f83b9`), set up as for
+[0.7.0](#a-big-room-on-three-nodes-070): the default 50 ms CPU budget,
+three 4-vCPU nodes with a real bucket, one node per machine, two apps per
+process, writes batched for the room and the pusher, six generators of the
+[harness](#reconnecting-room-harness) (two per machine, each aimed at the
+other two nodes, so clients arrive through all three), 600 s join, 900 s
+hold with 17 stalled readers for 60 s, 300 s leave, and six closed-loop
+publishers offering 10 messages/s of 256 bytes in total. One fresh room
+per step. **Default placement, no `actor move`**: the room, its pusher and
+its edges went where 0.8.0 wakes them, checked with `actor where` during
+the join, early in the hold and near its end. The target, set before the
+run: delivery p99 under 1 s on every generator and at least 9.9 of the 10
+messages/s acknowledged, with no message lost or repeated.
+[Results](../bench/results/2026-11-23-28f83b9-room-group-ovh-bhs-3vps-r08-default-placement.json).
+
+During the 900 s hold (ranges across the six generators):
+
+| Clients | Ready | Delivery p50 | Delivery p99 | Publishes acknowledged/s | Unacknowledged after 30 s | Incomplete clients | Repeats | Target met |
+|---|---|---|---|---|---|---|---|---|
+| 4,500 | 4,500 | 130-149 ms | 894-978 ms | 9.95 | 0 | 0 | 0 | yes |
+| 6,000 | 6,000 | 151-186 ms | 0.99-1.04 s | 9.90 | 0 | 0 | 0 | no |
+| 10,000 (not valid) | 10,002 | 250-331 ms | 1.01-1.27 s | 9.97 | 0 | 0 | 0 | not counted |
+
+Where the actors were (`actor where`):
+
+| Clients | Room | Pusher | Edges per node (a / b / c) |
+|---|---|---|---|
+| 4,500 | a | c | 18 / 24 / 20 |
+| 4,500, after the rolling restart | b | c | 3 / 40 / 19 |
+| 6,000 | c | b | 29 / 22 / 14 |
+| 10,000 | a | b | 45 / 39 / 44 |
+
+The same layout early in the hold and near its end, in every step.
+
+No node trapped, and the stalled readers caught up (102 of 102) in every
+step. Every node's memory came back after the leave: the nodes held
+393-469 MB during the 4,500 hold, 400-621 MB at 6,000 and 786-877 MB at
+10,000, and 100-120 MB five minutes after the leave.
+
+### How to read it
+
+- **4,500 clients meet the target with no hand placement.** 0.7.0 needed
+  `actor move` for the same result. The margin is smaller: delivery p99
+  894-978 ms against 644-763 ms with the hand layout, as the room's node now
+  also runs about a third of the edges.
+- **The layout survives a rolling restart.** At 4,500 clients, after the
+  hold, each node was restarted in turn (the next only once the last was
+  serving again and one heartbeat later). The room moved to another node,
+  stayed apart from its pusher, and the edges stayed on all three nodes,
+  most of them on the room's new node. During the restarts delivery p99
+  rose to 18.8-33.5 s, 271 publishes failed and 2 went unacknowledged for
+  30 s; no client saw a gap or a repeat, and all 4,500 were back before
+  the leave.
+- **6,000 is still the edge**: delivery p99 0.99-1.04 s, just over the
+  target.
+- **10,000 is not counted**: the two generators on the room node's
+  machine were saturated for 14-16 % of the run, so the step is shown for
+  reference only (delivery p99 1.01-1.27 s, 9.97 messages/s).
+- Not measured: a killed node, the apart and spread rules on two nodes.
 
 
 ## Local room-memory recovery
