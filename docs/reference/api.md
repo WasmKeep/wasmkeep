@@ -292,9 +292,9 @@ A fully buffered request, delivered to the callee's
 | --- | --- |
 | `invalid-address(string)` | The address is not `class/name`, or the class does not exist. |
 | `reentrant` | The call would re-enter an actor already waiting in this call chain (including the caller itself), which would deadlock. |
-| `too-large` | The request or response exceeded the body limit (16 MB). |
+| `too-large` | The request or response exceeded the body limit (16 MB), or the request's headers their limit (96 headers, 62 KiB of path and headers as written on the wire). |
 | `timeout` | The callee did not answer by the caller's call deadline. |
-| `failed(string)` | The callee trapped, or the host could not deliver the call. |
+| `failed(string)` | The callee trapped, the host could not deliver the call, or the call chain would pass 16 actors. |
 
 ### `actor-address` (record)
 

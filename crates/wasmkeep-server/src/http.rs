@@ -198,6 +198,9 @@ impl App {
 }
 
 pub(crate) mod apps;
+#[cfg(test)]
+mod front_limits_tests;
+pub(crate) mod stall;
 
 /// The path and query a request arrived with, before routing rewrote it to
 /// what the actor sees; forwarding to another node uses it.
@@ -266,6 +269,61 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 /// Largest request body a component or actor receives (front door and
 /// forwarded requests alike); a larger one fails the guest's read.
 pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest client request head (request line and headers, as on the
+/// wire) a node takes, the size of the fields a guest may build
+/// ([`crate::MAX_GUEST_FIELDS_BYTES`]): a request a guest holds keeps
+/// about as much in host memory as fields it builds itself. Node headers
+/// (`x-wasmkeep-*`) are not counted (see [`HOP_RESERVE_BYTES`]). Over it:
+/// 431.
+pub(crate) const MAX_REQUEST_HEAD_BYTES: usize = crate::MAX_GUEST_FIELDS_BYTES;
+
+/// Most header fields a client request may carry, node headers aside.
+/// Over it: 431.
+pub(crate) const MAX_REQUEST_HEADERS: usize = 100;
+
+/// What a hop to another node adds to a request head (its signature,
+/// sender, admission, app, chain of callers, the `/actor/...` path): the
+/// parser takes this much more than [`MAX_REQUEST_HEAD_BYTES`] on both
+/// ports, since a node's hops reach the public port too unless plaintext
+/// hops are refused, and the service checks the client's part.
+const HOP_RESERVE_BYTES: usize = 24 * 1024;
+
+/// The header fields a hop may add, likewise (one per caller of a call's
+/// chain, which is capped at 16, and about ten more).
+const HOP_RESERVE_HEADERS: usize = 32;
+
+/// The client's part of `req`'s head, as the wire counts it: the request
+/// line and each header that is not a node's, name, value and 4 bytes of
+/// framing; and how many such headers.
+fn client_head<B>(req: &Request<B>) -> (usize, usize) {
+    let target = req.uri().path_and_query().map_or(1, |p| p.as_str().len())
+        + req.uri().authority().map_or(0, |a| a.as_str().len() + 8);
+    let line = req.method().as_str().len() + target + " HTTP/1.1\r\n ".len();
+    req.headers()
+        .iter()
+        .filter(|(n, _)| !n.as_str().starts_with("x-wasmkeep-"))
+        .fold((line, 0), |(bytes, count), (n, v)| {
+            (bytes + n.as_str().len() + v.len() + 4, count + 1)
+        })
+}
+
+/// 431, and the connection closed: the client's part of a head was over
+/// [`MAX_REQUEST_HEAD_BYTES`] or [`MAX_REQUEST_HEADERS`].
+fn head_too_large() -> Response<HyperOutgoingBody> {
+    let mut r = text_response(
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        "request header fields too large\n",
+    );
+    r.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    r
+}
+
+/// [`ServeLimits::write_idle_timeout`] by default.
+pub(crate) const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the rest of a request body is still read after its reader let
 /// go of it (see [`CappedBody`]).
@@ -431,6 +489,11 @@ pub struct ServeLimits {
     /// Time a client has to send a request's headers, also between
     /// requests on a kept-alive connection (slow clients, idle sockets).
     pub header_read_timeout: Duration,
+    /// Time a response write may wait with no byte taken by the client
+    /// (one that stopped reading) before the connection is closed. A
+    /// connection with nothing to write, or a slow reader that keeps
+    /// reading, is not affected; WebSockets included.
+    pub write_idle_timeout: Duration,
     /// Wall-clock limit for a front request, including streaming its
     /// response (ADR 0023).
     pub front_wall: Duration,
@@ -447,6 +510,7 @@ impl Default for ServeLimits {
         Self {
             max_connections: 10_000,
             header_read_timeout: Duration::from_secs(30),
+            write_idle_timeout: WRITE_IDLE_TIMEOUT,
             front_wall: Duration::from_secs(30),
             cluster_connections: crate::fds::CLUSTER_CONNECTIONS,
             front_reservations: None,
@@ -672,6 +736,7 @@ pub(crate) async fn serve_served(
             port,
             app.clone(),
             limits.header_read_timeout,
+            limits.write_idle_timeout,
             limits.cluster_connections,
             stop_rx.clone(),
         ))
@@ -717,6 +782,7 @@ pub(crate) async fn serve_served(
             tracing::debug!(%peer, error = %e, "set_nodelay failed");
         }
         let (app, stop, timeout) = (app.clone(), stop_rx.clone(), limits.header_read_timeout);
+        let stream = stall::WriteIdle::new(stream, limits.write_idle_timeout);
         connections.spawn(async move {
             let _slot = slot;
             serve_connection(stream, app, None, timeout, stop, peer).await;
@@ -772,6 +838,7 @@ async fn serve_cluster_port(
     port: ClusterPort,
     app: Served,
     header_read_timeout: Duration,
+    write_idle_timeout: Duration,
     max_connections: usize,
     stop: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -816,6 +883,7 @@ async fn serve_cluster_port(
             Arc::clone(&port.pins),
         );
         let handshake_timeout = port.handshake_timeout;
+        let stream = stall::WriteIdle::new(stream, write_idle_timeout);
         connections.spawn(async move {
             let _slot = slot;
             let tls = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
@@ -872,6 +940,10 @@ async fn serve_connection<I>(
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
+            let (bytes, count) = client_head(&req);
+            if bytes > MAX_REQUEST_HEAD_BYTES || count > MAX_REQUEST_HEADERS {
+                return Ok(head_too_large());
+            }
             req.extensions_mut().insert(PeerAddress(peer));
             let Some(cluster) = cluster else {
                 let response = match &app {
@@ -927,11 +999,15 @@ async fn serve_connection<I>(
             }))
         }
     });
+    // A hop carries the client's head and the node's own headers; the
+    // service checks the client's part.
     // `with_upgrades` hands WebSocket upgrades over to their own task.
     let conn = http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(header_read_timeout)
         .keep_alive(true)
+        .max_header_size(MAX_REQUEST_HEAD_BYTES + HOP_RESERVE_BYTES)
+        .max_headers(MAX_REQUEST_HEADERS + HOP_RESERVE_HEADERS)
         .serve_connection(TokioIo::new(io), service)
         .with_upgrades();
     let mut conn = std::pin::pin!(conn);
@@ -964,13 +1040,15 @@ fn not_live() -> Response<HyperOutgoingBody> {
 
 /// Serves `GET /metrics` (Prometheus text format) on its own listener,
 /// meant for a private address: the page names classes and counts. Up to
-/// 16 scrapers at once; until `shutdown`.
+/// 16 scrapers at once; until `shutdown`. A request must name the
+/// listener by IP address or `localhost` (or, off loopback, a
+/// single-label name), else 421; see `metrics_host_allowed`.
 pub async fn serve_metrics(
     listener: TcpListener,
     actors: Option<ActorService>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
-    serve_metrics_of(listener, Metered::One(actors), shutdown).await
+    serve_metrics_of(listener, Metered::One(actors), Arc::from([]), shutdown).await
 }
 
 /// What a metrics page is rendered from.
@@ -1008,12 +1086,81 @@ impl Metered {
     }
 }
 
+/// Time a scraper has to send its request's headers, also between
+/// requests on a kept-alive connection.
+const METRICS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time a metrics page write may wait for a scraper that stopped reading.
+const METRICS_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one metrics connection is served at most.
+const METRICS_CONNECTION_LIMIT: Duration = Duration::from_secs(60);
+
+/// Largest request head a scraper may send.
+const METRICS_HEAD_BYTES: usize = 16 * 1024;
+
+/// Whether a metrics request's one `Host` names this listener the way a
+/// scraper does:
+/// - an IP address (any: the listener may be bound to all addresses, or
+///   reached through a mapped port), `localhost` or a name under it;
+/// - one of `names`, the names configured for it (`--metrics-host`);
+/// - on a listener not bound to loopback, a single-label name (a container
+///   or host name resolved on the private network).
+///
+/// Any other name is refused: a web page could point a name of its own at
+/// this address and read the page from a browser. A loopback listener
+/// refuses single-label names too, since whoever answers for one on the
+/// network could point it at loopback. The port is not checked.
+fn metrics_host_allowed(
+    headers: &hyper::HeaderMap,
+    bound: std::net::IpAddr,
+    names: &[String],
+) -> bool {
+    let mut hosts = headers.get_all(hyper::header::HOST).iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return false;
+    };
+    let Some(authority) = host
+        .to_str()
+        .ok()
+        .filter(|h| !h.contains('@'))
+        .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
+    else {
+        return false;
+    };
+    let host = authority.host();
+    if host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        return true;
+    }
+    let name = metrics_host_name(host);
+    !name.is_empty()
+        && (name == "localhost"
+            || name.ends_with(".localhost")
+            || names.contains(&name)
+            || (!bound.is_loopback() && !name.contains('.')))
+}
+
+/// `host` as the metrics listener compares names: lowercase, with no
+/// trailing dot.
+pub(crate) fn metrics_host_name(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
 /// [`serve_metrics`] for what `metered` names.
 pub(crate) async fn serve_metrics_of(
     listener: TcpListener,
     metered: Metered,
+    names: Arc<[String]>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
+    let bound = listener.local_addr().map_err(Error::Io)?.ip();
+    let names: Arc<[String]> = names.iter().map(|n| metrics_host_name(n)).collect();
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut shutdown = std::pin::pin!(shutdown);
     // The page is served, so the scheduling probe runs for as long.
@@ -1037,13 +1184,19 @@ pub(crate) async fn serve_metrics_of(
             },
             () = &mut shutdown => return Ok(()),
         };
-        let metered = metered.clone();
+        let (metered, names) = (metered.clone(), Arc::clone(&names));
         let service = service_fn(move |req: Request<Incoming>| {
-            let metered = metered.clone();
+            let (metered, names) = (metered.clone(), Arc::clone(&names));
             async move {
                 let page = req.uri().path() == "/metrics"
                     && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
-                let response = if page {
+                let response = if !metrics_host_allowed(req.headers(), bound, &names) {
+                    text_response(
+                        StatusCode::MISDIRECTED_REQUEST,
+                        "scrape the metrics by IP address or localhost, or name the host with \
+                         --metrics-host\n",
+                    )
+                } else if page {
                     let body = metered.page();
                     let mut r = text_response(StatusCode::OK, &body);
                     r.headers_mut().insert(
@@ -1059,13 +1212,15 @@ pub(crate) async fn serve_metrics_of(
                 Ok::<_, std::convert::Infallible>(response)
             }
         });
+        let stream = stall::WriteIdle::new(stream, METRICS_WRITE_IDLE_TIMEOUT);
         tokio::spawn(async move {
             let _slot = slot;
             let conn = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
+                .header_read_timeout(METRICS_HEADER_READ_TIMEOUT)
+                .max_header_size(METRICS_HEAD_BYTES)
                 .serve_connection(TokioIo::new(stream), service);
-            let _ = tokio::time::timeout(Duration::from_secs(60), conn).await;
+            let _ = tokio::time::timeout(METRICS_CONNECTION_LIMIT, conn).await;
         });
     }
 }

@@ -1,5 +1,53 @@
 use super::*;
 
+/// A hop carries its chain as one header per caller, within the receiving
+/// port's reserve: a chain past [`MAX_CALL_CHAIN`] callers is refused.
+#[tokio::test]
+async fn a_call_past_the_chain_cap_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        wasmkeep_runtime::Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+    let service = ActorService::new(runtime, ActorConfig::new(dir.path()), vec![]).unwrap();
+    let address = |i: usize| ActorAddress::new("default", "a", format!("n{i}")).unwrap();
+    let request = || CallRequest {
+        method: "GET".into(),
+        path: "/".into(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    // The caller is the chain's last member: MAX_CALL_CHAIN callers in all.
+    let chain: Chain = (0..MAX_CALL_CHAIN - 1).map(address).collect();
+    let refused = Arc::clone(&service.inner)
+        .call(
+            &Caller::Actor(address(MAX_CALL_CHAIN)),
+            &chain,
+            address(MAX_CALL_CHAIN + 1),
+            request(),
+            Duration::from_secs(1),
+            &BodyBudget::one(),
+        )
+        .await;
+    assert!(
+        !matches!(refused, Err(CallError::Failed(ref m)) if m.contains("chain")),
+        "{refused:?}"
+    );
+    let chain: Chain = (0..MAX_CALL_CHAIN).map(address).collect();
+    let refused = Arc::clone(&service.inner)
+        .call(
+            &Caller::Actor(address(MAX_CALL_CHAIN)),
+            &chain,
+            address(MAX_CALL_CHAIN + 1),
+            request(),
+            Duration::from_secs(1),
+            &BodyBudget::one(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(CallError::Failed(ref m)) if m.contains("chain")),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn a_call_keeps_the_guests_headers_but_not_framing_or_upgrades() {
     let from = ActorAddress::new("default", "a", "x").unwrap();

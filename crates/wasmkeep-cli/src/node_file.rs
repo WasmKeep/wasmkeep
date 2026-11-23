@@ -40,6 +40,9 @@ pub(crate) struct Listen {
     pub(crate) cluster: Option<SocketAddr>,
     pub(crate) cluster_advertise: Option<String>,
     pub(crate) metrics: Option<SocketAddr>,
+    /// `metrics-hosts`: names the metrics page answers to besides IP
+    /// addresses and `localhost`, normalized.
+    pub(crate) metrics_hosts: Vec<String>,
 }
 
 /// `[limits]`.
@@ -102,6 +105,7 @@ const LISTEN: &[&str] = &[
     "cluster",
     "cluster-advertise",
     "metrics",
+    "metrics-hosts",
 ];
 const LIMITS: &[&str] = &["max-sockets-per-node"];
 const APP: &[&str] = &[
@@ -188,6 +192,20 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
         file.listen.public = addr("public")?;
         file.listen.cluster = addr("cluster")?;
         file.listen.metrics = addr("metrics")?;
+        for (host, span) in crate::project::strings(&src, t, "metrics-hosts", "[listen]")? {
+            let Some(normal) = hostname(&host) else {
+                return src.err(
+                    span,
+                    format!(
+                        "[listen] metrics-hosts: {host:?} is not a hostname (letters, digits \
+                         and '-' in dot-separated labels; no port, no scheme)"
+                    ),
+                );
+            };
+            if !file.listen.metrics_hosts.contains(&normal) {
+                file.listen.metrics_hosts.push(normal);
+            }
+        }
         if let Some((a, span)) = string_at(&src, t, "public-advertise", "[listen]")? {
             if !a.starts_with("http://") || a.len() == "http://".len() {
                 return src.err(
@@ -553,7 +571,7 @@ fn boolean(
 /// `host` normalized (lowercase, a trailing dot removed), if it is a
 /// hostname: dot-separated labels of 1 to 63 letters, digits and '-', not
 /// starting or ending with '-', 253 characters at most.
-fn hostname(host: &str) -> Option<String> {
+pub(crate) fn hostname(host: &str) -> Option<String> {
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     let ok = !host.is_empty()
         && host.len() <= 253
@@ -719,6 +737,7 @@ impl NodeFile {
                 cluster: args.cluster_listen,
                 cluster_advertise: args.cluster_advertise.clone(),
                 metrics: args.metrics_listen,
+                metrics_hosts: args.metrics_hosts.clone(),
             },
             limits: Limits {
                 max_sockets_per_node: args.max_sockets_per_node,
@@ -803,6 +822,7 @@ impl NodeFile {
         args.cluster_advertise
             .clone_from(&self.listen.cluster_advertise);
         args.metrics_listen = self.listen.metrics;
+        args.metrics_hosts.clone_from(&self.listen.metrics_hosts);
         args.max_sockets_per_node = self.limits.max_sockets_per_node;
         if let Some(dir) = self.data_dir_of(a) {
             args.data_dir = dir.to_path_buf();

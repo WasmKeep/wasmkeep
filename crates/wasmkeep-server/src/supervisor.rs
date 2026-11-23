@@ -32,6 +32,10 @@ pub struct Listeners {
     pub cluster: Option<TcpListener>,
     /// The metrics page, if asked for.
     pub metrics: Option<TcpListener>,
+    /// Names the metrics page answers to besides IP addresses and
+    /// `localhost` (`--metrics-host`): scrapers that name the node by a
+    /// dotted host name.
+    pub metrics_hosts: Vec<String>,
 }
 
 /// One start of an app runtime: the app, and the tasks that belong to that
@@ -110,10 +114,11 @@ impl Supervisor {
         F: Future<Output = ()> + Send + 'static,
     {
         if let Some(metrics) = listeners.metrics {
-            let actors = app.actors.clone();
+            let metered = crate::http::Metered::One(app.actors.clone());
+            let names = Arc::from(listeners.metrics_hosts);
             let stop = stop();
             tokio::spawn(async move {
-                let _ = crate::http::serve_metrics(metrics, actors, stop).await;
+                let _ = crate::http::serve_metrics_of(metrics, metered, names, stop).await;
             });
         }
         // A second process found running with this node id (both started
@@ -242,9 +247,10 @@ impl Supervisor {
             // One page for the process: app series carry their app's labels
             // (ADR 0038, section 9); the process's gauges sum the apps'.
             let metered = crate::http::Metered::Table(Arc::clone(&table));
+            let names = Arc::from(listeners.metrics_hosts);
             let stop = stop();
             tokio::spawn(async move {
-                let _ = crate::http::serve_metrics_of(metrics, metered, stop).await;
+                let _ = crate::http::serve_metrics_of(metrics, metered, names, stop).await;
             });
         }
         let shutdown = stop();

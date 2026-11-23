@@ -58,8 +58,10 @@ struct Reply {
 fn request(addr: SocketAddr, method: &str, path: &str) -> Option<Reply> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    // A loopback metrics listener answers IP addresses and localhost only.
+    let host = if path == "/metrics" { "localhost" } else { "t" };
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     s.write_all(req.as_bytes()).ok()?;
     let mut raw = String::new();

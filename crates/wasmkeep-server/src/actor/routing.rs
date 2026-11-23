@@ -227,6 +227,11 @@ impl ServiceInner {
         if me == Some(&target) || chain.contains(&target) {
             return Err(CallError::Reentrant);
         }
+        if chain.len() + usize::from(me.is_some()) > MAX_CALL_CHAIN {
+            return Err(CallError::Failed(format!(
+                "call chain deeper than {MAX_CALL_CHAIN} actors"
+            )));
+        }
         if request.body.len() > MAX_CALL_BODY {
             return Err(CallError::TooLarge);
         }
@@ -504,13 +509,25 @@ pub(super) use crate::cluster::HOP_BY_HOP;
 pub(super) const SIGNED_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Headers one call may carry. The callee gets them as its request's,
-/// which no `fields` size check covers, so a call is held to what a guest
-/// may build in one (`MAX_GUEST_FIELDS_BYTES`, counted here as the names'
-/// and values' bytes) and to this many entries.
-pub(super) const MAX_CALL_HEADERS: usize = 256;
+/// which no `fields` size check covers, so a call is held to a client's
+/// request head (`crate::http::MAX_REQUEST_HEADERS`), less room for the
+/// headers the host adds (`host`, the body's length).
+pub(super) const MAX_CALL_HEADERS: usize = crate::http::MAX_REQUEST_HEADERS - 4;
+
+/// Bytes of path and headers one call may carry, counted as on the wire
+/// (name, value and 4 bytes per header): a client's head cap
+/// (`crate::http::MAX_REQUEST_HEAD_BYTES`) less room for what the host
+/// adds (the `/actor/...` prefix of the path, `host`, the body's length).
+pub(super) const MAX_CALL_HEAD_BYTES: usize = crate::http::MAX_REQUEST_HEAD_BYTES - 2 * 1024;
+
+/// Callers a call's chain may hold, the caller included: a hop to another
+/// node carries one header per caller, within the receiving port's
+/// reserve for the hop's own headers.
+pub(super) const MAX_CALL_CHAIN: usize = 16;
 
 /// `request` as the callee gets it. Refused with `TooLarge` past
-/// [`MAX_CALL_HEADERS`] headers or `MAX_GUEST_FIELDS_BYTES` of them.
+/// [`MAX_CALL_HEADERS`] headers or [`MAX_CALL_HEAD_BYTES`] of path and
+/// headers.
 pub(super) fn build_request(
     from: &Caller,
     to: &ActorAddress,
@@ -519,12 +536,14 @@ pub(super) fn build_request(
     if !request.path.starts_with('/') {
         return Err(CallError::Failed("path must start with /".into()));
     }
-    let header_bytes = request
+    let head_bytes = request
         .headers
         .iter()
-        .try_fold(0usize, |sum, (n, v)| sum.checked_add(n.len() + v.len()));
+        .try_fold(request.path.len(), |sum, (n, v)| {
+            sum.checked_add(n.len() + v.len() + 4)
+        });
     if request.headers.len() > MAX_CALL_HEADERS
-        || header_bytes.is_none_or(|n| n > crate::MAX_GUEST_FIELDS_BYTES)
+        || head_bytes.is_none_or(|n| n > MAX_CALL_HEAD_BYTES)
     {
         return Err(CallError::TooLarge);
     }

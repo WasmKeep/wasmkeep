@@ -21,6 +21,24 @@ limits below are enforced by the code (each has a test), not aspirations.
 
 **Front door** (`crates/wasmkeep-server/src/http.rs`)
 - 30 s to send request headers, and idle limit between kept-alive requests.
+- Request heads: 64 KiB, counted as on the wire (request line, and each
+  header's name, value and 4 bytes of framing), and 100 header fields;
+  over either, 431. That is about the guest field cap below, which counts
+  a few dozen bytes more per entry. Node headers (`x-wasmkeep-*`) are not
+  counted, but both ports read at most 24 KiB and 32 fields of them on top,
+  the room a hop to another node needs (a node's hops reach the public
+  port too unless `--cluster-plaintext refuse`). So a guest holds at most
+  88 KiB and 132 fields of a request's head, node headers it ignores
+  included.
+- A response write that waits 60 s with no byte taken by the client (one
+  that stopped reading) closes the connection. Only a waiting write counts:
+  kept-alive connections and idle WebSockets are not cut. A TCP socket
+  reports room to write only once about a third of its send buffer is
+  free, so once the 60 s pass the waiting bytes are offered to it: a
+  reader that took anything in that time takes them and is kept. A reader
+  that takes nothing for 60 s (its receive window closed) is cut, however
+  slowly it read before. There is no per-address connection cap: behind a
+  proxy or load balancer every client shares its address.
 - 10,000 connections per node (`--max-connections`); more wait in the
   kernel backlog. Accept errors back off instead of spinning.
 - Request bodies: 16 MB (413 when declared larger; a failed read past it).
@@ -71,15 +89,16 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   actor's instance is replaced by a fresh one at its next event. A
   response to an outbound request fails past 64 KiB of head (status line
   and headers), and its body past 64 KiB of trailers. An `actors.call`
-  carries at most 256 headers and 64 KiB of names and values (else
-  `too-large`). A body a guest writes queues at most 64 KiB in the host
+  carries at most 96 headers and 62 KiB of path and headers as written on
+  the wire (else `too-large`), so that it fits a client's head cap on
+  another node with what the host adds, and a chain of at most 16 callers
+  (else `failed`). A body a guest writes queues at most 64 KiB in the host
   until it is sent (writes of at most 32 KiB at a time). So a guest that
   fills its table with requests it never sends, each with full headers
   and a full queue, holds about 512 MiB per instance (4,096 × 128 KiB)
   in the worst case. A request it was sent carries the headers its client
-  sent, bounded by the HTTP parser (100 headers in about 400 KiB); one
-  that keeps those requests instead of dropping them holds up to that
-  each.
+  sent, bounded by the front door (see above); one that keeps those
+  requests instead of dropping them holds up to that each.
 - Outbound HTTP: public addresses only (the host resolves, checks and
   connects to the checked address; TLS verified against the name);
   `--allow-outbound` and `--outbound-ca` open specific internal services.
