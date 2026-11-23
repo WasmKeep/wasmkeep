@@ -1,0 +1,468 @@
+{
+  "schema": "room-group-summary-1",
+  "date": "2026-11-23",
+  "commit": "28f83b9",
+  "binary": "0.7.0+28f83b95fb85",
+  "hardware": "three VPS (4 vCPU, 7.7 GB) in one region, each running one node with two apps and two generators aimed at the other two nodes, so clients arrive through all three nodes",
+  "cpu_budget_ms": 50,
+  "payload_bytes": 256,
+  "publish_rate_total_per_s": 10,
+  "publishers": 6,
+  "publishers_closed_loop": true,
+  "writes": "batched for the room and the pusher",
+  "placement": "default: no actor move; the room and its pusher kept apart at wake-up, edges spread over the live nodes",
+  "profile": "per generator: 50 clients, join to N/6 over 600 s, hold 900 s (17 stalled readers at 700 s for 60 s), leave to N/30 over 300 s, hold 60 s. The 4,500 step adds a second hold of 420 s after the first, during which the three nodes were restarted one at a time",
+  "target": "during the 900 s hold (phase 2-hold): delivery p99 at most 1 s on every generator, at least 9.9 of the 10 offered messages/s acknowledged, no message lost or repeated",
+  "note": "one fresh room per step, 4,500 first. 4,500 meets the target. 6,000 misses delivery p99 narrowly. At 10,000 two generators (on the machine of the room node) were saturated, so that step is not valid and is shown for reference only. Rolling restart at 4,500: each node restarted once, the next only after the previous reported serving and one heartbeat period passed",
+  "not_shown": "a killed node, two nodes, a valid 10,000-client step",
+  "cells": [
+    {
+      "clients": 4500,
+      "generators": 6,
+      "generators_valid": true,
+      "target_met": true,
+      "placement": "default placement, no actor move. actor where 42 s into the hold and 34 s before its end: room on node a, pusher on node c, edges 18 on a, 24 on b, 20 on c. After the rolling restart (phase 3-hold): room on node b, pusher on node c, edges 3 on a, 40 on b, 19 on c",
+      "publish_failures_by_status": {
+        "503": 88,
+        "network": 186
+      },
+      "unacknowledged_after_30s": 2,
+      "incomplete_clients": 0,
+      "repeats": 0,
+      "void_numbers": 0,
+      "stalled_readers_caught_up": "102/102",
+      "phases": {
+        "1-join": {
+          "seconds": 600,
+          "ready_at_end": 4500,
+          "delivery_p50_ms_range": [
+            119,
+            157
+          ],
+          "delivery_p95_ms_range": [
+            1725,
+            1831
+          ],
+          "delivery_p99_ms_range": [
+            2922,
+            3228
+          ],
+          "published_ok_per_s": 9.96,
+          "delivered_per_client_per_s": 5.29,
+          "reconnect_attempts": 5363,
+          "close_4801": 3750,
+          "close_4802": 0,
+          "publish_failed": 3,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "2-hold": {
+          "seconds": 900,
+          "ready_at_end": 4500,
+          "delivery_p50_ms_range": [
+            130,
+            149
+          ],
+          "delivery_p95_ms_range": [
+            523,
+            577
+          ],
+          "delivery_p99_ms_range": [
+            894,
+            978
+          ],
+          "published_ok_per_s": 9.95,
+          "delivered_per_client_per_s": 9.95,
+          "reconnect_attempts": 102,
+          "close_4801": 0,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "ack_p50_ms_range": [
+            16,
+            34
+          ],
+          "ack_p99_ms_range": [
+            607,
+            719
+          ],
+          "acknowledged_per_s": 9.95
+        },
+        "3-hold": {
+          "seconds": 420,
+          "ready_at_end": 4500,
+          "delivery_p50_ms_range": [
+            180,
+            229
+          ],
+          "delivery_p95_ms_range": [
+            2836,
+            6414
+          ],
+          "delivery_p99_ms_range": [
+            18786,
+            33456
+          ],
+          "published_ok_per_s": 9.16,
+          "delivered_per_client_per_s": 9.17,
+          "reconnect_attempts": 43486,
+          "close_4801": 2338,
+          "close_4802": 0,
+          "publish_failed": 271,
+          "publish_unacknowledged": 2,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "4-leave": {
+          "seconds": 300,
+          "ready_at_end": 865,
+          "delivery_p50_ms_range": [
+            238,
+            266
+          ],
+          "delivery_p95_ms_range": [
+            1577,
+            1609
+          ],
+          "delivery_p99_ms_range": [
+            2234,
+            2468
+          ],
+          "published_ok_per_s": 9.99,
+          "delivered_per_client_per_s": 31.11,
+          "reconnect_attempts": 1676,
+          "close_4801": 1715,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "5-hold": {
+          "seconds": 60,
+          "ready_at_end": 900,
+          "delivery_p50_ms_range": [
+            55,
+            101
+          ],
+          "delivery_p95_ms_range": [
+            373,
+            441
+          ],
+          "delivery_p99_ms_range": [
+            704,
+            903
+          ],
+          "published_ok_per_s": 9.98,
+          "delivered_per_client_per_s": 9.98,
+          "reconnect_attempts": 50,
+          "close_4801": 20,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        }
+      },
+      "nodes": {
+        "a_room": "144 MB before the join, 393-408 MB (hold), 103 MB 5 min after the leave",
+        "b": "134 MB before the join, 460-469 MB (hold), 112 MB 5 min after the leave",
+        "c_pusher": "150 MB before the join, 436-446 MB (hold), 103 MB 5 min after the leave",
+        "traps": "0 (no failed event, no CPU-budget trap, on any node)"
+      },
+      "unacknowledged_in_hold": 0,
+      "counted": true,
+      "rolling_restart": {
+        "phase": "3-hold",
+        "order": "b, c, a",
+        "note": "each node restarted once; the next only after the previous answered ready and reported serving, then one heartbeat period (3 s) plus margin; restart to serving 28 s, 53 s and 34 s. The 2 unacknowledged publishes and 271 failed publishes of the run fall in this phase; no client saw a gap or a repeat"
+      }
+    },
+    {
+      "clients": 6000,
+      "generators": 6,
+      "generators_valid": true,
+      "target_met": false,
+      "placement": "default placement, no actor move. actor where 42 s into the hold and 49 s before its end: room on node c, pusher on node b, edges 29 on a, 22 on b, 14 on c",
+      "publish_failures_by_status": {
+        "network": 1
+      },
+      "unacknowledged_after_30s": 0,
+      "incomplete_clients": 0,
+      "repeats": 0,
+      "void_numbers": 0,
+      "stalled_readers_caught_up": "102/102",
+      "phases": {
+        "1-join": {
+          "seconds": 600,
+          "ready_at_end": 6000,
+          "delivery_p50_ms_range": [
+            163,
+            243
+          ],
+          "delivery_p95_ms_range": [
+            2168,
+            2302
+          ],
+          "delivery_p99_ms_range": [
+            3711,
+            3939
+          ],
+          "published_ok_per_s": 9.97,
+          "delivered_per_client_per_s": 5.22,
+          "reconnect_attempts": 5708,
+          "close_4801": 4084,
+          "close_4802": 0,
+          "publish_failed": 1,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "2-hold": {
+          "seconds": 900,
+          "ready_at_end": 6000,
+          "delivery_p50_ms_range": [
+            151,
+            186
+          ],
+          "delivery_p95_ms_range": [
+            572,
+            595
+          ],
+          "delivery_p99_ms_range": [
+            988,
+            1038
+          ],
+          "published_ok_per_s": 9.9,
+          "delivered_per_client_per_s": 9.91,
+          "reconnect_attempts": 102,
+          "close_4801": 0,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "ack_p50_ms_range": [
+            14,
+            54
+          ],
+          "ack_p99_ms_range": [
+            638,
+            843
+          ],
+          "acknowledged_per_s": 9.9
+        },
+        "3-leave": {
+          "seconds": 300,
+          "ready_at_end": 1171,
+          "delivery_p50_ms_range": [
+            184,
+            231
+          ],
+          "delivery_p95_ms_range": [
+            1205,
+            1292
+          ],
+          "delivery_p99_ms_range": [
+            1708,
+            1924
+          ],
+          "published_ok_per_s": 9.99,
+          "delivered_per_client_per_s": 30.64,
+          "reconnect_attempts": 1543,
+          "close_4801": 1573,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "4-hold": {
+          "seconds": 60,
+          "ready_at_end": 1200,
+          "delivery_p50_ms_range": [
+            61,
+            81
+          ],
+          "delivery_p95_ms_range": [
+            544,
+            638
+          ],
+          "delivery_p99_ms_range": [
+            1038,
+            1531
+          ],
+          "published_ok_per_s": 10.0,
+          "delivered_per_client_per_s": 10.02,
+          "reconnect_attempts": 155,
+          "close_4801": 133,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        }
+      },
+      "nodes": {
+        "a": "91 MB before the join, 614-621 MB (hold), 101 MB 5 min after the leave",
+        "b_pusher": "121 MB before the join, 533-540 MB (hold), 111 MB 5 min after the leave",
+        "c_room": "120 MB before the join, 400-410 MB (hold), 107 MB 5 min after the leave",
+        "traps": "0 (no failed event, no CPU-budget trap, on any node)"
+      },
+      "unacknowledged_in_hold": 0,
+      "counted": true
+    },
+    {
+      "clients": 10002,
+      "generators": 6,
+      "generators_valid": false,
+      "target_met": false,
+      "placement": "default placement, no actor move. actor where 26 s into the hold and 40 s before its end: room on node a, pusher on node b, edges 45 on a, 39 on b, 44 on c",
+      "publish_failures_by_status": {
+        "network": 13,
+        "503": 1
+      },
+      "unacknowledged_after_30s": 0,
+      "incomplete_clients": 0,
+      "repeats": 0,
+      "void_numbers": 0,
+      "stalled_readers_caught_up": "102/102",
+      "phases": {
+        "1-join": {
+          "seconds": 600,
+          "ready_at_end": 9911,
+          "delivery_p50_ms_range": [
+            650,
+            697
+          ],
+          "delivery_p95_ms_range": [
+            2492,
+            2672
+          ],
+          "delivery_p99_ms_range": [
+            4952,
+            5749
+          ],
+          "published_ok_per_s": 9.84,
+          "delivered_per_client_per_s": 5.0,
+          "reconnect_attempts": 16795,
+          "close_4801": 8105,
+          "close_4802": 0,
+          "publish_failed": 13,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "2-hold": {
+          "seconds": 900,
+          "ready_at_end": 10002,
+          "delivery_p50_ms_range": [
+            250,
+            331
+          ],
+          "delivery_p95_ms_range": [
+            619,
+            726
+          ],
+          "delivery_p99_ms_range": [
+            1008,
+            1267
+          ],
+          "published_ok_per_s": 9.97,
+          "delivered_per_client_per_s": 9.97,
+          "reconnect_attempts": 465,
+          "close_4801": 253,
+          "close_4802": 0,
+          "publish_failed": 1,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0,
+          "ack_p50_ms_range": [
+            43,
+            93
+          ],
+          "ack_p99_ms_range": [
+            538,
+            638
+          ],
+          "acknowledged_per_s": 9.97
+        },
+        "3-leave": {
+          "seconds": 300,
+          "ready_at_end": 1989,
+          "delivery_p50_ms_range": [
+            315,
+            424
+          ],
+          "delivery_p95_ms_range": [
+            1486,
+            1641
+          ],
+          "delivery_p99_ms_range": [
+            2568,
+            2726
+          ],
+          "published_ok_per_s": 9.97,
+          "delivered_per_client_per_s": 30.05,
+          "reconnect_attempts": 2563,
+          "close_4801": 2586,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        },
+        "4-hold": {
+          "seconds": 60,
+          "ready_at_end": 1989,
+          "delivery_p50_ms_range": [
+            222,
+            258
+          ],
+          "delivery_p95_ms_range": [
+            877,
+            921
+          ],
+          "delivery_p99_ms_range": [
+            1102,
+            1625
+          ],
+          "published_ok_per_s": 10.0,
+          "delivered_per_client_per_s": 9.39,
+          "reconnect_attempts": 1377,
+          "close_4801": 1371,
+          "close_4802": 0,
+          "publish_failed": 0,
+          "publish_unacknowledged": 0,
+          "repeats": 0,
+          "void_numbers": 0,
+          "resets": 0
+        }
+      },
+      "nodes": {
+        "a_room": "90 MB before the join, 863-877 MB (hold), 120 MB 5 min after the leave",
+        "b_pusher": "93 MB before the join, 786-797 MB (hold), 110 MB 5 min after the leave",
+        "c": "120 MB before the join, 824-832 MB (hold), 100 MB 5 min after the leave",
+        "traps": "0 (no failed event, no CPU-budget trap, on any node)"
+      },
+      "unacknowledged_in_hold": 0,
+      "counted": false,
+      "note": "not valid: the two generators on the room node machine were saturated (event-loop delay or CPU) in 14-16 % of samples; shown for reference"
+    }
+  ]
+}
