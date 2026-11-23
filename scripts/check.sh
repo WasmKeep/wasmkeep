@@ -177,9 +177,10 @@ if $full || $rust; then
     # is bounded at half the budget in fuel and runs in every run; its
     # StarlingMonkey variant still runs here with the others.
     # The two TypeScript fanout tests also remain ignored because their
-    # in-test node build is load-sensitive.
+    # in-test node build is load-sensitive. A 500-socket wake on
+    # StarlingMonkey is speed-sensitive; its QuickJS variant runs always.
     cargo nextest run -p wasmkeep-server --test big_room --test room_edge --locked --run-ignored only \
-      -E '(binary(big_room) & (test(/^typescript_big_room_distinct_positions_at_default_budget(_starlingmonkey)?$/) | test(=typescript_big_room_full_window_at_default_budget_starlingmonkey))) | (binary(room_edge) & test(/^fanout_500_(quickjs|starlingmonkey)_default_budget$/))' "${threads[@]}"
+      -E '(binary(big_room) & (test(/^typescript_big_room_distinct_positions_at_default_budget(_starlingmonkey)?$/) | test(=typescript_big_room_full_window_at_default_budget_starlingmonkey))) | (binary(room_edge) & (test(/^fanout_500_(quickjs|starlingmonkey)_default_budget$/) | test(=wake_500_starlingmonkey_default_budget)))' "${threads[@]}"
   else
     # The cluster suite over TLS repeats the cluster suite on another
     # transport: --full only.

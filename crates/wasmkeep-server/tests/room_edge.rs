@@ -542,3 +542,186 @@ async fn room_edge_quiet_wake_delivers_one_publish_and_answers_ping() {
     let _ = stop.send(());
     let _ = server.await;
 }
+// ADR 0040, sections 5 and 13: a quiet room whose room, pusher and edge all
+// hibernated. The pusher kept where its edge stood when it went idle, so
+// the one publish that wakes everything reaches every socket live, in an
+// m frame of the new epoch: no ready, no history fetch by any client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn room_edge_full_hibernation_pushes_one_publish_with_no_history_fetch() {
+    let wasm = guests::build_guest("../wasmkeep-sdk/tests/room-edge-guest", "room_edge_guest");
+    let runtime = Runtime::new(&RuntimeConfig {
+        max_instances: 8,
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    let component = guests::compile(&runtime, &wasm);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ActorConfig::new(dir.path());
+    config.mailbox.idle_timeout = Duration::from_millis(300);
+    let svc = ActorService::new(
+        runtime,
+        config,
+        vec![
+            ("t".into(), component.clone(), wasm.clone()),
+            ("pusher".into(), component.clone(), wasm.clone()),
+            ("edge".into(), component, wasm),
+        ],
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(wasmkeep_server::serve(listener, svc.clone(), async {
+        let _ = stopped.await;
+    }));
+    let warm = request(addr, "/actor/t/driver/r3-start").await;
+    assert!(warm.starts_with("HTTP/1.1 200"), "{warm}");
+    let mut clients = vec![];
+    for c in ["one", "two", "three"] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/actor/edge/e/?c={c}&p=0000000000000000"
+        ))
+        .await
+        .unwrap();
+        let ready = json_frame(&mut ws, "ready").await;
+        assert_eq!(ready["t"], "ready");
+        let last = (ready["e"].as_u64().unwrap(), ready["n"].as_u64().unwrap());
+        clients.push((ws, last));
+    }
+    // Room, pusher and edge hibernate; the sockets stay open.
+    hibernated(&svc).await;
+    let published = request(addr, "/actor/t/driver/r3-publish").await;
+    assert!(published.starts_with("HTTP/1.1 200"), "{published}");
+    let at = body_of(&published);
+    let (e, n) = at.trim().split_once('.').unwrap();
+    let target: (u64, u64) = (e.parse().unwrap(), n.parse().unwrap());
+    assert!(target.0 > clients[0].1.0, "the wake opened an epoch");
+    for (ws, last) in &mut clients {
+        let f = json_frame(ws, "the published message").await;
+        // The first frame after the wake is the message, live: an m frame
+        // of the new epoch whose base is the client's own position (rule 2:
+        // nothing void), right after it (rule 3: no gap).
+        assert_eq!(f["t"], "m", "{f} after {last:?}");
+        assert_eq!(f["e"].as_u64(), Some(target.0), "{f}");
+        assert_eq!(f["b"].as_u64(), Some(last.1), "{f}");
+        assert_eq!(f["n"].as_u64(), Some(last.1 + 1), "{f}");
+        assert_eq!(f["m"].as_array().unwrap().len(), 1, "{f}");
+        *last = target;
+    }
+    for (mut ws, _) in clients {
+        ws.close(None).await.unwrap();
+    }
+    let _ = stop.send(());
+    let _ = server.await;
+}
+
+/// The guest for an engine: the Rust room-edge guest, or a TypeScript one.
+fn engine_guest(engine: &str, ts: &str) -> Vec<u8> {
+    if engine == "rust" {
+        return guests::build_guest("../wasmkeep-sdk/tests/room-edge-guest", "room_edge_guest");
+    }
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("edge.wasm");
+    assert!(
+        std::process::Command::new("node")
+            .current_dir(root)
+            .args([
+                "sdks/typescript/bin/wasmkeep-ts.mjs",
+                "build",
+                ts,
+                "--engine",
+                engine,
+                "-o"
+            ])
+            .arg(&output)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::read(output).unwrap()
+}
+// ADR 0040, section 5: one edge woken from hibernation by a push, holding
+// 500 sockets and no cursors. Each wake, header-only (500 ready frames)
+// and carrying a message (500 m frames), stays within the default 50 ms
+// event CPU budget: no trap, and every event under the fanout ceilings.
+async fn wake_budget(engine: &str) {
+    // nextest runs engines in separate processes; keep loopback sockets <=500.
+    let lock = std::fs::File::create(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fanout-test.lock"),
+    )
+    .unwrap();
+    lock.lock().unwrap();
+    let wasm = engine_guest(
+        engine,
+        "crates/wasmkeep-server/tests/guests/room-fanout/wake.ts",
+    );
+    let runtime_config = RuntimeConfig {
+        measure_fuel: true,
+        ..RuntimeConfig::default()
+    };
+    assert_eq!(runtime_config.cpu_budget, Duration::from_millis(50));
+    let runtime = Runtime::new(&runtime_config).unwrap();
+    let component = guests::compile(&runtime, &wasm);
+    let data = tempfile::tempdir().unwrap();
+    let mut config = ActorConfig::new(data.path());
+    config.mailbox.idle_timeout = Duration::from_millis(500);
+    let service =
+        ActorService::new(runtime, config, vec![("wake".into(), component, wasm)]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(wasmkeep_server::serve(listener, service.clone(), async {
+        let _ = stopped.await;
+    }));
+    let mut sockets = Vec::new();
+    for _ in 0..500 {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/actor/wake/e/"))
+            .await
+            .unwrap();
+        let ready = json_frame(&mut ws, "ready").await;
+        assert_eq!(ready["t"], "ready");
+        sockets.push(ws);
+    }
+    for kind in ["header", "messages"] {
+        // Every cursor is gone; the 500 sockets stay.
+        hibernated(&service).await;
+        let response = request(addr, &format!("/actor/wake/e/{kind}")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{engine}: {response}");
+        let ack: serde_json::Value = serde_json::from_str(&body_of(&response)).unwrap();
+        assert_eq!(ack["sockets"], 500, "{engine} {kind}: {ack}");
+        for ws in &mut sockets {
+            let f = json_frame(ws, kind).await;
+            if kind == "header" {
+                assert_eq!(
+                    (&f["t"], &f["b"], &f["n"]),
+                    (&"ready".into(), &0.into(), &512.into()),
+                    "{f}"
+                );
+            } else {
+                assert_eq!((&f["t"], &f["n"]), (&"m".into(), &513.into()), "{f}");
+            }
+        }
+    }
+    drop(sockets);
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+    fuel::assert_ceiling(match engine {
+        "rust" => 10_000_000,
+        "quickjs" => 250_000_000,
+        _ => 500_000_000,
+    });
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wake_500_rust_default_budget() {
+    wake_budget("rust").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wake_500_quickjs_default_budget() {
+    wake_budget("quickjs").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "speed-sensitive: a slow CI runner's CPU can trap on the real 50 ms budget; scripts/check.sh --full runs it"]
+async fn wake_500_starlingmonkey_default_budget() {
+    wake_budget("starlingmonkey").await;
+}

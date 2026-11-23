@@ -385,6 +385,31 @@ when a header-only push said 375 stayed at 373 until the next publish.
 A socket that joined the woken edge before that push already had its
 `ready` with `n: null` and gets no second one.
 
+(Amended 2026-11-23.) "First push" means the first since the instance
+started, whatever head it already has:
+
+- A client that joined the woken edge before that push was told
+  `n: null` and checks its position over HTTP. The push no longer sends
+  it `behind`, which made it fetch a second time: it starts, with no
+  frame, where the push starts, and the push's messages follow it live.
+- A head the edge took from a stored configuration (`init`, `range` or
+  `drain` before any push, with nothing buffered) no longer places the
+  sockets it kept at that head in silence. The first push places them as
+  above: at `first - 1` when it carries messages (the edge starts there,
+  below the stored head if need be, since it has nothing buffered), and,
+  header-only, at the edge's head, announced by a `ready` with `b`.
+  Clients that joined after the stored head resumed from it and keep
+  their cursor.
+- A first push with the `recover` flag starts the edge at its head, and
+  announces it the same way. A socket found gone when told is forgotten.
+
+A wake stays at one frame per socket. Shared vectors
+(`wake-vectors.txt`) cover each case in both SDKs, and
+`room_edge.rs`'s `wake_500_*` tests wake an edge holding 500 sockets,
+header-only and with a message: under 5 M fuel in Rust, 100 M on QuickJS and 250 M on
+StarlingMonkey (whose test runs in `--full`), under the 500 M the 50 ms
+budget is calibrated for.
+
 **Open.** The front's hand-off path is the root with the query
 `?c=<client id>&p=<point, 16 hex digits>&e=<epoch>&n=<number>`, the
 position absent for a new client; an edge trusts it because its class is
@@ -843,10 +868,45 @@ by its own recorded steps. What it loses is memory: positions,
 suspects and lag retries. Its first round is header-only, and the
 answers rebuild the positions, as a 0.6.0 room's cold start did.
 
+(Amended 2026-11-23.) It keeps one position. When it goes idle with
+every child initialized and acknowledged at the head its idle pull
+confirmed, the pusher writes that head to its own SQLite
+(`wasmkeep_pusher_idle`, a plain write), and it deletes it when a round
+leaves it busy: at most one write each way per burst of publishes, none
+while it stays idle. A cold start reads it and gives it to every child
+that has no position, so its first round pulls from there. In a quiet
+room whose room, pusher and edges all hibernated, the publish that wakes
+them is then pushed, not announced: each edge's sockets get it in an `m`
+frame of the new epoch whose base is the clients' position (rule 2:
+nothing void; rule 3: no gap), and no client fetches history. Before,
+the first round was header-only, each woken edge told its sockets the
+new head with a `ready`, and every client of the room fetched that one
+message over HTTP at once.
+
+- A child that is elsewhere answers its own position, as after any push:
+  one above drops the repeats; one below (a lost delete after a crash
+  mid-burst) gets a hole and sends `behind`, as a child below the window
+  does.
+- A position the room refuses (`invalid position`) is dropped and those
+  children start with none, the header-only round. So does a missing
+  table, a failed read or a lost write.
+- Not the room's base: a cold room's new epoch starts at the last number
+  published, not the last delivered, and a pusher that was busy when the
+  room restarted would push past an edge's position (a `behind` where
+  the old round caught it up). Nor a jittered or conditional fetch:
+  either still makes every client of the room ask for the same message.
+- No wire or pull-contract change: a pull at a position is 0.7's, and a
+  0.7 pusher simply has no position to read.
+
+`room_edge_full_hibernation_pushes_one_publish_with_no_history_fetch`
+(Rust) and `room-round.test.ts` (TypeScript) test it; `room-model.test.ts`
+restarts its pusher from the kept position among its faults.
+
 **Write mode (amended 2026-11-20).** Deploy the pusher with batched
 writes ([ADR 0034](0034-batched-plain-writes.md)). Its per-round write is
 its alarm; everything that must survive a crash is committed durably;
-child positions are never stored. Strict, a busy pusher spent most of its
+child positions are never stored, but for the idle position above, a
+plain write a crash may lose. Strict, a busy pusher spent most of its
 time on the replication of its own alarm moves: each one, and its alarm
 index entry, a bucket round trip before its next round. Batched loses
 nothing that matters:
@@ -855,7 +915,8 @@ nothing that matters:
   committed with `exec-durable`, which waits for the acknowledged head
   in a batched class too (the other migration writes land in those same
   transactions);
-- positions are rebuilt from the edges' answers (above);
+- positions are rebuilt from the edges' answers (above); a lost idle
+  position leaves the header-only first round;
 - an edge drops numbers it already has, and the client's rule 1 drops
   repeats, so a round repeated after a lost alarm move delivers nothing
   twice to the application;

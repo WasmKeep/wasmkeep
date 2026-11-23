@@ -4,10 +4,16 @@
 #   sockets IDS            host sockets that outlived the hibernation
 #   open ID [E N]          a client joins, with its position if it has one
 #   ping ID                that client's ping
+#   stored E N             the head of a configuration init, range or drain
+#                          stored (an edge that knows no head takes it)
+#   gone ID                sends to that socket answer gone from now on;
+#                          the host lists it no more after this event
 #   push E B FIRST HEAD K [OE OB OK]
 #                          a push of K messages numbered from FIRST; the
 #                          first OK of them keep their identity in epoch OE
 #                          of base OB (retained from an older epoch)
+#   recover E B HEAD       a header-only push with the recover flag
+#   count S                the edge's last answer counted S sockets
 # Each event is followed by every frame it sent, in order, one per line:
 #   ID ready E N | ID ready E B N | ID ready E null | ID m E B N COUNT
 #   ID behind E N | ID pong E N | ID pong null
@@ -56,13 +62,74 @@ push 1 0 5 5 1
 1 m 1 0 5 1
 
 # A client that joined the woken edge before its first push already got a
-# ready with no position.
-sockets 1
-open 2 1 3
-2 ready 0 null
+# ready with no position and is fetching its own: the push's messages
+# follow it live, not a behind that would make it fetch again.
+sockets 2
+open 1 1 3
+1 ready 0 null
 push 1 0 5 5 1
 1 m 1 0 5 1
-2 behind 1 5
+2 m 1 0 5 1
+
+# The same, the first push header-only: the kept socket is told where the
+# stream starts, the client that joined is not told twice.
+sockets 2
+open 1 1 3
+1 ready 0 null
+push 1 0 6 5 0
+2 ready 1 0 5
+push 1 0 6 6 1
+1 m 1 0 6 1
+2 m 1 0 6 1
+
+# A stored head (init, range or drain before the first push): a header-only
+# push still tells each kept socket where the stream starts, at that head.
+sockets 1
+stored 1 3
+push 1 0 6 5 0
+1 ready 1 0 3
+count 1
+push 1 0 4 5 2
+1 m 1 0 4 2
+
+# A stored head above the first push's messages: nothing is buffered, so
+# the edge starts where the push does. A client resumed at the stored head
+# gets what follows it; the kept socket gets the whole push.
+sockets 2
+stored 1 4
+open 1 1 4
+1 ready 1 4
+push 1 0 3 5 3
+1 m 1 0 5 1
+2 m 1 0 3 3
+
+# A stored head below the first push (a hole), a client that joined before
+# it: both start where the push does, no behind.
+sockets 2
+open 1 1 3
+1 ready 0 null
+stored 1 2
+ping 1
+1 pong 1 2
+push 1 0 5 5 1
+1 m 1 0 5 1
+2 m 1 0 5 1
+
+# A recover flag on the first push: the edge starts at the head, and says so.
+sockets 1
+recover 2 3 7
+1 ready 2 3 7
+push 2 3 8 8 1
+1 m 2 3 8 1
+
+# A kept socket that is gone when told: no cursor, not counted, no close.
+sockets 1,2
+gone 1
+push 1 0 6 5 0
+2 ready 1 0 5
+count 1
+push 1 0 6 6 1
+2 m 1 0 6 1
 
 # The second push is not a wake: no announcement.
 sockets 1

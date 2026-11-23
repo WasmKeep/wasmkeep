@@ -3,6 +3,7 @@
  * internal class beside the room's define(). It pulls from the room and
  * pushes to relays and edges; the room never calls it. */
 import * as alarms from "wasmkeep:actor/alarms@0.2.0";
+import * as storage from "wasmkeep:actor/storage@0.2.0";
 import * as actors from "wasmkeep:actor/actors@0.2.0";
 import { call } from "./call";
 import { Round, type RoundResult, type Source } from "./broadcast-round";
@@ -101,20 +102,77 @@ export const SAFETY_ROUND = 5000;
  * (a node death, a failed call) is delivered by then even if nothing
  * else ever comes. An empty group keeps none (ADR 0040, section 13). */
 export const IDLE_ROUND = 60000;
+/** Where every child stood when this pusher last went idle: kept in its
+ * own SQLite (a plain write, at most one per burst), so a cold start can
+ * give it to its children (ADR 0040, section 13). Best effort: a missing
+ * table or a failed read is no position, a header-only first push. */
+function storedIdle(): Position | undefined {
+    try {
+        const r = storage.query("SELECT e,n FROM wasmkeep_pusher_idle WHERE id=1", []).values[0];
+        if (r?.[0]?.tag === "integer" && r[1]?.tag === "integer" && r[0].val >= 0n && r[1].val >= 0n)
+            return { e: r[0].val, n: r[1].val };
+    }
+    catch {
+        // No table yet: no position.
+    }
+    return undefined;
+}
+/** Stores or clears the idle position when it changes. A failed write is
+ * ignored: it only leaves the next cold start without a position. */
+function keepIdle(kept: { at?: Position | null }, p: Position | undefined) {
+    const same = (a?: Position | null, b?: Position) => a === undefined ? false : (a === null ? b === undefined : b !== undefined && a.e === b.e && a.n === b.n);
+    if (same(kept.at, p))
+        return;
+    try {
+        if (p) {
+            storage.exec("CREATE TABLE IF NOT EXISTS wasmkeep_pusher_idle(id INTEGER PRIMARY KEY CHECK(id=1),e INTEGER NOT NULL,n INTEGER NOT NULL)", []);
+            storage.exec("INSERT INTO wasmkeep_pusher_idle(id,e,n) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET e=excluded.e,n=excluded.n", [{ tag: "integer", val: p.e }, { tag: "integer", val: p.n }]);
+        }
+        else {
+            try {
+                storage.exec("DELETE FROM wasmkeep_pusher_idle", []);
+            }
+            catch {
+                // No table yet: nothing to clear.
+            }
+        }
+        kept.at = p ?? null;
+    }
+    catch {
+        // Best effort.
+    }
+}
 /** After a round whose next alarm is not 20 ms away, the pusher tells the
  * room it stops clocking itself: the room then asks publishers' fronts to
  * poke it. A head that moved meanwhile keeps the 20 ms clock instead. */
-function idle(source: Source, result: RoundResult, now: number, safe: { head?: Position }, idleMs: number) {
+function idle(source: Source, result: RoundResult, now: number, safe: { head?: Position }, idleMs: number, kept: { at?: Position | null }) {
     const { delivered: at, next, occupied } = result;
-    if (next !== undefined && next <= now + 20)
+    if (next !== undefined && next <= now + 20) {
+        // Busy: a cold start must not believe the children still there.
+        keepIdle(kept, undefined);
         return;
+    }
     const later = (t: number) => next === undefined || next > t;
     const keep = (delay: number) => {
         if (later(now + delay))
             alarms.setAlarm(BigInt(now + delay));
     };
+    let h: Pull;
     try {
-        const h = source.pull(at, 0, true, now);
+        h = source.pull(at, 0, true, now);
+    }
+    catch {
+        keepIdle(kept, undefined);
+        // The room is unreachable: it cannot ask for a poke, so keep a clock.
+        if (later(now + 1000))
+            alarms.setAlarm(BigInt(now + 1000));
+        return;
+    }
+    // Idle with every child acknowledged at the head: where a cold start
+    // puts them. Anything else clears it.
+    const s = result.settled;
+    keepIdle(kept, s && at && s.e === h.e && s.n === h.head && at.e === s.e && at.n === s.n ? s : undefined);
+    {
         if (at && (h.e !== at.e || h.head !== at.n))
             keep(20);
         else if (at && (safe.head?.e !== at.e || safe.head?.n !== at.n)) {
@@ -124,11 +182,6 @@ function idle(source: Source, result: RoundResult, now: number, safe: { head?: P
         else if (occupied)
             keep(idleMs);
     }
-    catch {
-        // The room is unreachable: it cannot ask for a poke, so keep a clock.
-        if (later(now + 1000))
-            alarms.setAlarm(BigInt(now + 1000));
-    }
 }
 export function definePusher(options: PusherOptions = {}): ActorDefinition {
     if (options.scaling && options.edges?.length)
@@ -136,6 +189,8 @@ export function definePusher(options: PusherOptions = {}): ActorDefinition {
     const round = new Round(options.edges ?? []);
     let scale: ScaleHost | undefined, source: Pulled | undefined, lastRound: number | undefined;
     const safe: { head?: Position } = {};
+    // The idle position as stored: undefined until this instance read it.
+    const kept: { at?: Position | null } = {};
     const room = () => {
         if (!source) {
             const a = actors.selfAddress();
@@ -154,8 +209,14 @@ export function definePusher(options: PusherOptions = {}): ActorDefinition {
             const s = scaler();
             if (s && !s.migrate(room(), now))
                 return;
+            if (kept.at === undefined) {
+                const p = storedIdle();
+                kept.at = p ?? null;
+                if (p)
+                    round.wakeAt(p);
+            }
             const result = s ? s.run(round, room(), now) : round.run(room(), now);
-            idle(room(), result, now, safe, options.idleMs ?? IDLE_ROUND);
+            idle(room(), result, now, safe, options.idleMs ?? IDLE_ROUND, kept);
         },
         fetch(req: ActorRequest): ActorResponse {
             if (!header(req.headers, "x-wasmkeep-caller"))

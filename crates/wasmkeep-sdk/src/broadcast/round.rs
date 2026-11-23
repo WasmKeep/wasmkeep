@@ -8,6 +8,12 @@ pub struct Round {
     relay_suspects: std::collections::BTreeMap<String, Suspect>,
     /// The child the last round deferred first: the next round starts there.
     resume: Option<String>,
+    /// Where every child stood when this pusher last went idle, read back
+    /// after a cold start: the first run gives it to the children that have
+    /// no position ([`Round::wake_at`]).
+    wake: Option<Position>,
+    /// The position the first run gave, until a pull refuses it.
+    seeded: Option<Position>,
 }
 #[derive(Debug)]
 struct Child {
@@ -117,6 +123,8 @@ impl Round {
             relays: vec![],
             relay_suspects: Default::default(),
             resume: None,
+            wake: None,
+            seeded: None,
             children: addresses
                 .iter()
                 .map(|address| Child {
@@ -131,11 +139,27 @@ impl Round {
                 .collect(),
         })
     }
+    /// After a cold start: where every child stood when this pusher last
+    /// went idle (ADR 0040, section 13). The next run gives it to each child
+    /// that has no position, so a quiet room's first publish after a full
+    /// hibernation is pushed to the edges, not announced as a header every
+    /// client would then fetch over HTTP. A child that was elsewhere answers
+    /// its own position, as after any push.
+    pub fn wake_at(&mut self, p: Position) {
+        self.wake = Some(p);
+    }
     /// One round over `source` (the room's pull through [`Pulled`], or a
     /// local [`Core`]). Sets the next alarm when one is due and answers it,
     /// with the lowest head a pushed child was given, for the pusher's idle
     /// pull (ADR 0040, section 13).
     pub fn run(&mut self, source: &mut impl Source, now: u64) -> Result<RoundResult, String> {
+        if let Some(p) = self.wake.take() {
+            for c in self.children.iter_mut().filter(|c| c.position.is_none()) {
+                c.position = Some(p);
+            }
+            self.seeded = Some(p);
+        }
+        let mut refused = false;
         let mut indices = vec![];
         let mut heads: Vec<Option<(u64, u64)>> = vec![];
         let mut requests = vec![];
@@ -286,6 +310,14 @@ impl Round {
                                 // Not durable yet (confirm): the upload's retry is 50 ms.
                                 if e.contains("not durable") {
                                     retry = 50;
+                                }
+                                // A position read back that the room no longer
+                                // accepts: those children start with none.
+                                if e.contains("invalid position")
+                                    && self.seeded.is_some()
+                                    && child.position == self.seeded
+                                {
+                                    refused = true;
                                 }
                                 None
                             }
@@ -503,14 +535,29 @@ impl Round {
         if let Some(at) = next {
             crate::alarms::set_alarm(at);
         }
+        if refused {
+            let seeded = self.seeded.take();
+            for c in self.children.iter_mut().filter(|c| c.position == seeded) {
+                c.position = None;
+            }
+        }
         let occupied = self
             .children
             .iter()
             .any(|c| c.sockets.is_none_or(|n| n > 0));
+        // Every child initialized and acknowledged at one position: where an
+        // idle pusher may say they all stand.
+        let first = self.children.first().and_then(|c| c.position);
+        let settled = first.filter(|p| {
+            self.children
+                .iter()
+                .all(|c| c.initialized && c.position == Some(*p))
+        });
         Ok(RoundResult {
             next,
             delivered,
             occupied,
+            settled,
         })
     }
 }
@@ -546,6 +593,9 @@ pub struct RoundResult {
     pub delivered: Option<Position>,
     /// Some child holds sockets, or did not say: an idle pusher keeps an alarm.
     pub occupied: bool,
+    /// Every child is initialized and acknowledged this one position: an
+    /// idle pusher keeps it, for its next cold start ([`Round::wake_at`]).
+    pub settled: Option<Position>,
 }
 /// Distinct positions one round pulls at most: the rest are deferred to
 /// the next round, so laggards at many positions never make one round a

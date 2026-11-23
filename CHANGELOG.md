@@ -55,6 +55,33 @@ not suspect it. `--no-placement` turns the spread off
 New metric `wasmkeep_placement_spread_total{outcome}`. Nothing to
 deploy or configure.
 
+**A quiet room's first publish after a full hibernation is pushed, not
+fetched by every client.** A pusher that woke with no positions pushed a
+header alone, every woken edge told its sockets the new head with a
+`ready`, and every client of the room fetched that one message over HTTP
+at once. The pusher now keeps where every child stood when it last went
+idle with all of them at the head (a plain write to its own SQLite, at
+most one per burst, deleted while busy), and a cold start pulls from
+there: the edges' sockets get the message in an `m` frame and no client
+fetches. A position the room refuses, or none kept, gives the header
+alone, as before
+([ADR 0040, section 13](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20)).
+In both SDKs' edges
+([section 5](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#5-the-edge)),
+a client that joined a woken edge before its first push no longer gets a
+`behind` after its `ready` with `n: null`, so it fetches history once,
+not twice; and a head stored by `init`, `range` or `drain` before the
+first push no longer places the sockets the edge kept at that head
+without telling them: the first push places and announces them as it
+does on a headless edge. Shared vectors (`wake-vectors.txt`) cover these
+cases, `recover` as the first push and a socket gone when told. A wake of
+an edge holding 500 sockets stays under the 50 ms CPU budget in Rust and
+QuickJS (`wake_500_*`, StarlingMonkey in `--full`).
+
+Upgrading: nothing changes on the wire, for clients, edges or the
+room's `pull`; deploy the classes together as usual. A 0.7 pusher keeps
+no position, so its first round stays header-only.
+
 ### Act on these when you upgrade
 
 These change what a node accepts or does at start, or what an actor or a

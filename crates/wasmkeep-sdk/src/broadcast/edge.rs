@@ -163,11 +163,27 @@ struct Cursor {
     n: u64,
     lagging: bool,
     stalled: bool,
+    /// Opened before the edge knew a head: told `n: null`, the client
+    /// checks its position over HTTP. A head, stored or pushed, places it.
+    unplaced: bool,
+}
+impl Cursor {
+    fn at(n: u64) -> Self {
+        Self {
+            n,
+            lagging: false,
+            stalled: false,
+            unplaced: false,
+        }
+    }
 }
 #[derive(Debug, Default)]
 pub struct Edge {
     pub head: Option<Position>,
     pub floor: u64,
+    /// A push came since this instance started. A head before it is a
+    /// stored one (`init`, `range`, `drain`), with nothing buffered.
+    pushed: bool,
     pub(super) buffer: VecDeque<Buffered>,
     size: usize,
     cursors: BTreeMap<u64, Cursor>,
@@ -245,9 +261,8 @@ impl Edge {
         self.cursors.insert(
             id,
             Cursor {
-                n,
-                lagging: false,
-                stalled: false,
+                unplaced: self.head.is_none(),
+                ..Cursor::at(n)
             },
         );
         let ready = if self.head.is_none() || (position.is_some() && !resume) {
@@ -272,14 +287,59 @@ impl Edge {
         self.cursors.remove(&id);
         self.points.remove(&id);
     }
+    /// The head of a stored configuration (`init`, `range`, `drain`), on an
+    /// edge that knows none: clients that open now resume from it. Sockets
+    /// kept through a hibernation, and those that opened before it (told
+    /// `n: null`), are left to the first push, which places them where the
+    /// stream it carries starts.
+    pub fn stored(&mut self, h: Position) {
+        if self.head.is_none() {
+            self.head = Some(h);
+            self.floor = h.n;
+        }
+    }
+    /// Sockets with no cursor start at the head once a push has come;
+    /// before it, the first push places them ([`Edge::receive`]).
     pub fn adopt(&mut self, ids: &[u64]) {
-        if let Some(h) = self.head {
+        if let Some(h) = self.head.filter(|_| self.pushed) {
             for id in ids {
-                self.cursors.entry(*id).or_insert(Cursor {
-                    n: h.n,
-                    lagging: false,
-                    stalled: false,
-                });
+                self.cursors.entry(*id).or_insert(Cursor::at(h.n));
+            }
+        }
+    }
+    /// The first push's placement, at `h` (the head it starts from: before
+    /// its messages, or the head of a header-only one). Sockets opened before
+    /// any head are fetching their position over HTTP: live frames follow
+    /// from there. Sockets kept through a hibernation start there too; with
+    /// no messages to show it, each is told with one `ready` carrying `b`.
+    fn place(&mut self, p: &Push, h: Position, kept: &[u64], io: &mut impl SocketIo) {
+        for c in self.cursors.values_mut().filter(|c| c.unplaced) {
+            *c = Cursor::at(h.n);
+        }
+        if !p.messages.is_empty() {
+            // Its frames carry each message's own position (and epoch):
+            // rules 2 and 3 apply, one frame per socket.
+            for id in kept {
+                self.cursors.insert(*id, Cursor::at(h.n));
+            }
+            return;
+        }
+        let ready = format!(
+            "{{\"t\":\"ready\",\"e\":{},\"b\":{},\"n\":{}}}",
+            h.e, p.base, h.n
+        );
+        for id in kept {
+            match io.send(*id, &ready) {
+                SendResult::Ok => {
+                    self.cursors.insert(*id, Cursor::at(h.n));
+                }
+                // Like a `behind` that cannot be queued: the client would
+                // never learn where it stands.
+                SendResult::Backpressure => {
+                    io.close(*id, 4802);
+                    self.slow += 1;
+                }
+                SendResult::Gone => {}
             }
         }
     }
@@ -296,64 +356,35 @@ impl Edge {
     }
     /// A push from the room or a relay, `ids` the host's sockets.
     ///
-    /// The first push after a wake from hibernation (no head, sockets with
-    /// no cursor) places those sockets at `first - 1`, so the messages it
-    /// carries go out, their frames saying where they stand. A header-only
-    /// one has nothing to send, so it tells each socket that position with
-    /// a `ready` carrying `b`: a client whose own position is lower fetches
-    /// the rest over HTTP, one that missed nothing makes no request
-    /// (ADR 0040, section 5).
+    /// The first push since this instance started (after a wake from
+    /// hibernation, sockets with no cursor) places those sockets at
+    /// `first - 1`, so the messages it carries go out, their frames saying
+    /// where they stand. A header-only one has nothing to send, so it tells
+    /// each of them the edge's head with a `ready` carrying `b`: a client
+    /// whose own position is lower fetches the rest over HTTP, one that
+    /// missed nothing makes no request (ADR 0040, section 5). A head stored
+    /// by `init`, `range` or `drain` before it does not change this.
     pub fn receive(&mut self, p: &Push, ids: &[u64], io: &mut impl SocketIo) -> Ack {
-        if self.head.is_some() {
+        if self.pushed {
             self.adopt(ids);
-        } else if !p.messages.is_empty() {
-            // Its frames carry each message's own position (and epoch):
-            // rules 2 and 3 apply, one frame per socket.
-            let n = p.first.saturating_sub(1);
-            for id in ids {
-                self.cursors.entry(*id).or_insert(Cursor {
-                    n,
-                    lagging: false,
-                    stalled: false,
-                });
-            }
-        } else {
-            let n = p.first.saturating_sub(1);
-            let ready = format!(
-                "{{\"t\":\"ready\",\"e\":{},\"b\":{},\"n\":{n}}}",
-                p.e, p.base
-            );
-            for id in ids {
-                if self.cursors.contains_key(id) {
-                    continue;
-                }
-                match io.send(*id, &ready) {
-                    SendResult::Ok => {
-                        self.cursors.insert(
-                            *id,
-                            Cursor {
-                                n,
-                                lagging: false,
-                                stalled: false,
-                            },
-                        );
-                    }
-                    // Like a `behind` that cannot be queued: the client
-                    // would never learn where it stands.
-                    SendResult::Backpressure => {
-                        io.close(*id, 4802);
-                        self.slow += 1;
-                    }
-                    SendResult::Gone => {}
-                }
-            }
+            return self.push(p, io);
         }
-        self.push(p, io)
+        let kept: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.cursors.contains_key(id))
+            .collect();
+        self.take(p, &kept, io)
     }
     pub fn push(&mut self, p: &Push, io: &mut impl SocketIo) -> Ack {
+        self.take(p, &[], io)
+    }
+    /// A push; on the first one, `kept` are the sockets to place.
+    fn take(&mut self, p: &Push, kept: &[u64], io: &mut impl SocketIo) -> Ack {
         if self.head.is_some_and(|h| p.e < h.e) {
             return self.answer();
         }
+        let first_push = !std::mem::replace(&mut self.pushed, true);
         let mut h = self.head.unwrap_or(Position {
             e: p.e,
             n: if p.messages.is_empty() {
@@ -383,11 +414,20 @@ impl Edge {
             self.floor = p.head;
             h.n = p.head;
         }
+        // A stored head has nothing buffered: the first push may start
+        // below it, so its messages reach the sockets it places.
+        if first_push && self.buffer.is_empty() && !p.messages.is_empty() && p.first <= h.n {
+            h.n = p.first - 1;
+            self.floor = h.n;
+        }
         if !p.messages.is_empty() && p.first > h.n.saturating_add(1) {
             self.buffer.clear();
             self.size = 0;
             self.floor = p.first - 1;
             h.n = self.floor;
+        }
+        if first_push {
+            self.place(p, h, kept, io);
         }
         for (i, item) in p.messages.iter().enumerate() {
             let n = p.first + i as u64;
@@ -429,7 +469,11 @@ impl Edge {
         let Some(head) = self.head else { return };
         let mut groups: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         for id in ids {
-            if let Some(c) = self.cursors.get(&id).filter(|c| c.n < head.n) {
+            if let Some(c) = self
+                .cursors
+                .get(&id)
+                .filter(|c| c.n < head.n && !c.unplaced)
+            {
                 groups.entry(c.n).or_default().push(id);
             }
         }
