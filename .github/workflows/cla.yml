@@ -10,11 +10,19 @@ on:
   pull_request_target:
     types: [opened, closed, synchronize]
 
+# What the action's code calls (v2.6.1 at the pinned commit): the Actions API
+# to re-run the check once a contributor signs (actions: write), the contents
+# API to write signatures/cla.json on the cla-signatures branch (contents:
+# write), and the pull request and comment APIs to read the PR, comment and
+# lock it after the merge (pull-requests: write). It sets no commit status
+# (the check is the workflow run itself), so `statuses` is not granted. This
+# is the pull_request_target token of the base repository: the action reads
+# the pull request through the API and checks no code of it out, and nothing
+# here may add a checkout step.
 permissions:
   actions: write
   contents: write
   pull-requests: write
-  statuses: write
 
 jobs:
   cla:

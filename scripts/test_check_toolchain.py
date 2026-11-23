@@ -8,7 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FILES = ('deploy/toolchain/Dockerfile', 'deploy/Dockerfile', '.github/workflows/ci.yml',
-         '.github/workflows/release.yml')
+         '.github/workflows/release.yml', 'scripts/requirements/languages.txt')
 
 
 class Toolchain(unittest.TestCase):
@@ -35,7 +35,7 @@ class Toolchain(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_pin_moved_in_ci_only_fails(self):
-        self.edit('.github/workflows/ci.yml', 'componentize-py==', 'componentize-py==9')
+        self.edit('scripts/requirements/languages.txt', 'componentize-py==', 'componentize-py==9')
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
         self.assertIn('COMPONENTIZE_PY_VERSION', result.stderr)
@@ -51,7 +51,7 @@ class Toolchain(unittest.TestCase):
         self.assertIn('TINYGO_VERSION is 0.40.0 in deploy/toolchain/Dockerfile, 0.39.0 in release.yml', result.stderr)
 
     def test_a_pin_missing_from_the_release_fails(self):
-        self.edit('.github/workflows/release.yml', 'componentize-py==', 'componentize-py>=')
+        self.edit('.github/workflows/release.yml', 'requirements/languages.txt', 'requirements/other.txt')
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
         self.assertIn('COMPONENTIZE_PY_VERSION', result.stderr)

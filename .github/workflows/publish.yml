@@ -150,7 +150,7 @@ jobs:
           node-version: 24
       - name: the Python wheel and source archive
         run: |
-          pip install build==1.6.1 twine==7.0.0
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/packaging.txt
           python -m build --outdir "$RUNNER_TEMP/pypi" sdks/python
           twine check --strict "$RUNNER_TEMP"/pypi/*
           ls "$RUNNER_TEMP/pypi"

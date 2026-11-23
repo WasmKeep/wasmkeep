@@ -60,6 +60,11 @@ registry.
 - **A registry refused, or an approval was rejected or ran out**: use
   "Re-run failed jobs" on the run, or run the workflow by hand on the tag
   (Run workflow, with the tag as the ref). It publishes the same files.
+- **Running `release.yml` by hand** (a dry run, or again on a tag) works
+  from a `v<version>` tag or from `main` only: the workflow signs and pushes
+  images with its own identity, so it refuses any other ref. The signed
+  files also get a GitHub build provenance attestation:
+  `gh attestation verify <file> --repo WasmKeep/wasmkeep`.
 - **`publish.yml` itself is wrong at the tag**: it cannot be fixed for
   that tag, since a run always uses the tag's own copy. Publish what is
   missing by hand from a checkout of the tag (`cargo publish`,
@@ -111,3 +116,13 @@ settings matter.
 
 `publish.yml` keeps its file name and its jobs stay in it: a renamed or
 reusable workflow would be refused by the registries.
+
+## Pinned tools
+
+Nothing a release builds with is fetched unchecked: `rustup-init`
+(`scripts/build-portable.sh`), TinyGo, LDC and the WASI adapter
+(`scripts/componentize-core.sh`) are pinned by version and SHA-256, and the
+Python tools CI and the workflows install come from
+`scripts/requirements/*.txt`, installed with `--require-hashes`. To move a
+Python pin, edit the `.in` beside it and run
+`uv pip compile --universal --generate-hashes --python-version 3.12 --no-header X.in -o X.txt`.

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.29.0@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 #
 # The toolchain image: `wasmkeep` and the build tools of every Recommended
 # and Supported SDK, at the versions CI builds the examples with, so a

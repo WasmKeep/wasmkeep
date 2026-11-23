@@ -204,6 +204,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+      # The examples are workspaces of their own, with lockfiles of their
+      # own that the check above does not read: the same policy on each
+      # (about ten seconds in all).
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny on the examples' lockfiles
+        run: |
+          for lock in examples/*/Cargo.lock examples/*/*/Cargo.lock; do
+            dir=$(dirname "$lock")
+            echo "::group::$dir"
+            cargo deny --locked --manifest-path "$dir/Cargo.toml" --config deny.toml check
+            echo "::endgroup::"
+          done
 
   clippy:
     name: clippy
@@ -407,7 +421,7 @@ jobs:
           tool: cargo-nextest
       - name: start the S3 server
         run: |
-          pip install --quiet "moto[server]==5.2.5"
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/moto.txt
           moto_server -p 5055 > moto.log 2>&1 &
           for _ in $(seq 1 30); do
             curl -sf -o /dev/null http://127.0.0.1:5055/moto-api/ && break
@@ -504,6 +518,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             sdks/python/pyproject.toml
+            scripts/requirements/*.txt
             .github/workflows/ci.yml
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
@@ -512,7 +527,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld wasi-libc libclang-rt-18-dev-wasm32
-          pip install ziglang==0.17.1 componentize-py==0.25.1
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/languages.txt
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.7"
@@ -521,13 +536,18 @@ jobs:
             examples/go-*/go.sum
       - name: toolchains (Go)
         run: |
-          curl -sSL https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          # Checked by the SHA-256 deploy/toolchain/Dockerfile pins.
+          curl -sSfL -o "$RUNNER_TEMP/tinygo.tar.gz" https://github.com/tinygo-org/tinygo/releases/download/v0.39.0/tinygo0.39.0.linux-amd64.tar.gz
+          echo "a119801579ef0a7a4f3ee285f0caf55241eaa9e115154c2028b696770b47a846  $RUNNER_TEMP/tinygo.tar.gz" | sha256sum -c
+          tar xzf "$RUNNER_TEMP/tinygo.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
           go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: toolchains (D)
         run: |
-          curl -sSL https://github.com/ldc-developers/ldc/releases/download/v1.43.0/ldc2-1.43.0-linux-x86_64.tar.xz | tar xJ -C "$RUNNER_TEMP"
+          curl -sSfL -o "$RUNNER_TEMP/ldc.tar.xz" https://github.com/ldc-developers/ldc/releases/download/v1.43.0/ldc2-1.43.0-linux-x86_64.tar.xz
+          echo "35805db60f47fd1a162b2035da84d96beec37e6d1e7b1edf60498a90acfaedce  $RUNNER_TEMP/ldc.tar.xz" | sha256sum -c
+          tar xJf "$RUNNER_TEMP/ldc.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/ldc2-1.43.0-linux-x86_64/bin" >> "$GITHUB_PATH"
       - name: toolchains (MoonBit)
         # Pinned by its moonc version (dated versions are not served) and
@@ -608,7 +628,7 @@ jobs:
         run: |
           sdks/python/test/run.sh
           diff -r crates/wasmkeep-wit/wit sdks/python/wasmkeep/wit
-          pip install build==1.6.1 twine==7.0.0
+          pip install --require-hashes --only-binary=:all: -r scripts/requirements/packaging.txt
           sdks/python/scripts/package.sh "$RUNNER_TEMP/python-package"
           cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language

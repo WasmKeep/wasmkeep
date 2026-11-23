@@ -7,7 +7,8 @@ deploy/Dockerfile's. A pin missing on either side fails too, so moving one
 in ci.yml without the image (or the other way round) is caught here.
 .github/workflows/release.yml builds the counter of every language the
 image is for (the release's counter-<lang>.wasm) and must pin the same
-versions too.
+versions too. The Python tools (componentize-py, ziglang) are pinned with
+hashes in scripts/requirements/languages.txt, which both workflows install.
 
     python3 -I scripts/check-toolchain.py [ROOT]
 """
@@ -40,6 +41,14 @@ def check(root):
     server = args((root / 'deploy/Dockerfile').read_text())
     ci = (root / '.github/workflows/ci.yml').read_text()
     release = (root / '.github/workflows/release.yml').read_text()
+    # The Python tools are installed from a hashed requirements file: its
+    # pins count for a workflow that installs it.
+    req_path = 'scripts/requirements/languages.txt'
+    req = (root / req_path).read_text()
+    if req_path in ci:
+        ci += req
+    if req_path in release:
+        release += req
     errors = []
     for arg, pattern in PINS.items():
         found = sorted(set(re.findall(pattern, release)))

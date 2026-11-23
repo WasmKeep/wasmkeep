@@ -32,10 +32,11 @@ jobs:
     steps:
       - name: the ref is a release tag
         run: |
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "not a release tag: $TAG" >&2; exit 1 ;;
-          esac
+          # vX.Y.Z, or vX.Y.Z-pre.1: nothing after the digits but a
+          # pre-release suffix (a glob like v[0-9]*.[0-9]*.[0-9]* took
+          # v1.2.3 followed by anything, or a path-like name).
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "not a release tag: $TAG" >&2; exit 1; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ env.TAG }}
