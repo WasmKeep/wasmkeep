@@ -39,3 +39,15 @@ test("a response stream the caller closed ends the write quietly; other failures
     assert.equal(logged.length, 2);
     assert(logged.every(m => m.includes('"tag":"closed"')), logged.join("\n"));
 });
+import { describeStreamError } from "../src/stream-error";
+test("a broken stream's error is released once described", () => {
+    let dropped = 0;
+    const error = { toDebugString: () => "connection reset", [Symbol.dispose]() { dropped += 1; } };
+    assert.equal(describeStreamError(new ComponentError({ tag: "last-operation-failed", val: error })), "connection reset");
+    assert.equal(dropped, 1);
+    // With its HTTP error code, when the host gives one.
+    const coded = describeStreamError(new ComponentError({ tag: "last-operation-failed", val: error }), () => ({ tag: "connection-terminated" }));
+    assert.equal(coded, "connection-terminated");
+    assert.equal(dropped, 2);
+    assert.equal(describeStreamError(new ComponentError({ tag: "closed" })), "closed");
+});

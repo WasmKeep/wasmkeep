@@ -25,6 +25,15 @@ static void set_error(const char *kind, const uint8_t *msg, size_t len) {
 const char *wk_error(void) { return error_message; }
 const char *wk_error_kind(void) { return error_kind; }
 
+/* Frees a stream error, and drops the error handle a broken stream gives
+ * (the generated free does not), or the host keeps it. */
+static void release_stream_error(wasi_io_streams_stream_error_t *err) {
+  if (err->tag == WASI_IO_STREAMS_STREAM_ERROR_LAST_OPERATION_FAILED) {
+    wasi_io_error_error_drop_own(err->val.last_operation_failed);
+  }
+  wasi_io_streams_stream_error_free(err);
+}
+
 /* ------------------------------------------------------------- storage */
 
 static actor_string_t str(const char *s) {
@@ -350,7 +359,7 @@ wk_bytes wk_request_body(wk_request *req) {
           wasi_io_streams_stream_error_t err;
           if (!wasi_io_streams_method_input_stream_blocking_read(wasi_io_streams_borrow_input_stream(stream), 65536,
                                                                  &chunk, &err)) {
-            wasi_io_streams_stream_error_free(&err);
+            release_stream_error(&err);
             break; /* closed: the body has ended */
           }
           char *grown = realloc(st->body, st->body_len + chunk.len + 1);
@@ -497,7 +506,7 @@ static void send_response(wasi_http_types_own_response_outparam_t out, wk_respon
       wasi_io_streams_stream_error_t serr;
       if (!wasi_io_streams_method_output_stream_blocking_write_and_flush(
               wasi_io_streams_borrow_output_stream(stream), &bytes, &serr)) {
-        wasi_io_streams_stream_error_free(&serr);
+        release_stream_error(&serr);
         break;
       }
     }

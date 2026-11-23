@@ -113,6 +113,10 @@ func readBody(req httptypes.IncomingRequest) ([]byte, error) {
 			if !e.Closed() { // closed is the body's end
 				err = errIncomplete
 			}
+			// The error's handle is released, or the host keeps it.
+			if f := e.LastOperationFailed(); f != nil {
+				f.ResourceDrop()
+			}
 			break
 		}
 		out = append(out, chunk.OK().Slice()...)
