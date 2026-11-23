@@ -3,6 +3,10 @@
 What a node tells you about itself: two health endpoints on the main port,
 and Prometheus metrics on a port of their own.
 
+Every metric, with its type and labels, is listed in the
+[metrics reference](reference/metrics.md); what a status code or a readiness reason means,
+and what to do about it, is in [Troubleshooting](troubleshooting.md).
+
 ## Health and readiness
 
 | Path | Answers |

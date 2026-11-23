@@ -265,6 +265,8 @@ deploy, and Prometheus and Grafana on the same cluster;
 - [Languages](docs/languages.md): which languages work today and how
 - [Concepts](docs/concepts.md): addresses, events, life cycle, storage, alarms, calls, WebSockets
 - [API reference](docs/reference/api.md): every host function and hook, with its name in the Rust, TypeScript, Python, C and Zig SDKs
+- [CLI reference](docs/reference/cli.md) and [metrics reference](docs/reference/metrics.md): every command, flag and metric
+- [Troubleshooting](docs/troubleshooting.md): what a 503, 421, 403, 431, 408 or 409 means, a node that is not ready or will not start, and what to do; and a [glossary](docs/glossary.md)
 - Deploying: [one server (VPS)](docs/deploy/single-node.md), [three nodes](docs/deploy/three-nodes.md), [back up and restore the bucket](docs/deploy/backup-and-restore.md)
 - Examples: [counter](examples/counter), [chat room](examples/chat-room) (WebSockets),
   [rate limiter](examples/rate-limiter) (alarms), [AI agent](examples/agent) (a model over
