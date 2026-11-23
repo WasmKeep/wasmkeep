@@ -211,7 +211,7 @@ Oracles:
 - every acknowledged write is restored (existing);
 - the final re-plan never returns `Missing`, whatever landed late (existing);
 - **new: head unchanged.** For every pass, the plan's head and the head object's key are the same before and after;
-- **new: restore identical.** The positions the snapshot model holds after the pass equal those before it;
+- **new: restore identical.** The positions the snapshot model holds after the pass equal those before it, and those of the listing without `S` (as built: before the pass alone, `S` is at the head on both sides);
 - **new: no gap.** After a pass the plan is a snapshot with every segment after it listed.
 
 Unsafe variants some seed must catch (or, if no seed reaches it within the budget, a scripted unit test as ADR 0012 did for its guard):
@@ -254,7 +254,35 @@ Add a second, separate scripted trace for the pass (acquisition, listing, delete
 
 ## Simulation results
 
-Filled in by slice 3.
+Slice 3, in `sim/tests/madsim_replication.rs` (the `Idle` dimension of `Rules`). The model:
+
+- An owner that hibernates uploads an idle snapshot at its head if its hold wrote the head and none is there, in one bounded attempt. Then it releases.
+- One wake in ten only reads: it restores, takes the periodic snapshot a restore of five or more segments makes, and hibernates.
+- The node then runs the pass 0.3 to 3 s later, in the actor's mailbox: its own workload waits, and a pass is skipped while the actor is resident there.
+- Nobody wakes the actor until after the pass four times in five. Otherwise a wake may come first.
+- The pass reads the released record's version back. The server is to take it from the release, see "Confirmed in the code".
+- Deletes go through the client whose requests time out and land late, under the faults the other cases use: held links, kills, slow requests, skewed clocks.
+
+The per-pass oracles are checked on the pass's own listing, not on later live reads, where a legal late commit can move the head:
+
+- head position and head object key unchanged;
+- no gap: the plan after the pass is a snapshot with every segment after it;
+- restore identical.
+
+Restore identical is checked twice. Against the plan before the pass, the check is vacuous: with `S` at the head, both plans read `S`'s body. So the restore after the pass is also compared with the listing *without* `S`, the history the segments alone give, wherever that still plans.
+
+At 2,000 seeds (30 simulated seconds each):
+
+- **Safe**: 39,256 acknowledged writes, all restored. 2,945 idle snapshots and 3,054 passes: 640 deleted, 175 were dropped for a changed record, 589 found no snapshot of the released generation (read-only wakes), and 449 more were skipped with the actor resident. 100 deletes landed after their pass's hold ended. 881 restores were compared without the snapshot. Beside ADR 0012's periodic collection: 33,917 writes, all restored, 560 passes deleted.
+- **Each oracle against a mutation** (first seed at 200 seeds):
+  - head unchanged: deleting the segment at `P`, seed 2;
+  - no gap: also deleting `S`, seed 2;
+  - final re-plan never `Missing`: also deleting `S`, seed 3;
+  - restore identical: an idle snapshot whose body misses its own head position, seed 2;
+  - every acknowledged write restored: the same snapshot, seed 1.
+- **Unsafe, also deleting the segment at `P`**: caught by the head oracle at seed 2. It also breaks a restore (a late segment of an earlier generation becomes a head whose parent is gone) at seed 120, and on 14 of 2,000 seeds.
+- **Unsafe, any snapshot at the head**: not caught within 2,000 seeds. 170 passes compacted from another generation's snapshot, one a read-only wake uploaded at a previous owner's head, but none was followed by ADR 0012's condition-2 landing. As for ADR 0012, the interleaving is scripted instead: `an_idle_pass_from_any_snapshot_at_the_head_would_break_a_restore` in `replication.rs` fails with `Missing`.
+- **The version check dropped** (a plain acquisition, the remembered generation): 39 passes took a record changed since the release and deleted, and every seed keeps every acknowledged write. **The sim says the version check carries no weight for the chain's safety**, as section 3 argues. The model has no app incarnations (constraint 7), which is what the check is for, together with the app tombstone check (see "Confirmed in the code"). The case stays in the suite as a guard of that claim.
 
 ## Not confirmed
 
