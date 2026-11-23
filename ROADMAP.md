@@ -31,7 +31,12 @@ pusher on different nodes is still the operator's. In this order:
    segment-upload latency from the room's node.
 4. **Compacting idle actors' histories** (M), last, the other half of a
    faster change feed: listing is parallel in 0.7.0, but a poll still
-   lists every object of a long history.
+   lists every object of a long history. Designed in
+   [ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md)
+   (proposed): a snapshot at the head when an actor hibernates, and one
+   retention window later the existing collection under a fresh hold,
+   without moving the head. The rule and its simulation are in; the
+   server's snapshot and pass are next.
 
 ## Next
 

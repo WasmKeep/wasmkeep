@@ -107,4 +107,5 @@ are designs, not available capabilities. -->
 - [0039 The change feed (accepted, as built)](adr/0039-the-change-feed.md)
 - [0040 Directory, broadcast groups and the reconnecting room (accepted, as built)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
 - [0041 Placement at wake-up](adr/0041-placement-at-wake-up.md)
+- [0042 Compacting an idle actor's history (proposed)](adr/0042-compacting-an-idle-actors-history.md)
 

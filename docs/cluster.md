@@ -1724,6 +1724,9 @@ background, never delays a write, and stops if the node loses the actor's
 lease; deleted objects are counted by `wasmkeep_history_collected_total`
 ([monitoring](monitoring.md)). An actor that stops writing keeps fewer
 than 64 writes (and anything that was younger than the window at its last
-pass) until it writes again. Late uploads of earlier owners that land
+pass) until it writes again; compacting that history once the actor is
+idle is designed in
+[ADR 0042](adr/0042-compacting-an-idle-actors-history.md) (proposed, not
+built yet). Late uploads of earlier owners that land
 after a pass stay until the next pass. Old deploy versions are removed
 by `wasmkeep deploy` (see [Deploying](#deploying)).
