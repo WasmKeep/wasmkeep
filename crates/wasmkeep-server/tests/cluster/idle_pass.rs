@@ -97,18 +97,38 @@ async fn export(store: &Arc<dyn ObjectStore>, name: &str, point: Point) -> (hist
     (result, n)
 }
 
-/// Lets `node`'s remembered passes run now, and waits until its queue is
-/// empty and `outcome` was counted once more.
-async fn run_passes(node: &Node, outcome: &str) {
-    let before = compactions(outcome).await;
+const OUTCOMES: [&str; 5] = ["done", "changed", "nothing", "refused", "busy"];
+
+/// Every outcome's count.
+async fn all_compactions() -> Vec<u64> {
+    let mut counts = Vec::new();
+    for outcome in OUTCOMES {
+        counts.push(compactions(outcome).await);
+    }
+    counts
+}
+
+/// Lets `node`'s one remembered pass run now, and waits until it was
+/// counted: its outcome.
+async fn run_passes(node: &Node) -> &'static str {
+    let before = all_compactions().await;
     node.service.idle_passes_due_now();
     node.service.pause_idle_passes(false);
     eventually("the idle pass ran", async || {
-        node.service.idle_passes_queued().is_empty() && compactions(outcome).await > before
+        node.service.idle_passes_queued().is_empty() && all_compactions().await != before
     })
     .await;
     // Its release and the hibernation of its job.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = all_compactions().await;
+    let moved: Vec<&str> = OUTCOMES
+        .iter()
+        .zip(before.iter().zip(&after))
+        .filter(|(_, (b, a))| a > b)
+        .map(|(o, _)| *o)
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    moved[0]
 }
 
 /// ADR 0042, Tests, "Restore identical": a burst over two generations,
@@ -144,7 +164,7 @@ async fn an_idle_pass_leaves_the_snapshot_and_its_segment_and_the_same_database(
     // A window (and the skew bound) after the release.
     tokio::time::sleep(WINDOW + Duration::from_millis(200)).await;
     let collected = super::snapshots::counter("wasmkeep_history_collected_total").await;
-    run_passes(&a, "done").await;
+    assert_eq!(run_passes(&a).await, "done");
     let after = actor_keys(&store, "x").await;
     assert_eq!(after.len(), 2, "not S and the segment at P: {after:?}");
     let at_head = |kind: &str| {
@@ -195,8 +215,9 @@ async fn a_wake_before_the_pass_leaves_every_object() {
     hibernated(&a).await;
     let before = actor_keys(&store, "w").await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    run_passes(&a, "changed").await;
+    let outcome = run_passes(&a).await;
     assert_eq!(actor_keys(&store, "w").await, before);
+    assert_eq!(outcome, "changed");
 }
 
 /// A draining node runs no pass: its entries are dropped, nothing listed
@@ -215,8 +236,9 @@ async fn a_draining_node_runs_no_pass() {
     drain(&store, "a").await;
     wait_drain_line(&store, "a", "drained").await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    run_passes(&a, "refused").await;
+    let outcome = run_passes(&a).await;
     assert_eq!(actor_keys(&store, "d").await, before);
+    assert_eq!(outcome, "refused");
 }
 
 /// ADR 0042, constraint 7, the recreate case. The app is deleted and
@@ -278,12 +300,13 @@ async fn a_pass_deletes_nothing_of_a_recreated_app() {
     // The remembered version, as an `ETag` of the same bytes would be.
     a.service.idle_passes_take_current_versions().await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    run_passes(&a, "refused").await;
+    let outcome = run_passes(&a).await;
     assert_eq!(
         actor_keys(&store, "r").await,
         before,
         "a's pass deleted objects of the recreated app"
     );
+    assert_eq!(outcome, "refused");
     let r = send(c.addr, "GET", "/actor/t/r/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "8"), "{}", r.body);
 }
