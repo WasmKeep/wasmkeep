@@ -81,8 +81,8 @@ upgrades). `wasmkeep_socket_limit_requested` and
 `wasmkeep_socket_actor_limit_requested` and
 `wasmkeep_socket_actor_limit_effective` show actor ceilings. A difference
 means the requested capacity cannot all be admitted. Capacity refusals count
-in `wasmkeep_admission_refused_total{reason="capacity"}` and return 503 with
-`Retry-After`. See [CLI options and tuning](reference/socket-limits.md).
+in `wasmkeep_admission_refused_total{reason="capacity"}`; a WebSocket upgrade over a
+socket limit returns 503 with `Retry-After: 5`. See [CLI options and tuning](reference/socket-limits.md).
 
 The resident cap includes actors still closing their databases and blocking
 database work left by a cancelled event. An address without a mailbox
@@ -237,7 +237,7 @@ its first request.
 | `wasmkeep_event_fuel{tenant,app,class,kind}` | histogram | Wasmtime fuel units consumed by each actor event, with the same kinds as event duration. Excludes host work. See [event work](#event-work-fuel). |
 | `wasmkeep_event_duration_seconds{tenant,app,class,kind}` | histogram | Guest event execution, including awaited host calls: `fetch` (HTTP and actor calls), `alarm`, `websocket` (open/message/close), or `other` (initialization). Excludes post-event replication. |
 | `wasmkeep_event_start_rule_wait_seconds{tenant,app,class}` | histogram | A batched event's boundary holding back the next event: capture, upload-budget wait and the event-start rule's upload wait. Recorded once per completed boundary, including failed ones; absent for strict holds. |
-| `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit) or `lease` (this node lost the actor mid-event). |
+| `wasmkeep_event_cuts_total{reason}` | counter | Events the host stopped: `wall` (past the wall-clock limit), `lease` (this node lost the actor mid-event), `replica` (replication failed under a batched hold) or `stop` (the node was stopping). |
 | `wasmkeep_cpu_budget_exceeded_total` | counter | Guest calls stopped for using their CPU budget. The budget counts the guest's own CPU time on Linux and macOS, not time spent in host calls or time the OS runs other threads in the middle of the guest's work: on a busy node an event is charged at most two epoch ticks (2 ms) beyond its CPU time. Time a hypervisor takes from the VM (steal) may be counted: the thread CPU clock leaves it out only where the guest kernel accounts steal apart (`CONFIG_PARAVIRT_TIME_ACCOUNTING`). |
 | `wasmkeep_instantiate_seconds` | histogram | Creating an actor's instance: the wake cost. |
 | `wasmkeep_wakes_total`, `wasmkeep_hibernations_total` | counters | Actor instances created (first request or wake) and dropped (hibernated, evicted, discarded after a trap, replaced by a new version, shut down): is the idle timeout right? |
