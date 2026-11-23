@@ -927,15 +927,16 @@ impl LeaseHold {
                 .release_attempt()
                 .min(left.max(Duration::from_millis(50)));
             let invalid = !cluster.node_lease_valid();
-            let sent = tokio::time::timeout(bound, cluster.owners.release(&hold))
-                .await
-                .unwrap_or(Released::Pending);
+            let (sent, written) =
+                tokio::time::timeout(bound, cluster.owners.release_written(&hold))
+                    .await
+                    .unwrap_or((Released::Pending, None));
             if invalid && sent == Released::Released {
                 cluster.released_after_lapse(&hold.key);
             }
             match sent {
                 Released::Released => {
-                    cluster.pending.release_landed(&hold);
+                    cluster.release_landed(&hold, written);
                     return LeaseReturn::Released;
                 }
                 Released::Superseded => return LeaseReturn::Superseded,
@@ -1154,16 +1155,25 @@ impl Cluster {
     /// lapse, its write landing after).
     async fn send_release(&self, hold: &Hold) -> Released {
         let invalid = !self.node_lease_valid();
-        let sent = tokio::time::timeout(self.release_attempt(), self.owners.release(hold))
-            .await
-            .unwrap_or(Released::Pending);
+        let (sent, written) =
+            tokio::time::timeout(self.release_attempt(), self.owners.release_written(hold))
+                .await
+                .unwrap_or((Released::Pending, None));
         if invalid && sent == Released::Released {
             self.released_after_lapse(&hold.key);
         }
         if sent == Released::Released {
-            self.pending.release_landed(hold);
+            self.release_landed(hold, written);
         }
         sent
+    }
+
+    /// A release of `hold` landed, `written` the version its answer gave:
+    /// its frozen head's entry ends, and a hold that wrote is remembered
+    /// for its idle pass (ADR 0042, section 3).
+    fn release_landed(&self, hold: &Hold, written: Option<wasmkeep_cluster::lease::Version>) {
+        self.pending.release_landed(hold);
+        self.note_idle_release(hold, written);
     }
 
     /// A release that landed while this node's lease was not valid:
@@ -1447,13 +1457,15 @@ impl Cluster {
                     // landed (its frozen head's entry ends) from one
                     // superseded (it stays, ADR 0035 section 2).
                     PendingEntry::Release(hold) => {
-                        let sent =
-                            tokio::time::timeout(self.lease_attempt, self.owners.release(&hold))
-                                .await
-                                .unwrap_or(Released::Pending);
+                        let (sent, written) = tokio::time::timeout(
+                            self.lease_attempt,
+                            self.owners.release_written(&hold),
+                        )
+                        .await
+                        .unwrap_or((Released::Pending, None));
                         match sent {
                             Released::Released => {
-                                self.pending.release_landed(&hold);
+                                self.release_landed(&hold, written);
                                 Retried::Ended
                             }
                             Released::Superseded => Retried::Ended,

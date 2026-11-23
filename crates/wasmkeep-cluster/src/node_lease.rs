@@ -1403,6 +1403,14 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
     /// Releases a hold: the record names nobody, generation kept, `If-Match`
     /// on the hold's version only (never a version read later).
     pub async fn release(&self, hold: &Hold) -> Released {
+        self.release_written(hold).await.0
+    }
+
+    /// [`Self::release`], with the version the release wrote when this
+    /// write's own answer says it landed (`None` for every other outcome):
+    /// what an idle pass (ADR 0042, section 3) remembers, to take the
+    /// record later only if it is still that one.
+    pub async fn release_written(&self, hold: &Hold) -> (Released, Option<Version>) {
         let body = OwnerRecord {
             holder: None,
             generation: hold.generation,
@@ -1417,12 +1425,14 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
         // Never a record no reader could decode (a permanent refusal of
         // the actor): kept pending, nothing written.
         if OwnerRecord::decode(&body).is_none() {
-            return Released::Pending;
+            return (Released::Pending, None);
         }
         match self.bucket.replace(&hold.key, body, &hold.version).await {
-            Ok(_) => Released::Released,
-            Err(BucketError::Unavailable(_)) => Released::Pending,
-            Err(BucketError::Conflict) => self.still_this_hold(&hold.key, hold.generation).await,
+            Ok(version) => (Released::Released, Some(version)),
+            Err(BucketError::Unavailable(_)) => (Released::Pending, None),
+            Err(BucketError::Conflict) => {
+                (self.still_this_hold(&hold.key, hold.generation).await, None)
+            }
         }
     }
 
@@ -2056,6 +2066,38 @@ mod tests {
             run(a.acquire("owners/x", || true, async || Ok(1))),
             Err(AcquireError::Held { .. })
         ));
+    }
+
+    /// The idle pass's memory (ADR 0042, section 3): a release gives the
+    /// version it wrote, which is the record's version until anything
+    /// rewrites it, so an acquisition unchanged on it takes the record,
+    /// and on a stale one does not. A release that does not land gives
+    /// none.
+    #[test]
+    fn a_release_gives_the_version_it_wrote() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let mut la = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        run(la.start(None)).unwrap();
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let version_of = |key: &str| run((&mem).get(key)).unwrap().unwrap().1;
+        let hold = run(a.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        let (released, written) = run(a.release_written(&hold));
+        assert_eq!(released, Released::Released);
+        assert_eq!(written, Some(version_of("owners/x")));
+        // Released again: the record moved on, nothing written.
+        assert_eq!(run(a.release_written(&hold)), (Released::Superseded, None));
+        let written = written.unwrap();
+        let pass = run(a.acquire_unchanged("owners/x", |v| *v == written, || true)).unwrap();
+        assert_eq!(pass.generation, hold.generation + 1);
+        assert_eq!(run(a.release(&pass)), Released::Released);
+        assert_eq!(
+            run(a.acquire_unchanged("owners/x", |v| *v == written, || true)),
+            Err(AcquireError::Changed),
+            "the pass's own release changed the record"
+        );
     }
 
     /// A write that landed with a failure reported (its reply lost, or a

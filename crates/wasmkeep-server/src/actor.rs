@@ -48,6 +48,7 @@ mod alarm_delivery;
 mod blob_sweeps;
 mod classes;
 mod collection;
+pub(crate) mod compaction;
 mod deletes;
 mod deploys;
 mod disk;
@@ -840,6 +841,64 @@ impl ActorService {
     #[doc(hidden)]
     pub fn reaches_node(&self, node: &str) -> bool {
         self.inner.cluster.as_ref().is_some_and(|c| c.reaches(node))
+    }
+
+    /// The idle passes this node remembers (ADR 0042, section 3), due
+    /// first: each record key and the generation its release kept. Empty
+    /// outside a cluster. For tests and diagnostics.
+    #[doc(hidden)]
+    pub fn idle_passes_queued(&self) -> Vec<(String, u64)> {
+        self.inner.cluster.as_ref().map_or_else(Vec::new, |c| {
+            c.idle_passes
+                .entries()
+                .into_iter()
+                .map(|e| (e.key, e.generation))
+                .collect()
+        })
+    }
+
+    /// Tests: stops this node taking idle passes from its queue (`true`),
+    /// or lets it again.
+    #[doc(hidden)]
+    pub fn pause_idle_passes(&self, paused: bool) {
+        if let Some(c) = &self.inner.cluster {
+            c.idle_passes.pause(paused);
+        }
+    }
+
+    /// Tests: makes every remembered idle pass due now.
+    #[doc(hidden)]
+    pub fn idle_passes_due_now(&self) {
+        if let Some(c) = &self.inner.cluster {
+            let now = now_ms();
+            for mut e in c.idle_passes.entries() {
+                e.due_ms = now;
+                c.idle_passes.push(e);
+            }
+        }
+    }
+
+    /// Tests: gives every remembered idle pass the version its record has
+    /// now, as an `ETag` that is a hash of the body gives a recreated
+    /// app's record at the same generation (ADR 0042, constraint 7).
+    #[doc(hidden)]
+    pub async fn idle_passes_take_current_versions(&self) {
+        use object_store::ObjectStoreExt as _;
+        let Some(c) = &self.inner.cluster else {
+            return;
+        };
+        for mut e in c.idle_passes.entries() {
+            let path =
+                object_store::path::Path::from(format!("{}{}", c.state_root().prefix(), e.key));
+            if let Ok(meta) = c.store.head(&path).await {
+                e.version = wasmkeep_cluster::lease::Version(format!(
+                    "{}\n{}",
+                    meta.e_tag.unwrap_or_default(),
+                    meta.version.unwrap_or_default()
+                ));
+                c.idle_passes.push(e);
+            }
+        }
     }
 
     /// Whether the node lease is valid now (always, outside a cluster).
