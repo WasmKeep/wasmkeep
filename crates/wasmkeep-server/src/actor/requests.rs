@@ -227,6 +227,7 @@ impl ActorService {
                 }
                 routed = Some(route);
             }
+            let mut reread = false;
             loop {
                 let handback = match self
                     .dispatch_routed(
@@ -278,14 +279,31 @@ impl ActorService {
                             Held::Answer(response) => return response,
                             Held::Forward => {}
                         }
+                        // Already forwarded: answered 503 here, the peer
+                        // never asked, so no reason to suspect it.
+                        let sent = !crate::cluster::never_forward(&back);
+                        // Sent here by another node, and another owner
+                        // seen, maybe from this node's own hint, learned
+                        // under a second ago and stale now: the record read
+                        // once more (ADR 0040, amendment of 2026-11-22).
+                        if !sent && !elsewhere && !reread {
+                            reread = true;
+                            self.inner.forget_owner(&address);
+                            req = back;
+                            continue;
+                        }
                         if let Some(ticket) = ticket.take() {
                             ticket.end("forwarded");
                         }
                         let req = back;
-                        // Already forwarded: answered 503 here, the peer
-                        // never asked, so no reason to suspect it.
-                        let sent = !crate::cluster::never_forward(&req);
-                        let response = cluster.forward(&node, req).await;
+                        // Still another owner, from the record: marked, so
+                        // the sender suspects nobody. A draining node's
+                        // answer stays unmarked.
+                        let response = if !sent && !elsewhere {
+                            crate::cluster::owner_changing(&node)
+                        } else {
+                            cluster.forward(&node, req).await
+                        };
                         if response.status().is_server_error() {
                             if elsewhere && sent && super::routing::peer_failed(&response) {
                                 // Down, unreachable, or draining itself: not
@@ -346,11 +364,34 @@ impl ActorService {
                 .run_placed(cluster, address, req, chain, outside, mark)
                 .await;
         }
-        match self.dispatch(address, req, chain, outside).await {
+        // A call is never forwarded twice (the calling node sent it to the
+        // owner it saw); the calling actor gets the 503.
+        let changing = || crate::cluster::unavailable("actor ownership is changing; retry\n");
+        let handback = match self
+            .dispatch(address.clone(), req, Arc::clone(&chain), outside)
+            .await
+        {
+            Ok(response) => return response,
+            Err(handback) => *handback,
+        };
+        // Draining, or moving it away: unmarked, so its sender suspects
+        // this node (ADR 0014).
+        if handback.elsewhere {
+            return changing();
+        }
+        // Another owner, maybe from this node's own hint, learned under a
+        // second ago and stale now (the owner released it since): read
+        // the record once more. Still another owner: marked, so the sender
+        // takes the ordinary path to it and suspects nobody (ADR 0040,
+        // amendment of 2026-11-22).
+        self.inner.forget_owner(&address);
+        match self
+            .dispatch(address.clone(), handback.req, chain, outside)
+            .await
+        {
             Ok(response) => response,
-            // A call is never forwarded twice (the calling node sent it to
-            // the owner it saw); the calling actor gets the 503.
-            Err(_) => crate::cluster::unavailable("actor ownership is changing; retry\n"),
+            Err(handback) if handback.elsewhere => changing(),
+            Err(handback) => crate::cluster::owner_changing(&handback.node),
         }
     }
 
@@ -510,7 +551,11 @@ impl ActorService {
             let response = cluster.forward_buffered(&node, hop).await;
             if elsewhere {
                 if super::routing::not_run_by_peer(&response) {
-                    cluster.suspect(&node);
+                    // Not a peer that saw another owner: the ordinary path
+                    // goes to that owner.
+                    if super::routing::peer_failed(&response) {
+                        cluster.suspect(&node);
+                    }
                     // Sent apart and not run there: run it here, once.
                     if apart {
                         apart = false;

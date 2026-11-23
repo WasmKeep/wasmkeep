@@ -348,7 +348,11 @@ impl ServiceInner {
                         let copy = apart.then(|| copy_request(&sent));
                         match cluster.call(&peer, &target, &waiting, sent).await {
                             Ok(response) if not_run_by_peer(&response) => {
-                                cluster.suspect(&peer);
+                                // Not a peer that saw another owner: the
+                                // ordinary path below goes to that owner.
+                                if peer_failed(&response) {
+                                    cluster.suspect(&peer);
+                                }
                                 if let Some(copy) = copy {
                                     (apart, req) = (false, copy);
                                     continue;
@@ -483,11 +487,14 @@ pub(super) fn not_run_by_peer<B>(response: &Response<B>) -> bool {
 /// it is suspected for a while: a host's `5xx` that its actor did not
 /// answer. A `500` is the actor's error (a trap, a restore that failed) and
 /// a `5xx` with `x-wasmkeep-node` the actor's own answer: neither is the
-/// node's.
+/// node's. Nor is "ownership is changing" from a peer that read the
+/// actor's record as naming another owner ([`crate::cluster::OWNER_SEEN`]):
+/// the event goes the ordinary path to that owner.
 pub(super) fn peer_failed<B>(response: &Response<B>) -> bool {
     response.status().is_server_error()
         && response.status() != StatusCode::INTERNAL_SERVER_ERROR
         && !response.headers().contains_key(SERVED_BY)
+        && !response.headers().contains_key(crate::cluster::OWNER_SEEN)
 }
 
 /// Headers `actors.call` drops from a guest's request.
@@ -747,6 +754,13 @@ mod peer_answer_tests {
         assert!(!not_run_by_peer(&actor) && !peer_failed(&actor));
         let unknown = answer(unavailable, &[("x-wasmkeep-outcome", "unknown")]);
         assert!(!not_run_by_peer(&unknown) && peer_failed(&unknown));
+        // A peer that read the record as naming another owner (ADR 0040,
+        // amendment of 2026-11-22): not run, and nothing wrong with it.
+        let seen = answer(
+            unavailable,
+            &[("retry-after", "1"), ("x-wasmkeep-owner-seen", "c")],
+        );
+        assert!(not_run_by_peer(&seen) && !peer_failed(&seen));
         let trap = answer(StatusCode::INTERNAL_SERVER_ERROR, &[]);
         assert!(!not_run_by_peer(&trap) && !peer_failed(&trap));
         let late = answer(

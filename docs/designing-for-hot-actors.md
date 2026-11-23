@@ -151,10 +151,11 @@ most
 ([ADR 0040, section 14](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
 On three nodes, a room's edges end on two or three of them; about a third
 share the room's node. A running edge never moves for it, so clients
-reconnect no more than before, and a drained node's edges go to the
-others edge by edge. With one node alive the edges wake where they are
-called; `--no-placement` turns it off. List the edges with the same
-command:
+reconnect no more than before. A drain releases its node's edges; each
+wakes where its first event after takes it: a reconnecting client's
+socket wakes it where that client landed, the pusher's next push on its
+spread choice. With one node alive the edges wake where they are called;
+`--no-placement` turns it off. List the edges with the same command:
 
 ```bash
 wasmkeep actor where --app acme/chat edge/lobby.e1 edge/lobby.e2 edge/lobby.e3 --bucket s3://acme-wasmkeep/prod

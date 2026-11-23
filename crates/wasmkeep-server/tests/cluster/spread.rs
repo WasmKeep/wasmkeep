@@ -8,16 +8,18 @@
 use super::*;
 
 /// A node serving the broadcast SDKs' default class names (the test actor
-/// for each), with room for many residents so that the load rule keeps
-/// these few actors below its floor: only the rules for a big room move
-/// anything. `adjust` changes the rest.
+/// for each), with an instance pool of 128: placement's floor (a fifth of
+/// the residents it allows) is then far above the actors of these tests,
+/// even with a stub for each edge of a `call-many` being woken, so the
+/// load rule moves nothing and only the rules for a big room do. `adjust`
+/// changes the rest.
 async fn room_node(
     id: &str,
     data: &Path,
     store: &Arc<dyn ObjectStore>,
     adjust: impl FnOnce(&mut ActorConfig),
 ) -> Node {
-    node_configured(
+    start_node_pooled(
         id,
         data,
         store,
@@ -26,12 +28,12 @@ async fn room_node(
         test_actor_wasm(),
         Duration::from_secs(30),
         "",
-        |config: &mut ActorConfig| {
-            config.mailbox.max_resident = 1000;
-            adjust(config);
-        },
+        adjust,
+        false,
+        128,
     )
     .await
+    .0
 }
 
 /// The node `class/name`'s ownership record names, if any.
@@ -67,6 +69,30 @@ fn rendezvous(key: &str, nodes: &[&str]) -> String {
         .to_owned()
 }
 
+/// Where `edge/<name>` is predicted to wake, over `nodes`.
+fn choice(name: &str, nodes: &[&str]) -> String {
+    rendezvous(&format!("default/edge/{name}"), nodes)
+}
+
+/// The node the pusher `pusher/lobby` wakes on when a, holding its room,
+/// wakes it: the rendezvous choice over b and c (ADR 0041, amendment).
+fn pusher_node() -> &'static str {
+    if rendezvous("default/pusher/lobby", &["b", "c"]) == "b" {
+        "b"
+    } else {
+        "c"
+    }
+}
+
+/// The first edge name whose choice over the three nodes is `node`,
+/// skipping `skip`.
+fn edge_on(node: &str, skip: &[&str]) -> String {
+    (1..)
+        .map(|k| format!("lobby.e{k}"))
+        .find(|e| !skip.contains(&e.as_str()) && choice(e, &["a", "b", "c"]) == node)
+        .unwrap()
+}
+
 /// The count of one series of this process's metrics page (0 if absent).
 fn metric(series: &str) -> u64 {
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
@@ -80,37 +106,9 @@ const SENT: &str =
 const PLACED: &str =
     r#"wasmkeep_placements_total{tenant="default",app="default",kind="call",outcome="placed"}"#;
 
-/// Three of the room's edges, named as the SDK names them (`lobby.e<k>`):
-/// the first whose rendezvous choice over the three nodes is `a`, `b` and
-/// `c` each. One per node keeps each node, with the room or the pusher,
-/// below placement's floor (a fifth of the 16 instances of a test
-/// process), so the load rule moves none of them.
+/// The room's edges `lobby.e1` to `lobby.e12`, as the SDK names them.
 fn edges() -> Vec<String> {
-    let mut on = std::collections::HashMap::new();
-    (1..)
-        .map(|k| format!("lobby.e{k}"))
-        .filter(|e| {
-            let n = on
-                .entry(rendezvous(&format!("default/edge/{e}"), &["a", "b", "c"]))
-                .or_insert(0);
-            *n += 1;
-            *n <= 1
-        })
-        .take(3)
-        .collect()
-}
-
-/// The pusher's first call to each edge, one at a time, as its scale steps
-/// create them (one split a step): each wakes the edge, on `count`.
-async fn create(via: &Node, edges: &[String]) {
-    for e in edges {
-        let path = format!("/actor/pusher/lobby/call?to=edge/{e}&path=%2Fdurable");
-        let r = send_reachable(via.addr, "POST", &path, "").await;
-        assert_eq!((r.status, r.body.trim()), (200, "200:1"), "{e}");
-        // The stub left on the pusher's node for an edge woken away
-        // closes before the next decision counts its residents.
-        settle().await;
-    }
+    (1..=12).map(|k| format!("lobby.e{k}")).collect()
 }
 
 /// One `call-many` from the pusher to every edge, sent through `via`: each
@@ -128,24 +126,30 @@ async fn push(via: &Node, edges: &[String], count: u64) {
     assert_eq!(r.body.trim(), want);
 }
 
-/// Three nodes, default placement. The room wakes on a and its pusher on
-/// a peer (kept apart); the pusher's calls wake its edges, each on the
-/// rendezvous choice over the three nodes, the pusher's own node included.
-/// The edges end on two nodes or more, none moves on the next calls from
-/// any node, and a drain of one node (a rolling restart's step) keeps them
-/// on two.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rooms_edges_wake_spread_and_stay_put() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let a = room_node("a", dirs[0].path(), &store, |_| {}).await;
-    let b = room_node("b", dirs[1].path(), &store, |_| {}).await;
-    let c = room_node("c", dirs[2].path(), &store, |_| {}).await;
+/// One call from the pusher to `edge/<name>`, through `via`: its answer.
+async fn call(via: &Node, name: &str) -> String {
+    let path = format!("/actor/pusher/lobby/call?to=edge/{name}&path=%2Fdurable");
+    let r = send_reachable(via.addr, "POST", &path, "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.body.trim().to_owned()
+}
+
+/// Three nodes, `adjust` for each by id, every one serving; the room woken
+/// on a and its pusher, kept apart, on [`pusher_node`].
+async fn three(
+    store: &Arc<dyn ObjectStore>,
+    dirs: &[tempfile::TempDir],
+    adjust: impl Fn(&str, &mut ActorConfig),
+) -> [Node; 3] {
+    let mut nodes = Vec::new();
+    for (id, dir) in ["a", "b", "c"].into_iter().zip(dirs) {
+        nodes.push(room_node(id, dir.path(), store, |config| adjust(id, config)).await);
+    }
     for id in ["a", "b", "c"] {
-        wait_drain_line(&store, id, "serving").await;
+        wait_drain_line(store, id, "serving").await;
     }
     settle().await;
-
+    let a = &nodes[0];
     let r = send_reachable(a.addr, "GET", "/actor/room/lobby/fired", "").await;
     assert_eq!(
         (r.status, r.node.as_deref()),
@@ -154,23 +158,39 @@ async fn a_rooms_edges_wake_spread_and_stay_put() {
         r.body
     );
     let r = send_reachable(a.addr, "GET", "/actor/pusher/lobby/fired", "").await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    let pusher = r.node.unwrap();
-    assert_ne!(pusher, "a", "the pusher woke beside its room");
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some(pusher_node())),
+        "{}",
+        r.body
+    );
+    nodes.try_into().ok().unwrap()
+}
+
+/// Three nodes, default placement. The room wakes on a and its pusher on
+/// a peer (kept apart); one `call-many` of the pusher wakes twelve edges,
+/// each on the rendezvous choice over the three nodes, the pusher's own
+/// node included. The edges end on every node, none moves on the next
+/// calls from any node, and when a node drains (a rolling restart's step)
+/// its edges, released, wake where the pusher's next push sends them: the
+/// choice over the two others.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rooms_edges_wake_spread_and_stay_put() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let [a, b, c] = three(&store, &dirs, |_, _| {}).await;
+    let pusher = pusher_node();
 
     let edges = edges();
-    let predicted: Vec<String> = edges
-        .iter()
-        .map(|e| rendezvous(&format!("default/edge/{e}"), &["a", "b", "c"]))
-        .collect();
+    let predicted: Vec<String> = edges.iter().map(|e| choice(e, &["a", "b", "c"])).collect();
     // The names cover every case: an edge whose choice is the pusher's own
     // node (woken where it is called), the room's node, and the third.
     for node in ["a", "b", "c"] {
         assert!(predicted.iter().any(|p| p == node), "{predicted:?}");
     }
     let (sent, placed) = (metric(SENT), metric(PLACED));
-    create(&a, &edges).await;
-    let away = predicted.iter().filter(|p| **p != pusher).count() as u64;
+    push(&a, &edges, 1).await;
+    let away = predicted.iter().filter(|p| *p != pusher).count() as u64;
     let mut held = Vec::new();
     for e in &edges {
         held.push(holder(&store, "edge", e).await.unwrap());
@@ -178,8 +198,6 @@ async fn a_rooms_edges_wake_spread_and_stay_put() {
     assert_eq!(held, predicted, "the pusher on {pusher}");
     assert_eq!(metric(SENT) - sent, away, "one hop per edge woken away");
     assert_eq!(metric(PLACED), placed, "the load rule placed none");
-    let nodes: std::collections::BTreeSet<_> = held.iter().collect();
-    assert!(nodes.len() >= 2, "edges on {nodes:?}");
 
     // None bounces: the pusher's next calls, and requests from every node,
     // reach each edge where it is, and nothing is spread again.
@@ -199,40 +217,124 @@ async fn a_rooms_edges_wake_spread_and_stay_put() {
     }
 
     // A rolling restart's step: the node that holds neither the room nor
-    // the pusher drains. Its edges go to the drain's choice over the other
-    // two; the others stay. The edges are still on two nodes.
+    // the pusher drains. A drain releases each edge's record and hands it
+    // to nobody; the first event after decides where it wakes. Here that
+    // is the pusher's next push (no client reconnects in this test), so
+    // each released edge wakes on the choice over the two other nodes,
+    // even on a node that still holds an owner hint naming the drained
+    // one (the GETs above, under a second old). The others stay.
     let third = ["b", "c"].into_iter().find(|n| *n != pusher).unwrap();
     drain(&store, third).await;
     wait_drain_line(&store, third, "drained").await;
-    // The pusher's next call to each edge: one whose hand-over is still
-    // under way answers "retry", as a round's failed child does.
     for e in &edges {
-        let path = format!("/actor/pusher/lobby/call?to=edge/{e}&path=%2Fdurable");
+        // A call reaching the drained node before its release answers
+        // "retry", as a round's failed child does.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let r = send_reachable(a.addr, "POST", &path, "").await;
-            if r.status == 200 && r.body.starts_with("200:") {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "{e}: {}", r.body);
+        while call(&a, e).await != "200:4" {
+            assert!(std::time::Instant::now() < deadline, "{e}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    let mut after = std::collections::BTreeSet::new();
     for (e, before) in edges.iter().zip(&held) {
         let now = holder(&store, "edge", e).await.unwrap();
-        if before == third {
-            // On the spread choice over the two others or, when that node
-            // answered that it did not run the call while the record was
-            // still changing hands, where it was called, once.
-            assert_ne!(now, third, "{e}");
+        let want = if before == third {
+            choice(e, &["a", pusher])
         } else {
-            assert_eq!(&now, before, "{e} moved off a node that is not draining");
-        }
-        after.insert(now);
+            before.clone()
+        };
+        assert_eq!(now, want, "{e}: was on {before}");
     }
-    assert_eq!(after.len(), 2, "edges on {after:?} after the drain");
     assert_eq!(holder(&store, "room", "lobby").await.as_deref(), Some("a"));
+}
+
+/// The receiver of a spread hop still holds an owner hint (one second,
+/// `HINT_MS`) naming the node that held the edge until just now. It reads
+/// the record again instead of answering "ownership is changing": the
+/// edge wakes there, and its sender suspects nothing (the next edge whose
+/// choice is that node goes there too).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_owner_hint_on_the_chosen_node_neither_refuses_nor_suspects_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let pusher = pusher_node();
+    let third = if pusher == "b" { "c" } else { "b" };
+    // The third node's actors hibernate soon after their last event.
+    let [a, b, c] = three(&store, &dirs, |id, config| {
+        if id == third {
+            config.mailbox.idle_timeout = Duration::from_millis(200);
+        }
+    })
+    .await;
+    let on_third = if third == "b" { &b } else { &c };
+    let edge = edge_on("a", &[]);
+    let next = edge_on("a", &[edge.as_str()]);
+
+    // The edge wakes on the third node (a request from outside is not
+    // spread), then a learns from the record that the third node holds it.
+    let path = format!("/actor/edge/{edge}/durable");
+    let r = send_reachable(on_third.addr, "GET", &path, "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some(third)),
+        "{}",
+        r.body
+    );
+    let r = send_reachable(a.addr, "GET", &path, "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some(third)),
+        "{}",
+        r.body
+    );
+    let learned = std::time::Instant::now();
+    // It hibernates there, its record released, within a's hint.
+    while holder(&store, "edge", &edge).await.is_some() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        learned.elapsed() < Duration::from_millis(900),
+        "released after a's hint expired: the test proves nothing"
+    );
+    // The pusher's call: spread to a, which holds the stale hint.
+    assert_eq!(call(&a, &edge).await, "200:1");
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("a"));
+    // a was not suspected: the next edge whose choice is a goes there.
+    assert_eq!(call(&a, &next).await, "200:1");
+    assert_eq!(holder(&store, "edge", &next).await.as_deref(), Some("a"));
+}
+
+/// The chosen node does not run the edge's wake-up: it has no resident
+/// slot (one, busy). Its host answers `503` before the actor, so the edge
+/// runs where it was called, the pusher's node, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edge_its_chosen_node_does_not_run_runs_where_it_is_called_once() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let pusher = pusher_node();
+    let third = if pusher == "b" { "c" } else { "b" };
+    let [a, b, c] = three(&store, &dirs, |id, config| {
+        if id == third {
+            config.mailbox.max_resident = 1;
+        }
+    })
+    .await;
+    let on_third = if third == "b" { &b } else { &c };
+    // Its one slot, busy for a while.
+    let addr = on_third.addr;
+    let busy =
+        tokio::spawn(async move { send(addr, "POST", "/actor/room/busy/sleep?ms=5000", "").await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while holder(&store, "room", "busy").await.is_none() {
+        assert!(std::time::Instant::now() < deadline, "never busy");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let edge = edge_on(third, &[]);
+    let sent = metric(SENT);
+    assert_eq!(call(&a, &edge).await, "200:1", "ran once");
+    assert_eq!(metric(SENT) - sent, 1, "sent to its choice first");
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some(pusher));
+    let r = busy.await.unwrap();
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 /// The fallback: with one node alive, every edge wakes there, never

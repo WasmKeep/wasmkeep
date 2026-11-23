@@ -573,11 +573,43 @@ async fn start_node(
     adjust: impl FnOnce(&mut ActorConfig),
     count_peers: bool,
 ) -> (Node, Option<PeerProxy>) {
+    start_node_pooled(
+        id,
+        data,
+        store,
+        idle,
+        classes,
+        wasm,
+        wall,
+        prefix,
+        adjust,
+        count_peers,
+        16,
+    )
+    .await
+}
+
+/// [`start_node`] with an instance pool of `instances` (16 there): room
+/// for more residents below placement's floor (a fifth of them).
+#[allow(clippy::too_many_arguments)]
+async fn start_node_pooled(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    idle: Duration,
+    classes: &[&str],
+    wasm: &[u8],
+    wall: Duration,
+    prefix: &str,
+    adjust: impl FnOnce(&mut ActorConfig),
+    count_peers: bool,
+    instances: u32,
+) -> (Node, Option<PeerProxy>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let runtime = Runtime::new(&RuntimeConfig {
-        max_instances: 16,
+        max_instances: instances,
         ..RuntimeConfig::default()
     })
     .unwrap();

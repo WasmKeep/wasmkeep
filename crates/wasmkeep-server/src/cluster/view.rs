@@ -538,10 +538,17 @@ impl Cluster {
     /// Where a wake-up of a spread actor (ADR 0040, amendment of 2026-11-22)
     /// goes instead of here: the rendezvous choice for `address` over this
     /// node and the peers [`Self::chosen_peer`] chooses from. `None`: wake
-    /// here (this node is the choice, or no peer can take it).
+    /// here (this node is the choice, or no peer can take it). A peer in
+    /// placement's backoff is left out: a placed hop it refused runs on
+    /// the ordinary path, which must not send it straight back.
     pub(crate) fn spread_peer(&self, address: &ActorAddress) -> Option<String> {
         let eligible = self.eligible_peers();
-        let eligible: Vec<&str> = eligible.iter().map(String::as_str).collect();
+        let backed_off = self.placement_backed_off();
+        let eligible: Vec<&str> = eligible
+            .iter()
+            .filter(|p| !backed_off.contains(p))
+            .map(String::as_str)
+            .collect();
         wasmkeep_cluster::placement::spread(&self.node_id, &eligible, &encode_address(address))
             .map(str::to_owned)
     }

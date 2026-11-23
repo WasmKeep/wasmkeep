@@ -366,6 +366,16 @@ impl Cluster {
             && m.name == address.name()
     }
 
+    /// The nodes in placement's backoff now (section 6): not chosen for a
+    /// spread edge either (ADR 0040, amendment of 2026-11-22), so a wake-up
+    /// that one refused does not go straight back to it.
+    pub(crate) fn placement_backed_off(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut state = self.placing.lock();
+        state.backoff.retain(|_, until| *until > now);
+        state.backoff.keys().cloned().collect()
+    }
+
     /// A placed hop to `node` was refused, never read or failed: it is no
     /// candidate for one heartbeat horizon (section 6).
     pub(crate) fn placement_backoff(&self, node: &str) {
