@@ -781,8 +781,8 @@ impl Cluster {
             .filter(|id| !stopped.contains(*id))
             .cloned()
             .collect();
-        // This node's own object too: the twin check, and this node's
-        // place in the live set (alarm shards) come from it.
+        // This node's own object too: the twin check reads it (the alarm
+        // shards count this node whatever its object shows).
         if !ids.contains(&self.node_id) {
             ids.push(self.node_id.clone());
         }

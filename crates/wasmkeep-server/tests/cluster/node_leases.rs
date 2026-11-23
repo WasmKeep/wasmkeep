@@ -1034,6 +1034,9 @@ struct Behind {
     armed: AtomicBool,
     /// Reads of `key` answered with the old body.
     served: AtomicUsize,
+    /// Written over `key` just before the next write to it lands, so that
+    /// write's condition fails: another writer got there first.
+    before_next_put: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl Behind {
@@ -1044,6 +1047,7 @@ impl Behind {
             key: object_store::path::Path::from(key),
             armed: AtomicBool::new(false),
             served: AtomicUsize::new(0),
+            before_next_put: std::sync::Mutex::new(None),
         })
     }
 
@@ -1076,6 +1080,15 @@ impl ObjectStore for Behind {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
+        let first = if *location == self.key {
+            self.before_next_put.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some(body) = first {
+            use object_store::ObjectStoreExt as _;
+            self.inner.put(location, body.into()).await?;
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -1192,24 +1205,19 @@ async fn released_node_a(shared: &Arc<dyn ObjectStore>, data: &Path) -> Vec<u8> 
 /// A node stopped cleanly (its lease `released`), then a new process with
 /// the same id. It serves; then reads of its own object answer with the
 /// predecessor's `released` body, the one its first write replaced (a
-/// replica behind, as seen on a three-node cluster during a rolling
-/// restart), or with the predecessor's last `live` body before it. Neither
-/// is a twin: the new process keeps serving.
+/// replica behind, or a read of a sibling app in the same process, as seen
+/// on a three-node cluster during a rolling restart), or with the
+/// predecessor's last `live` body before it. Neither is a twin: the new
+/// process keeps serving. A new process for each case, each case read by
+/// several rounds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_predecessors_body_read_after_a_restart_is_not_a_twin() {
+    use object_store::ObjectStoreExt as _;
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let da = tempfile::tempdir().unwrap();
     let released = released_node_a(&shared, da.path()).await;
     let (old_instance, old_written) = node_lease_writer(&released);
-
-    let behind = Behind::over(&shared, "nodes/a");
-    let seen: Arc<dyn ObjectStore> = behind.clone();
-    let again = node("a", da.path(), &seen, Duration::from_secs(30)).await;
-    again.service.node_id_checked().await.unwrap();
-    settle().await;
-    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
-    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
-
+    let mut count = 1;
     for (what, body) in [
         ("its released body", released.clone()),
         (
@@ -1217,18 +1225,99 @@ async fn a_predecessors_body_read_after_a_restart_is_not_a_twin() {
             node_lease_as(&released, "live", &old_instance, old_written),
         ),
     ] {
+        // The predecessor's `released` body under the key, as it left it.
+        shared
+            .put(
+                &object_store::path::Path::from("nodes/a"),
+                released.clone().into(),
+            )
+            .await
+            .unwrap();
+        let behind = Behind::over(&shared, "nodes/a");
+        let seen: Arc<dyn ObjectStore> = behind.clone();
+        let again = node("a", da.path(), &seen, Duration::from_secs(30)).await;
+        again.service.node_id_checked().await.unwrap();
+        settle().await;
+        count += 1;
+        let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+        assert_eq!(
+            (r.status, r.body.trim()),
+            (200, count.to_string().as_str()),
+            "{what}: {}",
+            r.body
+        );
         behind.serve(body).await;
+        // Several periods (100 ms): every round reads this node's object.
         let lost =
             tokio::time::timeout(Duration::from_millis(800), again.service.node_id_lost()).await;
         let served = behind.stop();
-        assert!(served > 0, "{what}: never read");
+        assert!(served >= 3, "{what}: read {served} times");
         assert!(
             lost.is_err(),
             "{what}: stopped on its predecessor's body: {lost:?}"
         );
+        count += 1;
+        let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+        assert_eq!(
+            (r.status, r.body.trim()),
+            (200, count.to_string().as_str()),
+            "{what}: {}",
+            r.body
+        );
+        again.service.shutdown(Duration::from_secs(2)).await;
+        stop_listening(again).await;
     }
-    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
-    assert_eq!((r.status, r.body.trim()), (200, "3"), "{}", r.body);
+}
+
+/// A first write that fails its condition goes back to the start check
+/// (ADR 0020, section 1), and the predecessor it then replaces is the one
+/// the check read again, not the first: here another stopped process's
+/// `released` body lands between the check and the write. A copy of that
+/// body read later is not a twin; one of the first predecessor's (a body
+/// this process's write never replaced) is.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_failed_first_write_the_predecessor_is_the_one_read_again() {
+    use object_store::ObjectStoreExt as _;
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let released = released_node_a(&shared, da.path()).await;
+    let (_, old_written) = node_lease_writer(&released);
+    let other = node_lease_as(&released, "released", "0dd0", old_written - 1_000);
+    for (what, read, twin) in [
+        ("the predecessor replaced", other.clone(), false),
+        ("the one never replaced", released.clone(), true),
+    ] {
+        shared
+            .put(
+                &object_store::path::Path::from("nodes/a"),
+                released.clone().into(),
+            )
+            .await
+            .unwrap();
+        let behind = Behind::over(&shared, "nodes/a");
+        *behind.before_next_put.lock().unwrap() = Some(other.clone());
+        let seen: Arc<dyn ObjectStore> = behind.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let again = node("a", dir.path(), &seen, Duration::from_secs(30)).await;
+        again.service.node_id_checked().await.unwrap();
+        assert!(
+            behind.before_next_put.lock().unwrap().is_none(),
+            "{what}: the first write was never raced"
+        );
+        settle().await;
+        behind.serve(read).await;
+        let lost =
+            tokio::time::timeout(Duration::from_millis(800), again.service.node_id_lost()).await;
+        assert!(behind.stop() > 0, "{what}: never read");
+        match lost {
+            Ok(why) => assert!(
+                twin && why.starts_with("this node's lease was released by another process: "),
+                "{what}: {why}"
+            ),
+            Err(_) => assert!(!twin, "{what}: not noticed"),
+        }
+        stop_listening(again).await;
+    }
 }
 
 /// The other side of the case above: a body read of this node's own

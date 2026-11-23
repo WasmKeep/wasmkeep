@@ -1620,6 +1620,7 @@ impl Cluster {
             // Junk on the public port is an outside request like any other.
             None if public_port => None,
             None => {
+                crate::metrics::inc(&crate::metrics::METRICS.signatures_bad);
                 self.note_refused("bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)");
                 None
             }

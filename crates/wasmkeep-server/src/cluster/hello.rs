@@ -32,14 +32,20 @@ impl Cluster {
     /// `failed` is set if a peer did not take it (no answer, or an answer
     /// other than 200 and the 404 of a node of 0.4.1): the heartbeat loop
     /// sends another round.
+    ///
+    /// Peers of this app only (ADR 0038): a process serving several apps
+    /// routes a hop to the runtime of the app it names, this one, which
+    /// checks the signature against its own node id. A hello to a node of
+    /// another app, signed for that node, would be refused there as
+    /// misaddressed; that app's own runtime says hello to it.
     pub(super) fn say_hello(self: &Arc<Self>, failed: Arc<std::sync::atomic::AtomicBool>) {
         let peers: Vec<String> = self
             .peers
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .filter(|id| **id != self.node_id)
-            .cloned()
+            .iter()
+            .filter(|(id, peer)| **id != self.node_id && peer.app == self.serves)
+            .map(|(id, _)| id.clone())
             .collect();
         for peer in peers {
             let cluster = Arc::downgrade(self);

@@ -5534,3 +5534,150 @@ async fn a_round_reads_only_the_nodes_that_may_still_write() {
     // evidence for whatever records name them).
     assert_eq!(a.known_nodes.lock().unwrap().len(), 93);
 }
+
+/// A node lease body of node `id` (format 3): `state` and `instance` (`-`:
+/// none) on its second line, `written_at` on its third, the heartbeat's
+/// fields after them.
+fn node_lease_body(id: &str, state: &str, instance: &str, written_at: u64) -> String {
+    format!(
+        "wasmkeep-node 3\n{state} {instance}\n{written_at}\n{id}\nhttp://{id}\n0.0.0\nt/\n\n\nserving\n\ntake\n"
+    )
+}
+
+/// Several apps in one process share the heartbeats as last read (ADR
+/// 0038). A sibling app's listing, made before this app's first write over
+/// its stopped predecessor's `released` lease, holds that body for this
+/// node's id; a read of a peer alone then applies it to this app's view
+/// before this app read its own object again. It is the body this app's
+/// first write replaced, not a twin. A body of another instance applied the
+/// same way still is one.
+#[tokio::test]
+async fn a_siblings_read_of_this_nodes_predecessor_is_not_a_twin() {
+    use super::process::Heartbeats;
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+        config.app = format!("t/{app}");
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    // The predecessor stopped cleanly a minute ago: the start check ends
+    // at once.
+    let then = now_ms() - 60_000;
+    let released = node_lease_body("a", "released", "cafe", then);
+    store
+        .inner
+        .put(
+            &StorePath::from("nodes/a"),
+            released.clone().into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    let peer = |at: u64| node_lease_body("b", "live", "beef", at);
+    store
+        .inner
+        .put(
+            &StorePath::from("nodes/b"),
+            peer(now_ms()).into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    let sibling = runtime("s", "other");
+    let a = runtime("a", "default");
+    a.identity().await.unwrap();
+    // From now on this app's reads of its own object never answer: what
+    // the process holds for it is what the sibling read.
+    *store.hang.lock().unwrap() = Some("nodes/a".to_owned());
+    let decoded = |body: &str| NodeInfo::decode(body.as_bytes()).unwrap();
+    sibling.transport.note_heartbeats(
+        Heartbeats::Listed(vec![decoded(&released), decoded(&peer(now_ms()))]),
+        std::time::Instant::now(),
+        |_, _, _| (),
+    );
+    assert!(a.read_heartbeats(&["b".to_owned()]).await);
+    assert!(
+        !a.identity_taken(),
+        "stopped on its predecessor's body, read by a sibling app"
+    );
+    // Another instance under this id, read by the sibling: a twin.
+    sibling.transport.note_heartbeats(
+        Heartbeats::Listed(vec![
+            decoded(&node_lease_body("a", "live", "feed", now_ms())),
+            decoded(&peer(now_ms())),
+        ]),
+        std::time::Instant::now(),
+        |_, _, _| (),
+    );
+    assert!(a.read_heartbeats(&["b".to_owned()]).await);
+    assert!(a.identity_taken());
+}
+
+/// The running twin check against a body of this node's own id, once this
+/// process's first write replaced the predecessor `cafe` written at `at`:
+/// copies of that writer's past are not a twin (its `released` or `fenced`
+/// body, an earlier one), everything else is (a later body of it, another
+/// instance, a body in the old format or naming no instance).
+#[tokio::test]
+async fn only_the_replaced_writers_past_is_not_a_twin() {
+    let store = Arc::new(SlowNodeReads::default());
+    let at = now_ms() - 60_000;
+    let cases = [
+        (
+            "its released body",
+            node_lease_body("a", "released", "cafe", at),
+            false,
+        ),
+        (
+            "its fenced body",
+            node_lease_body("a", "fenced", "cafe", at),
+            false,
+        ),
+        (
+            "an earlier live body",
+            node_lease_body("a", "live", "cafe", at - 500),
+            false,
+        ),
+        (
+            "a later body of it",
+            node_lease_body("a", "live", "cafe", at + 1),
+            true,
+        ),
+        (
+            "another instance",
+            node_lease_body("a", "released", "feed", at - 500),
+            true,
+        ),
+        (
+            "no instance",
+            node_lease_body("a", "fenced", "-", at - 500),
+            true,
+        ),
+        (
+            "the old format",
+            format!("wasmkeep-node 2\na\nhttp://a\n0\n{}\nt/\n", at - 500),
+            true,
+        ),
+    ];
+    for (what, body, twin) in cases {
+        let a = quiet_node(&store);
+        *a.replaced.lock().unwrap() = Some(("cafe".to_owned(), at));
+        a.heartbeat_reached_bucket(now_ms());
+        let listed = NodeInfo::decode(body.as_bytes()).unwrap_or_else(|| panic!("{what}"));
+        a.check_twin(&[listed]);
+        assert_eq!(a.identity_taken(), twin, "{what}");
+    }
+}
+
+/// A node `a` on `store` whose start check outlasts the test (a 3 h ttl,
+/// no object): it writes and reads nothing in the background.
+fn quiet_node(store: &Arc<SlowNodeReads>) -> Arc<Cluster> {
+    let shared: Arc<dyn ObjectStore> = Arc::clone(store) as Arc<dyn ObjectStore>;
+    let mut config = ClusterConfig::new("a", "http://a", shared);
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+    Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
+}

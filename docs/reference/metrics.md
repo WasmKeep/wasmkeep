@@ -95,6 +95,7 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_signatures_refused_full_total` | counter | `record` (`calls`, `control`, `ingress`) | Node calls refused because the record of used signatures was full. |
 | `wasmkeep_signatures_public_dropped_total` | counter | none | Signed calls on the public port, refused anyway, not recorded because their record was full. |
 | `wasmkeep_signatures_before_start_total` | counter | none | Node calls refused because they were signed before this node started. |
+| `wasmkeep_signatures_bad_total` | counter | none | Node calls refused because their signature did not hold (bad, expired or misaddressed). |
 | `wasmkeep_websocket_owner_closes_total` | counter | `reason` (`event`, `sweep`, `lease_lapse`, `drain`, `move`) | WebSockets closed with 1012 because this node no longer owned their actor. |
 | `wasmkeep_websocket_sweep_reads_total` | counter | none | Ownership records the WebSocket owner sweep read. |
 | `wasmkeep_websocket_sweep_unreadable_total` | counter | `read` (`owner`, `parked`) | Ownership records the sweep could not decode and passed over. |
