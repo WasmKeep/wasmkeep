@@ -459,11 +459,8 @@ impl ActorService {
             ) {
                 let control = req.headers().contains_key(crate::cluster::TAKE)
                     || req.headers().contains_key(crate::cluster::ALARM_HANDOFF);
-                if cluster.admission_replayed(&signed, control) {
-                    return Some(text_response(
-                        StatusCode::FORBIDDEN,
-                        "signature already used\n",
-                    ));
+                if let Some(why) = cluster.admission_replayed(&signed, control) {
+                    return Some(why.answer(req.headers()));
                 }
                 authenticated = true;
             }

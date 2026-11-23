@@ -215,7 +215,9 @@ impl Cluster {
         use wasmkeep_cluster::bucket_check::{CheckError, check_conditional_writes};
         let period = self.heartbeat_every;
         for attempt in 0u64.. {
-            let key = format!("probe/{}-{}-{attempt}", self.node_id, self.nonce_seed);
+            // The instance, never the nonce seed: this key is in the bucket.
+            let instance = self.membership.instance().unwrap_or_default();
+            let key = format!("probe/{}-{instance}-{attempt}", self.node_id);
             let verdict = check_conditional_writes(&self.control_keys, &key).await;
             let path = object_store::path::Path::from(format!("{}{key}", self.store_prefix()));
             let _ = self.store.delete(&path).await;

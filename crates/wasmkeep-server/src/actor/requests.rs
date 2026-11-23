@@ -340,13 +340,18 @@ impl ActorService {
         }
         // Spent only now: a copy sent ahead with another body was refused
         // above without using up the real call's signature.
-        let replayed = self
+        // A replay is 403; a call signed before this node started, or one
+        // past a full record, is 503, so the sender signs it again or
+        // runs a placed event itself, never taking it for the actor's.
+        let spent = self
             .inner
             .cluster
             .as_ref()
-            .is_none_or(|cluster| !cluster.first_use(&signed, handoff || take));
-        if replayed {
-            return text_response(StatusCode::FORBIDDEN, "signature already used\n");
+            .map_or(Err(crate::cluster::SignatureRefused::Used), |cluster| {
+                cluster.first_use(&signed, handoff || take)
+            });
+        if let Err(why) = spent {
+            return why.answer(&parts.headers);
         }
         if handoff {
             return self.accept_alarm(&address, &body);

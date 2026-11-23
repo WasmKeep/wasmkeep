@@ -463,7 +463,8 @@ pub(crate) struct Cluster {
     /// before its first heartbeat and before any lease (see
     /// [`Cluster::check_identity`]).
     identity: tokio::sync::watch::Sender<Identity>,
-    /// Random per process, and a counter: every signed call's nonce is new.
+    /// 16 random bytes per runtime, never published, and a counter: every
+    /// signed call's nonce is new, and none can be guessed ahead.
     nonce_seed: String,
     nonce_counter: std::sync::atomic::AtomicU64,
     /// The bucket, for reading `control/` (ADR 0014).
@@ -769,8 +770,9 @@ impl Cluster {
         .with_app(serves)
         .with_reads_secrets(config.reads_secrets)
         .with_place(config.placement);
-        // Random per process: in every heartbeat (a second process writing
-        // this id shows another one), and the seed of call nonces.
+        // Random per runtime, published in every heartbeat (a second
+        // process writing this id shows another one), so never the seed of
+        // call nonces, which nobody can guess (`nonce_seed`).
         let instance = random_hex(8).unwrap_or_else(|_| {
             // No /dev/urandom: the process and the start time still make
             // it unique to this run.
@@ -796,21 +798,28 @@ impl Cluster {
             Some(t) => membership.with_cluster_tls(t.advertise(), vec![t.pin()]),
             None => membership,
         };
+        // Never published, so a holder of the cluster secret cannot sign
+        // ahead (and spend on the public port) a call this node will send.
+        let nonce_seed = random_hex(16).map_err(|e| {
+            crate::Error::Config(format!("no randomness for the nonces of node calls: {e}"))
+        })?;
         // The records of used signatures start empty: one made before now
-        // may have been used by this node id's previous process or
-        // runtime, so it is refused. A peer whose clock is behind this
-        // one's by d has its calls refused for d after this start (at most
-        // the window, a minute).
-        let started = now_ms();
+        // plus the allowed skew may have been used by this node id's
+        // previous process or runtime, so it is refused. A peer whose clock
+        // is behind this one's by d has its calls refused for d plus that
+        // skew after this start (at most the window, a minute), answered
+        // 503 so that it signs again. A charged ingress proof only spares
+        // a rate charge: it is refused from the start without the skew,
+        // so forwards right after a start are never turned away for it.
+        let skew = config.lease.max_skew_ms();
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
-            seen: SeenSignatures::named("calls").since(started),
+            seen: SeenSignatures::named("calls").from_now(skew),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL)
-                .since(started),
+                .from_now(skew),
             seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS)
-                .since(started),
-            seen_public: SeenSignatures::with_cap("public", signing::MAX_SEEN_PUBLIC)
-                .since(started),
+                .from_now(0),
+            seen_public: SeenSignatures::public().from_now(skew),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -857,7 +866,7 @@ impl Cluster {
             heartbeat_every: config.heartbeat,
             heartbeat_landed: tokio::sync::Notify::new(),
             identity: tokio::sync::watch::Sender::new(Identity::Checking),
-            nonce_seed: instance,
+            nonce_seed,
             nonce_counter: std::sync::atomic::AtomicU64::new(0),
             control_keys,
             control: RwLock::new(Control::default()),
@@ -1701,46 +1710,71 @@ impl Cluster {
 
     /// Read-only early replay check; body verification still spends the
     /// signature later, so a bad-body copy cannot burn the legitimate call.
-    pub(crate) fn admission_replayed(&self, signed: &Signed, control: bool) -> bool {
-        let now = now_ms();
-        self.seen_public.holds(&signed.mac) || self.record(control).used(signed.mac, signed.ts, now)
+    /// Why the early check refuses it, if it does: a full record is left
+    /// to [`Self::first_use`], which spends.
+    pub(crate) fn admission_replayed(
+        &self,
+        signed: &Signed,
+        control: bool,
+    ) -> Option<SignatureRefused> {
+        if self.seen_public.holds(&signed.mac, signed.ts) {
+            self.note_refused("signature already spent on the public port");
+            return Some(SignatureRefused::Used);
+        }
+        match self.record(control).peek(signed.mac, signed.ts, now_ms()) {
+            signing::Spent::Fresh | signing::Spent::Full => None,
+            signing::Spent::Used => {
+                self.note_refused("signature already used");
+                Some(SignatureRefused::Used)
+            }
+            signing::Spent::BeforeStart => {
+                self.note_before_start();
+                Some(SignatureRefused::BeforeStart)
+            }
+        }
     }
 
-    /// Records a signature whose body matched; false if it was already used.
+    /// Records a signature whose body matched, or says why it is refused.
     /// Only then is it spent: a copy sent ahead with another body is
     /// refused without using up the real call's signature. `control`: a
     /// take or an alarm hand-off, recorded apart from other calls.
-    pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> bool {
+    pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> Result<(), SignatureRefused> {
         let now = now_ms();
         // Sent on the public port first: spent there, read only here.
-        if self.seen_public.holds(&signed.mac) {
+        if self.seen_public.holds(&signed.mac, signed.ts) {
             self.note_refused("signature already spent on the public port");
-            return false;
+            return Err(SignatureRefused::Used);
         }
         match self.record(control).spend(signed.mac, signed.ts, now) {
-            signing::Spent::Fresh => true,
+            signing::Spent::Fresh => Ok(()),
             signing::Spent::Used => {
                 self.note_refused("signature already used");
-                false
+                Err(SignatureRefused::Used)
             }
             signing::Spent::BeforeStart => {
-                self.note_refused(
-                    "signature made before this node started (a replay, or the sender's clock behind this one's)",
-                );
-                false
+                self.note_before_start();
+                Err(SignatureRefused::BeforeStart)
             }
             // Not a replay: more node calls than the record holds.
             signing::Spent::Full if control => {
                 self.note_refused(
                     "record of used signatures full (control: takes and alarm hand-offs)",
                 );
-                false
+                Err(SignatureRefused::Full)
             }
             signing::Spent::Full => {
                 self.note_refused("record of used signatures full (calls)");
-                false
+                Err(SignatureRefused::Full)
             }
         }
+    }
+
+    /// Counts and logs a call refused as signed before this node started.
+    fn note_before_start(&self) {
+        crate::metrics::inc(&crate::metrics::METRICS.signatures_before_start);
+        self.note_refused(
+            "signature made before this node started (a replay, or the sender's clock behind this one's)",
+        );
     }
 
     /// The record of used signatures for control calls, or for the rest.

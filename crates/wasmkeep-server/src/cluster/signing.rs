@@ -105,6 +105,9 @@ pub(crate) struct SeenSignatures {
     name: &'static str,
     /// Most signatures it holds at once.
     cap: usize,
+    /// The public port's burns ([`SeenSignatures::public`]): full, a new
+    /// one is dropped and counted apart, refusing nothing.
+    public: bool,
 }
 
 /// What [`SeenSignatures::spend`] found.
@@ -116,10 +119,52 @@ pub(crate) enum Spent {
     Used,
     /// The record is full: refused, though it may be fresh.
     Full,
-    /// Signed before this record was started ([`SeenSignatures::since`]):
+    /// Signed before this record was started ([`SeenSignatures::from_now`]):
     /// a record from before (another process, or runtime, under this node
     /// id) may have seen it, so it is refused.
     BeforeStart,
+}
+
+/// Why a node's validly signed call is refused by the replay check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignatureRefused {
+    /// Used already: a replay, answered 403.
+    Used,
+    /// Signed before this node started: the sender may sign it again (a
+    /// clock behind) or it is a replay; answered 503 so a node retries.
+    BeforeStart,
+    /// The record of used signatures is full: 503, retried.
+    Full,
+}
+
+impl SignatureRefused {
+    /// The status a sender gets.
+    pub(crate) fn status(self) -> hyper::StatusCode {
+        match self {
+            Self::Used => hyper::StatusCode::FORBIDDEN,
+            Self::BeforeStart | Self::Full => hyper::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// The answer to the request with `headers`: 403 for a replay; 503
+    /// otherwise, marked refused for a placed event (the sender runs it,
+    /// ADR 0041) and never an answer of the actor's.
+    pub(crate) fn answer(
+        self,
+        headers: &hyper::HeaderMap,
+    ) -> hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
+        match self {
+            Self::Used => text_response(hyper::StatusCode::FORBIDDEN, "signature already used\n"),
+            Self::BeforeStart => refuse_if_placed(
+                headers,
+                unavailable("call signed before this node started; sign it again\n"),
+            ),
+            Self::Full => refuse_if_placed(
+                headers,
+                unavailable("too many node calls to record their signatures; retry\n"),
+            ),
+        }
+    }
 }
 
 impl Default for SeenSignatures {
@@ -137,23 +182,49 @@ pub(crate) struct Seen {
     /// before it is refused (its record may be gone): so neither a body
     /// arriving late nor a clock stepping back lets one through twice.
     horizon: u64,
-    /// When the record was started (ms), and that moment on the monotonic
-    /// clock: a signature made earlier is refused, since only a record that
-    /// died with its process or runtime could tell whether it was used.
-    since: u64,
-    started: Option<std::time::Instant>,
+    /// When the record was started, on the monotonic clock, and the clock
+    /// skew allowed between nodes (ms): see [`Seen::floor`].
+    started: Option<(std::time::Instant, u64)>,
 }
 
 impl Seen {
-    /// The start, on this clock as it reads `now`: never later than now
-    /// less the time elapsed since, so a clock that started ahead and was
-    /// set back does not refuse every call until it catches up.
+    /// The earliest signature time accepted, as this clock reads `now`:
+    /// the start (now less the time elapsed since, so the floor follows
+    /// this clock when it is set back or forward) plus the allowed skew (a
+    /// sender whose clock is ahead may have dated a call to the previous
+    /// process up to that much past this start). A signature made earlier
+    /// is refused: only a record that died with its process or runtime
+    /// could tell whether it was used.
     fn floor(&self, now: u64) -> u64 {
-        let Some(started) = self.started else {
-            return self.since;
+        let Some((started, skew)) = self.started else {
+            return 0;
         };
+        // A millisecond more: the two clocks tick apart, and a call signed
+        // in the very millisecond of the start must not be refused for it.
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.since.min(now.saturating_sub(elapsed))
+        now.saturating_sub(elapsed.saturating_add(1))
+            .saturating_add(skew)
+    }
+
+    /// What spending `mac`, signed at `ts`, would find at `now`, recording
+    /// nothing.
+    fn judge(&self, mac: &[u8; 32], ts: u64, now: u64, cap: usize) -> Spent {
+        // verify() checked the window earlier (the body arrived since), and
+        // against a clock that may have stepped back: check it again against
+        // the horizon, past which records are gone.
+        if ts.saturating_add(SIGNATURE_WINDOW_MS) < self.horizon.max(now) {
+            return Spent::Used;
+        }
+        if ts < self.floor(now) {
+            return Spent::BeforeStart;
+        }
+        if self.macs.contains(mac) {
+            return Spent::Used;
+        }
+        if self.macs.len() >= cap {
+            return Spent::Full;
+        }
+        Spent::Fresh
     }
 }
 
@@ -185,34 +256,51 @@ impl SeenSignatures {
             seen: Mutex::default(),
             name,
             cap,
+            public: false,
         }
     }
 
-    /// The same record, refusing every signature made before `at` (ms):
-    /// a new process or runtime cannot know which of those it had used.
-    pub(super) fn since(self, at: u64) -> Self {
-        {
-            let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-            seen.since = at;
-            seen.started = Some(std::time::Instant::now());
+    /// The record of the public port's burns, up to [`MAX_SEEN_PUBLIC`]:
+    /// full, a new one is dropped and counted in
+    /// `wasmkeep_signatures_public_dropped_total`, refusing nothing.
+    pub(super) fn public() -> Self {
+        Self {
+            seen: Mutex::default(),
+            name: "",
+            cap: MAX_SEEN_PUBLIC,
+            public: true,
         }
+    }
+
+    /// The same record, refusing every signature made before now plus
+    /// `skew_ms` ([`Seen::floor`]): a new process or runtime cannot know
+    /// which of those its predecessor had used.
+    pub(super) fn from_now(self, skew_ms: u64) -> Self {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).started =
+            Some((std::time::Instant::now(), skew_ms));
         self
     }
 
-    /// Whether `mac` is recorded (spent and not yet forgotten).
-    pub(super) fn holds(&self, mac: &[u8; 32]) -> bool {
+    /// Whether `mac`, signed at `ts`, may have been spent here: recorded,
+    /// or so old that its record may be forgotten.
+    pub(super) fn holds(&self, mac: &[u8; 32], ts: u64) -> bool {
+        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.macs.contains(mac) || ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon
+    }
+
+    /// What spending `mac`, signed at `ts`, would find now, recording
+    /// nothing: for an early check that must not use up the signature.
+    pub(super) fn peek(&self, mac: [u8; 32], ts: u64, now: u64) -> Spent {
         self.seen
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .macs
-            .contains(mac)
+            .judge(&mac, ts, now, self.cap)
     }
 
+    /// Whether `mac`, signed at `ts`, is a replay or from before the start.
+    #[cfg(test)]
     pub(super) fn used(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
-        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        ts < seen.floor(now)
-            || ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now)
-            || seen.macs.contains(&mac)
+        matches!(self.peek(mac, ts, now), Spent::Used | Spent::BeforeStart)
     }
 
     /// Records `mac`, signed at `ts`; false if it was already used (or the
@@ -233,30 +321,24 @@ impl SeenSignatures {
             seen.by_expiry.pop_first();
             seen.macs.remove(&old);
         }
-        // verify() checked the window earlier (the body arrived since), and
-        // against a clock that may have stepped back: check it again against
-        // the horizon, past which records are gone.
-        if ts.saturating_add(SIGNATURE_WINDOW_MS) < horizon {
-            return Spent::Used;
-        }
-        if ts < seen.floor(now) {
-            return Spent::BeforeStart;
-        }
-        if seen.macs.contains(&mac) {
-            return Spent::Used;
-        }
-        if seen.macs.len() >= self.cap {
-            crate::metrics::inc(
+        let found = seen.judge(&mac, ts, now, self.cap);
+        match found {
+            Spent::Fresh => {
+                seen.macs.insert(mac);
+                seen.by_expiry
+                    .insert((ts.saturating_add(SIGNATURE_WINDOW_MS), mac));
+            }
+            Spent::Full if self.public => {
+                crate::metrics::inc(&crate::metrics::METRICS.signatures_public_dropped);
+            }
+            Spent::Full => crate::metrics::inc(
                 &crate::metrics::METRICS
                     .signatures_refused_full
                     .get(&[("record", self.name)]),
-            );
-            return Spent::Full;
+            ),
+            Spent::Used | Spent::BeforeStart => {}
         }
-        seen.macs.insert(mac);
-        seen.by_expiry
-            .insert((ts.saturating_add(SIGNATURE_WINDOW_MS), mac));
-        Spent::Fresh
+        found
     }
 
     #[cfg(test)]

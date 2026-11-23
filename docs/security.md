@@ -143,17 +143,21 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 **Between nodes** (`crates/wasmkeep-server/src/cluster.rs`)
 - Calls carry an HMAC-SHA256 signature (secret from the bucket, never sent)
   over the target node, method, path, the body's SHA-256, caller, chain,
-  time and a nonce unique to each send; valid for a minute, accepted once
-  (the replay record expires in order and holds up to 500,000 signatures,
-  several thousand calls a second into one node). That record does not
-  survive a restart, so a signature made before the receiving node (or
-  its runtime) started is refused, even within its minute: a peer whose
-  clock is behind by some seconds has its calls refused for that long
-  after the node starts (this node's own clock set back after its start
-  lowers the floor with it). This assumes the previous process stopped
-  taking calls before its successor started, as a restart does; a
-  replacement started elsewhere while the old one still serves is not
-  covered. The receiver checks the body
+  time and a nonce unique to each send (seeded by random bytes never
+  published, so no call can be signed ahead of the node that sends it);
+  valid for a minute, accepted once (the replay record expires in order
+  and holds up to 500,000 signatures, several thousand calls a second into
+  one node). That record does not survive a restart, so a signature dated
+  before the receiving node (or its runtime) started, plus the allowed
+  clock skew (`max_skew`, for a sender whose clock is ahead), is refused
+  with a 503 and signed again, even within its minute. The start is read
+  on the monotonic clock, so this node's clock stepping either way after
+  it started moves the floor with it. Calls in the first `max_skew` after
+  a start, and those of a peer whose clock is behind by d for d longer,
+  are refused that way (`wasmkeep_signatures_before_start_total`). This
+  assumes the previous process stopped taking calls before its successor
+  started, as a restart does; a replacement started elsewhere while the
+  old one still serves is not covered. The receiver checks the body
   against it before the actor runs (only a validly signed call is
   buffered). Heartbeats count only under their own key.
 - Without a cluster listener, only with `--cluster-plaintext accept` (by
@@ -198,7 +202,8 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   the cluster port. That record never fills the cluster port's own
   records: signed calls on the public port, however many, cannot refuse
   a node's calls, takes or alarm hand-offs. Once it is full, new ones are
-  dropped (and counted), and the cluster port's mutual TLS alone keeps
+  dropped (`wasmkeep_signatures_public_dropped_total`), and the cluster
+  port's mutual TLS alone keeps
   such a copy out; peers
   without a cluster listener are not used (their actors get a 503 from
   this node), and TLS peers are never reached in plaintext. The forwarded

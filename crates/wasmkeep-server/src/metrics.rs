@@ -571,10 +571,14 @@ pub(crate) struct Metrics {
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
     /// Node calls refused because the record of used signatures was full,
-    /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs;
-    /// `public`, signed calls on the public port in refuse mode, refused anyway: one
-    /// counted there was not recorded).
+    /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
+    /// Signed calls on the public port in refuse mode (refused anyway) not
+    /// recorded because their record was full: nothing else is refused.
+    pub(crate) signatures_public_dropped: AtomicU64,
+    /// Node calls refused because they were signed before this node
+    /// started (a replay, or the sender's clock behind).
+    pub(crate) signatures_before_start: AtomicU64,
     /// WebSockets this node closed with 1012 because it no longer owned
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
     /// `drain`, `move`).
@@ -927,7 +931,7 @@ pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `record` of `wasmkeep_signatures_refused_full_total`.
-pub(crate) const SIGNATURE_RECORDS: [&str; 4] = ["calls", "control", "ingress", "public"];
+pub(crate) const SIGNATURE_RECORDS: [&str; 3] = ["calls", "control", "ingress"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
 pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];
@@ -1665,6 +1669,18 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_signatures_refused_full_total",
         "Node calls refused because the record of used signatures was full, by record.",
         &m.signatures_refused_full,
+    );
+    counter(
+        &mut out,
+        "wasmkeep_signatures_public_dropped_total",
+        "Signed calls on the public port, refused anyway, not recorded because their record was full.",
+        m.signatures_public_dropped.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_signatures_before_start_total",
+        "Node calls refused because they were signed before this node started.",
+        m.signatures_before_start.load(Ordering::Relaxed),
     );
     family(
         &mut out,

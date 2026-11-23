@@ -82,13 +82,15 @@ impl ActorService {
                     );
                 }
                 // Spent once: a relay seen on the wire cannot open another.
-                let fresh = self
+                let spent = self
                     .inner
                     .cluster
                     .as_ref()
-                    .is_some_and(|cluster| cluster.first_use(&signed, false));
-                if !fresh {
-                    return text_response(StatusCode::FORBIDDEN, "signature already used\n");
+                    .map_or(Err(crate::cluster::SignatureRefused::Used), |cluster| {
+                        cluster.first_use(&signed, false)
+                    });
+                if let Err(why) = spent {
+                    return why.answer(req.headers());
                 }
                 Opener::Front
             }

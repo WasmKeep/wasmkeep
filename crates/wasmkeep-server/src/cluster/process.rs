@@ -306,6 +306,10 @@ impl Transport {
         let ran = instances.entry(id.to_owned()).or_default();
         if !ran.iter().any(|i| i == instance) {
             ran.push(instance.to_owned());
+            // The last few: an older one's heartbeat was replaced since.
+            if ran.len() > 16 {
+                ran.remove(0);
+            }
         }
     }
 
