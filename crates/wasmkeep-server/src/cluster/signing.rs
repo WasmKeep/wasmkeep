@@ -116,6 +116,10 @@ pub(crate) enum Spent {
     Used,
     /// The record is full: refused, though it may be fresh.
     Full,
+    /// Signed before this record was started ([`SeenSignatures::since`]):
+    /// a record from before (another process, or runtime, under this node
+    /// id) may have seen it, so it is refused.
+    BeforeStart,
 }
 
 impl Default for SeenSignatures {
@@ -133,6 +137,10 @@ pub(crate) struct Seen {
     /// before it is refused (its record may be gone): so neither a body
     /// arriving late nor a clock stepping back lets one through twice.
     horizon: u64,
+    /// When the record was started (ms): a signature made earlier is
+    /// refused, since only a record that died with its process or runtime
+    /// could tell whether it was used.
+    since: u64,
 }
 
 /// Most signatures remembered at once (about 80 bytes each); past it, calls
@@ -142,6 +150,11 @@ pub(super) const MAX_SEEN: usize = 500_000;
 /// The same for take and alarm hand-off calls, which are rare: a drain or
 /// a move sends one per actor.
 pub(super) const MAX_SEEN_CONTROL: usize = 50_000;
+/// Signed calls that arrived on the public port in refuse mode, spent so
+/// that the same copy is never honoured on the cluster port. Never fails
+/// closed: once full, new ones are dropped (and counted), and only the
+/// cluster port's checks read it.
+pub(super) const MAX_SEEN_PUBLIC: usize = 50_000;
 /// Charged ingress forwarded after an ownership race: rare, fail closed when full.
 pub(super) const MAX_SEEN_INGRESS: usize = 4_096;
 
@@ -161,9 +174,27 @@ impl SeenSignatures {
         }
     }
 
+    /// The same record, refusing every signature made before `at` (ms):
+    /// a new process or runtime cannot know which of those it had used.
+    pub(super) fn since(self, at: u64) -> Self {
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).since = at;
+        self
+    }
+
+    /// Whether `mac` is recorded (spent and not yet forgotten).
+    pub(super) fn holds(&self, mac: &[u8; 32]) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .macs
+            .contains(mac)
+    }
+
     pub(super) fn used(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
         let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now) || seen.macs.contains(&mac)
+        ts < seen.since
+            || ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now)
+            || seen.macs.contains(&mac)
     }
 
     /// Records `mac`, signed at `ts`; false if it was already used (or the
@@ -189,6 +220,9 @@ impl SeenSignatures {
         // the horizon, past which records are gone.
         if ts.saturating_add(SIGNATURE_WINDOW_MS) < horizon {
             return Spent::Used;
+        }
+        if ts < seen.since {
+            return Spent::BeforeStart;
         }
         if seen.macs.contains(&mac) {
             return Spent::Used;

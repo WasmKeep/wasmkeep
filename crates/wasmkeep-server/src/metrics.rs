@@ -571,7 +571,9 @@ pub(crate) struct Metrics {
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
     /// Node calls refused because the record of used signatures was full,
-    /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs).
+    /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs;
+    /// `public`, signed calls on the public port in refuse mode, refused anyway: one
+    /// counted there was not recorded).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
     /// WebSockets this node closed with 1012 because it no longer owned
     /// their actor, by how it found out (`event`, `sweep`, `lease_lapse`,
@@ -925,7 +927,7 @@ pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `record` of `wasmkeep_signatures_refused_full_total`.
-pub(crate) const SIGNATURE_RECORDS: [&str; 3] = ["calls", "control", "ingress"];
+pub(crate) const SIGNATURE_RECORDS: [&str; 4] = ["calls", "control", "ingress", "public"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
 pub(crate) const OWNER_CLOSE_REASONS: [&str; 5] =
     ["event", "sweep", "lease_lapse", "drain", "move"];

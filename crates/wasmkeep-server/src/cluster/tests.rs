@@ -1136,6 +1136,135 @@ async fn refuse_mode_honours_node_signatures_on_the_cluster_port_only() {
     assert!(refuse.is_internal(&method, path, &headers, false).is_none());
 }
 
+/// A call to node `a` signed with `secret` at `ts`, with nonce `n` and
+/// the `marker` header if any.
+fn signed_call(secret: &str, ts: u64, n: u64, marker: Option<&str>) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    if let Some(m) = marker {
+        headers.insert(
+            hyper::header::HeaderName::from_bytes(m.as_bytes()).unwrap(),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+    }
+    let hash = body_sha256(b"");
+    let nonce = format!("{n:x}");
+    let mac = signature(
+        secret,
+        ts,
+        &nonce,
+        "a",
+        &hyper::Method::POST,
+        "/actor/u/x/",
+        &hash,
+        &headers,
+    );
+    headers.insert(
+        INTERNAL,
+        format!("v4 {ts} {nonce} {hash} {mac}").parse().unwrap(),
+    );
+    headers
+}
+
+/// Node `a` in refuse mode, the cluster secret `secret` loaded.
+async fn refuse_node(secret: &str) -> Arc<Cluster> {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            secret.to_owned().into_bytes().into(),
+        )
+        .await
+        .unwrap();
+    let mut config = ClusterConfig::new("a", "http://a", store);
+    config.heartbeat = Duration::from_secs(3_600);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+    config.cluster_tls = Some(ClusterTlsConfig::new("https://a.test:7443"));
+    config.cluster_plaintext = ClusterPlaintext::Refuse;
+    let c = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+    c.load_secret().await;
+    c
+}
+
+/// Signed calls on the public port (refuse mode) are spent in a record of
+/// their own: however many arrive, they never fill the records the
+/// cluster port's calls, takes and alarm hand-offs are checked against,
+/// and once that record is full new ones are dropped, refusing nothing
+/// on the cluster port. One spent there while it had room is still
+/// refused on the cluster port.
+#[tokio::test]
+async fn public_port_signatures_never_fill_the_cluster_ports_records() {
+    let secret = "ab".repeat(32);
+    let c = refuse_node(&secret).await;
+    let m = hyper::Method::POST;
+    let path = "/actor/u/x/";
+    let ts = now_ms();
+    let early = signed_call(&secret, ts, 0, Some(TAKE));
+    assert!(c.is_internal(&m, path, &early, false).is_none());
+    let copy = c.is_internal(&m, path, &early, true).unwrap();
+    assert!(c.admission_replayed(&copy, true));
+    assert!(!c.first_use(&copy, true));
+    // More than any record but the calls' holds, two in three with a
+    // marker.
+    let n = u64::try_from(signing::MAX_SEEN_CONTROL.max(signing::MAX_SEEN_PUBLIC)).unwrap() * 2;
+    for i in 1..=n {
+        let marker = [Some(TAKE), Some(ALARM_HANDOFF), None][usize::try_from(i % 3).unwrap()];
+        let h = signed_call(&secret, ts, i, marker);
+        assert!(c.is_internal(&m, path, &h, false).is_none());
+    }
+    // The cluster port's take, alarm hand-off and call still pass.
+    for (i, marker, control) in [
+        (n + 1, Some(TAKE), true),
+        (n + 2, Some(ALARM_HANDOFF), true),
+        (n + 3, None, false),
+    ] {
+        let h = signed_call(&secret, ts, i, marker);
+        let signed = c.is_internal(&m, path, &h, true).unwrap();
+        assert!(!c.admission_replayed(&signed, control), "{marker:?}");
+        assert!(c.first_use(&signed, control), "{marker:?} refused");
+    }
+    assert_eq!(c.seen_control.len(), 2);
+    assert_eq!(c.seen.len(), 1);
+}
+
+/// A signature made before the receiving runtime started is refused, even
+/// within its window: the records of what was used died with the previous
+/// process (or runtime) under this node id, so it may have been used
+/// there. One made since passes.
+#[tokio::test]
+async fn a_signature_made_before_this_node_started_is_refused() {
+    let secret = "ab".repeat(32);
+    let before = now_ms() - 5_000;
+    for c in [refuse_node(&secret).await, {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(
+                &StorePath::from(SECRET_KEY),
+                secret.clone().into_bytes().into(),
+            )
+            .await
+            .unwrap();
+        let mut config = ClusterConfig::new("a", "http://a", store);
+        config.heartbeat = Duration::from_secs(3_600);
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+        let c = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+        c.load_secret().await;
+        c
+    }] {
+        let m = hyper::Method::POST;
+        let path = "/actor/u/x/";
+        for (marker, control) in [(None, false), (Some(TAKE), true)] {
+            let old = signed_call(&secret, before, 1, marker);
+            let signed = c.is_internal(&m, path, &old, true).unwrap();
+            assert!(c.admission_replayed(&signed, control));
+            assert!(!c.first_use(&signed, control), "an older signature passed");
+            let new = signed_call(&secret, now_ms(), 2, marker);
+            let signed = c.is_internal(&m, path, &new, true).unwrap();
+            assert!(!c.admission_replayed(&signed, control));
+            assert!(c.first_use(&signed, control));
+        }
+    }
+}
+
 /// ADR 0011, amendment of 2026-11-14: a hello asks for a listing only as
 /// a node's signed call to this node, with an empty body, once; anything
 /// else is refused and asks for nothing.
@@ -5034,6 +5163,68 @@ async fn an_older_read_landing_late_never_undoes_a_newer_one() {
         |a, _, _| a.to_vec(),
     );
     assert_eq!(all.len(), 1, "a failed read keeps the node as last read");
+}
+
+/// A runtime restarted in place (same process, same node id, a new
+/// instance) whose first heartbeat has landed is not a twin of its
+/// predecessor: the process may still hold the predecessor's heartbeat as
+/// last read, and a read of a peer alone applies every node as last read.
+/// A heartbeat of another process under this id still is a twin.
+#[tokio::test]
+async fn a_runtime_restarted_in_place_is_not_its_own_predecessors_twin() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = || {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new("a", "http://a", shared);
+        config.heartbeat = Duration::from_millis(100);
+        // A 3 h ttl, so nothing runs in the background.
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
+    };
+    let body = |instance: &str| {
+        let text = format!(
+            "wasmkeep-node 3\nlive {instance}\n{}\na\nhttp://a\n0.0.0\nt/\n\n\nserving\n\ntake\n",
+            now_ms()
+        );
+        NodeInfo::decode(text.as_bytes()).unwrap()
+    };
+    let first = runtime();
+    let old = first.membership.instance().unwrap().to_owned();
+    // Its own heartbeat, as the process last read it.
+    first.transport.note_heartbeats(
+        Heartbeats::Read(vec![(
+            "a".to_owned(),
+            HeartbeatRead::Found(Box::new(body(&old))),
+        )]),
+        std::time::Instant::now(),
+        |_, _, _| (),
+    );
+    first.leave_process();
+    drop(first);
+    let second = runtime();
+    assert_ne!(second.membership.instance(), Some(old.as_str()));
+    second.heartbeat_reached_bucket(now_ms());
+    // A peer read before this runtime's first listing.
+    publish_tls(&store, "b", now_ms(), 1).await;
+    assert!(second.read_heartbeats(&["b".to_owned()]).await);
+    assert!(
+        !second.identity_taken(),
+        "the restarted runtime stopped on its predecessor's heartbeat"
+    );
+    // Another process's heartbeat under this id: a twin.
+    second.transport.note_heartbeats(
+        Heartbeats::Read(vec![(
+            "a".to_owned(),
+            HeartbeatRead::Found(Box::new(body("beef"))),
+        )]),
+        std::time::Instant::now(),
+        |_, _, _| (),
+    );
+    assert!(second.read_heartbeats(&["b".to_owned()]).await);
+    assert!(second.identity_taken());
 }
 
 /// The first read of a heartbeat dated ahead is the process's (ADR 0038:

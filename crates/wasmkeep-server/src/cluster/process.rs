@@ -185,6 +185,7 @@ impl NodeProcess {
                     nodes,
                     live: RwLock::default(),
                     heard: Mutex::default(),
+                    instances: Mutex::default(),
                 });
                 *slot = Some(Arc::clone(&t));
                 t
@@ -273,6 +274,10 @@ pub(crate) struct Transport {
     /// read that fails changes nothing: its node stays as last read,
     /// trusted until that heartbeat's own horizon and no longer.
     heard: Mutex<Heard>,
+    /// The instances each node id ran under in this process, one runtime
+    /// after another ([`Transport::note_instance`]): a heartbeat of an
+    /// earlier one is a stopped predecessor's, never a twin's.
+    instances: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// [`Transport::note_heartbeats`]'s state.
@@ -293,6 +298,26 @@ pub(super) enum Heartbeats {
 }
 
 impl Transport {
+    /// Notes that a runtime of node `id` runs under `instance` in this
+    /// process. Its runtimes run one at a time (a node id joins the process
+    /// once), so every earlier instance noted for `id` has stopped.
+    pub(super) fn note_instance(&self, id: &str, instance: &str) {
+        let mut instances = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        let ran = instances.entry(id.to_owned()).or_default();
+        if !ran.iter().any(|i| i == instance) {
+            ran.push(instance.to_owned());
+        }
+    }
+
+    /// Whether node `id` ran under `instance` in this process.
+    pub(super) fn ran_here(&self, id: &str, instance: &str) -> bool {
+        self.instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .is_some_and(|ran| ran.iter().any(|i| i == instance))
+    }
+
     /// Records heartbeats read by a listing or reads issued at `issued`,
     /// then runs `apply` on the result while still holding it, so that two
     /// apps of the process never apply their views out of order (each

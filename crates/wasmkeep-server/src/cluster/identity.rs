@@ -153,6 +153,21 @@ impl Cluster {
         if listed.instance.as_deref() == Some(ours) || self.identity_taken() {
             return;
         }
+        // A runtime restarted in place: the process may still hold its
+        // stopped predecessor's heartbeat as last read (a read of a peer
+        // alone brings every node as last read here), or a read issued
+        // before this runtime's first write may land after it. That
+        // instance ran in this process and stopped before this one joined:
+        // it writes no more, so its heartbeat is not a twin's. Judged by
+        // the writer, not by when the body was read, so no read in flight,
+        // of this runtime or a sibling's, can bring it back as one.
+        if listed
+            .instance
+            .as_deref()
+            .is_some_and(|i| self.transport.ran_here(&self.node_id, i))
+        {
+            return;
+        }
         // The same verdict the next lease write's re-read would give.
         let stopped = match listed.lease {
             None => Stopped::OldVersion,

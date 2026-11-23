@@ -376,6 +376,11 @@ pub(crate) struct Cluster {
     seen_control: SeenSignatures,
     /// Rare charged ingress hand-offs, isolated from actor and control calls.
     seen_ingress: SeenSignatures,
+    /// Signed calls that arrived on the public port in refuse mode: spent
+    /// here, apart, so that no number of them fills the records above, and
+    /// read by the cluster port's checks, so that such a copy is never
+    /// honoured there while it is remembered. Full, it drops new ones.
+    seen_public: SeenSignatures,
     /// When each reason for refusing a node signature was last logged
     /// (ms): one slot per reason, so junk on the public port cannot hide a
     /// real refusal.
@@ -779,6 +784,9 @@ impl Cluster {
             .clone()
             .unwrap_or_else(NodeProcess::new)
             .attach(config, bucket.clone())?;
+        // A heartbeat of an earlier runtime of this id in this process is
+        // a stopped predecessor's, not a twin's (`check_twin`).
+        transport.note_instance(&config.node_id, &instance);
         // Its heartbeat names the process (ADR 0038, section 2).
         let membership = match joined.process().name() {
             Some(name) => membership.with_process(name),
@@ -788,11 +796,21 @@ impl Cluster {
             Some(t) => membership.with_cluster_tls(t.advertise(), vec![t.pin()]),
             None => membership,
         };
+        // The records of used signatures start empty: one made before now
+        // may have been used by this node id's previous process or
+        // runtime, so it is refused. A peer whose clock is behind this
+        // one's by d has its calls refused for d after this start (at most
+        // the window, a minute).
+        let started = now_ms();
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
-            seen: SeenSignatures::named("calls"),
-            seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL),
-            seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS),
+            seen: SeenSignatures::named("calls").since(started),
+            seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL)
+                .since(started),
+            seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS)
+                .since(started),
+            seen_public: SeenSignatures::with_cap("public", signing::MAX_SEEN_PUBLIC)
+                .since(started),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(
@@ -1412,25 +1430,38 @@ impl Cluster {
             UPGRADE_MARK,
             hyper::header::HeaderValue::from_static("websocket"),
         );
-        let body_hash = body_sha256(b"");
-        let ts = now_ms();
-        let nonce = self.nonce();
-        let mac = signature(
+        self.sign_call(
+            headers,
             &secret,
-            ts,
-            &nonce,
             owner,
             &hyper::Method::GET,
             path,
-            &body_hash,
-            headers,
-        );
+            &body_sha256(b""),
+        )
+    }
+
+    /// Signs a call to node `to` in `headers` (its [`INTERNAL`] value, with
+    /// its own nonce) and names this node its sender. Over the headers as
+    /// they are now: every signed one (caller, chain, markers, app) must
+    /// be in place first.
+    fn sign_call(
+        &self,
+        headers: &mut hyper::HeaderMap,
+        secret: &str,
+        to: &str,
+        method: &hyper::Method,
+        path: &str,
+        body_hash: &str,
+    ) -> Result<(), String> {
+        let ts = now_ms();
+        let nonce = self.nonce();
+        let mac = signature(secret, ts, &nonce, to, method, path, body_hash, headers);
         headers.insert(
             INTERNAL,
             hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
                 .map_err(|e| e.to_string())?,
         );
-        self.add_sender(headers, &secret, "internal", &mac);
+        self.add_sender(headers, secret, "internal", &mac);
         Ok(())
     }
 
@@ -1508,8 +1539,11 @@ impl Cluster {
     /// In refuse mode, only a request that arrived on the cluster port
     /// (`on_cluster_port`) can be a node's: on the public port the request
     /// counts as coming from outside, and a valid signature there is spent
-    /// (without the body check), so that copy can never become a node's
-    /// call on the cluster port later.
+    /// (without the body check) in a record of its own, which the cluster
+    /// port's checks read, so that copy does not become a node's call on
+    /// the cluster port later. That record is bounded and, full, drops new
+    /// ones rather than refusing anything: the cluster port's mutual TLS
+    /// remains what keeps such a copy out then.
     pub(crate) fn is_internal(
         &self,
         method: &hyper::Method,
@@ -1528,11 +1562,11 @@ impl Cluster {
         let now = now_ms();
         match verify(secret, given, now, &self.node_id, method, path, headers) {
             Some(signed) if public_port => {
-                // Burnt, never honoured here, in the record a node's call
-                // with the same markers would be checked against (both
-                // markers are signed).
-                let control = headers.contains_key(TAKE) || headers.contains_key(ALARM_HANDOFF);
-                self.record(control).first_use(signed.mac, signed.ts, now);
+                // Burnt, never honoured here, apart from the records the
+                // cluster port spends in: those only a node holding a
+                // pinned certificate can fill. Dropped (and counted) once
+                // this record is full.
+                self.seen_public.spend(signed.mac, signed.ts, now);
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
                 None
             }
@@ -1668,7 +1702,8 @@ impl Cluster {
     /// Read-only early replay check; body verification still spends the
     /// signature later, so a bad-body copy cannot burn the legitimate call.
     pub(crate) fn admission_replayed(&self, signed: &Signed, control: bool) -> bool {
-        self.record(control).used(signed.mac, signed.ts, now_ms())
+        let now = now_ms();
+        self.seen_public.holds(&signed.mac) || self.record(control).used(signed.mac, signed.ts, now)
     }
 
     /// Records a signature whose body matched; false if it was already used.
@@ -1676,10 +1711,22 @@ impl Cluster {
     /// refused without using up the real call's signature. `control`: a
     /// take or an alarm hand-off, recorded apart from other calls.
     pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> bool {
-        match self.record(control).spend(signed.mac, signed.ts, now_ms()) {
+        let now = now_ms();
+        // Sent on the public port first: spent there, read only here.
+        if self.seen_public.holds(&signed.mac) {
+            self.note_refused("signature already used");
+            return false;
+        }
+        match self.record(control).spend(signed.mac, signed.ts, now) {
             signing::Spent::Fresh => true,
             signing::Spent::Used => {
                 self.note_refused("signature already used");
+                false
+            }
+            signing::Spent::BeforeStart => {
+                self.note_refused(
+                    "signature made before this node started (a replay, or the sender's clock behind this one's)",
+                );
                 false
             }
             // Not a replay: more node calls than the record holds.
@@ -1937,24 +1984,7 @@ impl Cluster {
             }
         }
         crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "call")]));
-        let ts = now_ms();
-        let nonce = self.nonce();
-        let mac = signature(
-            &secret,
-            ts,
-            &nonce,
-            owner,
-            &method,
-            &signed_path,
-            &body_hash,
-            headers,
-        );
-        headers.insert(
-            INTERNAL,
-            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
-                .map_err(|e| e.to_string())?,
-        );
-        self.add_sender(headers, &secret, "internal", &mac);
+        self.sign_call(headers, &secret, owner, &method, &signed_path, &body_hash)?;
         self.check_tls_target(&base)
             .map_err(|e| format!("node {owner}: {e}"))?;
         let call = self.clients().call.clone();
