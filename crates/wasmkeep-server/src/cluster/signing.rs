@@ -137,10 +137,24 @@ pub(crate) struct Seen {
     /// before it is refused (its record may be gone): so neither a body
     /// arriving late nor a clock stepping back lets one through twice.
     horizon: u64,
-    /// When the record was started (ms): a signature made earlier is
-    /// refused, since only a record that died with its process or runtime
-    /// could tell whether it was used.
+    /// When the record was started (ms), and that moment on the monotonic
+    /// clock: a signature made earlier is refused, since only a record that
+    /// died with its process or runtime could tell whether it was used.
     since: u64,
+    started: Option<std::time::Instant>,
+}
+
+impl Seen {
+    /// The start, on this clock as it reads `now`: never later than now
+    /// less the time elapsed since, so a clock that started ahead and was
+    /// set back does not refuse every call until it catches up.
+    fn floor(&self, now: u64) -> u64 {
+        let Some(started) = self.started else {
+            return self.since;
+        };
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.since.min(now.saturating_sub(elapsed))
+    }
 }
 
 /// Most signatures remembered at once (about 80 bytes each); past it, calls
@@ -177,7 +191,11 @@ impl SeenSignatures {
     /// The same record, refusing every signature made before `at` (ms):
     /// a new process or runtime cannot know which of those it had used.
     pub(super) fn since(self, at: u64) -> Self {
-        self.seen.lock().unwrap_or_else(|p| p.into_inner()).since = at;
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.since = at;
+            seen.started = Some(std::time::Instant::now());
+        }
         self
     }
 
@@ -192,7 +210,7 @@ impl SeenSignatures {
 
     pub(super) fn used(&self, mac: [u8; 32], ts: u64, now: u64) -> bool {
         let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        ts < seen.since
+        ts < seen.floor(now)
             || ts.saturating_add(SIGNATURE_WINDOW_MS) < seen.horizon.max(now)
             || seen.macs.contains(&mac)
     }
@@ -221,7 +239,7 @@ impl SeenSignatures {
         if ts.saturating_add(SIGNATURE_WINDOW_MS) < horizon {
             return Spent::Used;
         }
-        if ts < seen.since {
+        if ts < seen.floor(now) {
             return Spent::BeforeStart;
         }
         if seen.macs.contains(&mac) {

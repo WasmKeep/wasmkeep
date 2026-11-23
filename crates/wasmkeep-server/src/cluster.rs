@@ -1714,7 +1714,7 @@ impl Cluster {
         let now = now_ms();
         // Sent on the public port first: spent there, read only here.
         if self.seen_public.holds(&signed.mac) {
-            self.note_refused("signature already used");
+            self.note_refused("signature already spent on the public port");
             return false;
         }
         match self.record(control).spend(signed.mac, signed.ts, now) {

@@ -149,7 +149,11 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   survive a restart, so a signature made before the receiving node (or
   its runtime) started is refused, even within its minute: a peer whose
   clock is behind by some seconds has its calls refused for that long
-  after the node starts. The receiver checks the body
+  after the node starts (this node's own clock set back after its start
+  lowers the floor with it). This assumes the previous process stopped
+  taking calls before its successor started, as a restart does; a
+  replacement started elsewhere while the old one still serves is not
+  covered. The receiver checks the body
   against it before the actor runs (only a validly signed call is
   buffered). Heartbeats count only under their own key.
 - Without a cluster listener, only with `--cluster-plaintext accept` (by

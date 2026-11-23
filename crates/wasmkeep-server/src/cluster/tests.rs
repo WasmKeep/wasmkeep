@@ -357,6 +357,22 @@ fn a_full_record_tells_full_from_used() {
     assert_eq!(seen.spend([1; 32], 1_000, 1_000), Spent::Used);
 }
 
+/// The start floor follows this node's clock set back: a node that
+/// started with its clock ahead does not refuse every signature until real
+/// time catches up with its start, only those made before it started.
+#[test]
+fn a_clock_set_back_after_the_start_lowers_the_start_floor() {
+    let start = 10_000_000;
+    let seen = SeenSignatures::default().since(start);
+    assert!(seen.used([1; 32], start - 1, start));
+    // The clock is set back an hour (no signature was spent meanwhile:
+    // ahead by more than the window, every one was refused unchecked).
+    let now = start - 3_600_000;
+    assert!(!seen.used([2; 32], now, now));
+    assert_eq!(seen.spend([2; 32], now, now), Spent::Fresh);
+    assert_eq!(seen.spend([3; 32], now - 5_000, now), Spent::BeforeStart);
+}
+
 #[test]
 fn a_signature_is_accepted_once() {
     let seen = SeenSignatures::default();
