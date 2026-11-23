@@ -57,14 +57,14 @@ sudo install -d -m 0700 -o wasmkeep -g wasmkeep /var/lib/wasmkeep/data /var/lib/
 ```
 
 The data directory holds every actor's database: keep it readable by the
-service alone. `serve` creates a missing `--data-dir` with mode 0700 and
-warns at start when an existing one is open to other accounts; it never
-changes the mode of a directory that exists. On an existing install,
-tighten them once:
-
-```bash
-sudo chmod 700 /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
-```
+service alone, as the unit's `UMask=0077` does for what the service
+creates. `serve` creates a missing `--data-dir` with mode 0700 and warns at
+start when an existing one is open to other accounts; it never changes the
+mode of a directory that exists. The cache directory holds native code the
+server runs: it loads from it only while the directory and its files belong
+to the service's user and no one else can write to them. To tighten an
+install made before 0.8, see
+[Upgrading an existing install to 0.8](#upgrading-an-existing-install-to-08).
 
 Copy your components (built as in each SDK's README) into
 `/var/lib/wasmkeep/classes/`. The unit below serves two: the counter, which
@@ -74,15 +74,31 @@ leave the chat lines out to serve the counter alone.
 
 Configuration and secrets for a class (API keys, webhook URLs: see
 [Configuration and secrets](../concepts.md#configuration-and-secrets)) go in
-a file only the service can read, and cannot rewrite: root's, readable by
-the service's group. The server refuses a file other users can open, or
-its group can write:
+a file only the service can read, and cannot rewrite: root's (`0640`,
+group `wasmkeep`). The server refuses a file other users can open, a file
+its group can write, and a file its group can read while the service's user
+owns it (that one is `0600`):
 
 ```bash
 sudo install -d -m 750 -o root -g wasmkeep /etc/wasmkeep
 sudo install -m 640 -o root -g wasmkeep /dev/null /etc/wasmkeep/chat.env
 sudoedit /etc/wasmkeep/chat.env       # NAME=value lines
 ```
+
+An app that keeps its secrets in the bucket (`--app`, see
+[Secrets in the bucket](../cluster.md#secrets-in-the-bucket)) also needs a
+secrets key on the node. The key file has a stricter rule than an env file:
+`0600`, owned by the service's user, since the server refuses a key its group
+can read. Create it once and hand it over:
+
+```bash
+sudo wasmkeep secrets new-key --out /etc/wasmkeep/secrets.key
+sudo chown wasmkeep:wasmkeep /etc/wasmkeep/secrets.key   # stays 0600
+```
+
+and add `--secrets-key /etc/wasmkeep/secrets.key` to `ExecStart`. Keep a copy
+of the key off the machine: without it the sealed secrets in the bucket
+cannot be opened.
 
 ## 2. Run it with systemd
 
@@ -106,7 +122,7 @@ ExecStart=/usr/local/bin/wasmkeep serve \
   --listen 127.0.0.1:8080
 Environment=RUST_LOG=info
 Restart=on-failure
-# Files the service creates (databases, scratch copies, logs) are its own.
+# Files the service creates (databases, scratch copies, cache) are its own.
 UMask=0077
 # SIGTERM: in-flight requests get up to 10 s, then actors finish their
 # queued events (up to 10 s more) and, in a cluster, hand over. Give it room.
@@ -138,7 +154,8 @@ The first start compiles each component and caches the result in
 `--cache-dir`; later starts take a fraction of a second. What is cached
 there runs as native code, so the server loads it only while the directory
 and the file belong to its user and no one else can write to them;
-otherwise it compiles again and logs a warning.
+otherwise it compiles again, and logs at start the command that fixes the
+directory.
 
 ## 3. Put a reverse proxy in front
 
@@ -260,6 +277,28 @@ A plain `cp` of a live database can produce a corrupt copy.
   within seconds, actor by actor (see [Running a cluster](../cluster.md#deploying)).
 - **New WasmKeep binary**: install it and restart. Open WebSockets are
   closed; clients reconnect.
+
+### Upgrading an existing install to 0.8
+
+0.8.0 (the next release, unreleased) refuses files and directories that
+other accounts can reach. An install made from an earlier version of this
+page needs these once, before the first start of the new binary (the
+service stopped):
+
+```bash
+# data and cache: the service's alone
+sudo chown -R wasmkeep:wasmkeep /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
+sudo chmod 700 /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
+# env files: root's, readable by the service's group, never writable by it
+sudo chown root:wasmkeep /etc/wasmkeep/*.env
+sudo chmod 640 /etc/wasmkeep/*.env
+# the secrets key, if you use one: the service's, 0600
+sudo chmod 600 /etc/wasmkeep/secrets.key
+```
+
+Then add `UMask=0077` to the unit (as above), `sudo systemctl daemon-reload`,
+and restart. An env file the server will not accept stops the start. The full list of changes is in
+[upgrading to 0.8.0](upgrading-to-0.8.md).
 
 ## Sizing
 

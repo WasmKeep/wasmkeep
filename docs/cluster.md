@@ -1561,7 +1561,8 @@ every node, upgrade them all, start them all**, unless that release's
 upgrading page says a rolling upgrade, one node at a time, is supported.
 Read the page for the release you move to
 ([0.4.0](deploy/upgrading-to-0.4.md), [0.5.0](deploy/upgrading-to-0.5.md),
-[0.6.0](deploy/upgrading-to-0.6.md), [0.7.0](deploy/upgrading-to-0.7.md)):
+[0.6.0](deploy/upgrading-to-0.6.md), [0.7.0](deploy/upgrading-to-0.7.md),
+[0.8.0, unreleased](deploy/upgrading-to-0.8.md)):
 it is the rule for that release, and this page does not override it.
 Without such a statement, WasmKeep does not support nodes of different
 versions in one cluster, even for the length of a rolling restart. The
