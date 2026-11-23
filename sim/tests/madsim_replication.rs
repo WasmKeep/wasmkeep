@@ -316,7 +316,9 @@ struct IdleCounts {
     /// Passes that compacted from a snapshot of another generation than
     /// the released one (only when any snapshot at the head is taken).
     foreign: u64,
-    /// Deletes a pass sent that landed after its hold ended.
+    /// Deletes a pass sent that landed after its hold ended: keys it sent,
+    /// still there when its hold ended, gone later. Another deleter of the
+    /// same key (a later pass, or periodic collection) counts too.
     late_deletes: u64,
     /// Passes whose listing without its snapshot still planned, so the
     /// restore was compared against the segments' own history.
@@ -2313,7 +2315,12 @@ fn idle_compaction_beside_collection_keeps_every_acknowledged_write() {
 /// The first seed within the budget whose run `fails`, run twice to show
 /// it reproduces.
 fn first_seed(rules: Rules, fails: impl Fn(&Outcome) -> bool) -> Option<u64> {
-    let seed = (0..seeds()).find(|&s| fails(&simulate(s, rules, Duration::from_secs(30))))?;
+    first_seed_within(seeds(), rules, fails)
+}
+
+/// [`first_seed`] within `budget` seeds.
+fn first_seed_within(budget: u64, rules: Rules, fails: impl Fn(&Outcome) -> bool) -> Option<u64> {
+    let seed = (0..budget).find(|&s| fails(&simulate(s, rules, Duration::from_secs(30))))?;
     assert!(
         fails(&simulate(seed, rules, Duration::from_secs(30))),
         "seed {seed} did not reproduce"
@@ -2395,8 +2402,12 @@ fn an_idle_pass_deleting_the_segment_at_p_breaks_a_restore() {
         idle: Idle::DropSegmentAtP,
         ..SAFE_IDLE
     };
-    let seed = first_seed(rules, |o| final_failure(o, "is missing"))
-        .unwrap_or_else(|| panic!("no Missing within the seed budget"));
+    // Rarer (14 seeds in 2,000 when this was written): at least 1,000
+    // seeds, however small the budget; it stops at the first.
+    let seed = first_seed_within(seeds().max(1_000), rules, |o| {
+        final_failure(o, "is missing")
+    })
+    .unwrap_or_else(|| panic!("no Missing within the seed budget"));
     eprintln!("replication idle: deleting the segment at P fails a restore at seed {seed}");
 }
 

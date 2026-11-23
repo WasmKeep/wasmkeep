@@ -205,10 +205,14 @@ pub fn collectable(listing: &Listing, owner_generation: u64, snapshot: SegmentId
 ///
 /// The snapshot `S` is the newest one of generation `released_generation`
 /// whose segment (at the same position `P`) is also listed; the keys are
-/// [`collectable`]`(listing, released_generation, S)`, so `S` and the
-/// segment at `P` are always kept, and every object of a generation above
-/// `released_generation`, or at a txid above `P`'s, too. `None` if there
-/// is no such snapshot: nothing to do.
+/// [`collectable`]`(listing, released_generation, S)`: every object with a
+/// txid below `P`'s or a generation below `released_generation`, except `S`
+/// and the segment at `P`. What is kept besides those two is what has both
+/// a txid at or above `P`'s and a generation at or above
+/// `released_generation`. A later generation's object below `P`'s txid
+/// would be deleted; the precondition below is what makes one impossible
+/// (every later hold restores from a listing that has `P`, and builds
+/// above it). `None` if there is no such snapshot: nothing to do.
 ///
 /// Why the released generation and not any snapshot at the head: a
 /// snapshot key names the position's generation, not its uploader. A hold
