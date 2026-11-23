@@ -582,6 +582,63 @@ fn secrets_round_trip_through_the_bucket() {
     ]));
     assert!(!run(&["list"], &k1, b"").status.success());
     assert!(ok(run(&["list"], &k2, b"")).contains("STRIPE_KEY"));
+    let sealed_with = || {
+        rt.block_on(async {
+            use futures_util::TryStreamExt as _;
+            let metas: Vec<_> = store
+                .list(Some(&Path::from(format!(
+                    "{prefix}/apps/acme/shop/secrets"
+                ))))
+                .try_collect()
+                .await
+                .unwrap();
+            let mut ids = Vec::new();
+            for m in metas {
+                if m.location.filename() == Some("current") {
+                    continue;
+                }
+                let bytes = store.get(&m.location).await.unwrap().bytes().await.unwrap();
+                ids.push(wasmkeep_server::secrets::sealed_with(&bytes).unwrap());
+            }
+            ids
+        })
+    };
+    let k1_id = wasmkeep_server::secrets::SecretsKey::load(&k1)
+        .unwrap()
+        .id()
+        .to_owned();
+    let k2_id = wasmkeep_server::secrets::SecretsKey::load(&k2)
+        .unwrap()
+        .id()
+        .to_owned();
+    // The rotation keeps the one before `current`, sealed with k1.
+    assert!(sealed_with().contains(&k1_id));
+    // --finish: nothing sealed with k1 is left, and k2 still opens.
+    let finish = |key: &std::path::Path| {
+        wasmkeep(&[
+            "secrets",
+            "rotate-key",
+            "--bucket",
+            &url,
+            "--app",
+            "acme/shop",
+            "--new-key",
+            key.to_str().unwrap(),
+            "--finish",
+        ])
+    };
+    assert!(
+        !finish(&k3).status.success(),
+        "a key the current set is not sealed with is refused"
+    );
+    assert!(sealed_with().contains(&k1_id));
+    ok(finish(&k2));
+    let ids = sealed_with();
+    assert!(
+        !ids.is_empty() && ids.iter().all(|id| *id == k2_id),
+        "{ids:?}"
+    );
+    assert!(ok(run(&["list"], &k2, b"")).contains("STRIPE_KEY"));
 
     // The key is lost: a reset writes a whole set under a new one.
     let fresh = dir.path().join("fresh");

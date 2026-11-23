@@ -304,6 +304,11 @@ never from the command line, and are never printed or logged.
 - **Does not protect against** whoever can write the bucket: they can
   deploy code that reads `env.get` and sends the values out. Signed deploys
   (planned, not yet designed) would narrow that.
+- **Changing the key** (`secrets rotate-key`, then `rotate-key --finish`
+  once no node holds the old key, which deletes the objects it sealed)
+  does not change the values. Whoever held the old key, or a copy of the
+  bucket from before, can still open them: after a key compromise, rotate
+  the values themselves too ([Changing the key](cluster.md)).
 - **A node that cannot open the current secrets** (no key, another key, an
   altered object at once; 30 s without reaching the current set) refuses
   the app's events with 503, hands its actors to a node that can, takes

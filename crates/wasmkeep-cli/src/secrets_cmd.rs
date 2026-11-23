@@ -30,6 +30,7 @@ pub(crate) enum SecretsCommand {
     List(AppArgs),
     /// Re-seal an app's secrets under a new key (`--all`: every app under
     /// the prefix). Nodes need the new key first (`--secrets-key` twice).
+    /// `--finish` then deletes the objects the old key sealed.
     RotateKey(RotateArgs),
     /// Write a whole set from a file without opening the current one:
     /// recovery after losing the key. Nodes need the new key to open it.
@@ -107,9 +108,9 @@ pub(crate) struct RotateArgs {
     #[arg(long)]
     all: bool,
     /// The key the secrets are sealed with now.
-    #[arg(long)]
-    key: PathBuf,
-    /// The key to seal them with.
+    #[arg(long, required_unless_present = "finish", conflicts_with = "finish")]
+    key: Option<PathBuf>,
+    /// The key to seal them with (with `--finish`: the key to keep).
     #[arg(long)]
     new_key: PathBuf,
     /// Every node of the app already has the new key (`serve
@@ -118,6 +119,12 @@ pub(crate) struct RotateArgs {
     /// until it gets the key.
     #[arg(long)]
     nodes_have_new_key: bool,
+    /// The last step, once the old key is removed from every node: delete
+    /// every sealed object another key sealed, so the old key opens nothing
+    /// left in the bucket. Refused for an app whose current set does not
+    /// open with `--new-key`.
+    #[arg(long)]
+    finish: bool,
 }
 
 #[derive(Debug, Args)]
@@ -425,9 +432,36 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        SecretsCommand::RotateKey(args) if args.finish => {
+            let new = SecretsKey::load(&args.new_key)?;
+            let (store, prefix) = crate::open_bucket(&args.bucket)?;
+            let rt = runtime()?;
+            let apps = match &args.app {
+                Some(one) => vec![one.clone()],
+                None => rt.block_on(secret_store::apps_with_secrets(&store, &prefix))?,
+            };
+            for (tenant, app) in apps {
+                let one = SecretStore::new(Arc::clone(&store), &prefix, &tenant, &app);
+                let deleted = rt.block_on(one.retire_other_keys(&new)).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{tenant}/{app}: {e} (--finish deletes nothing unless the current \
+                         set opens with --new-key: run rotate-key without --finish first)"
+                    )
+                })?;
+                println!(
+                    "{tenant}/{app}: deleted {deleted} object(s) sealed with another key; \
+                     only key {} opens what is left.",
+                    new.id()
+                );
+            }
+            Ok(())
+        }
         SecretsCommand::RotateKey(args) => {
             nodes_have_new_key(args.nodes_have_new_key, "rotate-key")?;
-            let old = SecretsKey::load(&args.key)?;
+            let Some(key) = args.key.as_deref() else {
+                anyhow::bail!("--key is required without --finish");
+            };
+            let old = SecretsKey::load(key)?;
             let new = SecretsKey::load(&args.new_key)?;
             let (store, prefix) = crate::open_bucket(&args.bucket)?;
             let rt = runtime()?;
@@ -449,6 +483,10 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 })?;
                 println!("{tenant}/{app}: sealed with key {} at seq {seq}.", new.id());
             }
+            println!(
+                "Objects sealed with the old key are still in the bucket. Once the old key \
+                 is removed from every node, run rotate-key --finish to delete them."
+            );
             Ok(())
         }
         SecretsCommand::Reset(args) => {

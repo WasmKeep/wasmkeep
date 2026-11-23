@@ -324,6 +324,56 @@ impl SecretStore {
         }
         Ok(doomed.len())
     }
+
+    /// The last step of a key change: deletes every sealed object below
+    /// `current` that another key sealed, the one before `current`
+    /// included, so the old key opens nothing left in the bucket. Refused
+    /// unless `current` opens with `key`. `current` itself, objects above
+    /// it (a command that may still be running) and objects that cannot
+    /// be parsed are left. Returns how many were deleted.
+    pub async fn retire_other_keys(&self, key: &SecretsKey) -> Result<usize, SecretStoreError> {
+        let Some((current, _)) = self.current().await? else {
+            return Ok(0);
+        };
+        self.read(std::slice::from_ref(key), current).await?;
+        let mut deleted = 0;
+        for l in self.list().await? {
+            if l.seq >= current {
+                continue;
+            }
+            let path = self.path(&secrets::object_name(l.seq));
+            let bytes = match self.fetch(&path).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(e) => return Err(e),
+            };
+            match secrets::sealed_with(&bytes) {
+                Ok(id) if id == key.id() => {}
+                Ok(_) => match self.store.delete(&path).await {
+                    Ok(()) => deleted += 1,
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => return Err(bucket(e)),
+                },
+                Err(_) => {}
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// An object's bytes, `None` if it is gone or too large to be one.
+    async fn fetch(&self, path: &StorePath) -> Result<Option<bytes::Bytes>, SecretStoreError> {
+        match self.store.head(path).await {
+            Ok(meta) if meta.size > secrets::MAX_OBJECT as u64 => return Ok(None),
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(bucket(e)),
+        }
+        match self.store.get(path).await {
+            Ok(r) => Ok(Some(r.bytes().await.map_err(bucket)?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(bucket(e)),
+        }
+    }
 }
 
 /// How long a node may go without opening the set `current` names before
@@ -610,6 +660,57 @@ mod tests {
                     .1,
                 fresh
             );
+        });
+    }
+
+    #[test]
+    fn retiring_a_key_deletes_every_object_it_sealed() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            for name in ["A", "B"] {
+                app.change(std::slice::from_ref(&old), &old, |s| set_one(s, name, "v"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            // Not sealed with the key to keep yet: refused, nothing deleted.
+            assert!(app.retire_other_keys(&new).await.is_err());
+            assert_eq!(app.list().await.unwrap().len(), 2);
+            // The rotation: the predecessor, sealed with the old key, stays.
+            let keys = [old.clone(), new.clone()];
+            let seq = app
+                .change(&keys, &new, |_| Ok::<(), SecretsError>(()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(seq, 3);
+            app.delete_old(u64::MAX, RETENTION).await.unwrap();
+            assert!(
+                app.read(std::slice::from_ref(&old), 2).await.is_ok(),
+                "the old key still opens the same set until the key is retired"
+            );
+            assert_eq!(app.retire_other_keys(&new).await.unwrap(), 1);
+            let left = app.list().await.unwrap();
+            assert_eq!(left.iter().map(|l| l.seq).collect::<Vec<_>>(), [3]);
+            for l in left {
+                let bytes = store
+                    .get(&app.path(&secrets::object_name(l.seq)))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                assert_eq!(secrets::sealed_with(&bytes).unwrap(), new.id());
+            }
+            let (seq, set) = app.read_current(std::slice::from_ref(&new)).await.unwrap();
+            assert_eq!(seq, Some(3));
+            assert_eq!(set.class("api").unwrap().len(), 2);
+            assert!(app.read_current(std::slice::from_ref(&old)).await.is_err());
+            // Again: nothing left to do.
+            assert_eq!(app.retire_other_keys(&new).await.unwrap(), 0);
         });
     }
 

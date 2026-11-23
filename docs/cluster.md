@@ -1084,8 +1084,21 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   re-sealed set and answers 503 for the app until it gets the key, and no
   heartbeat says which keys a node holds. `set` and `unset` given two
   keys seal with the first, and take the same flag when that one is not
-  the key the current set is sealed with. After a key compromise, change
-  the values too: the old key opens the objects it sealed.
+  the key the current set is sealed with.
+- **Finishing a key change.** `rotate-key` keeps the object before
+  `current`, sealed with the old key, for a node that read `current` just
+  before it moved. Once the old key is removed from every node, run
+  `wasmkeep secrets rotate-key --new-key new.key --app acme/shop --finish`
+  (or `--all`): it deletes every object below `current` that another key
+  sealed, and refuses an app whose current set does not open with
+  `--new-key`. Run it while no other `secrets` command is running for the
+  app. On a bucket with object versioning, the deleted objects stay as
+  noncurrent versions until a lifecycle rule removes them.
+- **Rotating the key does not change the values.** The new key seals the
+  same values. A value the old key could open (a leaked key, an old
+  backup of the bucket, a noncurrent version) is exposed for good: after a
+  key compromise, rotate the values themselves at their source (new API
+  keys, new tokens), then `set` them.
 - **Losing the key.** Give every node the new key, then `wasmkeep secrets
   reset --new-key new.key --from FILE --nodes-have-new-key` writes a whole
   set without opening the current one.
