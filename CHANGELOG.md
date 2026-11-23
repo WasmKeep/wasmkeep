@@ -55,6 +55,151 @@ not suspect it. `--no-placement` turns the spread off
 New metric `wasmkeep_placement_spread_total{outcome}`. Nothing to
 deploy or configure.
 
+### Act on these when you upgrade
+
+These change what a node accepts or does at start, or what an actor or a
+client sees. The steps are in
+[upgrading to 0.8.0](docs/deploy/upgrading-to-0.8.md) (for the next
+release, unreleased).
+
+- **`--env` files must be private.** On Unix, `--env` and `--front-env`
+  files, and `wasmkeep dev`'s `.env.local`, are refused at start if other
+  users can open them, if their group can write them, or if their group can
+  read them while the server's user owns them (before, a world-readable file
+  only logged a warning). Use `chmod 600 FILE` for a file the service owns,
+  or `chown root:wasmkeep FILE && chmod 640 FILE`. `--config` files are not
+  affected.
+- **Guest output is logged in a new format.** What guests print is the last
+  field of its line, `line="..."`, quoted, after a fixed `guest output`
+  message (before, it was the event message). Update log filters that match
+  it. Escapes follow logfmt and now cover format characters and line
+  separators; actor names, event errors and traps are quoted the same way.
+  The 4 KB limit applies after escaping, and output is limited to 1,000
+  lines a second per app and 5,000 per process, beyond each instance's
+  `--guest-log-rate`.
+- **`actors.call` carries less.** At most 96 headers and 62 KiB of path and
+  headers (was 256 headers and 64 KiB), and a call chain of at most 16
+  actors; past them a call fails (`too-large`, `failed`). Check actors that
+  forward many headers or call deeply.
+- **A request head over 64 KiB or 100 header fields gets `431`.** Node
+  headers are not counted; both ports leave 24 KiB and 32 fields for them.
+  Check a proxy that adds large cookies or many headers.
+- **The metrics listener checks `Host`.** It answers `421` unless the host is
+  an IP address, `localhost` or a name under it, a name given with the new
+  `--metrics-host` (`[listen] metrics-hosts`), or, when not bound to
+  loopback, a single-label name. A scraper that names a node by a dotted
+  host name needs `--metrics-host`. A stalled scraper is let go after 10 s.
+- **A stalled client's socket is closed.** A response write that waits 60 s
+  with no byte taken by the client closes the connection; a WebSocket closed
+  this way ends with `1006`. Kept-alive connections and idle WebSockets are
+  not affected. Clients that stop reading must reconnect.
+- **The component cache directory is checked.** `--cache-dir` loads an
+  artefact only if the directory and the file belong to the server's user,
+  are not group- or world-writable, and are not reached through a symlink;
+  otherwise the component is compiled again and the command that fixes the
+  directory is logged at start. New cache directories are created 0700 and
+  artefacts 0600; existing artefacts others can read are made 0600 when
+  loaded. Run `chmod 700` on the cache and data directories of an existing
+  install.
+- **Data directories are owner-only.** `serve` and `dev` create a missing
+  data directory 0700 and warn when an existing one is readable by others;
+  CLI scratch directories that hold actor data (backup, restore, actor read
+  and sql, inspect, the feed) are created 0700. The single-node guide sets
+  `UMask=0077`.
+- **Changing the secrets key has a second step.** After a key change,
+  `wasmkeep secrets rotate-key --finish` deletes the sealed objects another
+  key sealed (keeping the one before `current` for 30 s after it moved, and
+  objects above `current` for the one-hour retention window), and fails
+  while any are left. Changing the key does not change the values: rotate
+  values the old key could open at their source.
+- **File uploads are budgeted.** Files being written by streamed writes and
+  upload links are spooled within 1 GiB per app (at least one file of
+  `--max-blob-bytes`, at most half the process's) and 4 GiB per process (at
+  least two such files). An upload link holds its whole size before it reads
+  its body and answers `503` past a budget; a streamed write fails with
+  `unavailable`. An upload body that sends nothing for 60 s, or averages
+  under 16 KiB/s after its first 30 s, is aborted with `408`; the same link
+  sent again while its first body is arriving answers `409`. An instance has
+  at most 16 streamed writes open, and one left open goes when its event
+  ends. Clients must retry `503`, and uploaders must keep a steady rate.
+- **Tighter SQLite limits.** A statement may compile to at most 2,000,000
+  instructions (`quota-exceeded` past it), SQLite's heap is capped at 4 GiB
+  per process (temporary data included, as it now stays in memory), and
+  `instr`, `replace` and `trim` stop at the statement's budgets. Guest schema
+  changes may not name the reserved `_wasmkeep_` prefix. Check actors with
+  very large sorts or temporary data.
+- **Rebuild StarlingMonkey actors.** A guest now holds at most 4,096 host
+  resources (handles) at once; past that its event fails and the actor's
+  instance is replaced. The TypeScript SDK now releases each request's handles
+  once it is answered, and the TypeScript, Go, C, Zig and MoonBit SDKs release
+  a broken stream's error. A StarlingMonkey actor built with an earlier SDK
+  leaks handles and fails one request about every 2,000: rebuild it with
+  this version's SDK and deploy it.
+- **Manual releases are restricted.** The release workflow run by hand starts
+  only on a `vX.Y.Z` tag or on `main`; any other ref is refused. Tag pushes
+  and pull requests are unchanged. This concerns whoever cuts releases, not
+  operators of a node.
+
+### Security and hardening
+
+- **Wasm and wasi-http field limits.** A `wasi:http` `fields` a guest builds
+  is at most 64 KiB. An outbound response fails past 64 KiB of head or of
+  trailers (trailers were held to 16 KiB before). Writes to an outgoing body
+  are at most 32 KiB at a time, so an unsent body holds at most 64 KiB in
+  the host.
+- **A tighter SQL sandbox for actor databases.** Host statements no longer
+  run guest triggers or foreign key cascades, and have the statement
+  deadline. The authorizer refuses actions it does not name, and the
+  write-ahead log cap is also checked while a statement runs
+  ([security](docs/security.md)).
+- **Cluster signatures.** Signed calls arriving on the public port (refuse
+  mode) are recorded apart from the cluster port's records, so they can no
+  longer get the cluster port's calls, takes or alarm hand-offs refused; once
+  that record is full, new ones are dropped and counted
+  (`wasmkeep_signatures_public_dropped_total`). A node refuses signed calls
+  dated before it started plus the allowed clock skew, so a call accepted
+  before a restart cannot be accepted again; such calls, and calls past a full
+  signature record, are answered `503` so the sender signs them again
+  (`wasmkeep_signatures_before_start_total`). Call nonces no longer derive
+  from the instance published in heartbeats.
+- **Local files and links.** The history export creates its database 0600 at
+  open, and presigned-link probe errors no longer include the signed URL.
+  Without a bucket, the node-link key file is written
+  whole and linked into place, so two starts on one data directory agree on
+  one key, and a key file that is not 32 bytes is always refused.
+- **Config `Debug` output** shows names only, never values.
+- **Build and release supply chain.** Build scripts and workflows check the
+  SHA-256 of what they download (rustup-init, the WASI adapter, TinyGo, LDC),
+  install Python tools from hash-locked requirements, and pin Dockerfile
+  syntax by digest. `cargo deny` also runs on every example's lockfile. The
+  release's `sign` job attests build provenance for everything `SHA256SUMS`
+  lists ([releasing](docs/releasing.md)).
+
+### Fixed
+
+- **A node no longer drops an app when it cannot read its local markers.** A
+  local read error (too many open files under socket load, an I/O or
+  permission error) was taken as a deleted app: the node stopped it, closed
+  its sockets, stopped its actors without flushing and removed its local
+  files; at start the same error removed the app's local files. Now only a
+  missing file or other bytes count as a mismatch: any other error is retried
+  while serving, and fails the start without removing anything. A node that
+  keeps failing to read them is not ready until a check reads them again.
+- **A rollback racing `wasmkeep app delete` is refused**, as a deploy already
+  was, instead of reporting success for a deleted app. A rollback that cannot
+  check for a delete made meanwhile says it switched `current` (to which
+  version) and not to roll back again, and an assets deploy whose marker
+  renewal fails says whether `current` was switched.
+- **A blocked checkpoint no longer drops captured changes.** When the
+  checkpoint after a capture could not run (a reader still on the write-ahead
+  log), the changes already captured were lost and the event failed. They are
+  now returned, later checkpoints do not wait for the reader at every event,
+  and capture carries on across the log's restart.
+- **A runtime restarted in place no longer stops itself** as a twin of its own
+  predecessor.
+- CI: CodeQL also runs on push to `main`, and a speed-sensitive StarlingMonkey
+  test moves to the full suite.
+
 ## 0.7.0
 
 **Big rooms, a cluster that keeps its peers on a slow bucket, and the

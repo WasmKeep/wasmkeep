@@ -17,6 +17,37 @@ limits below are enforced by the code (each has a test), not aspirations.
 | A node of the cluster | Sign calls to other nodes; take leases; write the bucket | (Trusted: nodes and the bucket's owner control the cluster) |
 | Whoever can write the bucket | Everything: data, deploys, the cluster secret | (Trusted) |
 
+## Limits at a glance
+
+Each value is the default; where it is set is in the last column (paths are
+under `crates/`). Per-node and per-app limits are local to a node's process.
+
+| Scope | Limit | Value | Set in |
+| --- | --- | --- | --- |
+| Request | Head size, header fields (431 past either) | 64 KiB on the wire, 100 fields; node headers get 24 KiB and 32 fields more | `wasmkeep-server/src/http.rs` (`MAX_REQUEST_HEAD_BYTES`, `MAX_REQUEST_HEADERS`, `HOP_RESERVE_*`) |
+| Request | Body | 16 MiB (413) | `http.rs` (`MAX_BODY_BYTES`) |
+| Connection | Response write with no byte taken, then closed (a WebSocket ends 1006) | 60 s | `http.rs` (`WRITE_IDLE_TIMEOUT`) |
+| Connection | Metrics listener: head, header read, write idle, lifetime | 16 KiB, 10 s, 10 s, 60 s | `http.rs` (`METRICS_*`) |
+| Node | Connections | 10,000 (`--max-connections`) | `wasmkeep-server/src/fds.rs` |
+| Actor | WebSockets | 1,000 | `wasmkeep-server/src/socket_limits.rs` (`per_actor`) |
+| App | WebSocket sessions, relays included | 50,000 (`--max-sockets-per-app`) | `socket_limits.rs` (`per_app`) |
+| Node | WebSocket sessions | 50,000 requested (`--max-sockets-per-node`), less the descriptor budget | `socket_limits.rs`, `fds.rs` |
+| Guest | Host resources (handles) held at once | 4,096 | `wasmkeep-server/src/guest_tables.rs` (`MAX_GUEST_RESOURCES`) |
+| Guest | A `wasi:http` `fields`, and an outbound response's head or trailers | 64 KiB | `guest_tables.rs` (`MAX_GUEST_FIELDS_BYTES`) |
+| Guest | `actors.call` headers, path and headers, chain | 96, 62 KiB, 16 callers | `wasmkeep-server/src/actor/routing.rs` (`MAX_CALL_*`) |
+| Guest | Event CPU, SQL CPU, wall clock | 50 ms, 2 s, 30 s | `wasmkeep-server/src/actor.rs` (`wall_per_event`), `wasmkeep-storage/src/db.rs` (`max_sql_cpu_per_event`); the front's CPU is `front.rs` (`DEFAULT_CPU_BUDGET`) |
+| Guest | Log lines: per instance, per app, per process | 50, 1,000, 5,000 a second; 4,096 bytes a line | `wasmkeep-server/src/guest_log.rs` |
+| Actor | Outbound HTTP in flight | 16 (256 per node) | [concepts](concepts.md) |
+| Actor | Database size, value, query result | 1 GiB, 16 MiB, 16 MiB | `wasmkeep-storage/src/db.rs` (`max_db_bytes`, `max_value_bytes`, `max_result_bytes`) |
+| Actor | Write-ahead log between captures | 256 MiB | `db.rs` (`max_wal_bytes`) |
+| Statement | Compiled instructions (`quota-exceeded`) | 2,000,000 | `db.rs` (`GUEST_MAX_VDBE_OPS`) |
+| Node | SQLite heap, temporary data included | 4 GiB | `db.rs` (`SQLITE_HEAP_LIMIT_BYTES`) |
+| Instance | Streamed file writes open at once | 16 | `wasmkeep-server/src/blobs.rs` (`MAX_OPEN_WRITES`) |
+| App | Spooled file bytes | 1 GiB (at least one `--max-blob-bytes` file, at most half the node's) | `blobs.rs` (`APP_SPOOL`) |
+| Node | Spooled file bytes | 4 GiB (at least two such files) | `blobs.rs` (`NODE_SPOOL`) |
+| Upload link | Idle body, then minimum rate after 30 s (408) | 60 s, 16 KiB/s | `wasmkeep-server/src/blobs/serve.rs` (`UPLOAD_*`) |
+| Node | Signature records (cluster port, public port, forwarded proofs) | 500,000, 50,000, 4,096 | `wasmkeep-server/src/cluster/signing.rs` (`MAX_SEEN*`) |
+
 ## Layers
 
 **Front door** (`crates/wasmkeep-server/src/http.rs`)
@@ -39,6 +70,12 @@ limits below are enforced by the code (each has a test), not aspirations.
   that takes nothing for 60 s (its receive window closed) is cut, however
   slowly it read before. There is no per-address connection cap: behind a
   proxy or load balancer every client shares its address.
+- The metrics listener (`--metrics-listen`) answers `421` unless the
+  request's `Host` is an IP address, `localhost` or a name under it, a name
+  given with `--metrics-host` (`[listen] metrics-hosts`), or, when the
+  listener is not bound to loopback, a single-label name. Its request heads are at
+  most 16 KiB, a scraper has 10 s to send them and to take a page, and a
+  connection lasts at most 60 s.
 - 10,000 connections per node (`--max-connections`); more wait in the
   kernel backlog. Accept errors back off instead of spinning.
 - Request bodies: 16 MB (413 when declared larger; a failed read past it).
@@ -107,16 +144,19 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   a crafted HTTP request can drive some of those servers;
   `--allow-outbound-port` opens one. 16 requests in flight per actor, 256
   per node.
-- What a guest prints reaches the node's log within a line rate per
-  instance, per app and per process (`--guest-log-rate`; past it, lines are dropped
-  and counted), as the last field of its line (`line="..."`, after the
-  app, the actor and the stream), cut at 4 KB a line once escaped.
-  Quotes and backslashes are escaped, and so are controls, format
-  characters (bidi controls, zero-width ones) and line separators, in
-  the text and in actor names (a name with a space or `=` is quoted): a
-  guest cannot flood the log, start a line of its own, add fields to its
-  line, reorder what a terminal shows or send terminal escapes. What it prints is its choice, secrets included, so the node's
-  log is as sensitive as the actors make it.
+- What a guest prints reaches the node's log within a line rate: 50 a
+  second per instance by default (`--guest-log-rate`), 1,000 per app and
+  5,000 per process on top of it; past a rate, lines are dropped and
+  counted. It is logged after a fixed `guest output` message, as the last
+  field of its line (`line="..."`, after the app, the actor and the stream),
+  cut at 4,096 bytes a line once escaped. Quotes and backslashes are
+  escaped, and so are controls, format characters (bidi controls,
+  zero-width ones) and line separators, in the text and in actor names, the
+  errors of failed events and traps (a name with a space or `=` is quoted):
+  a guest cannot flood the log, start a line of its own, add fields to its
+  line, reorder what a terminal shows or send terminal escapes. What it
+  prints is its choice, secrets included, so the node's log is as
+  sensitive as the actors make it.
 
 **SQLite sandbox** (`crates/wasmkeep-storage/src/db.rs`)
 - No `ATTACH`, `VACUUM`, extensions, `fts3_tokenizer`, or temporary
@@ -290,11 +330,27 @@ secrets are warned about without the value; the manifest holds digests,
 not values; `Debug` output of configuration shows names only. Node `--env`
 values win by name.
 
+**Files on the node.** What the node writes is private to its user. `serve`
+and `dev` create a missing `--data-dir` with mode 0700 and warn at start when
+an existing one is open to other accounts (they never change an existing
+one's mode); the CLI's scratch directories that hold actor data (backup,
+restore, actor read and sql, inspect, the feed) are created 0700, and the
+history export creates its database 0600. The single-node guide sets
+`UMask=0077` for the same reason. The component cache (`--cache-dir`) holds
+native code the server runs, so it loads an artefact only if the directory
+and the file belong to the server's user, are not group- or world-writable,
+and are not reached through a symlink; otherwise it compiles again and logs
+the command that fixes the directory. New cache directories are created
+0700 and artefacts 0600, and an existing artefact others can read is made
+0600 when loaded.
+
 `wasmkeep secrets` stores an app's secrets in the bucket, sealed
 ([ADR 0016](adr/0016-secrets-in-the-bucket.md)): ChaCha20-Poly1305 under a
 key derived per app from a 32-byte secrets key, which the operator gives
-to the nodes (`--secrets-key`, refused if its group or others can read
-it) and to the machine running `wasmkeep secrets`. Each object opens only at its own bucket
+to the nodes (`--secrets-key`) and to the machine running `wasmkeep
+secrets`. The key file is refused if its group or others can read it, so it
+is `0600` and owned by the service's user: unlike an `--env` file, the
+root-owned `0640` form is not accepted. Each object opens only at its own bucket
 prefix, tenant, app and sequence number. Values come from stdin or a file,
 never from the command line, and are never printed or logged.
 
@@ -348,48 +404,6 @@ publishes its pin. Trust is per node id, not per certificate:
 The apps share the process's crashes, engine and memory: per-app floors
 and ceilings protect against a noisy neighbour, not a hostile one. Put
 apps of different trust in different processes.
-
-## Known gaps
-
-- Hostile multi-tenancy: every actor of a node shares one process (see the note above).
-  Isolation tiers per app (a process per app, or one started by an
-  operator's launcher inside a microVM, Kata Containers or gVisor) are
-  planned, not built ([roadmap](../ROADMAP.md#later-on-demand)).
-- Node-to-node traffic goes over mutual TLS by default
-  ([ADR 0011](adr/0011-node-to-node-mtls.md)): a node in a cluster needs
-  `--cluster-listen` and `--cluster-advertise`, and refuses plain HTTP
-  between nodes. A node started with `--cluster-plaintext accept` opens
-  the plaintext path again: without a listener it reaches peers at their
-  plain address, and with one it stays reachable, signed calls included,
-  on its public port; there a response to a call is not signed, and
-  someone on the path can read traffic and change responses. Refusing
-  nodes still serve outside clients on the public port as usual, and the
-  mode is not published: nothing stops a node from being started in
-  `accept` mode later, so each node's flags are what count.
-- Host work other than SQL (encoding sends and HTTP, WebSocket frames) is
-  not charged to any CPU budget; it is small per call, and the wall clock
-  bounds it.
-- In a cluster, a deleted actor of an `existing` class can be woken from
-  outside (as an empty actor).
-- Limits are per node. A process serves one tenant (several tenants per
-  process is planned but not started), so
-  today that is also per tenant; within a tenant, one class or
-  actor can use the node's whole share (instance pool, connections,
-  sockets), bounded per actor only where noted above.
-
-## Audits
-
-Before the first public release the code had an internal security review
-in ten parts (front door, guest boundary, cluster); each fix came with a
-test that fails without it. Later hardening: plain HTTP between nodes
-refused by default, outbound HTTP refusing the ports browsers block, and
-limits on what actors print reaching the node's log (all described above).
-No independent third-party audit has been done yet.
-
-## Reporting a vulnerability
-
-Report privately through the repository's security advisories, not in a
-public issue.
 
 ## Ingress rate limits
 
@@ -491,3 +505,46 @@ intentional exception to no-policy compatibility.
 These limits control app admission. Use edge filtering and connection
 limits for floods that can overwhelm the listener or the network before
 app admission runs.
+
+## Known gaps
+
+- Hostile multi-tenancy: every actor of a node shares one process (see the note above).
+  Isolation tiers per app (a process per app, or one started by an
+  operator's launcher inside a microVM, Kata Containers or gVisor) are
+  planned, not built ([roadmap](../ROADMAP.md#later-on-demand)).
+- Node-to-node traffic goes over mutual TLS by default
+  ([ADR 0011](adr/0011-node-to-node-mtls.md)): a node in a cluster needs
+  `--cluster-listen` and `--cluster-advertise`, and refuses plain HTTP
+  between nodes. A node started with `--cluster-plaintext accept` opens
+  the plaintext path again: without a listener it reaches peers at their
+  plain address, and with one it stays reachable, signed calls included,
+  on its public port; there a response to a call is not signed, and
+  someone on the path can read traffic and change responses. Refusing
+  nodes still serve outside clients on the public port as usual, and the
+  mode is not published: nothing stops a node from being started in
+  `accept` mode later, so each node's flags are what count.
+- Host work other than SQL (encoding sends and HTTP, WebSocket frames) is
+  not charged to any CPU budget; it is small per call, and the wall clock
+  bounds it.
+- In a cluster, a deleted actor of an `existing` class can be woken from
+  outside (as an empty actor).
+- Limits are per node unless the table above says per app or per actor.
+  A process serves one tenant (several tenants per process is planned but
+  not started); within a tenant, one class or actor can use the node's whole
+  share (instance pool, connections, sockets), bounded per actor only where
+  noted above. Apps of one process share the process's limits, and per-app
+  limits keep one app from using another's share, not from a hostile one.
+
+## Audits
+
+Before the first public release the code had an internal security review
+in ten parts (front door, guest boundary, cluster); each fix came with a
+test that fails without it. Later hardening: plain HTTP between nodes
+refused by default, outbound HTTP refusing the ports browsers block, and
+limits on what actors print reaching the node's log (all described above).
+No independent third-party audit has been done yet.
+
+## Reporting a vulnerability
+
+Report privately through the repository's security advisories, not in a
+public issue.
