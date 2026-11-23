@@ -89,8 +89,7 @@ and every warehouse read; no smaller maintained writer exists.
 It sets `default-features = false` and enables **no optional features**:
 the column writer and reader need neither Arrow arrays nor a compression
 codec. Files are uncompressed; no Arrow array crates or codec dependencies
-are added. The licence allow-list is unchanged. This writer primitive does
-not yet expose a `feed` command.
+are added. The licence allow-list is unchanged. The `wasmkeep feed` command uses this writer.
 
 Development-only tools, never part of WasmKeep: workerd (Apache-2.0, in
 `bench/workerd`), the Go LTX conformance tool, wasm-tools and wit-bindgen

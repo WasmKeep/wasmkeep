@@ -242,7 +242,7 @@ it from the bucket:
 ```bash
 git clone https://github.com/wasmkeep/wasmkeep && cd wasmkeep/deploy/compose
 docker compose up -d --build                                # the first build takes a few minutes; then wait a few seconds for the nodes
-curl -i -X POST http://127.0.0.1:8082/actor/counter/alice   # 1, x-wasmkeep-node: b (the node asked first takes a new actor)
+curl -i -X POST http://127.0.0.1:8082/actor/counter/alice   # 1, x-wasmkeep-node: b (placement at wake-up picks the node, so yours may be a or c: kill that one below)
 docker compose kill b                                       # kill the node that runs alice
 curl -i -X POST http://127.0.0.1:8081/actor/counter/alice   # through node a, 15 to about 21 s later: 2, from another node
 ```

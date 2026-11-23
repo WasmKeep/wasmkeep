@@ -2,7 +2,7 @@
 
 The change feed reads one app's bucket history and writes whole actor states
 as local Parquet files. It contacts no node and writes nothing to the bucket.
-This guide describes the implementation on the ADR 0039 development branch;
+This guide describes the change feed as shipped in 0.6.0 (ADR 0039);
 continuous polling (`--every`) is not implemented yet.
 
 ## Run a poll

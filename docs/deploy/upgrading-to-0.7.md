@@ -31,8 +31,10 @@ the relays and scaling.
    publish is numbered but the front answers an error, and a retry without
    an `id` publishes it twice.
 2. **Deploy the pusher batched**: `wasmkeep deploy --writes pusher=batched`,
-   or `writes = "batched"` under `[classes.pusher]` in `wasmkeep.toml`, or
-   `serve --writes pusher=batched`. What it must keep across a crash is
+   or `writes = "batched"` under `[classes.pusher]` in `wasmkeep.toml`.
+   (`serve --writes pusher=batched` applies only to a class given with
+   `--actor`; `serve` refuses `--writes` together with `--app`, because a
+   deployed app's version names each class's mode.) What it must keep across a crash is
    committed with `exec-durable`.
 3. **Deploy the front with the room** for `history-json`. A new TypeScript
    front against an older room still works, at the old cost; a Rust front's

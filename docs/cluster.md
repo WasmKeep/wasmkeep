@@ -1534,10 +1534,16 @@ process, and `wasmkeep cluster drain --process ID` drains them all. See
 
 Upgrading the `wasmkeep` binary itself (not your application: that is
 [Deploying](#deploying), which rolls from node to node safely): **stop
-every node, upgrade them all, start them all.** WasmKeep does not yet
-support nodes of different versions in one cluster, even
-for the length of a rolling restart. The cluster serves nothing between
-the last stop and the first start, so plan a short window.
+every node, upgrade them all, start them all**, unless that release's
+upgrading page says a rolling upgrade, one node at a time, is supported.
+Read the page for the release you move to
+([0.4.0](deploy/upgrading-to-0.4.md), [0.5.0](deploy/upgrading-to-0.5.md),
+[0.6.0](deploy/upgrading-to-0.6.md), [0.7.0](deploy/upgrading-to-0.7.md)):
+it is the rule for that release, and this page does not override it.
+Without such a statement, WasmKeep does not support nodes of different
+versions in one cluster, even for the length of a rolling restart. The
+cluster then serves nothing between the last stop and the first start, so
+plan a short window.
 
 **One exception: from 0.4.0 to 0.4.1, one node at a time.** 0.4.1
 changes nothing 0.4.0 reads or writes in the bucket (layout, manifests,
@@ -1571,7 +1577,7 @@ is upgraded:
 - A component that imports `storage.delete-self-durable` cannot be
   loaded by a 0.4.1 node, and the 0.4.2 deploy does not check for it:
   that node stays not ready on the version ("cannot apply the deployed
-  version"). The next release's deploy refuses it
+  version"). From 0.5.0, deploy refuses it
   ([below](#rolling-upgrades-and-new-storage-functions)).
   Every TypeScript and Python component built with the 0.4.2 SDK imports
   it, called or not, as do Rust, Go, C and Zig components that call it.
@@ -1691,7 +1697,7 @@ What the check does not cover, during a rolling upgrade:
 
 A class's `writes` (`strict`, the default, or `batched`) is part of its
 version: `strict`, written or not, makes the same version and manifest
-as before. `batched` is refused by `deploy` for now; once it is built, a
+as before. `batched` is accepted by `deploy`: from 0.5.0 on, a
 version with a batched class is written as manifest format 5, which a
 deploy refuses while a live node lacks `flush` (and, as for formats 4
 and 3, `ends` and `front`).
