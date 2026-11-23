@@ -270,22 +270,57 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 /// forwarded requests alike); a larger one fails the guest's read.
 pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Largest request head (request line and headers) the public port
-/// reads: the size of the fields a guest may build
-/// ([`crate::MAX_GUEST_FIELDS_BYTES`]), so a request a guest holds keeps
-/// no more in host memory than fields it builds itself. Over it: 431.
+/// Largest client request head (request line and headers, as on the
+/// wire) a node takes, the size of the fields a guest may build
+/// ([`crate::MAX_GUEST_FIELDS_BYTES`]): a request a guest holds keeps
+/// about as much in host memory as fields it builds itself. Node headers
+/// (`x-wasmkeep-*`) are not counted (see [`HOP_RESERVE_BYTES`]). Over it:
+/// 431.
 pub(crate) const MAX_REQUEST_HEAD_BYTES: usize = crate::MAX_GUEST_FIELDS_BYTES;
 
-/// Most header fields a request may carry on the public port (hyper's
-/// default, which keeps them on the stack). Over it: 431.
+/// Most header fields a client request may carry, node headers aside.
+/// Over it: 431.
 pub(crate) const MAX_REQUEST_HEADERS: usize = 100;
 
-/// The cluster port's head limit: a hop carries a public request's head
-/// plus the cluster's own headers (sender, signature, admission, chain).
-const CLUSTER_HEAD_BYTES: usize = MAX_REQUEST_HEAD_BYTES + 16 * 1024;
+/// What a hop to another node adds to a request head (its signature,
+/// sender, admission, app, chain of callers, the `/actor/...` path): the
+/// parser takes this much more than [`MAX_REQUEST_HEAD_BYTES`] on both
+/// ports, since a node's hops reach the public port too unless plaintext
+/// hops are refused, and the service checks the client's part.
+const HOP_RESERVE_BYTES: usize = 24 * 1024;
 
-/// The cluster port's header count, for the same reason.
-const CLUSTER_HEADERS: usize = MAX_REQUEST_HEADERS + 32;
+/// The header fields a hop may add, likewise (one per caller of a call's
+/// chain, which is capped at 16, and about ten more).
+const HOP_RESERVE_HEADERS: usize = 32;
+
+/// The client's part of `req`'s head, as the wire counts it: the request
+/// line and each header that is not a node's, name, value and 4 bytes of
+/// framing; and how many such headers.
+fn client_head<B>(req: &Request<B>) -> (usize, usize) {
+    let target = req.uri().path_and_query().map_or(1, |p| p.as_str().len())
+        + req.uri().authority().map_or(0, |a| a.as_str().len() + 8);
+    let line = req.method().as_str().len() + target + " HTTP/1.1\r\n ".len();
+    req.headers()
+        .iter()
+        .filter(|(n, _)| !n.as_str().starts_with("x-wasmkeep-"))
+        .fold((line, 0), |(bytes, count), (n, v)| {
+            (bytes + n.as_str().len() + v.len() + 4, count + 1)
+        })
+}
+
+/// 431, and the connection closed: the client's part of a head was over
+/// [`MAX_REQUEST_HEAD_BYTES`] or [`MAX_REQUEST_HEADERS`].
+fn head_too_large() -> Response<HyperOutgoingBody> {
+    let mut r = text_response(
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        "request header fields too large\n",
+    );
+    r.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    r
+}
 
 /// [`ServeLimits::write_idle_timeout`] by default.
 pub(crate) const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -902,10 +937,13 @@ async fn serve_connection<I>(
     // The app of the connection's first request, on the public port of a
     // process serving several (ADR 0038, section 6).
     let first: Arc<apps::ConnectionApp> = Arc::default();
-    let on_cluster_port = cluster.is_some();
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
+            let (bytes, count) = client_head(&req);
+            if bytes > MAX_REQUEST_HEAD_BYTES || count > MAX_REQUEST_HEADERS {
+                return Ok(head_too_large());
+            }
             req.extensions_mut().insert(PeerAddress(peer));
             let Some(cluster) = cluster else {
                 let response = match &app {
@@ -961,22 +999,15 @@ async fn serve_connection<I>(
             }))
         }
     });
-    let mut builder = http1::Builder::new();
-    builder
+    // A hop carries the client's head and the node's own headers; the
+    // service checks the client's part.
+    // `with_upgrades` hands WebSocket upgrades over to their own task.
+    let conn = http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(header_read_timeout)
-        .keep_alive(true);
-    if on_cluster_port {
-        // A hop carries the client's head and the cluster's own headers.
-        builder
-            .max_header_size(CLUSTER_HEAD_BYTES)
-            .max_headers(CLUSTER_HEADERS);
-    } else {
-        // `MAX_REQUEST_HEADERS` is hyper's default count.
-        builder.max_header_size(MAX_REQUEST_HEAD_BYTES);
-    }
-    // `with_upgrades` hands WebSocket upgrades over to their own task.
-    let conn = builder
+        .keep_alive(true)
+        .max_header_size(MAX_REQUEST_HEAD_BYTES + HOP_RESERVE_BYTES)
+        .max_headers(MAX_REQUEST_HEADERS + HOP_RESERVE_HEADERS)
         .serve_connection(TokioIo::new(io), service)
         .with_upgrades();
     let mut conn = std::pin::pin!(conn);

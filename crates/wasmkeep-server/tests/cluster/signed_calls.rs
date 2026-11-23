@@ -2,6 +2,42 @@
 
 use super::*;
 
+/// The status `addr` answers to `raw`, sent in one write; 0 if none.
+async fn status_of_raw(addr: SocketAddr, raw: &str) -> u16 {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let _ = s.write_all(raw.as_bytes()).await;
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got).await;
+    String::from_utf8_lossy(&got)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A client's request at the head cap (100 headers in 64 KiB) is forwarded
+/// to the owner, whose port leaves room for the hop's headers; just past
+/// the cap, the node it reached answers 431.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_request_at_the_head_cap_is_forwarded_to_the_owner() {
+    let p = x_on_a_y_on_b().await;
+    let head = |v: usize| {
+        let extra: String = (0..97)
+            .map(|i| format!("x-h{i:02}: {}\r\n", "v".repeat(v)))
+            .collect();
+        format!(
+            "POST /actor/t/x/durable HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n{extra}\r\n"
+        )
+    };
+    // x is on a: b forwards it.
+    let under = head(660);
+    assert!(under.len() <= 64 * 1024, "{}", under.len());
+    assert_eq!(status_of_raw(p.b.addr, &under).await, 200);
+    let over = head(670);
+    assert!(over.len() > 64 * 1024);
+    assert_eq!(status_of_raw(p.b.addr, &over).await, 431);
+}
+
 /// ADR 0017: only a node's signed call may ask for a take. A client sending
 /// the marker gets an ordinary request.
 #[tokio::test(flavor = "multi_thread")]
@@ -134,6 +170,24 @@ async fn an_actor_can_call_an_actor_on_another_node() {
     )
     .await;
     assert_eq!((r.status, r.body.trim()), (200, "200:2"));
+}
+
+/// A call at the header caps (96 headers; 62 KiB of path and headers, as
+/// written on the wire) reaches an actor on another node: the hop's own
+/// headers fit in the receiving port's reserve. Just past either cap, the
+/// call is refused before it leaves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_at_the_header_caps_reaches_an_actor_on_another_node() {
+    let p = x_on_a_y_on_b().await;
+    let call =
+        |hn: usize, hv: usize| format!("/actor/t/x/call?to=t/y&path=%2Fcaller&hn={hn}&hv={hv}");
+    // `/caller` and 96 headers of 5 + 652 + 4 bytes: 63,463 of 63,488.
+    let r = send(p.a.addr, "POST", &call(96, 652), "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "200:default/t/x"));
+    let r = send(p.a.addr, "POST", &call(96, 653), "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "too-large"));
+    let r = send(p.a.addr, "POST", &call(97, 1), "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "too-large"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

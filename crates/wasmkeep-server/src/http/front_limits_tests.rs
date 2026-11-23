@@ -60,6 +60,44 @@ async fn more_headers_than_the_cap_are_refused_with_431() {
     assert_eq!(status_of(addr, &health_with(&many)).await, 431);
 }
 
+/// A head exactly at the client caps, as the wire counts it, passes; one
+/// byte or one header more is refused.
+#[tokio::test]
+async fn the_head_caps_count_the_request_line_and_each_header() {
+    let addr = start(ServeLimits::default()).await;
+    let base = health_with("");
+    // Host and Connection are 2 of the 100 headers; the final CRLF is not
+    // counted.
+    let fill = |n: usize, total: usize| {
+        let named: usize = (0..n).map(|i| format!("x-h{i:02}: \r\n").len()).sum();
+        let left = total - (base.len() - 2) - named;
+        (0..n)
+            .map(|i| {
+                let v = left / n + usize::from(i < left % n);
+                format!("x-h{i:02}: {}\r\n", "v".repeat(v))
+            })
+            .collect::<String>()
+    };
+    let at = fill(MAX_REQUEST_HEADERS - 2, MAX_REQUEST_HEAD_BYTES);
+    assert_eq!(status_of(addr, &health_with(&at)).await, 200);
+    let over = fill(MAX_REQUEST_HEADERS - 2, MAX_REQUEST_HEAD_BYTES + 1);
+    assert_eq!(status_of(addr, &health_with(&over)).await, 431);
+}
+
+/// Node headers (`x-wasmkeep-*`, a hop's) are not the client's: they fit
+/// in the hop reserve on top of a head at the client cap.
+#[tokio::test]
+async fn node_headers_fit_in_the_hop_reserve_on_top_of_the_client_cap() {
+    let addr = start(ServeLimits::default()).await;
+    let client = format!("x-big: {}\r\n", "a".repeat(63 * 1024));
+    let node: String = (0..30)
+        .map(|i| format!("x-wasmkeep-chain: {i}{}\r\n", "c".repeat(600)))
+        .collect();
+    let head = health_with(&format!("{client}{node}"));
+    assert!(head.len() > MAX_REQUEST_HEAD_BYTES + 16 * 1024);
+    assert_eq!(status_of(addr, &head).await, 200);
+}
+
 /// Serves one public connection over an in-memory pipe whose buffer holds
 /// `buffer` bytes, with a write-idle limit of `idle`.
 fn serve_pipe(
@@ -116,6 +154,97 @@ async fn a_port_client_that_stops_reading_gives_its_slot_back() {
     let served =
         tokio::time::timeout(Duration::from_secs(20), status_of(addr, &health_with(""))).await;
     assert_eq!(served, Ok(200), "the stalled connection kept its slot");
+}
+
+/// A public port serving one static asset of `size` bytes at `/big.bin`.
+async fn start_with_asset(size: usize, limits: ServeLimits) -> std::net::SocketAddr {
+    use crate::assets::{Content, Deployed, File, Index, digest};
+    use object_store::ObjectStoreExt;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let content = vec![b'x'; size];
+    let hash = digest(&content);
+    store
+        .put(
+            &format!("apps/default/default/_assets/content/{hash}").into(),
+            content.into(),
+        )
+        .await
+        .unwrap();
+    let mut index = Index::default();
+    index.files.insert(
+        "big.bin".into(),
+        File {
+            content_type: "application/octet-stream".into(),
+            identity: Content {
+                digest: hash,
+                size: size as u64,
+            },
+            br: None,
+            gzip: None,
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::ActorConfig::new(dir.path());
+    std::mem::forget(dir);
+    config.assets = Some(Deployed {
+        index: Arc::new(index),
+        previous: None,
+        app: crate::apps::AppRef::new(store, "", "default", "default"),
+    });
+    let service = ActorService::new(
+        wasmkeep_runtime::Runtime::new(&Default::default()).unwrap(),
+        config,
+        vec![],
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_with(
+        listener,
+        App::from(service),
+        std::future::pending(),
+        limits,
+    ));
+    addr
+}
+
+/// On a real socket with the kernel's default buffers, a reader that keeps
+/// taking bytes slowly is not cut, though the socket reports room to
+/// write only once a third of its (autotuned, several MiB) send buffer is
+/// free: at the limit, the bytes it takes show the reader is there. Here
+/// 16 KiB per 100 ms against a 1 s limit, for 6 s past the point where
+/// the buffers are full (60 times slower than a minute's limit asks, the
+/// same as about 2.7 KiB/s; loopback acknowledges in 64 KiB segments).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steady_slow_reader_on_a_real_socket_is_not_cut() {
+    let size = 16 << 20;
+    let addr = start_with_asset(
+        size,
+        ServeLimits {
+            write_idle_timeout: Duration::from_secs(1),
+            ..ServeLimits::default()
+        },
+    )
+    .await;
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /big.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut taken = 0usize;
+    while started.elapsed() < Duration::from_secs(8) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut chunk = 0;
+        while chunk < buf.len() {
+            match s.read(&mut buf[chunk..]).await {
+                Ok(0) | Err(_) => panic!("the slow reader was cut after {taken} bytes"),
+                Ok(n) => chunk += n,
+            }
+        }
+        taken += chunk;
+    }
 }
 
 #[tokio::test(start_paused = true)]

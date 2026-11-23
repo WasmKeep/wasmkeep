@@ -23,7 +23,8 @@
 //!   `GET /observed` answers `BEFORE AFTER` (a time or `none`)
 //! - `POST /call?to=CLASS/NAME&path=P` (P percent-encoded): `actors.call`
 //!   with GET P; answers `STATUS:BODY` or the call error (`&times=N`: the
-//!   same call N times in a row, answers joined by ` | `)
+//!   same call N times in a row, answers joined by ` | `; `&hn=N&hv=B`:
+//!   with N headers `x-h00`... of B bytes each)
 //! - `POST /call-many?to=A,B,...&path=P`: one `calls::call_many` with a
 //!   POST P to each address (comma-separated, P percent-encoded); answers
 //!   each entry as `/call` does, joined by ` | `, in input order
@@ -451,10 +452,15 @@ impl http::Guest for TestActor {
                     .unwrap_or_default();
                 let path =
                     query_param(&full, "path").map_or("/fired".to_owned(), |p| percent_decode(&p));
+                // `hn` headers `x-hNN` of `hv` bytes each.
+                let value = "v".repeat(usize::try_from(num("hv")).unwrap_or(0));
+                let headers = (0..num("hn"))
+                    .map(|i| (format!("x-h{i:02}"), value.clone()))
+                    .collect();
                 let request = actors::Request {
                     method: "POST".into(),
                     path,
-                    headers: vec![],
+                    headers,
                     body: vec![],
                 };
                 let call = || answer(actors::call(&to, &request));
