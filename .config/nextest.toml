@@ -39,6 +39,13 @@ filter = 'binary(soak) | binary(failover)'
 slow-timeout = { period = "300s" }
 
 [[profile.default.overrides]]
+# The mixed-version check (scripts/mixed-version.sh, ignored and gated on
+# WASMKEEP_MIXED_VERSION): about seven minutes after the release build;
+# ended after half an hour, its trap then stopping the nodes it started.
+filter = 'binary(=mixed_version)'
+slow-timeout = { period = "300s", terminate-after = 6 }
+
+[[profile.default.overrides]]
 # scripts/check.sh --s3 uses the default profile. Diagnose does 1,001
 # writes and deletes plus conditional-write retries on a real bucket;
 # the fleet pass took about 230 s. Keep those checks, allow up to 600 s,
