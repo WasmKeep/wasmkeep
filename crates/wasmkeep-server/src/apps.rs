@@ -44,6 +44,22 @@ pub use collect::KEEP_PREVIOUS;
 pub use delete::fence_app_nodes;
 pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 
+/// A local copy of an app marker (`.recreated`, `.restored`): `None` only
+/// when the file is missing. Any other error (EMFILE under socket load,
+/// EIO, EACCES) says nothing about the app: an error, so the caller retries
+/// or fails, never stops the app or removes its local files as if the
+/// marker did not match.
+fn read_local_marker(path: &std::path::Path) -> Result<Option<Vec<u8>>, DeployError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DeployError::Bucket(format!(
+            "reading {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -787,14 +803,16 @@ impl AppRef {
             markers[0].1.as_ref().map(|(body, _)| body.as_slice()),
             markers[1].1.as_ref().map(|(body, _)| body.as_slice()),
         );
-        if markers.iter().any(|(file, value)| {
-            value.as_ref().is_some_and(|(body, _)| {
-                !marker_matches(
-                    Some(body.as_slice()),
-                    std::fs::read(local.join(file)).ok().as_deref(),
-                )
-            })
-        }) {
+        // A local marker this node cannot read is an error, never a reason
+        // to remove the app's files.
+        let mut stale = false;
+        for (file, value) in &markers {
+            if let Some((body, _)) = value {
+                let ours = read_local_marker(&local.join(file))?;
+                stale |= !marker_matches(Some(body.as_slice()), ours.as_deref());
+            }
+        }
+        if stale {
             remove("the app was recreated or restored since this node last ran it")?;
             std::fs::create_dir_all(local).map_err(bucket)?;
             for (file, value) in markers {
@@ -1838,21 +1856,7 @@ impl AppRef {
             let Some((marker, _)) = self.get(remote).await? else {
                 continue;
             };
-            // Only a missing file, or other bytes, is a mismatch. Any other
-            // error (EMFILE under socket load, EIO, EACCES) says nothing
-            // about the app: an error, so the caller retries rather than
-            // stopping the app and removing its local files.
-            let path = local.join(file);
-            let ours = match std::fs::read(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(DeployError::Bucket(format!(
-                        "reading {}: {e}",
-                        path.display()
-                    )));
-                }
-            };
+            let ours = read_local_marker(&local.join(file))?;
             if !marker_matches(Some(marker.as_slice()), ours.as_deref()) {
                 return Ok(false);
             }
@@ -3721,5 +3725,37 @@ mod tests {
             matches!(&read, Err(DeployError::Bucket(why)) if why.contains(RECREATED_LOCAL)),
             "{read:?}"
         );
+    }
+
+    /// At start, too, a local marker this node cannot read is an error,
+    /// never a reason to remove the app's local files: only a missing
+    /// marker, or one with other bytes, is.
+    #[tokio::test]
+    async fn an_unreadable_local_marker_never_removes_local_files_at_start() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let data = tempfile::tempdir().unwrap();
+        let local = data.path().join("app");
+        app.put_once(RECREATED, b"one".to_vec()).await.unwrap();
+        // Missing locally: the directory is replaced, the marker written.
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("state"), b"old").unwrap();
+        app.prepare_local(&local).await.unwrap();
+        assert!(!local.join("state").exists());
+        assert_eq!(std::fs::read(local.join(RECREATED_LOCAL)).unwrap(), b"one");
+        // Same bytes: kept.
+        std::fs::write(local.join("state"), b"kept").unwrap();
+        app.prepare_local(&local).await.unwrap();
+        assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
+        // Unreadable: an error, and nothing is removed.
+        std::fs::remove_file(local.join(RECREATED_LOCAL)).unwrap();
+        std::fs::create_dir(local.join(RECREATED_LOCAL)).unwrap();
+        let prepared = app.prepare_local(&local).await;
+        assert!(
+            matches!(&prepared, Err(DeployError::Bucket(why)) if why.contains(RECREATED_LOCAL)),
+            "{prepared:?}"
+        );
+        assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
+        assert!(local.join(RECREATED_LOCAL).is_dir());
     }
 }
