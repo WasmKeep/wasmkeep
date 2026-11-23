@@ -354,8 +354,10 @@ fn soak_writes() -> Vec<String> {
 fn send(addr: SocketAddr, method: &str, path: &str) -> Option<(u16, Option<String>, String)> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    // A loopback metrics listener answers IP addresses and localhost only.
+    let host = if path == "/metrics" { "localhost" } else { "t" };
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     s.write_all(req.as_bytes()).ok()?;
     let mut raw = String::new();
@@ -380,7 +382,7 @@ fn send(addr: SocketAddr, method: &str, path: &str) -> Option<(u16, Option<Strin
 fn metrics_page(addr: SocketAddr) -> Option<String> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
-    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;
     let mut raw = String::new();
     s.read_to_string(&mut raw).ok()?;

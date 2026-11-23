@@ -13,6 +13,7 @@ public-advertise = "http://10.0.0.11:8080"
 cluster = "0.0.0.0:7443"
 cluster-advertise = "https://10.0.0.11:7443"
 metrics = "127.0.0.1:9100"
+metrics-hosts = ["Node1.Internal.", "node1.internal"]
 
 [limits]
 max-sockets-per-node = 50000
@@ -94,6 +95,7 @@ fn the_adr_example_parses_every_field_with_paths_from_the_file() {
         Some("https://10.0.0.11:7443")
     );
     assert_eq!(f.listen.metrics, Some("127.0.0.1:9100".parse().unwrap()));
+    assert_eq!(f.listen.metrics_hosts, ["node1.internal"]);
     assert_eq!(f.limits.max_sockets_per_node, Some(50_000));
     assert_eq!(f.apps.len(), 1);
     let a = &f.apps[0];

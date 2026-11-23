@@ -286,12 +286,19 @@ async fn an_idle_connection_is_not_cut_by_the_write_idle_limit() {
     done.await.unwrap();
 }
 
-/// Serves metrics on a loopback port; returns its address.
-async fn start_metrics() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_metrics(listener, None, std::future::pending()));
-    addr
+/// Serves metrics bound to `bind`, answering the names in `hosts` too;
+/// returns an address that reaches it.
+async fn start_metrics(bind: &str, hosts: &[&str]) -> std::net::SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hosts: Arc<[String]> = hosts.iter().map(|h| (*h).to_owned()).collect();
+    tokio::spawn(serve_metrics_of(
+        listener,
+        Metered::One(None),
+        hosts,
+        std::future::pending(),
+    ));
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 fn scrape(host: Option<&str>) -> String {
@@ -299,9 +306,10 @@ fn scrape(host: Option<&str>) -> String {
     format!("GET /metrics HTTP/1.1\r\n{host}Connection: close\r\n\r\n")
 }
 
-#[tokio::test]
-async fn the_metrics_page_answers_only_addresses_and_local_names() {
-    let addr = start_metrics().await;
+/// Answered on every bind: IP addresses (any, with any port), `localhost`
+/// and names under it. Refused on every bind: a missing or doubled Host,
+/// one with user information, and a dotted name nobody configured.
+async fn assert_common(addr: std::net::SocketAddr) {
     let bound = addr.to_string();
     for host in [
         bound.as_str(),
@@ -312,7 +320,6 @@ async fn the_metrics_page_answers_only_addresses_and_local_names() {
         "prometheus.localhost",
         "[::1]:9100",
         "10.0.0.7:9100",
-        "wasmkeep:9100",
     ] {
         assert_eq!(status_of(addr, &scrape(Some(host))).await, 200, "{host}");
     }
@@ -321,6 +328,8 @@ async fn the_metrics_page_answers_only_addresses_and_local_names() {
         "rebound.example:9100",
         "metrics.internal.",
         "localhost.example",
+        "user@127.0.0.1",
+        "a@localhost:9100",
         "",
     ] {
         assert_eq!(status_of(addr, &scrape(Some(host))).await, 421, "{host}");
@@ -328,4 +337,31 @@ async fn the_metrics_page_answers_only_addresses_and_local_names() {
     assert_eq!(status_of(addr, &scrape(None)).await, 421);
     let twice = "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: rebound.example\r\nConnection: close\r\n\r\n";
     assert_eq!(status_of(addr, twice).await, 421);
+}
+
+#[tokio::test]
+async fn a_loopback_metrics_bind_answers_only_addresses_and_localhost() {
+    let addr = start_metrics("127.0.0.1:0", &[]).await;
+    assert_common(addr).await;
+    // A single-label name could be pointed at loopback by whoever answers
+    // for it on the network.
+    assert_eq!(status_of(addr, &scrape(Some("wasmkeep:9100"))).await, 421);
+}
+
+#[tokio::test]
+async fn a_metrics_bind_on_all_addresses_also_answers_single_label_names() {
+    let addr = start_metrics("0.0.0.0:0", &[]).await;
+    assert_common(addr).await;
+    assert_eq!(status_of(addr, &scrape(Some("wasmkeep:9100"))).await, 200);
+}
+
+#[tokio::test]
+async fn configured_metrics_names_are_answered_on_any_bind() {
+    let addr = start_metrics("127.0.0.1:0", &["metrics.internal", "node1"]).await;
+    for host in ["metrics.internal", "Metrics.Internal.:9100", "node1"] {
+        assert_eq!(status_of(addr, &scrape(Some(host))).await, 200, "{host}");
+    }
+    for host in ["other.internal", "node2", "x.metrics.internal"] {
+        assert_eq!(status_of(addr, &scrape(Some(host))).await, 421, "{host}");
+    }
 }

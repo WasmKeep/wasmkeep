@@ -2363,8 +2363,15 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// Status line and body of a plain GET, whatever the framing.
 async fn get_raw(addr: SocketAddr, path: &str) -> (u16, String) {
+    // A loopback metrics listener answers IP addresses and localhost only.
+    let host = if path == "/metrics" { "localhost" } else { "t" };
+    get_raw_as(addr, path, host).await
+}
+
+/// [`get_raw`] with `host` as the `Host`.
+async fn get_raw_as(addr: SocketAddr, path: &str, host: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut raw = String::new();
     stream.read_to_string(&mut raw).await.unwrap();

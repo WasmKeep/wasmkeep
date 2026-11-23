@@ -217,6 +217,7 @@ async fn process_inner(
                     public,
                     cluster: Some(cluster),
                     metrics: None,
+                    metrics_hosts: Vec::new(),
                 },
                 specs,
                 move || {

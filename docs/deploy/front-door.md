@@ -49,11 +49,12 @@ node a     node b     node c       any node takes any request;
   head (request line and headers) is larger, or has more than 100 header
   fields. A load balancer that adds headers should leave room for them.
 - **A client that stops reading is let go.** A response write that waits
-  60 s with nothing taken closes the connection; a load balancer that
-  buffers responses, or a client that keeps reading slowly, is never cut.
+  60 s with nothing taken closes the connection. A load balancer that
+  buffers responses is not cut, nor is a client that takes some bytes in
+  every 60 s; one whose receive window stays closed that long is.
 - **Never expose** the metrics listener (`--metrics-listen`) or the
-  node-to-node traffic to the internet. Scrape it by IP address, or by a
-  single-label name such as a Compose service; a dotted name gets 421
+  node-to-node traffic to the internet. Scrape it by IP address; a dotted
+  host name needs `--metrics-host NAME`, else it gets 421
   ([monitoring](../monitoring.md#metrics)).
 
 ## Readiness with several apps

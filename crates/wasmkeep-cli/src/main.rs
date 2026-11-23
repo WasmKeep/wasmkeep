@@ -664,7 +664,7 @@ struct ServeArgs {
     /// read from its directory. Needs --bucket; one or more `[[app]]` entries.
     #[arg(long, value_name = "FILE", requires = "bucket", conflicts_with_all = [
         "app", "actors", "component", "node_id", "advertise", "listen", "cluster_listen",
-        "cluster_advertise", "metrics_listen", "max_sockets_per_node", "max_sockets_per_app",
+        "cluster_advertise", "metrics_listen", "metrics_hosts", "max_sockets_per_node", "max_sockets_per_app",
         "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
         "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
         "front_cpu_budget_ms", "no_alarms", "blob_link_base", "max_app_blob_bytes",
@@ -754,6 +754,13 @@ struct ServeArgs {
     /// counts: bind it to a private address.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+
+    /// A name the metrics page answers to, for a scraper that names this
+    /// node by a dotted host name (`node1.internal`). Repeatable. Without
+    /// it, the page answers IP addresses and `localhost`, and, off
+    /// loopback, single-label names; any other `Host` gets 421.
+    #[arg(long = "metrics-host", value_name = "NAME", value_parser = parse_metrics_host)]
+    metrics_hosts: Vec<String>,
 
     /// Let actors' outbound HTTP reach this non-public range (`10.0.0.0/8`,
     /// `127.0.0.1`, `fd00::/8`). Repeatable. By default only public
@@ -959,6 +966,17 @@ pub(crate) fn link_base(args: &ServeArgs, hostnames: &[String]) -> Option<String
         .or_else(|| hostnames.first().map(|h| format!("https://{h}")))
         .or_else(|| args.advertise.clone())
         .or_else(|| (!args.listen.ip().is_unspecified()).then(|| format!("http://{}", args.listen)))
+}
+
+/// Checks `--metrics-host` is a host name (no port, no scheme), lowercase
+/// with no trailing dot.
+fn parse_metrics_host(s: &str) -> Result<String, String> {
+    node_file::hostname(s).ok_or_else(|| {
+        format!(
+            "{s:?} is not a hostname (letters, digits and '-' in dot-separated labels; no \
+             port, no scheme)"
+        )
+    })
 }
 
 /// Checks `--cluster-advertise` is an `https://` address with a host (the
@@ -2091,6 +2109,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             public: listener,
             cluster,
             metrics,
+            metrics_hosts: args.metrics_hosts.clone(),
         };
         // The app deleted, or its node id lost (another process found
         // running with it): the process exits with the reason, non-zero.

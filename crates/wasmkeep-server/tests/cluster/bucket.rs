@@ -933,7 +933,7 @@ async fn readiness_follows_the_bucket_and_metrics_count_events() {
     // per-actor renewals).
     assert!(value("wasmkeep_node_lease_writes_total") >= 1, "{page}");
     // Only /metrics is served there.
-    assert_eq!(get_raw(metrics, "/").await.0, 404);
+    assert_eq!(get_raw_as(metrics, "/", "localhost").await.0, 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]

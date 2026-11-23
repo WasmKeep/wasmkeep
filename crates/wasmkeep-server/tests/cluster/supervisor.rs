@@ -76,6 +76,7 @@ async fn supervised(
                     public: listener,
                     cluster: cluster_port,
                     metrics: None,
+                    metrics_hosts: Vec::new(),
                 },
                 app,
                 move || {

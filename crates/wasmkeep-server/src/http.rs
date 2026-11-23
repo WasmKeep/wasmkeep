@@ -1040,15 +1040,15 @@ fn not_live() -> Response<HyperOutgoingBody> {
 
 /// Serves `GET /metrics` (Prometheus text format) on its own listener,
 /// meant for a private address: the page names classes and counts. Up to
-/// 16 scrapers at once; until `shutdown`. A request whose `Host` is a
-/// dotted name other than one under `localhost` is refused (421): scrape
-/// by IP address, `localhost` or a single-label name.
+/// 16 scrapers at once; until `shutdown`. A request must name the
+/// listener by IP address or `localhost` (or, off loopback, a
+/// single-label name), else 421; see `metrics_host_allowed`.
 pub async fn serve_metrics(
     listener: TcpListener,
     actors: Option<ActorService>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
-    serve_metrics_of(listener, Metered::One(actors), shutdown).await
+    serve_metrics_of(listener, Metered::One(actors), Arc::from([]), shutdown).await
 }
 
 /// What a metrics page is rendered from.
@@ -1088,7 +1088,7 @@ impl Metered {
 
 /// Time a scraper has to send its request's headers, also between
 /// requests on a kept-alive connection.
-const METRICS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const METRICS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time a metrics page write may wait for a scraper that stopped reading.
 const METRICS_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1100,13 +1100,22 @@ const METRICS_CONNECTION_LIMIT: Duration = Duration::from_secs(60);
 const METRICS_HEAD_BYTES: usize = 16 * 1024;
 
 /// Whether a metrics request's one `Host` names this listener the way a
-/// scraper does: an IP address (any: the listener may be bound to all
-/// addresses, or reached through a mapped port), `localhost` or a name
-/// under it, or a single-label name (a container or host name resolved
-/// locally). A name with a dot is refused: a web page could point such a
-/// name at this address and read the page from a browser. The port is
-/// not checked.
-fn metrics_host_allowed(headers: &hyper::HeaderMap) -> bool {
+/// scraper does:
+/// - an IP address (any: the listener may be bound to all addresses, or
+///   reached through a mapped port), `localhost` or a name under it;
+/// - one of `names`, the names configured for it (`--metrics-host`);
+/// - on a listener not bound to loopback, a single-label name (a container
+///   or host name resolved on the private network).
+///
+/// Any other name is refused: a web page could point a name of its own at
+/// this address and read the page from a browser. A loopback listener
+/// refuses single-label names too, since whoever answers for one on the
+/// network could point it at loopback. The port is not checked.
+fn metrics_host_allowed(
+    headers: &hyper::HeaderMap,
+    bound: std::net::IpAddr,
+    names: &[String],
+) -> bool {
     let mut hosts = headers.get_all(hyper::header::HOST).iter();
     let (Some(host), None) = (hosts.next(), hosts.next()) else {
         return false;
@@ -1114,6 +1123,7 @@ fn metrics_host_allowed(headers: &hyper::HeaderMap) -> bool {
     let Some(authority) = host
         .to_str()
         .ok()
+        .filter(|h| !h.contains('@'))
         .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
     else {
         return false;
@@ -1128,16 +1138,29 @@ fn metrics_host_allowed(headers: &hyper::HeaderMap) -> bool {
     {
         return true;
     }
-    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    !name.is_empty() && (name == "localhost" || name.ends_with(".localhost") || !name.contains('.'))
+    let name = metrics_host_name(host);
+    !name.is_empty()
+        && (name == "localhost"
+            || name.ends_with(".localhost")
+            || names.contains(&name)
+            || (!bound.is_loopback() && !name.contains('.')))
+}
+
+/// `host` as the metrics listener compares names: lowercase, with no
+/// trailing dot.
+pub(crate) fn metrics_host_name(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
 /// [`serve_metrics`] for what `metered` names.
 pub(crate) async fn serve_metrics_of(
     listener: TcpListener,
     metered: Metered,
+    names: Arc<[String]>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
+    let bound = listener.local_addr().map_err(Error::Io)?.ip();
+    let names: Arc<[String]> = names.iter().map(|n| metrics_host_name(n)).collect();
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut shutdown = std::pin::pin!(shutdown);
     // The page is served, so the scheduling probe runs for as long.
@@ -1161,16 +1184,17 @@ pub(crate) async fn serve_metrics_of(
             },
             () = &mut shutdown => return Ok(()),
         };
-        let metered = metered.clone();
+        let (metered, names) = (metered.clone(), Arc::clone(&names));
         let service = service_fn(move |req: Request<Incoming>| {
-            let metered = metered.clone();
+            let (metered, names) = (metered.clone(), Arc::clone(&names));
             async move {
                 let page = req.uri().path() == "/metrics"
                     && matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
-                let response = if !metrics_host_allowed(req.headers()) {
+                let response = if !metrics_host_allowed(req.headers(), bound, &names) {
                     text_response(
                         StatusCode::MISDIRECTED_REQUEST,
-                        "scrape the metrics by IP address, localhost or a single-label name\n",
+                        "scrape the metrics by IP address or localhost, or name the host with \
+                         --metrics-host\n",
                     )
                 } else if page {
                     let body = metered.page();

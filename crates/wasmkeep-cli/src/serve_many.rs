@@ -195,6 +195,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
                     public: public_listener,
                     cluster: Some(cluster_listener),
                     metrics,
+                    metrics_hosts: file.listen.metrics_hosts.clone(),
                 },
                 specs,
                 stop_signal,

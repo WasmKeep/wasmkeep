@@ -34,6 +34,7 @@ public-advertise = "http://10.0.0.11:8080"
 cluster = "0.0.0.0:7443"
 cluster-advertise = "https://10.0.0.11:7443"
 metrics = "127.0.0.1:9100"
+metrics-hosts = ["node1.internal"]  # names scrapers use, besides addresses
 
 [limits]
 max-sockets-per-node = 50000
@@ -79,10 +80,12 @@ Relative paths are read from the file's directory.
 | `data-dir` | Every app's data directory unless its entry names its own (default `.wasmkeep/data`, as `--data-dir`). |
 | `placement` | `false` turns placement at wake-up off for every app of the process, as `--no-placement` ([ADR 0041](../adr/0041-placement-at-wake-up.md)): its node ids keep every actor they wake and do not announce `place`. Default `true`. |
 
-`[listen]`: `public`, `public-advertise`, `cluster`, `cluster-advertise`
-and `metrics`, as `--listen`, `--advertise`, `--cluster-listen`,
-`--cluster-advertise` and `--metrics-listen`. `cluster` and
-`cluster-advertise` go together.
+`[listen]`: `public`, `public-advertise`, `cluster`, `cluster-advertise`,
+`metrics` and `metrics-hosts`, as `--listen`, `--advertise`,
+`--cluster-listen`, `--cluster-advertise`, `--metrics-listen` and
+`--metrics-host` (a list: the names the metrics page answers to besides
+IP addresses and `localhost`, see [monitoring](../monitoring.md#metrics)).
+`cluster` and `cluster-advertise` go together.
 
 `[limits]`: `max-sockets-per-node`, as `--max-sockets-per-node`.
 
