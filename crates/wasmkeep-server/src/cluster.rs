@@ -449,6 +449,11 @@ pub(crate) struct Cluster {
     /// hibernation finding none free takes none
     /// ([`crate::replica::IDLE_SNAPSHOTS_AT_ONCE`]).
     pub(crate) idle_snapshot_slots: Arc<tokio::sync::Semaphore>,
+    /// Idle passes due (ADR 0042, section 3): actors whose hold wrote and
+    /// whose release landed, remembered until a retention window later.
+    pub(crate) idle_passes: crate::actor::compaction::Queue,
+    /// Record keys this node holds for an idle pass now.
+    pub(crate) idle_pass_keys: std::sync::Mutex<std::collections::HashSet<String>>,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
     /// [`ClusterConfig::restore_budget`].
@@ -495,11 +500,11 @@ pub(crate) struct Cluster {
     /// Placement's own state (ADR 0041): credits, backoff, no return.
     placing: placing::Placing,
     /// The lease timing (ttl, grace, safety, skew).
-    lease_config: LeaseConfig,
+    pub(crate) lease_config: LeaseConfig,
     /// How often the node lease is written ([`lease_every`]).
     lease_every: Duration,
     /// How long one node lease write may take ([`lease_attempt`]).
-    lease_attempt: Duration,
+    pub(crate) lease_attempt: Duration,
     /// This node's lease validity, shared with every hold.
     pub(crate) validity: Arc<NodeValidity>,
     /// Run when a lease write finds the lease had run out, before every
@@ -873,6 +878,8 @@ impl Cluster {
             idle_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::replica::IDLE_SNAPSHOTS_AT_ONCE,
             )),
+            idle_passes: crate::actor::compaction::Queue::default(),
+            idle_pass_keys: std::sync::Mutex::default(),
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),
@@ -2244,6 +2251,9 @@ impl Cluster {
     pub(crate) fn app_tombstoned(&self) {
         self.app_gate
             .store(APP_DELETED, std::sync::atomic::Ordering::SeqCst);
+        // No idle pass of a deleted app (ADR 0042): what this node
+        // remembered names the app's old incarnation.
+        self.idle_passes.clear();
     }
 
     /// Whether this node's lease is valid now.

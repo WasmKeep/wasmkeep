@@ -557,6 +557,17 @@ impl Drop for InFlight {
 /// Nothing was written; the actor is not expired.
 pub(crate) const RECORD_CHANGED: &str = "the ownership record changed since the listing";
 
+/// Whether the record version `read` (an `ETag`, then a version id, as
+/// `object_store.rs` encodes them) is `remembered`: the same `ETag` and,
+/// where both carry a version id (a versioned bucket), the same id. An
+/// expiry's listing gives the `ETag` alone, which is then all compared.
+pub(crate) fn same_version(read: &str, remembered: &str) -> bool {
+    let (read_tag, read_id) = read.split_once('\n').unwrap_or((read, ""));
+    let (tag, id) = remembered.split_once('\n').unwrap_or((remembered, ""));
+    wasmkeep_cluster::expiry::etag(read_tag) == wasmkeep_cluster::expiry::etag(tag)
+        && (read_id.is_empty() || id.is_empty() || read_id == id)
+}
+
 /// This node's hold on one actor, released when dropped (hibernation).
 pub(crate) struct LeaseHold {
     cell: Cell,
@@ -644,11 +655,7 @@ impl LeaseHold {
                     .owners
                     .acquire_unchanged_prepared(
                         &key,
-                        |v| {
-                            let read = v.0.split('\n').next().unwrap_or_default();
-                            wasmkeep_cluster::expiry::etag(read)
-                                == wasmkeep_cluster::expiry::etag(listed)
-                        },
+                        |v| same_version(&v.0, listed),
                         Some(idle_origin_ms),
                         || cluster.validity.valid_in(epoch),
                         prepare,
@@ -674,6 +681,9 @@ impl LeaseHold {
                     tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), from = %previous, generation = hold.generation, "took over an actor whose node stopped");
                 }
                 let generation = hold.generation;
+                // Any acquisition here: the version an idle pass remembered
+                // is gone (ADR 0042).
+                cluster.idle_passes.remove(&key);
                 let cell = Arc::new(Mutex::new(Some(hold)));
                 cluster.pending.register(&key, &cell);
                 // The new hold carries the local evidence now.
@@ -927,15 +937,16 @@ impl LeaseHold {
                 .release_attempt()
                 .min(left.max(Duration::from_millis(50)));
             let invalid = !cluster.node_lease_valid();
-            let sent = tokio::time::timeout(bound, cluster.owners.release(&hold))
-                .await
-                .unwrap_or(Released::Pending);
+            let (sent, written) =
+                tokio::time::timeout(bound, cluster.owners.release_written(&hold))
+                    .await
+                    .unwrap_or((Released::Pending, None));
             if invalid && sent == Released::Released {
                 cluster.released_after_lapse(&hold.key);
             }
             match sent {
                 Released::Released => {
-                    cluster.pending.release_landed(&hold);
+                    cluster.release_landed(&hold, written);
                     return LeaseReturn::Released;
                 }
                 Released::Superseded => return LeaseReturn::Superseded,
@@ -1154,16 +1165,25 @@ impl Cluster {
     /// lapse, its write landing after).
     async fn send_release(&self, hold: &Hold) -> Released {
         let invalid = !self.node_lease_valid();
-        let sent = tokio::time::timeout(self.release_attempt(), self.owners.release(hold))
-            .await
-            .unwrap_or(Released::Pending);
+        let (sent, written) =
+            tokio::time::timeout(self.release_attempt(), self.owners.release_written(hold))
+                .await
+                .unwrap_or((Released::Pending, None));
         if invalid && sent == Released::Released {
             self.released_after_lapse(&hold.key);
         }
         if sent == Released::Released {
-            self.pending.release_landed(hold);
+            self.release_landed(hold, written);
         }
         sent
+    }
+
+    /// A release of `hold` landed, `written` the version its answer gave:
+    /// its frozen head's entry ends, and a hold that wrote is remembered
+    /// for its idle pass (ADR 0042, section 3).
+    fn release_landed(&self, hold: &Hold, written: Option<wasmkeep_cluster::lease::Version>) {
+        self.pending.release_landed(hold);
+        self.note_idle_release(hold, written);
     }
 
     /// A release that landed while this node's lease was not valid:
@@ -1447,13 +1467,15 @@ impl Cluster {
                     // landed (its frozen head's entry ends) from one
                     // superseded (it stays, ADR 0035 section 2).
                     PendingEntry::Release(hold) => {
-                        let sent =
-                            tokio::time::timeout(self.lease_attempt, self.owners.release(&hold))
-                                .await
-                                .unwrap_or(Released::Pending);
+                        let (sent, written) = tokio::time::timeout(
+                            self.lease_attempt,
+                            self.owners.release_written(&hold),
+                        )
+                        .await
+                        .unwrap_or((Released::Pending, None));
                         match sent {
                             Released::Released => {
-                                self.pending.release_landed(&hold);
+                                self.release_landed(&hold, written);
                                 Retried::Ended
                             }
                             Released::Superseded => Retried::Ended,

@@ -419,6 +419,13 @@ impl ActorService {
                 Arc::downgrade(&service.inner),
                 Arc::clone(&cluster),
             ));
+            // Idle passes (ADR 0042, section 3), on the node that released
+            // each actor, while this runtime's epoch is the app's.
+            tokio::spawn(compaction::compaction_loop(
+                Arc::downgrade(&service.inner),
+                Arc::clone(&cluster),
+                config.blob_epoch.clone(),
+            ));
             // Deleted actors' files and other epochs' (ADR 0030), on the
             // same node.
             tokio::spawn(blob_sweeps::sweep_loop(

@@ -653,6 +653,15 @@ impl<S> Mailboxes<S> {
         }
     }
 
+    /// How many jobs wait in `address`'s queue, not counting the one
+    /// running (0 without a mailbox): a long maintenance job checks it to
+    /// stop early when an event is waiting behind it.
+    pub fn waiting(&self, address: &ActorAddress) -> usize {
+        lock(&self.inner)
+            .get(address)
+            .map_or(0, |entry| entry.tx.max_capacity() - entry.tx.capacity())
+    }
+
     /// Whether this address has a registered mailbox that still accepts events.
     pub fn contains(&self, address: &ActorAddress) -> bool {
         lock(&self.inner)

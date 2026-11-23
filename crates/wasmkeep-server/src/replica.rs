@@ -19,7 +19,8 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload}
 use wasmkeep_cluster::local_heads::{Proof, Requirement, linked_back, prove};
 use wasmkeep_cluster::recorded_head::Position;
 use wasmkeep_cluster::replication::{
-    EMPTY, Listing, Plan, Segment, SegmentId, collectable, plan_restore, segment_key, snapshot_key,
+    EMPTY, Listing, Plan, Segment, SegmentId, collectable, idle_collectable, plan_restore,
+    segment_key, snapshot_key,
 };
 use wasmkeep_runtime::ActorAddress;
 use wasmkeep_storage::ltx::DbChecksum;
@@ -2690,13 +2691,73 @@ impl Collector {
         snapshot: SegmentId,
         retention: std::time::Duration,
     ) -> Result<usize, ReplicaError> {
-        use futures_util::{StreamExt, TryStreamExt};
         if !self.lease.is_valid() {
             return Ok(0);
         }
+        let listed = self.list().await?;
+        let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
+        let gone = collectable(&listing, self.generation, snapshot);
+        Ok(self
+            .delete_older(&listed, gone, retention, &|| false)
+            .await?
+            .0)
+    }
+
+    /// The collector of an idle pass (ADR 0042, section 3): `generation`
+    /// is the released record's, which the pass's own hold acquired
+    /// unchanged, and `lease` is the view of that new hold. Built from the
+    /// cluster: the pass restores nothing and has no replica.
+    pub(crate) fn idle(
+        cluster: &Cluster,
+        address: &ActorAddress,
+        generation: u64,
+        lease: LeaseView,
+    ) -> Self {
+        Self {
+            store: Arc::clone(&cluster.store),
+            prefix: format!("{}/", cluster.history_key(address)),
+            generation,
+            lease,
+        }
+    }
+
+    /// An idle pass's collection (ADR 0042, section 3, steps 4 and 5): one
+    /// listing; the snapshot and keys [`idle_collectable`] gives for this
+    /// collector's generation (the released one); and the deletes of
+    /// those older than `retention` by `last_modified`, in batches, the
+    /// lease checked before each, and `stop` too: the pass stops deleting
+    /// once it says so (its deadline, an event waiting behind it, a drain),
+    /// and what is left waits for the actor's next write. A lease already
+    /// invalid is [`ReplicaError::Late`], nothing listed.
+    pub(crate) async fn collect_idle(
+        &self,
+        retention: std::time::Duration,
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<IdleCollected, ReplicaError> {
+        if !self.lease.is_valid() {
+            return Err(ReplicaError::Late);
+        }
+        let listed = self.list().await?;
+        let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
+        let Some((snapshot, gone)) = idle_collectable(&listing, self.generation) else {
+            return Ok(IdleCollected::NoSnapshot);
+        };
+        let (deleted, kept, stopped) = self.delete_older(&listed, gone, retention, stop).await?;
+        Ok(IdleCollected::Collected {
+            snapshot,
+            deleted,
+            kept,
+            stopped,
+        })
+    }
+
+    /// The prefix, listed once: each key relative to it, with the exact
+    /// location and last-modified time the listing returned. As in `list`:
+    /// compared in the store's encoding, and the deletes use the exact
+    /// locations listed.
+    async fn list(&self) -> Result<Vec<(String, object_store::ObjectMeta)>, ReplicaError> {
+        use futures_util::TryStreamExt;
         let base = StorePath::from(self.prefix.trim_end_matches('/'));
-        // As in `list`: compare in the store's encoding, and delete the
-        // exact locations the listing returned.
         let encoded = format!("{}/", base.as_ref());
         let metas: Vec<object_store::ObjectMeta> = self
             .store
@@ -2704,32 +2765,54 @@ impl Collector {
             .try_collect()
             .await
             .map_err(|e| ReplicaError::Bucket(e.to_string()))?;
-        let relative: Vec<(String, &object_store::ObjectMeta)> = metas
-            .iter()
+        Ok(metas
+            .into_iter()
             .filter_map(|m| {
-                let rel = m.location.as_ref().strip_prefix(encoded.as_str())?;
-                Some((rel.to_owned(), m))
+                let rel = m
+                    .location
+                    .as_ref()
+                    .strip_prefix(encoded.as_str())?
+                    .to_owned();
+                Some((rel, m))
             })
-            .collect();
-        let listing = Listing::from_keys(relative.iter().map(|(k, _)| k.as_str()));
-        let gone: std::collections::HashSet<String> =
-            collectable(&listing, self.generation, snapshot)
-                .into_iter()
-                .collect();
+            .collect())
+    }
+
+    /// Deletes the listed objects `gone` names that are older than
+    /// `retention`, in batches, while the lease is valid and `stop` says
+    /// nothing. Returns how many were deleted (already gone counts), how
+    /// many were kept for being younger than the window, and whether
+    /// `stop` cut the deletes short.
+    async fn delete_older(
+        &self,
+        listed: &[(String, object_store::ObjectMeta)],
+        gone: Vec<String>,
+        retention: std::time::Duration,
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(usize, usize, bool), ReplicaError> {
+        use futures_util::StreamExt;
+        let gone: std::collections::HashSet<String> = gone.into_iter().collect();
         let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
         let cutoff = crate::alarm::now_ms_i64().saturating_sub(retention_ms);
-        let doomed: Vec<StorePath> = relative
-            .iter()
-            .filter(|(k, m)| {
-                gone.contains(k)
-                    && (retention.is_zero() || m.last_modified.timestamp_millis() <= cutoff)
-            })
-            .map(|(_, m)| m.location.clone())
-            .collect();
-        let mut deleted = 0;
+        let (mut doomed, mut kept) = (Vec::new(), 0);
+        for (k, m) in listed {
+            if !gone.contains(k) {
+                continue;
+            }
+            if retention.is_zero() || m.last_modified.timestamp_millis() <= cutoff {
+                doomed.push(m.location.clone());
+            } else {
+                kept += 1;
+            }
+        }
+        let (mut deleted, mut stopped) = (0, false);
         for batch in doomed.chunks(COLLECT_BATCH) {
             // ADR 0012, condition 3.
             if !self.lease.is_valid() {
+                break;
+            }
+            if stop() {
+                stopped = true;
                 break;
             }
             // The stream outlives the batch: it takes its own copies.
@@ -2749,8 +2832,26 @@ impl Collector {
                 }
             }
         }
-        Ok(deleted)
+        Ok((deleted, kept, stopped))
     }
+}
+
+/// What an idle pass's collection did ([`Collector::collect_idle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleCollected {
+    /// The listing has no snapshot of the released generation with its
+    /// segment (a read-only wake's release, say): nothing deleted.
+    NoSnapshot,
+    /// Compacted below the snapshot at `snapshot`: `deleted` objects gone
+    /// (already gone counts), `kept` collectable ones left for being
+    /// younger than the retention window.
+    Collected {
+        snapshot: SegmentId,
+        deleted: usize,
+        kept: usize,
+        /// The pass's stop condition cut the deletes short.
+        stopped: bool,
+    },
 }
 
 /// A restore's read in flight.
@@ -3068,6 +3169,8 @@ mod tests {
     struct LapseOnWrite {
         inner: InMemory,
         validity: Arc<crate::cluster::NodeValidity>,
+        /// Lapse at the first batch of deletes instead (an idle pass).
+        on_delete: bool,
     }
 
     impl std::fmt::Debug for LapseOnWrite {
@@ -3090,7 +3193,9 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            self.validity.invalidate();
+            if !self.on_delete {
+                self.validity.invalidate();
+            }
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -3114,6 +3219,9 @@ mod tests {
             &self,
             locations: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
         ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+            if self.on_delete {
+                self.validity.invalidate();
+            }
             self.inner.delete_stream(locations)
         }
 
@@ -3481,6 +3589,170 @@ mod tests {
 
     /// A read-back that finds this upload's own bytes after the lease
     /// lapsed is still under the acknowledgement rule: `Late`, not durable.
+    /// An idle pass's collection (ADR 0042, section 3) deletes what
+    /// `idle_collectable` gives for the released generation, below the
+    /// newest snapshot of that generation with its segment, and keeps
+    /// that snapshot, its segment and every later generation's object.
+    /// The lease is checked before each batch: one that lapses during the
+    /// first stops the deletes there. With no snapshot of the generation,
+    /// nothing is deleted.
+    #[tokio::test]
+    async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_lapse() {
+        use object_store::ObjectStoreExt as _;
+        let (view, validity) = LeaseView::lapsable(3);
+        let store = Arc::new(LapseOnWrite {
+            inner: InMemory::new(),
+            validity,
+            on_delete: true,
+        });
+        let prefix = "actors/t/c/a/";
+        let put = async |key: String| {
+            store
+                .inner
+                .put(&StorePath::from(format!("{prefix}{key}")), vec![1].into())
+                .await
+                .unwrap();
+        };
+        // Generation 2 wrote 1..=250 and snapshotted at 250; generation 3
+        // has a later segment (a late one, say).
+        let seg = |txid, generation, parent| Segment {
+            id: SegmentId { generation, txid },
+            parent_generation: parent,
+        };
+        for txid in 1..=250 {
+            put(segment_key(&seg(txid, 2, 2))).await;
+        }
+        put(snapshot_key(SegmentId {
+            generation: 2,
+            txid: 100,
+        }))
+        .await;
+        put(snapshot_key(SegmentId {
+            generation: 2,
+            txid: 250,
+        }))
+        .await;
+        put(segment_key(&seg(251, 3, 2))).await;
+        let count = async || {
+            use futures_util::TryStreamExt;
+            store
+                .inner
+                .list(Some(&StorePath::from(prefix.trim_end_matches('/'))))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len()
+        };
+        let collector = Collector {
+            store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            prefix: prefix.into(),
+            generation: 2,
+            lease: view.clone(),
+        };
+        // Generation 3 released nothing it snapshotted: nothing to do.
+        let other = Collector {
+            generation: 3,
+            ..collector.clone()
+        };
+        assert_eq!(
+            other
+                .collect_idle(std::time::Duration::ZERO, &|| false)
+                .await
+                .unwrap(),
+            IdleCollected::NoSnapshot
+        );
+        assert_eq!(count().await, 253);
+        // A stop that says so before the first batch: nothing deleted, and
+        // said.
+        assert!(matches!(
+            collector
+                .collect_idle(std::time::Duration::ZERO, &|| true)
+                .await
+                .unwrap(),
+            IdleCollected::Collected {
+                deleted: 0,
+                stopped: true,
+                ..
+            }
+        ));
+        assert_eq!(count().await, 253);
+        // 249 segments and one snapshot below 250: three batches, of
+        // which the first runs and lapses the lease.
+        let done = collector
+            .collect_idle(std::time::Duration::ZERO, &|| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            done,
+            IdleCollected::Collected {
+                snapshot: SegmentId {
+                    generation: 2,
+                    txid: 250
+                },
+                deleted: COLLECT_BATCH,
+                kept: 0,
+                stopped: false,
+            }
+        );
+        assert_eq!(count().await, 253 - COLLECT_BATCH);
+        assert!(matches!(
+            collector
+                .collect_idle(std::time::Duration::ZERO, &|| false)
+                .await,
+            Err(ReplicaError::Late)
+        ));
+        // Under a valid hold, the rest goes; the snapshot at 250, its
+        // segment and generation 3's segment stay. A window longer than
+        // the objects' age deletes nothing.
+        let valid = Collector {
+            lease: LeaseView::always_valid(3),
+            ..collector.clone()
+        };
+        assert_eq!(
+            valid
+                .collect_idle(std::time::Duration::from_secs(3600), &|| false)
+                .await
+                .unwrap(),
+            IdleCollected::Collected {
+                snapshot: SegmentId {
+                    generation: 2,
+                    txid: 250
+                },
+                deleted: 0,
+                kept: 250 - COLLECT_BATCH,
+                stopped: false,
+            }
+        );
+        valid
+            .collect_idle(std::time::Duration::ZERO, &|| false)
+            .await
+            .unwrap();
+        let mut left: Vec<String> = {
+            use futures_util::TryStreamExt;
+            store
+                .inner
+                .list(Some(&StorePath::from(prefix.trim_end_matches('/'))))
+                .map_ok(|m| m.location.to_string())
+                .try_collect()
+                .await
+                .unwrap()
+        };
+        left.sort();
+        let mut want = vec![
+            format!(
+                "{prefix}{}",
+                snapshot_key(SegmentId {
+                    generation: 2,
+                    txid: 250
+                })
+            ),
+            format!("{prefix}{}", segment_key(&seg(250, 2, 2))),
+            format!("{prefix}{}", segment_key(&seg(251, 3, 2))),
+        ];
+        want.sort();
+        assert_eq!(left, want);
+    }
+
     /// The first attempt lands with its reply lost; the lease lapses as
     /// the resend goes out, which meets the object and reads it back.
     #[tokio::test]
@@ -4311,6 +4583,7 @@ mod tests {
         r.store = Arc::new(LapseOnWrite {
             inner: InMemory::new(),
             validity,
+            on_delete: false,
         });
         r.lease = view;
         let head = r.head;

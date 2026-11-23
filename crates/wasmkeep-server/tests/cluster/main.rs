@@ -87,6 +87,8 @@ mod front_deploys;
 mod front_sockets;
 #[path = "golden_trace.rs"]
 mod golden_trace;
+#[path = "idle_pass.rs"]
+mod idle_pass;
 mod ingress_limits;
 #[path = "listings.rs"]
 mod listings;

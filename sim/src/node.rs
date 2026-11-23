@@ -563,6 +563,13 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
     /// [`Self::release`], with what the release did (`None`: nothing was
     /// held).
     pub async fn release_outcome(&self, held: &Held) -> Option<Released> {
+        self.release_written(held).await.map(|(r, _)| r)
+    }
+
+    /// [`Self::release_outcome`], with the version the release wrote when
+    /// its own answer said it landed (`Owners::release_written`): what an
+    /// idle pass remembers (ADR 0042, section 3).
+    pub async fn release_written(&self, held: &Held) -> Option<(Released, Option<Version>)> {
         let hold = {
             let mut s = lock(&self.shared);
             let hold = if self.setup.breaks.release_before_stop {
@@ -574,7 +581,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
             s.in_flight += 1;
             hold
         };
-        let released = self.owners.release(&hold).await;
+        let (released, written) = self.owners.release_written(&hold).await;
         let mut s = lock(&self.shared);
         if self.setup.breaks.release_before_stop && s.holds.get(&held.key) == Some(&hold) {
             s.holds.remove(&held.key);
@@ -583,7 +590,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         if matches!(released, Released::Pending | Released::Unchanged) {
             s.pending.push(PendingEntry::Release(hold));
         }
-        Some(released)
+        Some((released, written))
     }
 
     /// A clean stop: every hold released, then the lease task makes the

@@ -37,6 +37,12 @@ matching generation still does not prove acknowledgement. Add
 owner generation with exit code **3**, before publishing an export or emitting
 SQL results. Other runtime failures exit 1; argument errors exit 2. This checks
 the listed head even for historical selections; it does not prove durability.
+Every acquisition raises the owner generation, so an actor last woken without
+writing, or compacted by an idle pass (below), reads a generation past its
+head. In an app with the recorded-head format (ADR 0035), a released record one
+generation past the head whose recorded head is exactly the head still matches;
+in version 1 such an actor is refused with `--require-owner-match` until it
+next writes.
 
 `--at` takes an RFC3339 timestamp with timezone or a relative duration such
 as `-15m`, `-2h`, `-1d` (also seconds). Relative durations use the operator's
@@ -53,6 +59,13 @@ capture-time scan. `--txid` selects an exact boundary on that same ancestry. The
 
 A point older than retained history is refused with the available txid range.
 Collection limits how far back you can read; a delete erases prior history.
+An actor that stopped writing no longer keeps more than that: one retention
+window after its last write and hibernation, the node that hibernated it
+compacts its history to the snapshot at its head and the segment there
+([ADR 0042](adr/0042-compacting-an-idle-actors-history.md), see "History in
+the bucket" in [the cluster guide](cluster.md)). Points within the last
+window stay readable; older ones of an idle actor go, as they do for an
+actor that keeps writing.
 Exporting a deleted head gives an empty application database, with host
 metadata. Older writers do not label deletes, so an empty database is
 reported as **probably deleted**. A reset followed by new writes contains

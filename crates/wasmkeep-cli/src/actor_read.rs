@@ -29,7 +29,10 @@ pub(crate) struct Source {
     /// Parent directory for the plaintext scratch copy.
     #[arg(long, value_name = "DIR")]
     tmpdir: Option<PathBuf>,
-    /// Refuse an unavailable or mismatched owner hint (exit 3).
+    /// Refuse an unavailable or mismatched owner hint (exit 3). A released
+    /// version 2 record one generation past the head whose recorded head
+    /// is the head matches (after an idle pass or a read-only wake); in
+    /// version 1 such an actor is refused until it next writes.
     #[arg(long)]
     require_owner_match: bool,
 }
