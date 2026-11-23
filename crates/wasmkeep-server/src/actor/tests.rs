@@ -92,6 +92,42 @@ fn a_call_drops_every_wasmkeep_header_the_guest_set() {
     assert_eq!(req.headers()["x-other"], "kept");
 }
 
+/// A call's headers are held to what a guest may build in one `fields`:
+/// the callee gets them as its request's, outside that size check.
+#[test]
+fn a_call_with_too_many_or_too_large_headers_is_refused() {
+    let from = ActorAddress::new("default", "a", "x").unwrap();
+    let to = ActorAddress::new("default", "b", "y").unwrap();
+    let call = |headers: Vec<(String, String)>| {
+        build_request(
+            &Caller::Actor(from.clone()),
+            &to,
+            CallRequest {
+                method: "GET".into(),
+                path: "/".into(),
+                headers,
+                body: Vec::new(),
+            },
+        )
+    };
+    let many = |n: usize| {
+        (0..n)
+            .map(|i| (format!("x-h{i}"), "v".to_owned()))
+            .collect()
+    };
+    assert!(call(many(MAX_CALL_HEADERS)).is_ok());
+    assert!(matches!(
+        call(many(MAX_CALL_HEADERS + 1)),
+        Err(CallError::TooLarge)
+    ));
+    let big = |bytes: usize| vec![("x-big".to_owned(), "v".repeat(bytes))];
+    assert!(call(big(16 * 1024)).is_ok());
+    assert!(matches!(
+        call(big(crate::MAX_GUEST_FIELDS_BYTES)),
+        Err(CallError::TooLarge)
+    ));
+}
+
 #[tokio::test]
 async fn socket_registration_restore_gate_is_not_capacity() {
     let dir = tempfile::tempdir().unwrap();

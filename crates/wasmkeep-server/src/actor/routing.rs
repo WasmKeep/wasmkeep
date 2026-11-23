@@ -232,7 +232,7 @@ impl ServiceInner {
         }
 
         let head = request.method.eq_ignore_ascii_case("HEAD");
-        let req = build_request(caller, &target, request).map_err(CallError::Failed)?;
+        let req = build_request(caller, &target, request)?;
         let mut chain = chain.to_vec();
         if let Some(me) = me {
             chain.push(me.clone());
@@ -496,13 +496,30 @@ pub(super) use crate::cluster::HOP_BY_HOP;
 /// Longest a node's signed call may take to send its body.
 pub(super) const SIGNED_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Headers one call may carry. The callee gets them as its request's,
+/// which no `fields` size check covers, so a call is held to what a guest
+/// may build in one (`MAX_GUEST_FIELDS_BYTES`, counted here as the names'
+/// and values' bytes) and to this many entries.
+pub(super) const MAX_CALL_HEADERS: usize = 256;
+
+/// `request` as the callee gets it. Refused with `TooLarge` past
+/// [`MAX_CALL_HEADERS`] headers or `MAX_GUEST_FIELDS_BYTES` of them.
 pub(super) fn build_request(
     from: &Caller,
     to: &ActorAddress,
     request: CallRequest,
-) -> Result<Request<http_body_util::Full<bytes::Bytes>>, String> {
+) -> Result<Request<http_body_util::Full<bytes::Bytes>>, CallError> {
     if !request.path.starts_with('/') {
-        return Err("path must start with /".into());
+        return Err(CallError::Failed("path must start with /".into()));
+    }
+    let header_bytes = request
+        .headers
+        .iter()
+        .try_fold(0usize, |sum, (n, v)| sum.checked_add(n.len() + v.len()));
+    if request.headers.len() > MAX_CALL_HEADERS
+        || header_bytes.is_none_or(|n| n > crate::MAX_GUEST_FIELDS_BYTES)
+    {
+        return Err(CallError::TooLarge);
     }
     let mut builder = Request::builder()
         .method(request.method.as_str())
@@ -527,7 +544,7 @@ pub(super) fn build_request(
     }
     let mut req = builder
         .body(http_body_util::Full::new(bytes::Bytes::from(request.body)))
-        .map_err(|e| format!("invalid request: {e}"))?;
+        .map_err(|e| CallError::Failed(format!("invalid request: {e}")))?;
     // The same encoding as calls arriving from another node: the name
     // percent-encoded, so the value is unambiguous and plain ASCII.
     for (header, value) in [
