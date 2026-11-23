@@ -22,6 +22,10 @@
   and the pusher is deployed with batched writes ([section 13](#13-the-pusher-amended-2026-11-20)).
 - Amended 2026-11-20: a pusher round's work is bounded in counts, not
   only in bytes ("A round's work", [section 13](#13-the-pusher-amended-2026-11-20)).
+- Amended 2026-11-22 (0.8.0, item 2): a big room's edges wake spread
+  over the live nodes by default, not on the node that wakes them
+  ([section 14](#14-edges-spread-over-the-nodes-amended-2026-11-22)); the
+  placement limit of open question 1 is lifted.
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, "One directory for
   the scaling patterns"
@@ -866,6 +870,144 @@ operation under way.
 **Stats.** The pusher answers the topology (the example's `stats` route);
 the room's head and window come from `history`.
 
+### 14. Edges spread over the nodes (amended 2026-11-22)
+
+Since section 13, edges are woken by the pusher's calls (`init`, then
+its rounds), and a call wakes its callee on the caller's node. With the
+room and its pusher kept apart
+([ADR 0041, amendment](0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)),
+the whole tree therefore woke on the pusher's node, one node doing every
+edge's send loop, until that node passed placement's floor. Spreading
+moves fan-out CPU only: the room stays the one sequencer.
+
+**The rule.** In a version with classes named `room`, `pusher` and
+`edge` (the broadcast SDKs' default names), a wake-up of an `edge` actor
+goes to the **rendezvous choice for the edge's own address over the live
+nodes, the waking node included**. Edges are named `<room>.e<k>`, so a
+room's edges each have their own choice and spread about evenly. When the
+choice is the waking node, the edge wakes there; otherwise the event is
+sent there as a drain sends it (a call or request forwarded, an alarm
+handed off), and that node acquires it. It applies under the conditions of the room
+and pusher rule, through the same path:
+
+- the wake-up is this node's own: a call from an actor or the front
+  here, an alarm no node handed here, or a request from outside that this
+  node runs from its copy in memory (after the load rule's placed hop was
+  refused, or a hop sent apart was not run). A request whose body streams,
+  the ordinary case, is never spread; the SDK's edge is `internal`, so in
+  practice no request from outside reaches it. Never a socket handed to
+  the edge: an upgrade wakes it where it arrives (ADR 0041, section 1);
+- the route read answered "nobody holds it": a record naming a node, or
+  any "try here" (a takeover, a stub, a failed read), is the ordinary path;
+- the edge is not parked here (ADR 0024), and placement is on
+  (`--no-placement` turns it off with the other rules).
+
+The live nodes are this node and ADR 0014's eligible peers: same app,
+live, `serving`, not asked to drain, not suspected, reachable, and not in
+placement's backoff (ADR 0041, section 6), so a placed hop that a peer
+refused is not sent straight back to it. So:
+
+- **One hop.** The receiver acquires what it is sent and never judges it
+  again. A peer that answers that it did not run the event (a host `503`
+  before the actor) is suspected and the event runs here, once. **A
+  wake-up is never refused**: with no eligible peer, the edge wakes where
+  it lands.
+- **A stale hint is not a failed peer.** A node keeps the owner it last
+  read for an actor for one second (`HINT_MS`). A receiver whose hint
+  still names the node that released the edge a moment ago would answer
+  "ownership is changing", and its sender would suspect it, leaving every
+  other edge woken in that window beside the pusher. So a receiver of
+  another node's event that finds another owner forgets its hint and
+  reads the record once more: nobody holds it, and it acquires. If the
+  record names another owner, it answers `503` with `x-wasmkeep-owner-seen:
+  <owner>`, and the sender does not suspect it: it runs the event by the
+  ordinary path, which goes to that owner. A receiver that is draining
+  answers without the mark and is suspected, as before.
+- **The same choice from every node.** The set does not depend on which
+  node wakes the edge (the pusher's, a relay's, the sweep's), so two
+  nodes waking one edge agree, and a test can say in advance where each
+  edge goes.
+- **The room's node is not avoided.** About a third of a room's edges on
+  three nodes share the room's node. Avoiding it would take a read of the
+  room's record on each cold wake (the waking node, the pusher's, does
+  not hold the room), and on three nodes avoiding both the room's and the
+  pusher's node would leave one node for every edge.
+- **Past the floor, the load rule still applies first.** A call that
+  placement's load rule (ADR 0041, sections 1 to 5) sends to a lighter
+  node is a placed hop; its receiver does not spread it again.
+
+**What does not move.** The rule decides only where an edge nobody holds
+wakes. A running edge never moves for it, and an edge that hibernates
+with sockets keeps its socket home (ADR 0024): its record still names its
+node, so the next push goes to it. An edge without sockets that releases
+its record wakes on the same choice while the live set is the same, if a
+push wakes it first, or where a client's socket arrives. So
+spreading adds no reconnects after an edge's first wake: clients
+reconnect only for what section 7 already says (splits, merges, drains,
+a dead node).
+
+**A rolling restart.** A draining node closes its edges' sockets (1012),
+releases each edge's record and hibernates it: it hands no edge to a
+peer (only alarms are handed off). The first event for a released edge
+decides where it wakes, and two race:
+
+- a reconnecting client's socket, handed to the edge by the front, wakes
+  it on the node where the client's request landed (an upgrade is never
+  spread or placed);
+- the pusher's next push, a call, wakes it on the spread choice over the
+  nodes still live. A client's join pokes the pusher in the same
+  `call-many` as its lookup, so either can come first.
+
+The edges on the other nodes stay. When the drained node comes back,
+nothing moves to it until an edge wakes cold again. So on three nodes the
+drained node's edges land on the two others, by name or by where clients
+reconnect, and those keep their own: the tree stays on two nodes unless
+every edge lands on the same one (likely with many edges, not guaranteed
+with few). With two nodes, every edge is on the remaining node while the
+other restarts, and stays there until it wakes cold again.
+
+**Measuring it.** The release's fleet check: three nodes with default
+placement, clients connected through every node (as a balancer spreads
+them), a 4,500-client hold. `wasmkeep actor where` for the room, its
+pusher and its edges, 20 s into the hold, should name at least two nodes
+for the edges; record `wasmkeep_placement_spread_total{outcome}` from
+each node beside it. Then restart one node at a time: after a node
+reports `serving` again, wait at least one heartbeat refresh (so the
+others see it serving) before draining the next, and repeat `actor where`
+and the metric after the last.
+
+Not spread: the room, the pusher, the directory and relays (relays exist
+only past 16 edges, and wake beside the pusher). A setting for other
+class names is future work, as for the pair.
+
+**Mixed versions.** Nothing new in the bucket or on the heartbeat: a 0.7
+node keeps the edges it wakes and acquires those sent to it. It does not
+send `x-wasmkeep-owner-seen`, so a sender suspects it for a stale hint as
+before, and it ignores the mark.
+
+**Metrics.** `wasmkeep_placement_spread_total{outcome}`: wake-ups of a
+spread edge, `sent` to its node or woken `here` (this node is the choice,
+or no peer can take it).
+
+**Tests.** `placement::spreads` and `placement::spread`, and the peer
+answer classifiers with the mark (unit tests); `tests/cluster/spread.rs`,
+three nodes with default placement:
+
+- one `call-many` of the pusher wakes twelve edges, each on its predicted
+  node, on every node, one hop each, none placed by the load rule;
+- none moves on later calls from any node;
+- a drain releases a node's edges and the pusher's next push wakes each
+  on the choice over the two others, the others staying, though a node
+  still holds a hint naming the drained one;
+- a receiver whose hint names the node that just released the edge
+  acquires it, and is not suspected;
+- a chosen node with no resident slot answers `503` before the actor: the
+  edge runs on the pusher's node, once;
+- one node, and placement off, wake every edge where it is called.
+
+Not tested: a placed hop refused and then spread (the backoff rule), and
+a client's socket racing the push through a drain.
+
 ## Consequences
 
 - A room of tens of thousands of clients is four small classes and a
@@ -944,11 +1086,12 @@ group benchmark), the API reference, the ROADMAP item.
 
 ## Open questions
 
-1. **Resolved: placement limit.** A room's tree of edges runs on the room's
-   node until that node passes placement's floor. The tree does not spread
-   automatically across the fleet. Spreading would move only fan-out CPU;
-   the room remains the sequencer. A later `placement = "spread"` class key
-   is possible if the bounded edge implementation still saturates a node.
+1. **Resolved: placement limit.** Until 0.8.0, a room's tree of edges ran
+   on the node that woke it until that node passed placement's floor.
+   Since the amendment of 2026-11-22
+   ([section 14](#14-edges-spread-over-the-nodes-amended-2026-11-22)), its
+   edges wake spread over the live nodes by default, with no class key;
+   the room remains the sequencer.
 2. Publishing on the socket, by an outbox the room collects in push
    answers.
 3. Giving a dead edge's range to its neighbours during the takeover

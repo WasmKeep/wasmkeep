@@ -8,6 +8,8 @@
 - Amended 2026-11-22 (0.8.0, item 1): a room and its pusher kept apart
   at wake-up, by default
   ([amendment](#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
+  The same path spreads a big room's edges over the live nodes
+  ([ADR 0040, section 14](0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
 - Follows: [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) (a

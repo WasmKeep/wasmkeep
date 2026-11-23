@@ -61,6 +61,25 @@ pub(crate) fn outcome_unknown(why: &str) -> Response<HyperOutgoingBody> {
     ))
 }
 
+/// On a host's `503` for an event another node sent: the node that answers
+/// reads the actor's record as naming another owner, the value (it read
+/// the record again first, so not from a stale hint). It neither ran the
+/// event nor sent it on a second time. Its sender takes it as "not run"
+/// and does not suspect it: nothing is wrong with that node, ownership is
+/// changing hands (ADR 0040, amendment of 2026-11-22).
+pub(crate) const OWNER_SEEN: &str = "x-wasmkeep-owner-seen";
+
+/// `503` "ownership is changing" for an event another node sent, marked
+/// with the owner this node read ([`OWNER_SEEN`]).
+pub(crate) fn owner_changing(owner: &str) -> Response<HyperOutgoingBody> {
+    let mut r = unavailable("actor ownership is changing; retry\n");
+    if let Ok(v) = hyper::header::HeaderValue::from_str(owner) {
+        r.headers_mut()
+            .insert(hyper::header::HeaderName::from_static(OWNER_SEEN), v);
+    }
+    r
+}
+
 pub(crate) fn unavailable(text: &str) -> Response<HyperOutgoingBody> {
     let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, text);
     r.headers_mut().insert(

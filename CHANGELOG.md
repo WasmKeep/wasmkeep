@@ -37,6 +37,24 @@ answers with a `5xx`, or that traps, no longer marks the peer suspect.
 Upgrading: nothing to deploy. Nodes of 0.7.0 keep what they wake and
 acquire what is sent to them.
 
+**A big room's edges wake spread over the nodes, by default.** In a
+version with classes named `room`, `pusher` and `edge`, an edge nobody
+holds, woken by a call or an alarm, wakes on the rendezvous choice for
+its address over the live nodes (the waking node included) instead of
+beside the pusher that calls it: one hop at most, never refused, and
+with one node alive it wakes where it is called. A running edge never
+moves for it, so clients reconnect no more than before. A drain releases
+its node's edges, and each wakes where its first event takes it: a
+reconnecting client's socket where that client landed, the pusher's next
+push on its spread choice. A node that receives an event from another
+node and finds another owner by a hint under a second old reads the
+record again before answering "ownership is changing", and that answer
+now names the owner it read (`x-wasmkeep-owner-seen`) so its sender does
+not suspect it. `--no-placement` turns the spread off
+([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
+New metric `wasmkeep_placement_spread_total{outcome}`. Nothing to
+deploy or configure.
+
 ## 0.7.0
 
 **Big rooms, a cluster that keeps its peers on a slow bucket, and the

@@ -537,7 +537,9 @@ impl ActorState {
     /// apart from a companion this node holds (ADR 0041, amendment of
     /// 2026-11-22) is then not acquired here while a peer can take it:
     /// `Elsewhere`, as a drain of this one actor, and the peer acquires the
-    /// event it is sent (it never sends it on). `false` for everything
+    /// event it is sent (it never sends it on). A big room's edge (ADR 0040,
+    /// amendment of 2026-11-22) goes the same way to the rendezvous choice
+    /// over the live nodes when that is not this node. `false` for everything
     /// else: an event another node sent, a handed alarm, a take, an
     /// upgrade, the operator passes.
     pub(super) async fn ensure_owner_with(
@@ -630,6 +632,21 @@ impl ActorState {
                         return Err(OwnershipError::Elsewhere { peer });
                     }
                     None => crate::metrics::placement_apart(&self.app_labels, "alone"),
+                }
+            } else if self.class.spread {
+                // A big room's edge (ADR 0040, amendment of 2026-11-22):
+                // woken on the rendezvous choice over the live nodes, this
+                // one included, so a room's edges spread whichever node
+                // wakes them (the pusher's, by its calls). Sent there as a
+                // drain sends it; the peer acquires and never sends it on.
+                // Here when this node is the choice or no peer can take it.
+                match cluster.spread_peer(&self.address) {
+                    Some(peer) => {
+                        crate::metrics::placement_spread(&self.app_labels, "sent");
+                        tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %peer, "wake-up spread to its node");
+                        return Err(OwnershipError::Elsewhere { peer });
+                    }
+                    None => crate::metrics::placement_spread(&self.app_labels, "here"),
                 }
             }
         }

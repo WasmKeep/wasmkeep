@@ -301,6 +301,39 @@ pub fn peer_apart<'a>(eligible: &[&'a str], key: &str, avoid: &[&str]) -> Option
         .or_else(|| best(key, eligible.iter().copied()))
 }
 
+/// The class whose actors wake spread over the live nodes by default (ADR
+/// 0040, amendment of 2026-11-22): the broadcast SDKs' edge, under its
+/// default class name, in a version that also has the pair of
+/// [`DEFAULT_APART`]. Edges are named `<room>.e<k>`, so each edge of a
+/// room has its own address and its own rendezvous choice.
+pub const DEFAULT_SPREAD: &str = "edge";
+
+/// Whether `class`'s actors wake spread over the live nodes (ADR 0040,
+/// amendment of 2026-11-22): [`DEFAULT_SPREAD`], when `classes` (the
+/// version's) also has the room and its pusher. Only the built-in class:
+/// a setting naming others is future work.
+pub fn spreads(classes: &[&str], class: &str) -> bool {
+    let (a, b) = DEFAULT_APART;
+    class == DEFAULT_SPREAD
+        && classes.contains(&DEFAULT_SPREAD)
+        && classes.contains(&a)
+        && classes.contains(&b)
+}
+
+/// Where a wake-up of a spread actor goes instead of here (ADR 0040,
+/// amendment of 2026-11-22): the rendezvous choice for `key` over this node
+/// (`here`) and the peers a drain chooses from (`eligible`, ADR 0014, never
+/// this node). The same set gives the same node from whichever node wakes
+/// the actor. `None` means wake here: this node is the choice, or no peer
+/// can take it. It never refuses a wake-up.
+pub fn spread<'a>(here: &str, eligible: &[&'a str], key: &str) -> Option<&'a str> {
+    let chosen = best(key, eligible.iter().copied().chain([here]))?;
+    if chosen == here {
+        return None;
+    }
+    eligible.iter().copied().find(|p| *p == chosen)
+}
+
 /// The highest rendezvous weight, ties by node id: server
 /// `cluster.rs::rendezvous`'s choice.
 fn best<'a>(key: &str, nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
@@ -729,5 +762,58 @@ mod tests {
         // Every peer holds a companion: still taken, by the plain choice.
         assert_eq!(peer_apart(&["a"], key, &["a"]), Some("a"));
         assert_eq!(peer_apart(&[], key, &["a"]), None);
+    }
+
+    #[test]
+    fn only_the_sdks_edge_spreads_and_only_beside_the_room_and_its_pusher() {
+        let classes = ["directory", "edge", "pusher", "relay", "room"];
+        assert!(spreads(&classes, "edge"));
+        for class in ["room", "pusher", "relay", "directory"] {
+            assert!(!spreads(&classes, class), "{class}");
+        }
+        // An app's own class named edge, without the broadcast pair.
+        assert!(!spreads(&["edge", "room"], "edge"));
+        assert!(!spreads(&["edge", "pusher"], "edge"));
+        assert!(!spreads(&["edge"], "edge"));
+        // The pair without an edge class: nothing spreads.
+        assert!(!spreads(&["pusher", "room"], "edge"));
+    }
+
+    #[test]
+    fn spread_is_one_choice_over_every_live_node_whichever_node_wakes_it() {
+        let nodes = ["a", "b", "c"];
+        let mut on = std::collections::BTreeSet::new();
+        for k in 1..=12 {
+            let key = format!("default/edge/lobby.e{k}");
+            let target = best(&key, nodes.into_iter()).unwrap();
+            on.insert(target);
+            for here in nodes {
+                let eligible: Vec<&str> = nodes.into_iter().filter(|n| *n != here).collect();
+                let sent = spread(here, &eligible, &key);
+                // Woken on its choice: here. Elsewhere: sent to it, from
+                // every node alike.
+                assert_eq!(sent.unwrap_or(here), target, "{key} from {here}");
+                assert_eq!(sent.is_none(), here == target);
+            }
+        }
+        // A room's edges land on more than one node.
+        assert!(on.len() >= 2, "{on:?}");
+    }
+
+    #[test]
+    fn spread_wakes_here_with_no_peer_and_skips_excluded_peers() {
+        let key = "default/edge/lobby.e1";
+        // One node alive, or every peer draining or suspected: here.
+        assert_eq!(spread("a", &[], key), None);
+        // A peer excluded (draining, suspected) is never chosen: the choice
+        // is made over the others and this node.
+        for excluded in ["b", "c"] {
+            let eligible: Vec<&str> = ["b", "c"].into_iter().filter(|p| *p != excluded).collect();
+            assert_ne!(spread("a", &eligible, key), Some(excluded));
+            assert_eq!(
+                spread("a", &eligible, key).unwrap_or("a"),
+                best(key, eligible.iter().copied().chain(["a"])).unwrap()
+            );
+        }
     }
 }

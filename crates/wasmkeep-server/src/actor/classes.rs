@@ -34,6 +34,11 @@ pub(super) struct ActorClass {
     /// other class, when the version has both
     /// ([`wasmkeep_cluster::placement::companion`]).
     pub(super) apart: Option<&'static str>,
+    /// Whether this class's actors wake spread over the live nodes (ADR
+    /// 0040, amendment of 2026-11-22): the broadcast SDKs' edge, when the
+    /// version has the room and its pusher
+    /// ([`wasmkeep_cluster::placement::spreads`]).
+    pub(super) spread: bool,
 }
 
 /// The actor `address` is kept apart from, by `class` (ADR 0041,
@@ -144,6 +149,7 @@ pub(super) fn build_class(
         warned: Arc::default(),
         writes: crate::apps::Writes::Strict,
         apart: None,
+        spread: false,
     })
 }
 

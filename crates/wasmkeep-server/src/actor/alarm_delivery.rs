@@ -41,8 +41,9 @@ impl ActorState {
                 self.timing.delivered(Delivered::Deferred);
                 return;
             }
-            // This node is draining (ADR 0014), or holds the actor's
-            // companion (ADR 0041, amendment of 2026-11-22): the chosen
+            // This node is draining (ADR 0014), holds the actor's
+            // companion (ADR 0041, amendment of 2026-11-22), or is not a
+            // spread edge's choice (ADR 0040, amendment of 2026-11-22): the chosen
             // peer arms the alarm and fires it, from its own timer. If it does not take
             // it, this node's timer tries again soon: then another peer, or
             // with none left, this node claims.

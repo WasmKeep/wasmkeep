@@ -142,6 +142,28 @@ the pusher's node:
   heartbeat write takes. A rising tail there shows the node's bucket
   writes are slow, and can accompany slow segment uploads.
 
+**A room's edges spread over the nodes, by default.** The pusher's calls
+wake a room's edges (`edge/<room name>.e<k>`), and a call would wake each
+one on the pusher's node. In a version with the classes `room`, `pusher`
+and `edge`, each edge nobody holds wakes instead on the rendezvous choice
+for its own name over the live nodes, the pusher's included, one hop at
+most
+([ADR 0040, section 14](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
+On three nodes, a room's edges end on two or three of them; about a third
+share the room's node. A running edge never moves for it, so clients
+reconnect no more than before. A drain releases its node's edges; each
+wakes where its first event after takes it: a reconnecting client's
+socket wakes it where that client landed, the pusher's next push on its
+spread choice. With one node alive the edges wake where they are called;
+`--no-placement` turns it off. List the edges with the same command:
+
+```bash
+wasmkeep actor where --app acme/chat edge/lobby.e1 edge/lobby.e2 edge/lobby.e3 --bucket s3://acme-wasmkeep/prod
+```
+
+`wasmkeep_placement_spread_total{outcome}` counts the wake-ups of an edge
+`sent` to its node or woken `here`.
+
 ## Split independent state
 
 Choose actor names around the smallest useful owner of state:
@@ -272,11 +294,11 @@ splits sooner. An edge splits at 80% capacity; small neighbours can merge
 with hysteresis. Movement closes affected sockets with **4801**. If a slow
 client falls behind the edge buffer, it fetches history; if the edge cannot
 even queue the behind notification, it closes that socket with **4802**.
-A room's tree of edges runs on the room's node until that node passes
-placement's floor. More nodes do not automatically spread or rebalance the
-tree. Spreading would move only fan-out CPU; the room remains the sequencer.
-A later `placement = "spread"` class key is possible if the bounded edge
-still saturates a node.
+A room's edges wake spread over the live nodes
+([above](#place-a-large-rooms-pusher-on-another-node)); the relays wake
+beside the pusher. Spreading moves only fan-out CPU: the room remains the
+sequencer. Running edges are not rebalanced when a node joins; they move
+only through a drain, a split or merge, or a cold wake.
 
 The per-event bound limits frame construction; copying a large replay to
 hundreds of sockets still consumes CPU in each host send. The 500-socket

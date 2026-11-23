@@ -37,6 +37,7 @@ impl ActorService {
             let requires = Arc::new(config.requires.get(&name).cloned().unwrap_or_default());
             let writes = writes_of(&config.batched, &name);
             let apart = wasmkeep_cluster::placement::companion(&names, &name);
+            let spread = wasmkeep_cluster::placement::spreads(&names, &name);
             map.insert(
                 name,
                 Arc::new(ActorClass {
@@ -46,6 +47,7 @@ impl ActorService {
                     requires,
                     writes,
                     apart,
+                    spread,
                     ..class
                 }),
             );
