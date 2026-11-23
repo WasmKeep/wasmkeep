@@ -1695,7 +1695,8 @@ reviewed, redacted evidence under `bench/results/`, named
 `<date>-<commit>-room-group-<label>.json`, following the publication-path rules
 below. R7 commits no measurements; R8 owns real-bucket capacity claims.
 
-## A big room on three nodes (preview)
+<a id="a-big-room-on-three-nodes-preview"></a>
+## A big room on three nodes, 0.6.0
 
 One [ts-big-room](../examples/ts-big-room/README.md) lobby on 0.6.0
 (`cac4826`) at the default 50 ms CPU budget, on three 4-vCPU nodes with a
@@ -1721,7 +1722,7 @@ Ranges are across the six generators. The other two nodes stayed under
 
 ### How to read it
 
-- **Big rooms are a preview in 0.6.0, with no supported client count.**
+- **Big rooms were a preview in 0.6.0, with no supported client count** (0.7.0 changed that: see [below](#a-big-room-on-three-nodes-070)).
   No step met the targets set before the run: a delivery p99 of 1 s and
   all 10 messages/s acknowledged.
 - **The room no longer wedges at the default budget.** One client at
@@ -1736,6 +1737,40 @@ Ranges are across the six generators. The other two nodes stayed under
 - Not measured: a killed edge node, a fresh room per step, bucket requests.
 
 These are the first items of `0.7.0` in the [roadmap](../ROADMAP.md).
+
+## A big room on three nodes, 0.7.0
+
+The same lobby on 0.7.0 (`43119bd`) at the default 50 ms CPU budget, on
+three 4-vCPU nodes with a real bucket, one node per machine, two apps per
+process, writes batched for the room and the pusher. Six generators of the
+[harness](#reconnecting-room-harness), two aimed at each of the other
+nodes, each joined clients over 600 s, held 900 s (17 stalled readers for
+60 s), then left. Six closed-loop publishers offered 10 messages/s of 256
+bytes in total. One fresh room per step, 6,000 first, the room and its
+pusher on different nodes, moved by hand with `actor move` and checked
+with `actor where` (placement does not keep them apart yet). The target,
+set before the run: delivery p99 under 1 s on every generator and all 10
+messages/s acknowledged.
+[Results](../bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json).
+
+During the 900 s hold (ranges across the six generators):
+
+| Clients | Ready | Delivery p50 | Delivery p99 | Publishes acknowledged/s | Unacknowledged after 30 s | Incomplete clients | Repeats | Target met |
+|---|---|---|---|---|---|---|---|---|
+| 6,000 | 6,000 | 165-211 ms | 1.06-1.18 s | 9.83 | 0 | 0 | 0 | no |
+| 4,500 | 4,500 | 103-131 ms | 644-763 ms | 9.97 | 0 | 0 | 0 | yes |
+| 3,000 | 3,000 | 88-101 ms | 690-733 ms | 9.97 | 0 | 0 | 0 | yes |
+
+No node trapped, and the stalled readers caught up (102 of 102 at 6,000).
+At 6,000 clients the pusher's node held 895-914 MB during the hold and the
+room's node 357-362 MB.
+
+### How to read it
+
+- **4,500 clients met the target; 6,000 is the measured edge**, where
+  delivery p99 passed 1 s and 12 publishes failed.
+- **The figures are with the room and its pusher apart.** Not measured:
+  the default placement (both on one node), a killed node, 10,000 clients.
 
 
 ## Local room-memory recovery

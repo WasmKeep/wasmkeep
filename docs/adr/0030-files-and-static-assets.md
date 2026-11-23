@@ -1,6 +1,6 @@
 # 0030. Files and static assets
 
-- Status: proposed (2026-11-14); revised after an adversarial review
+- Status: accepted and shipped in 0.6.0 (proposed 2026-11-14); revised after an adversarial review
   (asset contents refreshed before reuse, a start proof of every link
   condition, fixed-length namespaces, the sweep judged only after a
   delete's outcome, stored headers overridden on download, indexes
@@ -9,7 +9,7 @@
   hostname picks the app's assets; a bucket layout with separate
   contents and indexes; collection guarded by deploy and collection
   markers instead of refreshed ages; slices A1 to A7). Section 9 accepted
-  and built (2026-11-17); the remaining sections stay proposed.
+  and built (2026-11-17); the files themselves shipped in 0.6.0.
   Sections 1 to 8 amended 2026-11-17 for `0.6.0`, against what shipped
   since they were written (online backup and restore, batched writes,
   the recorded head, several apps per process, operation ids): backups

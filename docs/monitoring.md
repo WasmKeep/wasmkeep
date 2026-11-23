@@ -282,12 +282,9 @@ its first request.
 | `wasmkeep_budget_share_part` | gauge | Each app's equal part of a budget the process shares between its apps (`budget`: `uploads` in bytes, `restore_reads`, `restore_megabytes`), by tenant and app; half of it is a floor never lent to another app. |
 | `wasmkeep_budget_share_in_use` | gauge | What each app holds now of a shared budget, by budget, tenant and app. |
 
-Not there yet: `tenant` and `app` on the series without a class (one app
-per process for now: join on `wasmkeep_info`), traps by reason
+Not there yet: traps by reason
 (`wasmkeep_events_total{outcome="failed"}` and
-`wasmkeep_cpu_budget_exceeded_total` cover them for now) and parked
-WebSockets (sockets are not parked yet; `wasmkeep_websockets_open` counts
-them).
+`wasmkeep_cpu_budget_exceeded_total` cover them for now).
 
 ### Attributing a slow publish
 

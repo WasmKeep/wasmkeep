@@ -127,6 +127,25 @@ prints the same as one object: `checks` (`name`, `status`, `value`),
 `incomplete`), `summary` and
 `exit_code`.
 
+### Presigned-link checks
+
+After the checks above, `cluster diagnose` runs a `blob-links` group that
+asks whether the bucket can serve [files](../files.md) through presigned
+links. Their failures are warnings, never `FAIL`: a node then uses node
+links (`--blob-links node`), and the verdict and exit code are unchanged.
+
+| Check | What it shows |
+| --- | --- |
+| `presigned-download` | A presigned download link serves the signed content type and file name, opens one key only, and is refused when a signed parameter is changed |
+| `presigned-expiry` | A link signed for 2 s is refused after 4 s (the check waits for it) |
+| `presigned-upload` | Always `skip`: uploads go through node links, because a presigned PUT cannot bind the size of what is uploaded |
+
+`--skip-links` leaves the group out (all three then show `skip`).
+`--link-endpoint URL` names the bucket's endpoint as browsers reach it,
+for a bucket the nodes reach on a private address; without it,
+`cluster diagnose` uses the endpoint `serve` would
+(`--blob-link-endpoint`).
+
 Checking that each live node answers on its health and cluster ports is
 not part of it yet; `cluster status` shows the nodes the bucket knows.
 

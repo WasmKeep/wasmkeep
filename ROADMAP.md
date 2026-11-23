@@ -11,26 +11,25 @@ side projects and staging.
 
 ## Now
 
-`0.7.0`: **big rooms, and the limits 0.6.0 measured.** A room's delivery
-moves to a pusher, off the publish path; a slow bucket no longer makes
-nodes distrust healthy peers; parallel change-feed listing, shorter
-restores, allocator trimming after a big room, metrics of where an
-actor's time and a node's bucket requests go, and `actor where`. What
-each brings is under [Built](#built); the limits known at release are in
-the [changelog](CHANGELOG.md).
-
-## Next
-
-What comes after 0.7.0, in this order.
+`0.8.0`: **a big room that needs no hand placement.** 0.7.0 released big
+rooms (what each brings is under [Built](#built); the limits known at
+release are in the [changelog](CHANGELOG.md)), but keeping a room and its
+pusher on different nodes is still the operator's. In this order:
 
 1. **A room and its pusher kept apart at wake-up** (S/M): placement
    considers load only, so an operator moves the pusher of a large room
    by hand ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
 2. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
-3. **Compacting idle actors' histories** (M), the other half of a
+3. **The upload tail** (M): a large room's delivery tail depends on
+   segment-upload latency from the room's node.
+4. **Compacting idle actors' histories** (M), last, the other half of a
    faster change feed: listing is parallel in 0.7.0, but a poll still
    lists every object of a long history.
+
+## Next
+
+After 0.8.0, the items below, not before it.
 
 ## After that
 
@@ -295,10 +294,12 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - In `0.6.0`, the change feed to Parquet
   ([ADR 0039](docs/adr/0039-the-change-feed.md),
   [guide](docs/change-feed.md)).
-- In `0.6.0`, a room past one actor, as a preview: a directory, a
-  broadcast group, edges and relays
+- In `0.6.0`, a room past one actor: a directory, a broadcast group,
+  edges and relays
   ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md),
-  [measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)).
+  [measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). A
+  preview then; no longer one since `0.7.0`
+  ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-070)).
 - In `0.6.0`, placement at wake-up, on by default
   ([ADR 0041](docs/adr/0041-placement-at-wake-up.md),
   [measured](docs/benchmarks.md#a-node-coming-back-with-and-without-placement)).

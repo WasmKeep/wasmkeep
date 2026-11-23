@@ -1,6 +1,6 @@
 # 0034. Batched plain writes: one segment in flight per actor
 
-- Status: proposed (2026-11-15). Written after an independent review of
+- Status: accepted and shipped in 0.5.0 (proposed 2026-11-15). Written after an independent review of
   a first sketch, which found it sound for durable writes and named what
   it lacked: barriers for snapshots and resets, a structural rule for
   ending a hold, and an opt-in rollout, since batching changes what the
@@ -13,7 +13,7 @@
   on a resident actor; uncatchable verification variants; several
   figures). The strict-only foundations S0 (golden trace), S1
   (snapshot and reset guards) and S2 (`Held` and `Barrier`) are merged.
-  Batched behavior is not enabled.
+  Batched behavior shipped in 0.5.0, opt-in per class.
 - Revised after the sign-off review (2026-11-15). That review signed the
   design off with conditions: the strict-only slices S0 to S5 of the
   plan may start; nothing that changes a batched class's behaviour
