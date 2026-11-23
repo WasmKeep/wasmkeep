@@ -56,6 +56,22 @@
 //! the final chain removed it, and nothing an acknowledged delete removed
 //! may be restored.
 //!
+//! With idle compaction on (ADR 0042), an owner that hibernates first
+//! uploads an idle snapshot at its head if its hold wrote the head, then
+//! releases; some wakes only read (restore, then hibernate at once). For
+//! a while after a hibernation nobody wakes the actor, and the node that
+//! hibernated it runs the idle pass after a delay of its own, so a pass
+//! finds the record either unchanged or taken by a wake. The pass runs in
+//! the actor's mailbox (the workload on its node waits for it), acquires
+//! the record with `acquire_unchanged` on the version the release wrote,
+//! lists, applies the shared rule (`idle_collectable` with the released
+//! generation), and deletes through the client whose deletes land late.
+//! Each pass is checked on its own listing: the plan's head and head
+//! object are unchanged, the restore holds the same positions (also
+//! against the listing without the idle snapshot, the history the
+//! segments alone give), and the plan after it is a snapshot with every
+//! segment after it. Then the final checks above.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -71,9 +87,10 @@ use madsim::net::NetSim;
 use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::lease::{Bucket, LeaseConfig};
-use wasmkeep_cluster::node_lease::Released;
+use wasmkeep_cluster::node_lease::{AcquireError, OwnerRecord, Released};
 use wasmkeep_cluster::replication::{
-    Listing, Plan, Segment, SegmentId, collectable, plan_restore, segment_key, snapshot_key,
+    EMPTY, Listing, Plan, Segment, SegmentId, collectable, idle_collectable, plan_restore,
+    segment_key, snapshot_key,
 };
 use wasmkeep_sim::driver::Env;
 use wasmkeep_sim::node::{Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, take_fences};
@@ -136,6 +153,34 @@ struct Rules {
     deletes: Deletes,
     /// Replace with a retained past state instead of deleting (ADR 0033).
     restores: bool,
+    /// Whether idle actors' histories are compacted (ADR 0042).
+    idle: Idle,
+}
+
+/// Compacting an idle actor's history (ADR 0042): an idle snapshot at
+/// hibernation, then a pass under a fresh hold after a delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idle {
+    /// Never.
+    Off,
+    /// As designed: the idle snapshot only when the hold wrote the head;
+    /// the pass through `acquire_unchanged` and `idle_collectable` with
+    /// the released generation.
+    Safe,
+    /// Unsafe: the pass compacts from any snapshot at the head, ignoring
+    /// the released record's generation.
+    AnySnapshotAtHead,
+    /// Unsafe: the pass also deletes the segment at `P`.
+    DropSegmentAtP,
+    /// The version check dropped: the pass takes the record by a plain
+    /// acquisition, whatever happened since the release, and compacts
+    /// with the generation it remembered.
+    ChangedRecord,
+    /// A mutation, for the no-gap oracle: the pass also deletes `S`.
+    DropSnapshot,
+    /// A mutation, for the restore oracles: the idle snapshot's body
+    /// misses the head's own position.
+    StaleSnapshot,
 }
 
 /// Deletes (ADR 0028): a reset, the snapshot at it, then the erase.
@@ -187,6 +232,7 @@ const SAFE: Rules = Rules {
     act_until_answered: false,
     deletes: Deletes::Off,
     restores: false,
+    idle: Idle::Off,
 };
 
 const SAFE_RELEASING: Rules = Rules {
@@ -198,6 +244,7 @@ const SAFE_RELEASING: Rules = Rules {
     act_until_answered: false,
     deletes: Deletes::Off,
     restores: false,
+    idle: Idle::Off,
 };
 
 /// Lease cuts, and no hibernation: besides fences and restarts, the actor
@@ -216,6 +263,7 @@ const SAFE_COLLECTING: Rules = Rules {
     act_until_answered: false,
     deletes: Deletes::Off,
     restores: false,
+    idle: Idle::Off,
 };
 
 const SAFE_DELETING: Rules = Rules {
@@ -227,6 +275,147 @@ const SAFE_DELETING_COLLECTING: Rules = Rules {
     deletes: Deletes::Safe,
     ..SAFE_COLLECTING
 };
+
+/// Idle compaction (ADR 0042) with releases, and no other collection: the
+/// passes do the deleting.
+const SAFE_IDLE: Rules = Rules {
+    idle: Idle::Safe,
+    ..SAFE_RELEASING
+};
+
+/// How long after a hibernation the pass runs (the retention window
+/// plus the skew bound in the server), at least and up to.
+const IDLE_PASS_AFTER_MS: (u64, u64) = (300, 3_000);
+/// How often nobody wakes the actor until its pass is done (in percent);
+/// otherwise a wake may come first, at a random time before the pass.
+const IDLE_PAST_PASS_PERCENT: u64 = 80;
+/// How long past the pass's start nobody wakes the actor then.
+const IDLE_QUIET_AFTER_PASS_MS: u64 = 1_000;
+/// The share of wakes that only read (in percent): restore, then
+/// hibernate at once.
+const READ_ONLY_WAKE_PERCENT: u64 = 10;
+
+/// What the idle passes of one run did (ADR 0042): the non-vacuity counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct IdleCounts {
+    /// Idle snapshots created at hibernation.
+    snapshots: u64,
+    /// Passes started (acquisitions tried).
+    passes: u64,
+    /// Passes skipped: the actor resident on its node, or another pass.
+    skipped: u64,
+    /// Passes that sent at least one delete.
+    deleted: u64,
+    /// Passes dropped because the record changed since the release.
+    changed: u64,
+    /// Passes that found no snapshot of the released generation.
+    nothing: u64,
+    /// Passes that took a record changed since the release (only without
+    /// the version check) and sent deletes.
+    took_changed: u64,
+    /// Passes that compacted from a snapshot of another generation than
+    /// the released one (only when any snapshot at the head is taken).
+    foreign: u64,
+    /// Deletes a pass sent that landed after its hold ended: keys it sent,
+    /// still there when its hold ended, gone later. Another deleter of the
+    /// same key (a later pass, or periodic collection) counts too.
+    late_deletes: u64,
+    /// Passes whose listing without its snapshot still planned, so the
+    /// restore was compared against the segments' own history.
+    compared_without_snapshot: u64,
+}
+
+fn count_idle(f: impl FnOnce(&mut IdleCounts)) {
+    IDLE.with(|c| f(&mut c.borrow_mut()));
+}
+
+/// Whether nobody wakes the actor now (after a hibernation, idle mode).
+fn quiet() -> bool {
+    QUIET_UNTIL.with(|q| q.get().is_some_and(|until| Instant::now() < until))
+}
+
+/// The key of the object the planner takes as the head: the newest
+/// segment of the highest generation, or the newest snapshot if there is
+/// no segment. With the head's position, what the change feed compares
+/// (ADR 0039, section 3).
+fn head_key(listing: &Listing) -> Option<String> {
+    match listing
+        .segments
+        .iter()
+        .max_by_key(|s| (s.id.generation, s.id.txid))
+    {
+        Some(s) => Some(segment_key(s)),
+        None => listing
+            .snapshots
+            .iter()
+            .max_by_key(|s| (s.generation, s.txid))
+            .map(|&s| snapshot_key(s)),
+    }
+}
+
+/// The per-pass oracles (ADR 0042, Tests), on the pass's own listing
+/// `objects` and the keys it sent (relative to the prefix), with its
+/// snapshot `s`. Pure: a later live read could see a legal late commit
+/// move the head. Each violation is named by its oracle.
+fn pass_violations(objects: &[(String, String)], gone: &[String], s: SegmentId) -> Vec<String> {
+    let mut found = Vec::new();
+    let full: Vec<String> = gone.iter().map(|k| format!("{PREFIX}{k}")).collect();
+    let after: Vec<(String, String)> = objects
+        .iter()
+        .filter(|(k, _)| !full.contains(k))
+        .cloned()
+        .collect();
+    let listing_of = |o: &[(String, String)]| read_listing(o.iter().map(|(k, _)| k.as_str()));
+    let (before_listing, after_listing) = (listing_of(objects), listing_of(&after));
+    let Ok(before) = plan_restore(&before_listing) else {
+        // Already broken before the pass: the final checks say so.
+        return found;
+    };
+    let after_plan = plan_restore(&after_listing);
+    // No gap: a snapshot, and every segment after it, listed.
+    match &after_plan {
+        Ok(plan) if plan.snapshot.is_some() => {}
+        other => found.push(format!(
+            "idle pass: gap after compacting from {s:?}: {other:?}"
+        )),
+    }
+    let Ok(after_plan) = after_plan else {
+        return found;
+    };
+    // Head unchanged: position and object.
+    if before.head() != after_plan.head() || head_key(&before_listing) != head_key(&after_listing) {
+        found.push(format!(
+            "idle pass: head moved from {:?} ({:?}) to {:?} ({:?})",
+            before.head(),
+            head_key(&before_listing),
+            after_plan.head(),
+            head_key(&after_listing)
+        ));
+    }
+    // Restore identical: the positions held before and after, and those
+    // the segments give without the snapshot, where that still plans.
+    let held_after = restored(&after_plan, &after);
+    if restored(&before, objects) != held_after {
+        found.push(format!(
+            "idle pass: restore differs after compacting from {s:?}"
+        ));
+    }
+    let snapshot = format!("{PREFIX}{}", snapshot_key(s));
+    let without: Vec<(String, String)> = objects
+        .iter()
+        .filter(|(k, _)| *k != snapshot)
+        .cloned()
+        .collect();
+    if let Ok(plan) = plan_restore(&listing_of(&without)) {
+        count_idle(|c| c.compared_without_snapshot += 1);
+        if restored(&plan, &without) != held_after {
+            found.push(format!(
+                "idle pass: restore differs from the history without the snapshot {s:?}"
+            ));
+        }
+    }
+    found
+}
 
 /// The body of a reset segment: the whole database replaced by an empty one.
 const RESET: &[u8] = b"reset";
@@ -344,6 +533,12 @@ thread_local! {
     static WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Deletes acknowledged as found carried out (after the fence).
     static READ_ACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// What the idle passes did in this run (ADR 0042).
+    static IDLE: std::cell::RefCell<IdleCounts> = std::cell::RefCell::new(IdleCounts::default());
+    /// What the per-pass oracles found in this run.
+    static IDLE_PROBLEMS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Until when nobody wakes the actor (idle mode, after a hibernation).
+    static QUIET_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 fn count_restore(index: usize, n: u64) {
@@ -686,6 +881,220 @@ async fn ack_by_read(
     true
 }
 
+/// What the workload and the idle passes of one process share: the
+/// actor's mailbox, which runs one of them at a time.
+#[derive(Debug, Default)]
+struct Mailbox {
+    /// The workload holds the actor, or is acquiring or restoring it.
+    resident: std::cell::Cell<bool>,
+    /// An idle pass runs: the workload waits.
+    pass: std::cell::Cell<bool>,
+}
+
+/// The owner hibernates in idle mode (ADR 0042, section 2): an idle
+/// snapshot at its head, one bounded attempt, if its hold wrote the head
+/// and no snapshot is there; then the release. If the release landed, the
+/// node runs the idle pass after a delay, on the record's version as the
+/// release wrote it, and nobody wakes the actor for a while.
+async fn hibernate(
+    node: &Rc<Node>,
+    bucket: &EpBucket,
+    rules: Rules,
+    o: &mut Owner,
+    rng: &mut Rng,
+    mailbox: &Rc<Mailbox>,
+    store: &Store,
+) {
+    let delay_ms = IDLE_PASS_AFTER_MS.0 + rng.below(IDLE_PASS_AFTER_MS.1 - IDLE_PASS_AFTER_MS.0);
+    // Mostly idle past the pass; now and then woken before it.
+    let quiet_ms = if rng.chance(IDLE_PAST_PASS_PERCENT) {
+        delay_ms + IDLE_QUIET_AFTER_PASS_MS
+    } else {
+        rng.below(delay_ms)
+    };
+    // `since_snapshot` is 0 when the last snapshot is at the head.
+    if o.head.generation == o.held.generation && o.since_snapshot >= 1 && node.may_act(&o.held) {
+        let mut body = o.held_positions.clone();
+        if rules.idle == Idle::StaleSnapshot {
+            body.remove(&o.head);
+        }
+        let key = format!("{PREFIX}{}", snapshot_key(o.head));
+        match bucket.create(&key, encode_positions(&body)).await {
+            Ok(_) => {
+                count_idle(|c| c.snapshots += 1);
+                o.since_snapshot = 0;
+            }
+            Err(wasmkeep_cluster::lease::BucketError::Conflict) => o.since_snapshot = 0,
+            // Unanswered, perhaps landing later: harmless, it is the
+            // database at an acknowledged head.
+            Err(_) => {}
+        }
+    }
+    let generation = o.held.generation;
+    trace(&format!("{} hibernates gen {generation}", node.id()));
+    let released = node.release(&o.held).await;
+    mailbox.resident.set(false);
+    if !released {
+        return;
+    }
+    QUIET_UNTIL.with(|q| {
+        let until = Instant::now() + Duration::from_millis(quiet_ms);
+        q.set(Some(q.get().map_or(until, |u| u.max(until))));
+    });
+    // The version the release wrote. The server's release is to return it
+    // (slice 5; `Owners::release` drops it today); here it is read back:
+    // a record naming nobody at this generation is that write, since every
+    // acquisition raises the generation.
+    let Ok(Some((body, version))) = bucket.get(RECORD).await else {
+        return;
+    };
+    if !OwnerRecord::decode(&body).is_some_and(|r| r.holder.is_none() && r.generation == generation)
+    {
+        return;
+    }
+    madsim::task::spawn_local(idle_pass(
+        Rc::clone(node),
+        rules,
+        generation,
+        version.0,
+        delay_ms,
+        Rc::clone(mailbox),
+        Arc::clone(store),
+    ));
+}
+
+/// The idle pass (ADR 0042, section 3), `delay_ms` after the release of
+/// generation `generation` wrote `version`: in the actor's mailbox, a
+/// fresh hold taken only if the record is unchanged, the rule, the
+/// deletes, the release. Then it watches for its deletes landing after
+/// the hold ended.
+async fn idle_pass(
+    node: Rc<Node>,
+    rules: Rules,
+    generation: u64,
+    version: String,
+    delay_ms: u64,
+    mailbox: Rc<Mailbox>,
+    store: Store,
+) {
+    let bucket = EpBucket::connect_with_timeout(WAIT).await;
+    let deletes = EpBucket::connect_with_timeout(DELETE_WAIT).await;
+    sleep(Duration::from_millis(delay_ms)).await;
+    // Step 1: not when the actor is resident here, nor beside another pass.
+    if node.lost() || mailbox.resident.get() || mailbox.pass.get() {
+        count_idle(|c| c.skipped += 1);
+        return;
+    }
+    mailbox.pass.set(true);
+    count_idle(|c| c.passes += 1);
+    // Step 2: the record, only if unchanged since the release.
+    let taken = if rules.idle == Idle::ChangedRecord {
+        node.acquire(RECORD, 1).await
+    } else {
+        node.acquire_unchanged(RECORD, &version).await
+    };
+    let hold = match taken {
+        Ok(hold) => hold,
+        Err(e) => {
+            if e == AcquireError::Changed {
+                count_idle(|c| c.changed += 1);
+            }
+            trace(&format!(
+                "{} idle pass of gen {generation}: {e:?}",
+                node.id()
+            ));
+            mailbox.pass.set(false);
+            return;
+        }
+    };
+    let sent = compact(&node, &bucket, &deletes, rules, generation, &hold).await;
+    // Step 6: the release. Deletes still in flight land after it.
+    let mut in_flight: Vec<String> = {
+        let s = store.lock().unwrap();
+        sent.into_iter().filter(|k| s.contains_key(k)).collect()
+    };
+    let _ = node.release(&hold).await;
+    mailbox.pass.set(false);
+    for _ in 0..40 {
+        if in_flight.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+        let s = store.lock().unwrap();
+        let before = in_flight.len();
+        in_flight.retain(|k| s.contains_key(k));
+        let landed = (before - in_flight.len()) as u64;
+        count_idle(|c| c.late_deletes += landed);
+    }
+}
+
+/// Steps 3 to 5 of the pass under `hold`: list, choose by the rule (or a
+/// broken variant), check the pass's oracles on its listing, delete while
+/// the hold may act. Returns the keys it sent deletes for.
+async fn compact(
+    node: &Node,
+    bucket: &EpBucket,
+    deletes: &EpBucket,
+    rules: Rules,
+    generation: u64,
+    hold: &Held,
+) -> Vec<String> {
+    let Ok(objects) = bucket.list(PREFIX).await else {
+        return Vec::new();
+    };
+    let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
+    let chosen = if rules.idle == Idle::AnySnapshotAtHead {
+        plan_restore(&listing)
+            .ok()
+            .map(|p| p.head())
+            .filter(|h| *h != EMPTY && listing.snapshots.contains(h))
+            .map(|h| (h, collectable(&listing, h.generation, h)))
+    } else {
+        idle_collectable(&listing, generation)
+    };
+    trace(&format!(
+        "{} idle pass of gen {generation} as gen {}: {:?}",
+        node.id(),
+        hold.generation,
+        chosen.as_ref().map(|(s, gone)| (s, gone.len()))
+    ));
+    let Some((s, mut gone)) = chosen else {
+        count_idle(|c| c.nothing += 1);
+        return Vec::new();
+    };
+    match rules.idle {
+        Idle::DropSegmentAtP => {
+            if let Some(seg) = listing.segments.iter().find(|x| x.id == s) {
+                gone.push(segment_key(seg));
+            }
+        }
+        Idle::DropSnapshot => gone.push(snapshot_key(s)),
+        _ => {}
+    }
+    let violations = pass_violations(&objects, &gone, s);
+    IDLE_PROBLEMS.with(|p| p.borrow_mut().extend(violations));
+    if hold.generation != generation + 1 && !gone.is_empty() {
+        count_idle(|c| c.took_changed += 1);
+    }
+    if s.generation != generation && !gone.is_empty() {
+        count_idle(|c| c.foreign += 1);
+    }
+    let mut sent = Vec::new();
+    for key in gone {
+        // The fresh hold, before each delete (a batch of one here).
+        if !node.may_act(hold) {
+            break;
+        }
+        let key = format!("{PREFIX}{key}");
+        let _ = deletes.delete(&key).await;
+        sent.push(key);
+    }
+    if !sent.is_empty() {
+        count_idle(|c| c.deleted += 1);
+    }
+    sent
+}
+
 /// One process's life on node leases: until its lease is lost (fenced, or
 /// replaced by its own restart), then it exits.
 #[allow(clippy::too_many_arguments)]
@@ -698,19 +1107,30 @@ async fn run_node(
     acked: &Mutex<Vec<SegmentId>>,
     resets: &Mutex<Vec<Reset>>,
     problems: &Mutex<Vec<String>>,
+    mailbox: &Rc<Mailbox>,
+    store: &Store,
 ) {
     let deleting = rules.deletes != Deletes::Off;
+    let idle = rules.idle != Idle::Off;
     let mut owner: Option<Owner> = None;
     // The generation of the hold given up last (once per hold, as the
     // server's dropped hold sends one release).
     let mut given: Option<u64> = None;
     loop {
+        mailbox.resident.set(owner.is_some());
         sleep(Duration::from_millis(100)).await;
         if node.lost() {
             trace(&format!("{} lost the node lease: exits", node.id()));
             return;
         }
         let Some(o) = owner.as_mut() else {
+            // Idle mode: nobody wakes the actor for a while after a
+            // hibernation, and an event here waits for a pass running in
+            // the actor's mailbox.
+            if idle && (mailbox.pass.get() || quiet()) {
+                continue;
+            }
+            mailbox.resident.set(true);
             // A parked hold is woken, a new generation (ADR 0024).
             let parked = deleting && node.is_parked(RECORD);
             let taken = if parked {
@@ -761,6 +1181,11 @@ async fn run_node(
                     // if enough segments were restored, at the restored
                     // head, whoever wrote it.
                     snapshot_and_collect(node, bucket, deletes, rules, &mut o).await;
+                    // Idle mode: a wake that only reads, then hibernates.
+                    if idle && rng.chance(READ_ONLY_WAKE_PERCENT) {
+                        hibernate(node, bucket, rules, &mut o, rng, mailbox, store).await;
+                        continue;
+                    }
                     // A delete found carried out by the restore (its
                     // request listed again) is acknowledged only once this
                     // hold's own upload ends the history (the server's
@@ -836,7 +1261,7 @@ async fn run_node(
         // Its previous upload has finished, as in production, where an
         // actor's state (and hold) is dropped only after its last event.
         let mut released = false;
-        if rules.releases != Releases::Never && rng.chance(if deleting { 10 } else { 4 }) {
+        if rules.releases != Releases::Never && rng.chance(if deleting || idle { 10 } else { 4 }) {
             trace(&format!("releases gen {}", o.held.generation));
             let held = o.held.clone();
             // Half the time it parks instead (a room hibernating with
@@ -848,6 +1273,8 @@ async fn run_node(
                     node.id(),
                     held.generation
                 ));
+            } else if idle {
+                hibernate(node, bucket, rules, o, rng, mailbox, store).await;
             } else {
                 let _ = node.release(&held).await;
             }
@@ -971,6 +1398,10 @@ struct Outcome {
     /// Fences nodes wrote over peers cut off from the bucket.
     fences: u64,
     problems: Vec<String>,
+    /// What the idle passes did (ADR 0042).
+    idle: IdleCounts,
+    /// What the per-pass oracles found.
+    idle_problems: Vec<String>,
     exports: usize,
     export_retries: usize,
     store: Store,
@@ -1010,6 +1441,9 @@ fn simulate_observed(
     COLLECTED.with(|c| c.set(0));
     WAKES.with(|w| w.set(0));
     READ_ACKS.with(|r| r.set(0));
+    IDLE.with(|c| *c.borrow_mut() = IdleCounts::default());
+    IDLE_PROBLEMS.with(|p| p.borrow_mut().clear());
+    QUIET_UNTIL.with(|q| q.set(None));
     let _ = take_fences();
     let config = LeaseConfig::new(1_000, 500, 200, 300).unwrap();
     let max_skew_ms = 300;
@@ -1028,6 +1462,7 @@ fn simulate_observed(
     let export_counts_out = Arc::clone(&export_counts);
     rt.block_on(async move {
         let export_store = Arc::clone(&store);
+        let node_store = Arc::clone(&store);
         let mut pending_export: Option<(Plan, Vec<SegmentId>, usize)> = None;
         let handle = Handle::current();
         let time = GlobalTime(Instant::now());
@@ -1052,10 +1487,11 @@ fn simulate_observed(
             let span = max_skew_ms * 2 + 1;
             let skew_ms =
                 i64::try_from(rng.below(span)).unwrap() - i64::try_from(max_skew_ms).unwrap();
-            let (acked, resets, problems) = (
+            let (acked, resets, problems, store) = (
                 Arc::clone(&acked),
                 Arc::clone(&resets),
                 Arc::clone(&problems),
+                Arc::clone(&node_store),
             );
             let cut = Arc::clone(&cuts[usize::try_from(i).unwrap() - 1]);
             // Not drawn from `rng`: existing seeds keep their fault schedules.
@@ -1065,10 +1501,11 @@ fn simulate_observed(
                 .name(format!("n{i}"))
                 .ip(format!("10.0.1.{i}").parse().unwrap())
                 .init(move || {
-                    let (acked, resets, problems) = (
+                    let (acked, resets, problems, store) = (
                         Arc::clone(&acked),
                         Arc::clone(&resets),
                         Arc::clone(&problems),
+                        Arc::clone(&store),
                     );
                     let cut = Arc::clone(&cut);
                     async move {
@@ -1133,7 +1570,16 @@ fn simulate_observed(
                         let deletes = EpBucket::connect_with_timeout(DELETE_WAIT).await;
                         let mut rng = Rng::new(node_seed);
                         run_node(
-                            &node, &bucket, &deletes, rules, &mut rng, &acked, &resets, &problems,
+                            &node,
+                            &bucket,
+                            &deletes,
+                            rules,
+                            &mut rng,
+                            &acked,
+                            &resets,
+                            &problems,
+                            &Rc::new(Mailbox::default()),
+                            &store,
                         )
                         .await;
                     }
@@ -1284,6 +1730,8 @@ fn simulate_observed(
         collected: COLLECTED.with(std::cell::Cell::get),
         fences: take_fences(),
         problems: problems_out.lock().unwrap().clone(),
+        idle: IDLE.with(|c| *c.borrow()),
+        idle_problems: IDLE_PROBLEMS.with(|p| p.borrow().clone()),
         store: store_out,
         exports,
         export_retries,
@@ -1296,6 +1744,14 @@ fn check(outcome: &Outcome) -> Result<usize, String> {
     if let Some(p) = outcome.problems.first() {
         return Err(p.clone());
     }
+    if let Some(p) = outcome.idle_problems.first() {
+        return Err(p.clone());
+    }
+    check_final(outcome)
+}
+
+/// The final checks alone: the bucket restored once more.
+fn check_final(outcome: &Outcome) -> Result<usize, String> {
     let store = outcome.store.lock().unwrap();
     let objects: Vec<(String, String)> = store
         .iter()
@@ -1760,4 +2216,259 @@ fn actor_restore_marker_replay_and_supersession_are_exercised() {
 fn actor_restore_racing_a_move_is_exercised() {
     let c = restore_coverage();
     assert!(c[4] > seeds() / 4, "no restore/move races: {c:?}");
+}
+
+/// Whether this file runs as its own test binary: `madsim_backup.rs`
+/// includes it as a module, which runs its tests there too. The idle
+/// compaction tests (ADR 0042) run here only.
+fn own_binary() -> bool {
+    module_path!() == "madsim_replication"
+}
+
+/// Idle compaction among takeovers, late uploads and late deletes: every
+/// seed passes every check, per pass and final. Returns the counts.
+fn idle_holds(rules: Rules, what: &str) -> IdleCounts {
+    let (mut acked, mut generations, mut t) = (0, 0, IdleCounts::default());
+    for seed in 0..seeds() {
+        let outcome = simulate(seed, rules, Duration::from_secs(30));
+        match check(&outcome) {
+            Ok(n) => acked += u64::try_from(n).unwrap(),
+            Err(v) => panic!("seed {seed}: {v}"),
+        }
+        generations += outcome
+            .acked
+            .iter()
+            .map(|id| id.generation)
+            .max()
+            .unwrap_or(0);
+        let c = outcome.idle;
+        t.snapshots += c.snapshots;
+        t.passes += c.passes;
+        t.skipped += c.skipped;
+        t.deleted += c.deleted;
+        t.changed += c.changed;
+        t.nothing += c.nothing;
+        t.took_changed += c.took_changed;
+        t.late_deletes += c.late_deletes;
+        t.compared_without_snapshot += c.compared_without_snapshot;
+    }
+    eprintln!(
+        "replication {what}: {} seeds x 30 s: {acked} acknowledged writes, all restored; \
+         {generations} generations; {} idle snapshots; {} passes ({} more skipped): {} deleted, {} dropped for a \
+         changed record, {} found nothing, {} took a changed record and deleted; {} deletes \
+         landed after their hold ended; {} restores compared without the snapshot",
+        seeds(),
+        t.snapshots,
+        t.passes,
+        t.skipped,
+        t.deleted,
+        t.changed,
+        t.nothing,
+        t.took_changed,
+        t.late_deletes,
+        t.compared_without_snapshot
+    );
+    assert!(acked > seeds() * 10, "too few writes ({acked})");
+    assert!(
+        generations > seeds() * 3,
+        "ownership rarely changed ({generations})"
+    );
+    t
+}
+
+/// ADR 0042: owners that hibernate take an idle snapshot, and the passes
+/// compact under a fresh hold. Non-vacuous: idle snapshots were taken,
+/// passes deleted, passes were dropped for a changed record, and deletes
+/// landed after their pass's hold ended.
+#[test]
+fn idle_compaction_keeps_every_acknowledged_write() {
+    if !own_binary() {
+        return;
+    }
+    let c = idle_holds(SAFE_IDLE, "with idle compaction");
+    assert!(c.snapshots > 0, "no idle snapshot: {c:?}");
+    assert!(c.deleted > 0, "no pass deleted anything: {c:?}");
+    assert!(c.changed > 0, "no pass found the record changed: {c:?}");
+    assert!(c.late_deletes > 0, "no delete landed after its hold: {c:?}");
+    assert!(
+        c.compared_without_snapshot > 0,
+        "the restore was never compared without the snapshot: {c:?}"
+    );
+}
+
+/// The same beside ADR 0012's collection after periodic snapshots.
+#[test]
+fn idle_compaction_beside_collection_keeps_every_acknowledged_write() {
+    if !own_binary() {
+        return;
+    }
+    let c = idle_holds(
+        Rules {
+            collect: Collect::Safe,
+            ..SAFE_IDLE
+        },
+        "with idle compaction and collection",
+    );
+    assert!(c.deleted > 0, "no pass deleted anything: {c:?}");
+}
+
+/// The first seed within the budget whose run `fails`, run twice to show
+/// it reproduces.
+fn first_seed(rules: Rules, fails: impl Fn(&Outcome) -> bool) -> Option<u64> {
+    first_seed_within(seeds(), rules, fails)
+}
+
+/// [`first_seed`] within `budget` seeds.
+fn first_seed_within(budget: u64, rules: Rules, fails: impl Fn(&Outcome) -> bool) -> Option<u64> {
+    let seed = (0..budget).find(|&s| fails(&simulate(s, rules, Duration::from_secs(30))))?;
+    assert!(
+        fails(&simulate(seed, rules, Duration::from_secs(30))),
+        "seed {seed} did not reproduce"
+    );
+    Some(seed)
+}
+
+fn idle_problem(outcome: &Outcome, oracle: &str) -> bool {
+    outcome.idle_problems.iter().any(|p| p.contains(oracle))
+}
+
+fn final_failure(outcome: &Outcome, what: &str) -> bool {
+    check_final(outcome).is_err_and(|e| e.contains(what))
+}
+
+/// Each oracle catches a mutation: dropping the segment at `P` moves the
+/// head object; deleting `S` leaves a gap, and the final re-plan fails
+/// with `Missing`; an idle snapshot missing its head's position changes
+/// the restore, and an acknowledged write is lost.
+#[test]
+fn each_idle_oracle_catches_a_mutation() {
+    if !own_binary() {
+        return;
+    }
+    type Fails<'a> = &'a dyn Fn(&Outcome) -> bool;
+    let with = |idle| Rules { idle, ..SAFE_IDLE };
+    let cases: [(&str, Idle, Fails); 5] = [
+        ("head unchanged", Idle::DropSegmentAtP, &|o| {
+            idle_problem(o, "head moved")
+        }),
+        ("no gap", Idle::DropSnapshot, &|o| {
+            idle_problem(o, "gap after")
+        }),
+        ("final re-plan never Missing", Idle::DropSnapshot, &|o| {
+            final_failure(o, "is missing")
+        }),
+        ("restore identical", Idle::StaleSnapshot, &|o| {
+            idle_problem(o, "restore differs")
+        }),
+        (
+            "every acknowledged write restored",
+            Idle::StaleSnapshot,
+            &|o| final_failure(o, "lost"),
+        ),
+    ];
+    for (oracle, idle, fails) in cases {
+        let seed = first_seed(with(idle), fails)
+            .unwrap_or_else(|| panic!("{oracle}: {idle:?} not caught within the seed budget"));
+        eprintln!("replication idle: oracle '{oracle}' caught {idle:?} at seed {seed}");
+    }
+}
+
+/// Deleting the segment at `P` too: the head object moves at every pass
+/// that deletes (the per-pass oracle), and a late segment of an earlier
+/// generation can then become a head whose parent is gone.
+#[test]
+fn an_idle_pass_deleting_the_segment_at_p_is_caught() {
+    if !own_binary() {
+        return;
+    }
+    let rules = Rules {
+        idle: Idle::DropSegmentAtP,
+        ..SAFE_IDLE
+    };
+    let seed = first_seed(rules, |o| check(o).is_err())
+        .unwrap_or_else(|| panic!("no violation within the seed budget"));
+    eprintln!("replication idle: deleting the segment at P caught at seed {seed}");
+}
+
+/// Deleting the segment at `P` too breaks a restore, not only the per-pass
+/// oracle: a late segment of an earlier generation becomes a head whose
+/// parent is gone.
+#[test]
+fn an_idle_pass_deleting_the_segment_at_p_breaks_a_restore() {
+    if !own_binary() {
+        return;
+    }
+    let rules = Rules {
+        idle: Idle::DropSegmentAtP,
+        ..SAFE_IDLE
+    };
+    // Rarer (14 seeds in 2,000 when this was written): at least 1,000
+    // seeds, however small the budget; it stops at the first.
+    let seed = first_seed_within(seeds().max(1_000), rules, |o| {
+        final_failure(o, "is missing")
+    })
+    .unwrap_or_else(|| panic!("no Missing within the seed budget"));
+    eprintln!("replication idle: deleting the segment at P fails a restore at seed {seed}");
+}
+
+/// Compacting from any snapshot at the head, ignoring the released
+/// generation, takes a snapshot of another generation on some passes
+/// (one a read-only wake uploaded at a previous owner's head). Breaking
+/// a restore then needs ADR 0012's condition-2 interleaving, two held
+/// uploads around a restore, after the pass: not reached within 2,000
+/// seeds when this was written, so it is scripted in
+/// `wasmkeep_cluster::replication`'s unit tests
+/// (`an_idle_pass_from_any_snapshot_at_the_head_would_break_a_restore`).
+/// Here: the variant is reached, and whether a seed caught it is printed.
+#[test]
+fn an_idle_pass_from_any_snapshot_at_the_head_is_reached() {
+    if !own_binary() {
+        return;
+    }
+    let rules = Rules {
+        idle: Idle::AnySnapshotAtHead,
+        ..SAFE_IDLE
+    };
+    let (mut foreign, mut caught) = (0, Vec::new());
+    for seed in 0..seeds() {
+        let outcome = simulate(seed, rules, Duration::from_secs(30));
+        foreign += outcome.idle.foreign;
+        if check(&outcome).is_err() {
+            caught.push(seed);
+        }
+    }
+    eprintln!(
+        "replication idle: any snapshot at the head: {foreign} passes compacted from another \
+         generation's snapshot in {} seeds; caught at seeds {caught:?}",
+        seeds()
+    );
+    assert!(
+        foreign > 0,
+        "no pass compacted from another generation's snapshot"
+    );
+}
+
+/// Without the version check (a plain acquisition, the remembered
+/// generation), passes take records that changed since the release and
+/// still delete; the chain survives. Safety of the chain does not rest on
+/// the version check, as ADR 0042 argues: only the released generation's
+/// own snapshots are chosen, at positions every later hold built on. The
+/// simulation has no app incarnations (ADR 0042, constraint 7), which is
+/// what the check is for.
+#[test]
+fn an_idle_pass_without_the_version_check_keeps_the_chain() {
+    if !own_binary() {
+        return;
+    }
+    let c = idle_holds(
+        Rules {
+            idle: Idle::ChangedRecord,
+            ..SAFE_IDLE
+        },
+        "with idle passes taking changed records",
+    );
+    assert!(
+        c.took_changed > 0,
+        "no pass took a changed record and deleted: {c:?}"
+    );
 }
