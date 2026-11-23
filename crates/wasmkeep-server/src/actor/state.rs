@@ -110,8 +110,6 @@ pub(super) struct ActorState {
     pub(super) held: Option<Held>,
     /// Another node's lease seen on the bucket: (owner, expiry in ms).
     pub(super) owner_hint: Option<(String, u64)>,
-    /// Set for the length of [`Self::ensure_owner_waking`].
-    pub(super) apart_wake: bool,
     /// The last `ensure_ready` failed because the actor already ran a newer
     /// deploy than this node has: a temporary refusal (503), not an error.
     pub(super) behind_deploy: bool,
@@ -353,7 +351,7 @@ impl ActorState {
         response_tx: oneshot::Sender<Outcome<B>>,
         chain: Chain,
         outside: bool,
-        own: bool,
+        apart: bool,
     ) where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
@@ -386,13 +384,9 @@ impl ActorState {
                 return;
             }
         }
-        // `own`: a wake-up of this node's own (ADR 0041, amendment of
-        // 2026-11-22); an event another node sent is acquired here.
-        let ownership = if own {
-            self.ensure_owner_waking().await
-        } else {
-            self.ensure_owner().await
-        };
+        // `apart`: a wake-up of this node's own, of an actor nobody holds
+        // (ADR 0041, amendment of 2026-11-22); any other is acquired here.
+        let ownership = self.ensure_owner_with(None, apart).await;
         match ownership {
             // Asked again after the wait for ownership (a takeover's restore
             // can be long): whoever sent it may have gone meanwhile.
@@ -509,66 +503,47 @@ impl ActorState {
     /// the instance (it may be stale: another node may have run events since)
     /// and is acquired again.
     pub(super) async fn ensure_owner(&mut self) -> Result<(), OwnershipError> {
-        self.ensure_owner_with(None).await
+        self.ensure_owner_with(None, false).await
     }
 
-    /// [`Self::ensure_owner`] for a wake-up that is this node's own: a
-    /// request that reached it unforwarded, a call from an actor or the
-    /// front here, an alarm. An actor kept apart from a companion (ADR
-    /// 0041, amendment of 2026-11-22) that this node holds is not acquired
-    /// here while a peer can take it: `Elsewhere`, as a drain of this one
-    /// actor, and the peer acquires the forwarded event (it never sends it
-    /// on). Never for an event another node sent, a take, an upgrade, or
-    /// the operator passes.
-    pub(super) async fn ensure_owner_waking(&mut self) -> Result<(), OwnershipError> {
-        self.apart_wake = true;
-        let owned = self.ensure_owner_with(None).await;
-        self.apart_wake = false;
-        owned
-    }
-
-    /// The actors this one is kept apart from (ADR 0041, amendment of
-    /// 2026-11-22): the same name in each companion class.
-    fn companions(&self) -> Vec<ActorAddress> {
-        self.class
-            .apart
-            .iter()
-            .filter_map(|class| {
-                ActorAddress::new(self.address.tenant(), class, self.address.name()).ok()
-            })
-            .collect()
-    }
-
-    /// The nodes that hold these companions now: this one from memory, the
-    /// others from their record (one read each, bounded). Read only while
-    /// this node drains an actor kept apart.
-    pub(super) async fn companion_owners(
-        companions: Vec<ActorAddress>,
+    /// The node that holds `companion` now: this one from memory, another
+    /// from its record (one read, bounded). Read only while this node
+    /// drains an actor kept apart (ADR 0041, amendment of 2026-11-22).
+    pub(super) async fn companion_owner(
+        companion: Option<ActorAddress>,
         cluster: &Cluster,
     ) -> Vec<String> {
-        let mut owners = Vec::new();
-        for companion in companions {
-            if cluster.holds_here(&companion) {
-                owners.push(cluster.node_id.clone());
-                continue;
-            }
-            use wasmkeep_cluster::node_lease::Route;
-            if let Ok(Ok(Route::Owner(owner))) =
-                tokio::time::timeout(COMPANION_READ, cluster.route(&companion)).await
-            {
-                owners.push(owner);
-            }
+        let Some(companion) = companion.filter(|_| cluster.placement_on()) else {
+            return Vec::new();
+        };
+        if cluster.holds_here(&companion) {
+            return vec![cluster.node_id.clone()];
         }
-        owners
+        use wasmkeep_cluster::node_lease::Route;
+        match tokio::time::timeout(COMPANION_READ, cluster.route(&companion)).await {
+            Ok(Ok(Route::Owner(owner))) => vec![owner],
+            _ => Vec::new(),
+        }
     }
 
     /// [`Self::ensure_owner`]; with `listed` (an idle expiry, ADR 0028), the
     /// acquisition takes the record only if it names nobody and is still
     /// the version the listing showed, and a hold already here or a learned
     /// owner is never taken as one (the caller refuses those first).
+    ///
+    /// `apart`: a wake-up of this node's own (an unforwarded request, a
+    /// call from an actor or the front here, an alarm nobody handed here)
+    /// whose route read answered that nobody holds the actor. An actor kept
+    /// apart from a companion this node holds (ADR 0041, amendment of
+    /// 2026-11-22) is then not acquired here while a peer can take it:
+    /// `Elsewhere`, as a drain of this one actor, and the peer acquires the
+    /// event it is sent (it never sends it on). `false` for everything
+    /// else: an event another node sent, a handed alarm, a take, an
+    /// upgrade, the operator passes.
     pub(super) async fn ensure_owner_with(
         &mut self,
         listed: Option<(&str, u64)>,
+        apart: bool,
     ) -> Result<(), OwnershipError> {
         let blocked = self
             .secrets_blocked
@@ -621,8 +596,8 @@ impl ActorState {
         // actor unreachable.
         // An actor kept apart from a companion goes to a peer that does
         // not hold it, if there is one (ADR 0041, amendment of 2026-11-22).
-        let avoid = if cluster.draining() && !self.class.apart.is_empty() {
-            Self::companion_owners(self.companions(), &cluster).await
+        let avoid = if cluster.draining() {
+            Self::companion_owner(companion_of(&self.class, &self.address), &cluster).await
         } else {
             Vec::new()
         };
@@ -641,14 +616,12 @@ impl ActorState {
         // of 2026-11-22): a wake-up of this node's own goes to a peer, as
         // a drain sends it. No peer (one node alive, every peer draining
         // or suspected): acquired here, as without the rule.
-        // Not for an actor parked here (ADR 0024): its record names this
-        // node, so a peer would find it held.
-        if self.apart_wake
-            && listed.is_none()
-            && !self.class.apart.is_empty()
-            && !cluster.is_parked(&self.address)
+        // Off with placement (`--no-placement`). Not for an actor parked
+        // here (ADR 0024): its record names this node.
+        if apart && listed.is_none() && cluster.placement_on() && !cluster.is_parked(&self.address)
         {
-            let here = self.companions().iter().any(|c| cluster.holds_here(c));
+            let here =
+                companion_of(&self.class, &self.address).is_some_and(|c| cluster.holds_here(&c));
             if here {
                 match cluster.apart_peer(&self.address, true) {
                     Some(peer) => {

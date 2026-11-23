@@ -117,18 +117,12 @@ async fn node_opts(
             // The test places edges itself (prewarmed on the nodes it names,
             // below). Placement at wake-up (ADR 0041, newer than this test)
             // may send an edge that wakes again on a loaded runner to a
-            // lighter node, and the sockets then miss a node.
-            cluster.placement = false;
-            // The room and its pusher wake where these tests send them, as
-            // before the rule keeping them apart (ADR 0041, amendment of
-            // 2026-11-22): a test that kills an edge's node assumes the room
-            // is not on it. `tests/cluster/apart.rs` tests the rule.
-            if !apart {
-                config.apart.insert(
-                    "pusher".into(),
-                    wasmkeep_cluster::placement::APART_NONE.into(),
-                );
-            }
+            // lighter node, and the sockets then miss a node. Off, it also
+            // keeps the room and its pusher where these tests send them
+            // (the rule keeping them apart, ADR 0041, amendment of
+            // 2026-11-22, is off with it): a test that kills an edge's node
+            // assumes the room is not on it. `apart`: on, as by default.
+            cluster.placement = apart;
             config.cluster = Some(cluster);
             let service = ActorService::new(
                 runtime,

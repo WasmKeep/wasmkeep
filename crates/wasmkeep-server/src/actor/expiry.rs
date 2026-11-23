@@ -65,7 +65,7 @@ impl ActorState {
         }
         self.owner_hint = None;
         match self
-            .ensure_owner_with(Some((&listed, idle_origin_ms)))
+            .ensure_owner_with(Some((&listed, idle_origin_ms)), false)
             .await
         {
             Ok(()) => {}

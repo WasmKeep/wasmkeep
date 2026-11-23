@@ -181,9 +181,6 @@ pub struct ActorConfig {
     /// The classes whose writes are batched (ADR 0034, section 1): the
     /// deployed version's; every other class is strict.
     pub batched: std::collections::BTreeSet<String>,
-    /// Each class's `apart` entry (ADR 0041, amendment of 2026-11-22): the
-    /// deployed version's. Classes not listed take the default pair.
-    pub apart: std::collections::BTreeMap<String, String>,
     /// Public ingress rate limits for this app.
     pub limits: crate::apps::limits::Policies,
     /// `--max-unsent-age` (ADR 0034, section 3): how long a committed write
@@ -283,7 +280,6 @@ impl ActorConfig {
             requires: std::collections::BTreeMap::new(),
             expire_after_idle: std::collections::BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
-            apart: std::collections::BTreeMap::new(),
             limits: Default::default(),
             max_unsent_age: DEFAULT_UNSENT_AGE,
             access: crate::access::AccessRules::default(),
@@ -422,8 +418,11 @@ impl ServiceInner {
         }
     }
 
-    /// A draining node handed this node `address`'s alarm.
-    fn note_handed(&self, address: &ActorAddress) {
+    /// A node handed this node `address`'s alarm, due at `at`: remembered
+    /// until the window after it is due, so the delivery here acquires the
+    /// actor and never sends it on again (ADR 0041, amendment of
+    /// 2026-11-22).
+    fn note_handed(&self, address: &ActorAddress, at: u64) {
         let now = now_ms();
         let window = self
             .cluster
@@ -443,7 +442,7 @@ impl ServiceInner {
                 handed.remove(&oldest);
             }
         }
-        handed.insert(address.clone(), now.saturating_add(window));
+        handed.insert(address.clone(), now.max(at).saturating_add(window));
     }
 
     /// Whether a draining node handed this node `address`'s alarm lately.

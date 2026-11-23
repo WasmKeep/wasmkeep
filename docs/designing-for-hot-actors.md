@@ -84,23 +84,24 @@ p99 passed 1 s ([measured](../bench/results/2026-11-22-43119bd-room-group-ovh-bh
 tails near `--max-unsent-age`.
 
 **It happens by default.** A node keeps the classes `room` and `pusher`
-apart at wake-up, the broadcast SDKs' default class names: a wake-up of
-`pusher/lobby` on the node that holds `room/lobby` goes to another node,
-and the other way round, by a request, a call, an alarm or a drain
+apart at wake-up, the broadcast SDKs' default class names. A wake-up of
+`pusher/lobby`, which nobody holds, on the node that holds `room/lobby`
+goes to another node, and the other way round. This applies to a
+request, a call, an alarm or a drain
 ([ADR 0041, amendment](adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
-Nothing to configure. With other class names, name the pair in
-`wasmkeep.toml` ([project file](project-file.md#keys)):
-
-```toml
-[classes.fanout]
-component = "dist/pusher.wasm"
-apart-from = "chatroom"
-```
+Nothing to configure, and `--no-placement` turns it off. Renamed classes
+are not kept apart in this version.
 
 With one node alive, or every other node draining, both wake where they
-land: the rule never refuses a wake-up. It does not move a running actor:
-an older version, or two wake-ups at the same moment on one node, can
-leave the pair together until one of them hibernates.
+land: the rule never refuses a wake-up. It does not move a running
+actor, and a busy pusher never hibernates, so in these cases the pair
+stays together until moved:
+
+- two wake-ups of the pair at the same moment on one node;
+- a takeover after a node died;
+- a node of an older version;
+- a cluster of two nodes after a rolling restart (while one restarts,
+  the other holds both).
 
 **Move the pusher as a fallback.** If `actor where` (below) shows them
 together and the room is busy, move the pusher alone

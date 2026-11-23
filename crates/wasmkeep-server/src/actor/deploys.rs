@@ -141,16 +141,7 @@ impl ActorService {
         limits: &crate::apps::limits::Policies,
     ) -> Result<(), (String, Error)> {
         self.apply_deployed_assets(
-            None,
-            seq,
-            classes,
-            rules,
-            config,
-            requires,
-            batched,
-            &std::collections::BTreeMap::new(),
-            front,
-            limits,
+            None, seq, classes, rules, config, requires, batched, front, limits,
         )
     }
 
@@ -167,7 +158,6 @@ impl ActorService {
         config: &std::collections::BTreeMap<String, crate::env::Vars>,
         requires: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
         batched: &std::collections::BTreeSet<String>,
-        apart: &std::collections::BTreeMap<String, String>,
         front: Option<&crate::front::DeployedFront>,
         limits: &crate::apps::limits::Policies,
     ) -> Result<(), (String, Error)> {
@@ -222,9 +212,7 @@ impl ActorService {
             );
             let required = Arc::new(requires.get(&name).cloned().unwrap_or_default());
             let writes = writes_of(batched, &name);
-            let apart = Arc::new(wasmkeep_cluster::placement::companions(
-                apart, &names, &name,
-            ));
+            let apart = wasmkeep_cluster::placement::companion(&names, &name);
             built.insert(
                 name,
                 Arc::new(ActorClass {
@@ -734,7 +722,6 @@ mod rate_review_tests {
                 Some(assets),
                 1,
                 &[],
-                &Default::default(),
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),

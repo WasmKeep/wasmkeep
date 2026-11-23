@@ -5,8 +5,8 @@
   (P1, P4) and documented (P5). On by default; the release's benchmark
   pass with a hashing balancer confirms the default, the floor and the
   band (open questions below).
-- Amended 2026-11-22 (0.8.0, item 1): an actor kept apart from a
-  companion at wake-up, the room and its pusher by default
+- Amended 2026-11-22 (0.8.0, item 1): a room and its pusher kept apart
+  at wake-up, by default
   ([amendment](#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
@@ -685,110 +685,140 @@ A large room delivers well only with its pusher on another node
 ([ADR 0040, section 13](0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20)):
 on three 4-vCPU nodes, 4,500 clients at 10 messages/s held delivery p99
 under 1 s only once the pusher was moved off the room's node by hand.
-The load rule above never separates them: below the floor it keeps
+The load rule above never separates them. Below the floor it keeps
 everything, and the pusher's pull and the front's poke are calls, which
 wake the callee on the caller's node. So, besides load, a wake-up now
-looks at one thing it already knows: which actors this node holds.
+looks at one more thing it already knows: which actors this node holds.
 
-**The key.** A class may name one other class to wake apart from, in
-`wasmkeep.toml`:
+**The pair.** In a version with classes named `room` and `pusher` (the
+broadcast SDKs' default class names), `room/x` and `pusher/x` are kept
+apart, for every name `x`; this matches the SDKs' addressing
+(`room/lobby` has the pusher `pusher/lobby`). Each node works it out
+from the version's classes. Nothing is written at deploy: the manifest,
+its format and the version id are unchanged, and an upgraded node
+applies the rule without a redeploy. There is no setting in this
+version. A key naming other classes (renamed SDK classes, other pairs)
+is future work: it needs a manifest line that older nodes cannot read,
+and so a format and a deploy gate of its own.
 
-```toml
-[classes.pusher]
-component = "dist/pusher.wasm"
-apart-from = "room"     # or false: apart from nothing
-```
+**The rule.** An actor of the pair is kept apart on a wake-up when all
+of these hold:
 
-The version carries it as a manifest line, `apart <class> <other>` (`-`
-for `false`). The relation is symmetric and per name: `pusher` apart
-from `room` keeps `pusher/x` and `room/x` apart, for every `x`, the
-broadcast SDKs' addressing (`room/lobby` has the pusher `pusher/lobby`).
-An entry naming a class the version lacks, or itself, is refused at
-deploy.
+- the wake-up is this node's own: a request that reached it unforwarded
+  (with a body that can be read into memory, as section 1's placeable
+  requests), a call from an actor or the front here, or an alarm due
+  here that no node handed to it;
+- the route read answered "nobody holds it" (section 1). "Another node
+  holds it" sends it there as ever. "Try here" (a record naming a node
+  not live, or this node with a release pending, a stub mailbox here, or
+  a read that failed) is the ordinary path, takeover included;
+- this node holds the companion now (read from memory, no bucket read);
+- placement is on (`--no-placement` turns this rule off with the load
+  rule: an operator's switch during an upgrade, or for an app whose
+  classes happen to be named `room` and `pusher`).
 
-**The default.** Without an entry for either class, a version with
-classes named `room` and `pusher` (the SDKs' default class names) keeps
-them apart. It is decided by each node from the version's classes, not
-written at deploy: a version that says nothing keeps its manifest format,
-bytes and id, and an upgraded node applies it without a redeploy. Renamed
-classes need the key; `apart-from = false` on either class turns the
-default off.
+Then:
 
-**The rule.** For an actor whose class is kept apart, on a wake-up that
-is this node's own (a request that reached it unforwarded, a call from an
-actor or the front here, an alarm due here), when the actor is not held
-here and this node holds a companion (same name, the other class; read
-from memory, no bucket read):
-
-1. If an eligible peer exists (ADR 0014's: live, same app, `serving`, not
-   asked to drain, not suspected, reachable), the event goes to the
-   rendezvous choice among them, as a drain sends it: a request or call
-   is forwarded, an alarm handed off (`x-wasmkeep-alarm-handoff`). The
-   peer acquires it as any forwarded event; it never sends it on.
+1. If an eligible peer exists (ADR 0014's: live, same app, `serving`,
+   not asked to drain, not suspected, reachable), the event goes to the
+   rendezvous choice among them, as a drain sends it. A request or call
+   is forwarded and an alarm handed off (`x-wasmkeep-alarm-handoff`);
+   the peer acquires it, as any event another node sent, and never sends
+   it on. A handed alarm is remembered on its receiver until after it is
+   due, and the delivery there acquires the actor whatever it finds: one
+   hop at most, also when the companion moved to the receiver in flight.
 2. Otherwise (one node alive, every peer draining or suspected), it is
    acquired here, as without the rule. **The rule never refuses a
    wake-up.**
 
-A draining node choosing the peer for such an actor (section 10, and
-ADR 0014's hand-over and alarm hand-off) reads its companions' records,
-one read each with a 1 s bound, and chooses among the peers that do not
-hold one; if every peer holds one, the plain choice. A placed hop
-(section 6) for such an actor is refused, with the mark, by a receiver
-that holds a companion (`wasmkeep_placements_received_total{outcome="apart"}`):
-its sender runs it, or sends it apart by the rule. Never under the rule:
-an event another node sent (it would be answered `503`), a take (an
-operator's move wins; the next cold wake-up applies the rule), a
-WebSocket upgrade (section 1), an actor parked here (ADR 0024: its
-record names this node), and the operator passes.
+A draining node choosing the peer for an actor of the pair (section 10,
+and ADR 0014's hand-over and alarm hand-off) reads the companion's
+record, one read with a 1 s bound, and chooses among the peers that do
+not hold it; if every peer holds it, the plain choice.
 
-**When the hop fails.** It fails as a drain's forward does: a peer that
-dies between its heartbeat and the hop answers the request `503` (a call
-`failed`), and is suspected for a heartbeat horizon, so the next wake-up
-chooses another peer or, with none, wakes here. A `5xx` the actor itself
-answered on the peer (it carries `x-wasmkeep-node`) no longer suspects
-that peer, for this rule and for a drain alike: an actor's error says
-nothing of its node. A record read that failed (routing's "try here")
-reaches the rule too; the peer then reads the record itself, and a holder
-it finds answers the forwarded event `503`, as during a drain.
+A placed hop (section 6) is refused, with the mark, by a receiver that
+holds the actor's companion, and with `x-wasmkeep-placed-reason: apart`
+beside it (`wasmkeep_placements_received_total{outcome="apart"}`). Its
+sender runs the event, or sends it apart by the rule, and does not back
+that receiver off: the refusal says nothing of its load. A sender of an
+older version backs it off, as for any refusal.
 
-**What it is not.** It is not a pin and it moves nothing running: a pair
-that is together stays together until one of them hibernates, which a
-busy pusher never does, so such a pair stays together until an
-operator moves one (ADR 0017). Two
-wake-ups of a pair at the same moment on one node can both acquire
-there, as can a pair on nodes of an older version. It does not depend on
-load or on placement being on: `--no-placement` turns off the load rule,
-not this one. A hop under this rule is a drain's forward, not a placed
-hop: it carries no placed mark, so the properties of the load rule
-(direction, the budget, no overshoot, quiet, an idle cluster silent) do
-not count it, and it needs no capability on the receiver.
+**When the peer does not run it.** A peer's `503` that its actor did not
+answer (no `x-wasmkeep-node`) and whose outcome is not unknown means the
+event did not run there. Examples: the peer started draining, had no
+slot, or found ownership changing. The sender then suspects the peer for
+a heartbeat horizon and runs the event here, once, by the ordinary path.
+An answer of unknown outcome (the hop failed after the write, no answer
+in time) is returned as a failed forward is, and the peer is suspected.
+A `5xx` the actor answered, or an actor error (`500`: a trap, a restore
+that failed), suspects nobody. The same holds for a drain's forwards: an
+actor's error says nothing of its node.
+
+**Never under the rule:** an event another node sent, a handed alarm, a
+take (an operator's move wins; the next cold wake-up applies the rule),
+a WebSocket upgrade (section 1), a request with a streamed body, an
+actor parked here (ADR 0024), and the operator passes.
+
+**What it is not.** It is not a pin, and it moves nothing running. A
+pair that is together stays together until one of them hibernates, and
+a busy pusher never hibernates. So a pair that lands together stays
+together until an operator moves one (ADR 0017). That happens when:
+
+- two wake-ups of the pair reach one node at the same moment: both find
+  the other not yet held, and both acquire there;
+- the waking node had no eligible peer;
+- the pusher's record named a node that died, and the node taking it
+  over holds the room (a takeover is "try here", not "nobody");
+- a node of an older version wakes one of them.
+
+**Two nodes and a rolling restart.** With two nodes, restarting one
+always leaves the other alone: while one drains, every wake-up and
+hand-over goes to the other, which holds both, `alone`. When the first
+comes back, nothing moves them: the pair stays on one node until one
+hibernates or is moved. Three nodes or more keep a peer for each step
+of a rolling restart.
+
+A hop under this rule is a drain's forward, not a placed hop: it carries
+no placed mark, needs no capability on the receiver, and the properties
+of the load rule (direction, the budget, no overshoot, quiet, an idle
+cluster silent) do not count it.
 
 **Metrics.** `wasmkeep_placement_apart_total{outcome}`: wake-ups of an
 actor whose companion this node held, `sent` to a peer or woken here
 `alone`.
 
-**Mixed versions.** The default pair needs nothing from the version, so
-a 0.7 node reads every version as before and simply keeps what it wakes;
-a 0.8 node sending to it apart sends a plain forward, which it acquires.
-An `apart` line makes the manifest format 8, which a 0.7 node cannot
-read: such a deploy is refused while a live node of the app lacks the
-capability word `apart` (heartbeat line 11, announced by every node of
-this version), as format 5 waits for `flush`. A 0.7 CLI refuses a
-`wasmkeep.toml` with `apart-from` (unknown key).
+**Mixed versions.** Nothing is new in the bucket or on the heartbeat.
+A 0.7 node keeps what it wakes. A forward from a 0.8 node is a plain
+forward, which it acquires. A placed refusal's reason is a header that
+it ignores.
 
-**Tests.** The pure rule (`placement::companions`, `apart`,
-`peer_apart`); the manifest line and the deploy gate; the key in the
-project file; three nodes, default placement, where a room and its
-pusher woken through one node by a request and by a call land on
-different nodes; a draining pusher's node handing its alarm and its next
-wake-up to the node without the room, for names whose plain drain choice
-is the room's node; a placed hop refused by the room's node and run on
-its sender; one node where both wake; the default turned off; and the
-SDK's own room and pusher on three nodes, clients joining and
-publishing through one node, ending on different nodes
-(`tests/room_cluster.rs`). The other room cluster tests lay their actors
-out themselves and turn the default off. The simulation
-`sim/tests/madsim_apart.rs` runs the rule over drains, restarts and
-hibernations: one hop at most, never refused, and a pair shares a node
-only when the deciding node had no peer without a companion; routing
-without the rule fails that.
+**Tests.**
+
+- The pure rule: `placement::companion`, `apart` and `peer_apart`.
+- How a peer's answer is read (not run, failed).
+- `tests/cluster/apart.rs`, plain and over TLS, on three nodes with
+  default placement:
+  - a room and its pusher woken through one node, by a request and by a
+    call, in both orders, land on different nodes;
+  - a draining pusher's node hands its alarm and its next wake-up to the
+    node without the room, for names whose plain drain choice is the
+    room's node;
+  - an alarm due beside its room on a node that is not draining is
+    handed once and fired on a peer;
+  - a pusher whose record names a dead node is taken over where the
+    request landed, not sent apart, and suspects no peer;
+  - a placed hop refused by the room's node runs on its sender and backs
+    nothing off;
+  - one node where both wake;
+  - placement off.
+- `tests/room_cluster.rs`: the SDKs' own room and pusher, clients
+  joining and publishing through one node, end on different nodes. The
+  other room cluster tests lay out their actors themselves and run with
+  placement off.
+- The simulation `sim/tests/madsim_apart.rs` models the decision
+  around the real pure rule, over drains, deaths, hibernations and
+  alarms whose companion moves in flight. A handed alarm hops once, and
+  a pair shares a node only where the rule cannot help. Each property
+  has a mutation that fails it: a receiver that judges a handed alarm
+  again, and routing blind to the rule. It does not model simultaneous
+  wake-ups or leases.

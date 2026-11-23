@@ -49,7 +49,7 @@ impl ActorState {
             let origin = owner.idle_origin_ms();
             self.owner_hint = None;
             if self
-                .ensure_owner_with(Some((&owner.version, origin)))
+                .ensure_owner_with(Some((&owner.version, origin)), false)
                 .await
                 .is_err()
             {

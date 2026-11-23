@@ -184,7 +184,7 @@ impl ActorService {
         self.inner.forget_owner(address);
         // Its record may still name the sender, its release pending: the
         // alarm path looks again rather than leave it to the sender.
-        self.inner.note_handed(address);
+        self.inner.note_handed(address, at);
         // An earlier time already registered here stays.
         self.inner.alarms.set_if_earlier(address.clone(), at);
         text_response(StatusCode::OK, "armed\n")
@@ -348,12 +348,7 @@ async fn hand_off(
 ) -> bool {
     // An actor kept apart from a companion goes to a peer that does not
     // hold it, if there is one (ADR 0041, amendment of 2026-11-22).
-    let companions = inner.companions_of(address);
-    let avoid = if companions.is_empty() {
-        Vec::new()
-    } else {
-        ActorState::companion_owners(companions, cluster).await
-    };
+    let avoid = ActorState::companion_owner(inner.companion(address), cluster).await;
     let Some(peer) = cluster.chosen_peer_apart(address, &avoid) else {
         inner.alarms.set_if_earlier(address.clone(), at);
         return false;

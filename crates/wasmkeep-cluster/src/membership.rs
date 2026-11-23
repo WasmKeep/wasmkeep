@@ -132,11 +132,6 @@ pub struct NodeInfo {
     /// only such a node is a candidate, or counts in `N`. `false` from
     /// nodes that predate it, and from a process with placement off.
     pub can_place: bool,
-    /// It reads the manifest's `apart` lines (format 8) and keeps an actor
-    /// apart from its companion at wake-up (heartbeat line 11, `apart`,
-    /// ADR 0041, amendment of 2026-11-22): a deploy that writes such a
-    /// line is refused while a live node lacks it.
-    pub can_apart: bool,
     /// The process that runs it (heartbeat line 11, `process=<id>`, ADR
     /// 0038): the node ids of one process share its address and
     /// certificate. `None` from nodes that predate it or name none.
@@ -488,7 +483,6 @@ impl NodeInfo {
             can_recorded_head: words.can_recorded_head,
             can_multi_app: words.can_multi_app,
             can_place: words.can_place,
-            can_apart: words.can_apart,
             process: words.process,
             instance: lease.instance,
             lease: Some(lease.state),
@@ -517,7 +511,6 @@ impl NodeInfo {
             (self.can_assets, "assets"),
             (self.can_blobs, "blobs"),
             (self.can_place, "place"),
-            (self.can_apart, "apart"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -555,7 +548,6 @@ impl NodeInfo {
             can_recorded_head: words.contains(&"recorded-head"),
             can_multi_app: words.contains(&"multi-app"),
             can_place: words.contains(&"place"),
-            can_apart: words.contains(&"apart"),
             process: words.iter().find_map(|w| {
                 let id = w.strip_prefix("process=")?;
                 validate_node_id(id).is_ok().then(|| id.to_owned())
@@ -836,7 +828,6 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_recorded_head: true,
             can_multi_app: true,
             can_place: self.place,
-            can_apart: true,
             process: self.process.clone(),
             instance: self.instance.clone(),
             lease: None,
@@ -1226,7 +1217,6 @@ mod tests {
             can_recorded_head: false,
             can_multi_app: false,
             can_place: false,
-            can_apart: false,
             process: None,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
@@ -1273,7 +1263,6 @@ mod tests {
             can_recorded_head: false,
             can_multi_app: false,
             can_place: false,
-            can_apart: false,
             process: None,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
@@ -1356,7 +1345,6 @@ mod tests {
             can_recorded_head: false,
             can_multi_app: false,
             can_place: false,
-            can_apart: false,
             process: None,
         }
     }
@@ -1740,7 +1728,6 @@ mod tests {
             can_recorded_head: false,
             can_multi_app: false,
             can_place: false,
-            can_apart: false,
             process: None,
         })
     }
@@ -1857,7 +1844,7 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs apart"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs"
             ),
             "{payload}"
         );
@@ -2258,8 +2245,6 @@ mod tests {
         // `place` is a capability word like the others, off by default.
         assert!(NodeInfo::words(Some("take place")).can_place);
         assert!(!NodeInfo::words(Some("take")).can_place);
-        assert!(NodeInfo::words(Some("take apart")).can_apart);
-        assert!(!NodeInfo::words(Some("take place")).can_apart);
         assert!(node.capabilities().any(|w| w == "place"));
         assert!(!loaded_node().capabilities().any(|w| w == "place"));
     }

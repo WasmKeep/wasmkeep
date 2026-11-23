@@ -262,45 +262,21 @@ pub fn receive(
 /// `pusher/lobby`.
 pub const DEFAULT_APART: (&str, &str) = ("pusher", "room");
 
-/// An `apart` entry naming no class: the class is kept apart from nothing,
-/// which also turns the default pair off. Never a class name (a class
-/// starts with a letter).
-pub const APART_NONE: &str = "-";
-
-/// The classes whose actor of the same name `class`'s actor is kept apart
-/// from (ADR 0041, amendment of 2026-11-22), sorted. `declared` is the
-/// version's `apart` entries (a class, then the class it names, or
-/// [`APART_NONE`]); `classes` the version's classes. The relation is
-/// symmetric: `pusher` apart from `room` keeps `room/x` apart from
-/// `pusher/x` too. An entry naming a class the version lacks, or itself,
-/// names nothing. Without an entry for either class, [`DEFAULT_APART`]
-/// applies when the version has both.
-pub fn companions(
-    declared: &BTreeMap<String, String>,
-    classes: &[&str],
-    class: &str,
-) -> Vec<String> {
-    let has = |c: &str| classes.contains(&c);
-    let mut pairs: Vec<(&str, &str)> = declared
-        .iter()
-        .filter(|(c, o)| *c != *o && o.as_str() != APART_NONE && has(c) && has(o))
-        .map(|(c, o)| (c.as_str(), o.as_str()))
-        .collect();
+/// The class whose actor of the same name `class`'s actor is kept apart
+/// from (ADR 0041, amendment of 2026-11-22), if any: the other class of
+/// [`DEFAULT_APART`], when `classes` (the version's) has both. Symmetric:
+/// `room/x` and `pusher/x` are kept apart from each other. Only the
+/// built-in pair: a setting naming other classes is future work.
+pub fn companion(classes: &[&str], class: &str) -> Option<&'static str> {
     let (a, b) = DEFAULT_APART;
-    if has(a) && has(b) && !declared.contains_key(a) && !declared.contains_key(b) {
-        pairs.push((a, b));
+    if !(classes.contains(&a) && classes.contains(&b)) {
+        return None;
     }
-    let mut out: Vec<String> = pairs
-        .into_iter()
-        .filter_map(|(c, o)| match () {
-            () if c == class => Some(o.to_owned()),
-            () if o == class => Some(c.to_owned()),
-            () => None,
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    match class {
+        c if c == a => Some(b),
+        c if c == b => Some(a),
+        _ => None,
+    }
 }
 
 /// Where a wake-up of an actor kept apart from a companion goes instead
@@ -712,56 +688,15 @@ mod tests {
         );
     }
 
-    fn declared(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
-        entries
-            .iter()
-            .map(|(c, o)| ((*c).to_owned(), (*o).to_owned()))
-            .collect()
-    }
-
     #[test]
     fn the_room_and_its_pusher_are_apart_by_default_both_ways() {
         let classes = ["directory", "edge", "pusher", "relay", "room"];
-        let none = BTreeMap::new();
-        assert_eq!(companions(&none, &classes, "pusher"), ["room"]);
-        assert_eq!(companions(&none, &classes, "room"), ["pusher"]);
-        assert!(companions(&none, &classes, "edge").is_empty());
+        assert_eq!(companion(&classes, "pusher"), Some("room"));
+        assert_eq!(companion(&classes, "room"), Some("pusher"));
+        assert_eq!(companion(&classes, "edge"), None);
         // Only with both classes in the version.
-        assert!(companions(&none, &["room", "edge"], "room").is_empty());
-        assert!(companions(&none, &["pusher"], "pusher").is_empty());
-    }
-
-    #[test]
-    fn a_declared_entry_names_the_pair_or_turns_the_default_off() {
-        let classes = ["feed", "fan", "pusher", "room"];
-        // Renamed classes: the entry keeps them apart, both ways; the
-        // default pair still holds for the classes nobody declared.
-        let named = declared(&[("fan", "feed")]);
-        assert_eq!(companions(&named, &classes, "fan"), ["feed"]);
-        assert_eq!(companions(&named, &classes, "feed"), ["fan"]);
-        assert_eq!(companions(&named, &classes, "pusher"), ["room"]);
-        // `-` on either class of the default pair turns it off.
-        for off in ["pusher", "room"] {
-            let off = declared(&[(off, APART_NONE)]);
-            assert!(companions(&off, &classes, "pusher").is_empty());
-            assert!(companions(&off, &classes, "room").is_empty());
-        }
-        // An entry on one of them replaces the default for both.
-        let other = declared(&[("pusher", "feed")]);
-        assert_eq!(companions(&other, &classes, "pusher"), ["feed"]);
-        assert!(companions(&other, &classes, "room").is_empty());
-        assert_eq!(companions(&other, &classes, "feed"), ["pusher"]);
-        // A class the version lacks, or the class itself, names nothing.
-        let odd = declared(&[("fan", "gone"), ("feed", "feed")]);
-        assert!(companions(&odd, &classes, "fan").is_empty());
-        assert!(companions(&odd, &classes, "feed").is_empty());
-        // Several classes may name one: each is apart from it, sorted,
-        // beside the default pair (neither of its classes declared).
-        let two = declared(&[("fan", "room"), ("feed", "room")]);
-        assert_eq!(
-            companions(&two, &classes, "room"),
-            ["fan", "feed", "pusher"]
-        );
+        assert_eq!(companion(&["room", "edge"], "room"), None);
+        assert_eq!(companion(&["pusher"], "pusher"), None);
     }
 
     #[test]

@@ -228,7 +228,6 @@ impl ActorService {
                 routed = Some(route);
             }
             loop {
-                let own = !crate::cluster::never_forward(&req);
                 let handback = match self
                     .dispatch_routed(
                         address.clone(),
@@ -236,7 +235,10 @@ impl ActorService {
                         Arc::clone(&chain),
                         outside,
                         routed.take(),
-                        own,
+                        // A streamed body cannot run here after a peer did
+                        // not run it: never sent apart (`place_request`
+                        // buffers the ones that may be).
+                        false,
                     )
                     .await
                 {
@@ -285,10 +287,7 @@ impl ActorService {
                         let sent = !crate::cluster::never_forward(&req);
                         let response = cluster.forward(&node, req).await;
                         if response.status().is_server_error() {
-                            // A 5xx its actor answered is the actor's, not
-                            // the node's.
-                            let served = response.headers().contains_key(SERVED_BY);
-                            if elsewhere && sent && !served {
+                            if elsewhere && sent && super::routing::peer_failed(&response) {
                                 // Down, unreachable, or draining itself: not
                                 // chosen again for a while (ADR 0014).
                                 cluster.suspect(&node);
@@ -380,7 +379,24 @@ impl ActorService {
             {
                 crate::metrics::placement_kept(app, reason);
             }
-            return Err(Box::new(req));
+            // Kept here, but this node holds the actor's companion (ADR
+            // 0041, amendment of 2026-11-22): read into memory, so that if
+            // the peer it is sent to does not run it, it runs here.
+            if !self.inner.companion_here(cluster, address) {
+                return Err(Box::new(req));
+            }
+            let (parts, body) = req.into_parts();
+            let max = usize::try_from(crate::cluster::MAX_PLACED_BODY).unwrap_or(usize::MAX);
+            let read = http_body_util::BodyExt::collect(http_body_util::Limited::new(body, max));
+            let Ok(body) = read.await else {
+                return Ok(text_response(
+                    StatusCode::BAD_REQUEST,
+                    "request body unreadable or too large\n",
+                ));
+            };
+            return Ok(self
+                .run_buffered(cluster, address, parts, body.to_bytes(), chain, outside)
+                .await);
         }
         // Read into memory, so that a refusal can run it here (section 6).
         // No deadline of its own: the server's limits apply, as to a body
@@ -432,6 +448,11 @@ impl ActorService {
                 self.run_buffered(cluster, address, parts, body, chain, outside)
                     .await
             }
+            // The receiver holds the actor's companion: no backoff.
+            Hop::Apart => {
+                self.run_buffered(cluster, address, parts, body, chain, outside)
+                    .await
+            }
             Hop::Failed(why) => {
                 cluster.placement_backoff(&node);
                 tracing::warn!(node, error = %why, "a placed request's hop failed");
@@ -454,36 +475,55 @@ impl ActorService {
         chain: &Chain,
         outside: bool,
     ) -> Response<HyperOutgoingBody> {
-        let full = http_body_util::BodyExt::map_err(
-            http_body_util::Full::new(body.clone()),
-            |never: std::convert::Infallible| -> wasmtime_wasi_http::Error { match never {} },
-        );
-        let req = Request::from_parts(parts, full);
-        match self
-            .dispatch_routed(address.clone(), req, Arc::clone(chain), outside, None, true)
-            .await
-        {
-            Ok(response) => response,
-            Err(handback) => {
-                let Handback {
-                    node,
+        fn never(never: std::convert::Infallible) -> wasmtime_wasi_http::Error {
+            match never {}
+        }
+        let full = |body: &bytes::Bytes| {
+            http_body_util::BodyExt::map_err(http_body_util::Full::new(body.clone()), never)
+        };
+        // The record read again; kept apart from a companion held here if
+        // nobody holds the actor (ADR 0041, amendment of 2026-11-22).
+        let mut apart = true;
+        let mut req = Request::from_parts(parts.clone(), full(&body));
+        loop {
+            let handback = match self
+                .dispatch_routed(
+                    address.clone(),
                     req,
-                    elsewhere,
-                } = *handback;
-                let (parts, _) = req.into_parts();
-                let req = Request::from_parts(parts, http_body_util::Full::new(body));
-                let response = cluster.forward_buffered(&node, req).await;
-                if response.status().is_server_error() {
-                    if elsewhere {
-                        if !response.headers().contains_key(SERVED_BY) {
-                            cluster.suspect(&node);
-                        }
-                    } else {
-                        self.inner.forget_owner(address);
+                    Arc::clone(chain),
+                    outside,
+                    None,
+                    apart,
+                )
+                .await
+            {
+                Ok(response) => return response,
+                Err(handback) => *handback,
+            };
+            let Handback {
+                node,
+                req: back,
+                elsewhere,
+            } = handback;
+            let (back_parts, _) = back.into_parts();
+            let hop = Request::from_parts(back_parts, http_body_util::Full::new(body.clone()));
+            let response = cluster.forward_buffered(&node, hop).await;
+            if elsewhere {
+                if super::routing::not_run_by_peer(&response) {
+                    cluster.suspect(&node);
+                    // Sent apart and not run there: run it here, once.
+                    if apart {
+                        apart = false;
+                        req = Request::from_parts(parts.clone(), full(&body));
+                        continue;
                     }
+                } else if super::routing::peer_failed(&response) {
+                    cluster.suspect(&node);
                 }
-                response
+            } else if response.status().is_server_error() {
+                self.inner.forget_owner(address);
             }
+            return response;
         }
     }
 
@@ -515,7 +555,8 @@ impl ActorService {
         // Kept apart from a companion this node holds (ADR 0041, amendment
         // of 2026-11-22): its sender runs it, or sends it apart.
         if self.inner.companion_here(cluster, &address) {
-            return refuse("apart", "this node holds the actor's companion\n");
+            crate::metrics::placement_received(app, "apart");
+            return crate::cluster::apart_refusal("this node holds the actor's companion\n");
         }
         let reservation = match cluster.arrive(mark, || super::load::rooms(&self.inner)) {
             Ok(reservation) => reservation,
@@ -632,9 +673,11 @@ impl ActorService {
 
     /// [`Self::dispatch`], with the route already read for this request
     /// (`routed`), so that a placement's decision costs no second read.
-    /// `own`: a wake-up of this node's own, which an actor kept apart from
-    /// a companion held here does not take (ADR 0041, amendment of
-    /// 2026-11-22); `false` for an event another node sent.
+    /// `own`: a wake-up of this node's own, whose body can be run here again
+    /// (buffered): an actor kept apart from a companion held here is then
+    /// sent to a peer if the route read answers that nobody holds it (ADR
+    /// 0041, amendment of 2026-11-22). `false` for an event another node
+    /// sent, or a streamed body.
     pub(super) async fn dispatch_routed<B>(
         &self,
         address: ActorAddress,
@@ -652,6 +695,7 @@ impl ActorService {
             Some(route) => route,
             None => self.inner.cold_route(&address).await,
         };
+        let apart = own && route == Cold::Nobody;
         if let Cold::Owner(owner) = route {
             return Err(Box::new(Handback {
                 node: owner,
@@ -670,7 +714,7 @@ impl ActorService {
                 state.record_mailbox_wait(waited);
                 Box::pin(async move {
                     state
-                        .owned_request(req, response_tx, chain, outside, own)
+                        .owned_request(req, response_tx, chain, outside, apart)
                         .await;
                 })
             },
@@ -684,6 +728,7 @@ impl ActorService {
                 // The host's mark only (ADR 0041): a guest cannot make a
                 // placed event's sender run it a second time.
                 response.headers_mut().remove(crate::cluster::PLACED);
+                response.headers_mut().remove(crate::cluster::PLACED_REASON);
                 if let Some(cluster) = &self.inner.cluster
                     && let Ok(v) = hyper::header::HeaderValue::from_str(&cluster.node_id)
                 {

@@ -731,7 +731,7 @@ async fn activation_deadline(lease_lapse: bool) {
             requires: Arc::default(),
             warned: Arc::default(),
             writes: crate::apps::Writes::Strict,
-            apart: Arc::default(),
+            apart: None,
         }),
     );
     let address = ActorAddress::new("default", "test", "timer").unwrap();
@@ -901,7 +901,7 @@ async fn activation_deadline_drains_write_before_releasing_hold() {
             requires: Arc::default(),
             warned: Arc::default(),
             writes: crate::apps::Writes::Strict,
-            apart: Arc::default(),
+            apart: None,
         }),
     );
     let address = ActorAddress::new("default", "test", "write").unwrap();

@@ -36,11 +36,7 @@ impl ActorService {
             let rules = Arc::clone(&rules);
             let requires = Arc::new(config.requires.get(&name).cloned().unwrap_or_default());
             let writes = writes_of(&config.batched, &name);
-            let apart = Arc::new(wasmkeep_cluster::placement::companions(
-                &config.apart,
-                &names,
-                &name,
-            ));
+            let apart = wasmkeep_cluster::placement::companion(&names, &name);
             map.insert(
                 name,
                 Arc::new(ActorClass {
@@ -234,7 +230,6 @@ impl ActorService {
                         cluster,
                         held: None,
                         owner_hint: None,
-                        apart_wake: false,
                         behind_deploy: false,
                         activation_interrupted: false,
                         egress: Arc::clone(&egress),
@@ -494,20 +489,30 @@ impl ActorService {
     pub(super) fn fire_alarm(&self, address: ActorAddress, delivery: Delivery) {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            if let Some(owner) = inner.remote_owner(&address).await {
+            let route = inner.cold_route(&address).await;
+            if let Cold::Owner(owner) = route {
                 inner.recheck_if_handing_over(&address, &owner);
                 inner.alarms.complete(address, delivery);
                 return;
             }
+            // Kept apart (ADR 0041, amendment of 2026-11-22) only when
+            // nobody holds the actor and no node handed this alarm here: a
+            // handed alarm is acquired here, never sent on again.
+            let apart = route == Cold::Nobody && !inner.handed_lately(&address);
             let event = inner.mailboxes.submit_wait_timed(
                 &address,
                 ADMISSION_WAIT,
                 move |state: &mut ActorState, waited| {
                     state.record_mailbox_wait(waited);
                     Box::pin(async move {
-                        state.alarm(delivery.hint, delivery.swept).await;
-                        // Set when another node turned out to own it.
-                        state.owner_hint.as_ref().map(|(owner, _)| owner.clone())
+                        state.alarm(delivery.hint, delivery.swept, apart).await;
+                        // Set when another node turned out to own it; and
+                        // whether nothing of the actor is held here (its
+                        // alarm handed off, or not runnable now).
+                        (
+                            state.owner_hint.as_ref().map(|(owner, _)| owner.clone()),
+                            state.held.is_none() && state.live.is_none(),
+                        )
                     })
                 },
             );
@@ -517,7 +522,7 @@ impl ActorService {
                 Err(MailboxError::Capacity(_) | MailboxError::Full(_)) => {
                     inner.alarms.retry(address, delivery);
                 }
-                Ok(Some(owner)) => {
+                Ok((Some(owner), _)) => {
                     // A stub that only learned the owner: no slot for it.
                     inner.mailboxes.hibernate(&address);
                     inner.remember_owner(&address, &owner);
@@ -537,9 +542,16 @@ impl ActorService {
                 // Ran (whatever it found), or the node is shutting down
                 // (`Closed`):
                 // other nodes take over, or the startup scan re-arms it.
-                Ok(None) | Err(_) => {
-                    // A draining node handed the alarm off: nothing of the
-                    // actor stays here (ADR 0014).
+                Ok((None, stub)) => {
+                    // The alarm handed off (a drain, ADR 0014, or an actor
+                    // kept apart, ADR 0041): nothing of the actor stays
+                    // here. A stub that holds nothing keeps no slot.
+                    if stub || inner.cluster.as_ref().is_some_and(|c| c.draining()) {
+                        inner.mailboxes.hibernate(&address);
+                    }
+                    inner.alarms.complete(address, delivery);
+                }
+                Err(_) => {
                     if inner.cluster.as_ref().is_some_and(|c| c.draining()) {
                         inner.mailboxes.hibernate(&address);
                     }

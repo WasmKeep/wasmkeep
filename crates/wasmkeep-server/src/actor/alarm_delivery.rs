@@ -16,7 +16,9 @@ impl ActorState {
     /// `hint` is the time the alarm was registered for on this node (from an
     /// event, the startup scan, a retry or the bucket's index: `swept`); the
     /// committed alarm in the database decides what runs.
-    pub(super) async fn alarm(&mut self, hint: u64, swept: bool) {
+    /// `apart`: nobody held the actor at the route read and no node handed
+    /// this alarm here ([`Self::ensure_owner_with`]).
+    pub(super) async fn alarm(&mut self, hint: u64, swept: bool, apart: bool) {
         self.chain = Arc::from(Vec::new());
         // The event runs on the class it takes now (ADR 0013).
         if let Err(e) = self.refresh_class() {
@@ -30,7 +32,7 @@ impl ActorState {
         // This node's own wake-up: an actor kept apart from a companion
         // held here is handed to a peer as a drain hands it (ADR 0041,
         // amendment of 2026-11-22).
-        match self.ensure_owner_waking().await {
+        match self.ensure_owner_with(None, apart).await {
             Ok(()) => {}
             // Another node owns the actor: it fires the alarm (it is in the
             // owner's committed state and the bucket's index).

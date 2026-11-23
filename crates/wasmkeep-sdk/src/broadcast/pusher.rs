@@ -173,8 +173,8 @@ pub mod handler {
     }
     /// The room's class, `room` by default: the pusher `pusher/lobby` pulls
     /// from `<class>/lobby`. Nodes keep the classes `room` and `pusher`
-    /// apart at wake-up; with other names, set `apart-from` in
-    /// `wasmkeep.toml`.
+    /// apart at wake-up (ADR 0041); classes named otherwise are not kept
+    /// apart.
     pub fn room_class(class: &str) {
         ROOM_CLASS.set(class.into());
     }
