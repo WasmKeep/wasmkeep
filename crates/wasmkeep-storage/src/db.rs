@@ -1016,7 +1016,9 @@ impl ActorDb {
             .as_mut()
             .ok_or(CaptureError::Sql("capture not started".into()))?;
         let changes = match capture.capture() {
-            Err(CaptureError::Lost(_)) if restart_ok => {
+            // A restart rewrites the header in place; anything else (the
+            // file shrank, say) is someone else's doing and stays an error.
+            Err(CaptureError::Lost(why)) if restart_ok && why == "the WAL header changed" => {
                 capture.wal_truncated();
                 self.wal_restart_ok = false;
                 capture.capture()?
@@ -1589,14 +1591,19 @@ const RESERVED_PREFIX: &str = "_wasmkeep_";
 /// SQLite virtual machine steps between deadline checks.
 const PROGRESS_STEPS: std::ffi::c_int = 10_000;
 
-// SQLite limits on guest connections, below SQLite's defaults: each bounds
-// what one statement can make SQLite allocate or compute.
-/// Columns in a table, index or result (SQLite: 2000).
-const GUEST_MAX_COLUMNS: i32 = 500;
-/// Arguments to one function call (SQLite: 1000).
-const GUEST_MAX_FUNCTION_ARGS: i32 = 64;
-/// Depth of an expression tree (SQLite: 1000).
-const GUEST_MAX_EXPR_DEPTH: i32 = 256;
+// SQLite limits on guest connections: each bounds what one statement can
+// make SQLite allocate or compute. SQLite applies the column, argument and
+// depth limits while it loads the schema, too: one lower than what a
+// stored table or CHECK, DEFAULT, generated-column or index expression
+// already uses makes the whole database unreadable. Those stay where an
+// existing database cannot already be past them.
+/// Columns in a table, index or result: SQLite's own maximum (2000), as
+/// set explicitly; lower, a wider existing table would fail to load.
+const GUEST_MAX_COLUMNS: i32 = 2000;
+/// Arguments to one function call (SQLite: 1000 since 3.48, 127 before).
+const GUEST_MAX_FUNCTION_ARGS: i32 = 127;
+/// Depth of an expression tree: SQLite's default (1000), as set explicitly.
+const GUEST_MAX_EXPR_DEPTH: i32 = 1000;
 /// Terms of a compound `SELECT` (SQLite: 500).
 const GUEST_MAX_COMPOUND_SELECT: i32 = 100;
 /// Instructions in one compiled statement (SQLite: 250,000,000).

@@ -165,9 +165,11 @@ fn replace(ctx: &Context<'_>, budget: &Budget, max_len: usize) -> Result<Option<
             if rep.len() > pattern.len() {
                 out_len += rep.len() - pattern.len();
                 if out_len > max_len {
+                    // No message: rusqlite would set it after the code,
+                    // which turns the code back into a plain error.
                     return Err(Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_TOOBIG),
-                        Some("string or blob too big".into()),
+                        None,
                     ));
                 }
             }

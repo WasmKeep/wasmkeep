@@ -95,23 +95,25 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   budget counts text/blob payloads after UTF-8 replacement, column names
   once, and conservative result/row/cell, allocation and vector-capacity
   overhead, including empty values ([details](concepts.md#storage)). A statement
-  is stopped at the event's wall clock and SQL CPU budget, checked every
-  10,000 steps of SQLite's virtual machine and inside `instr`, `replace`
-  and `trim`. Other steps on large values are slow too (a `LIKE` on a
-  16 MiB value takes about a second), so a statement built to repeat them
-  between two checks can still run past both. Host statements have the
-  same wall-clock limit.
-- SQLite limits on guest connections: 500 columns, 64 function arguments,
-  an expression depth of 256, 100 terms in a compound `SELECT`, 250,000
-  instructions per statement, 100 bytes per `LIKE` or `GLOB` pattern.
-  SQLite's heap is capped at 4 GiB for the whole process, temporary data
-  (sorts, materialised subqueries) included, as it stays in memory: a
-  statement that needs more fails with `quota-exceeded`. The cap is shared,
-  so while one statement holds most of it, others can fail too.
+  is stopped at the event's wall clock and SQL CPU budget, checked between
+  steps of SQLite's virtual machine and inside `instr`, `replace` and
+  `trim`; a single step over a large value is not interrupted, so a
+  statement can overrun them. Host statements have the same wall-clock
+  limit.
+- SQLite limits on guest connections: 127 function arguments, 100 terms in
+  a compound `SELECT`, 250,000 instructions per statement, 100 bytes per
+  `LIKE` or `GLOB` pattern (columns and expression depth stay at SQLite's
+  2,000 and 1,000: SQLite checks those when it loads a schema, so lower
+  ones would make existing databases unreadable). SQLite's heap is capped
+  at 4 GiB for the whole process, temporary data (sorts, materialised
+  subqueries) included, as it stays in memory: a statement that needs more
+  fails with `quota-exceeded`. The cap is shared, so while one statement
+  holds most of it, others can fail too.
 - 256 MB of write-ahead log between two captures: past it, statements that
   write fail until the event ends (reads, commit and rollback still run).
-  Checked before a statement that writes and while it runs; one statement
-  can still pass it by what it writes between two checks.
+  Checked before a statement that writes and while it runs; one stopped
+  while it runs rolls back the event's open transaction, as at a deadline,
+  and can have written past the cap by what it wrote since the last check.
   Capture reads the log frame by frame and holds only the newest version of
   each changed page, so rewriting the same rows costs no memory (a
   transaction touching many distinct pages still holds them all).

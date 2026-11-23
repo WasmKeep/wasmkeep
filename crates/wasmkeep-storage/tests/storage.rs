@@ -688,6 +688,14 @@ fn values_and_results_are_capped() {
         )
         .unwrap_err();
     assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    // A replacement that grows a value past the cap.
+    let err = db
+        .query(
+            "SELECT length(replace(printf('%.*c', 600000, 'a'), 'a', 'bb'))",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
     // Under both caps: fine.
     let ok = db.query("SELECT length(zeroblob(500000))", &[]).unwrap();
     assert_eq!(ok.values, vec![vec![V::Integer(500_000)]]);
@@ -1171,16 +1179,17 @@ fn reserved_names_are_refused_for_every_guest_object() {
 }
 
 #[test]
-fn guest_connections_have_tight_sqlite_limits() {
+fn guest_connections_have_sqlite_limits() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = storage(&dir).open("c", "a").unwrap();
     let columns = |n: usize| (0..n).map(|i| format!("{i}")).collect::<Vec<_>>().join(",");
-    db.query(&format!("SELECT {}", columns(500)), &[]).unwrap();
-    db.query(&format!("SELECT {}", columns(501)), &[])
+    db.query(&format!("SELECT {}", columns(2000)), &[]).unwrap();
+    db.query(&format!("SELECT {}", columns(2001)), &[])
         .unwrap_err();
     let args = |n: usize| (0..n).map(|_| "1").collect::<Vec<_>>().join(",");
-    db.query(&format!("SELECT max({})", args(64)), &[]).unwrap();
-    db.query(&format!("SELECT max({})", args(65)), &[])
+    db.query(&format!("SELECT max({})", args(127)), &[])
+        .unwrap();
+    db.query(&format!("SELECT max({})", args(128)), &[])
         .unwrap_err();
     let union = |n: usize| {
         (0..n)
@@ -1191,14 +1200,31 @@ fn guest_connections_have_tight_sqlite_limits() {
     db.query(&union(100), &[]).unwrap();
     db.query(&union(101), &[]).unwrap_err();
     let depth = |n: usize| format!("SELECT {}", vec!["1"; n].join(" + "));
-    db.query(&depth(200), &[]).unwrap();
-    db.query(&depth(300), &[]).unwrap_err();
+    db.query(&depth(900), &[]).unwrap();
+    db.query(&depth(1100), &[]).unwrap_err();
     let pattern = |n: usize| V::Text("a".repeat(n));
     db.query("SELECT 'a' LIKE ?1", &[pattern(100)]).unwrap();
     let err = db.query("SELECT 'a' LIKE ?1", &[pattern(101)]).unwrap_err();
     assert!(err.message.contains("too complex"), "{err:?}");
     let err = db.query("SELECT 'a' GLOB ?1", &[pattern(101)]).unwrap_err();
     assert!(err.message.contains("too complex"), "{err:?}");
+    drop(db);
+    // SQLite applies the column and argument limits while loading the
+    // schema: a database whose schema uses what SQLite itself allows (here
+    // a table as wide as it can be) still opens.
+    let raw = rusqlite::Connection::open(dir.path().join("actors/t/c/a.db")).unwrap();
+    raw.execute_batch(&format!(
+        "CREATE TABLE wide ({}); CREATE TABLE ch (x CHECK (max({}) > 0));",
+        (0..2000)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        args(127),
+    ))
+    .unwrap();
+    drop(raw);
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.query("SELECT count(*) FROM wide", &[]).unwrap();
 }
 
 /// `instr`, `replace` and the two-argument `trim`, `ltrim` and `rtrim` are
@@ -1349,24 +1375,36 @@ fn one_statement_cannot_write_far_past_the_wal_cap() {
     db.start_capture().unwrap();
     db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
     db.take_changes().unwrap();
-    let err = db
-        .exec(
-            "INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
-             WHERE x < 5000) SELECT randomblob(10000) FROM c",
-            &[],
-        )
-        .unwrap_err();
-    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
-    assert!(err.message.contains("write-ahead log"), "{err:?}");
+    let big = "INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+               WHERE x < 5000) SELECT randomblob(10000) FROM c";
     let mut wal = db.path().as_os_str().to_owned();
     wal.push("-wal");
-    let len = std::fs::metadata(&wal).unwrap().len();
-    assert!(len < 16 << 20, "the WAL grew to {len} bytes");
-    // Reads still run, and the event's rollback leaves the actor usable.
-    db.query("SELECT count(*) FROM t", &[]).unwrap();
-    db.end_event().unwrap();
-    db.take_changes().unwrap();
-    db.exec("INSERT INTO t VALUES (x'01')", &[]).unwrap();
+    for in_transaction in [false, true] {
+        if in_transaction {
+            db.exec("BEGIN", &[]).unwrap();
+            db.exec("INSERT INTO t VALUES (x'02')", &[]).unwrap();
+        }
+        let err = db.exec(big, &[]).unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+        assert!(err.message.contains("write-ahead log"), "{err:?}");
+        let len = std::fs::metadata(&wal).unwrap().len();
+        assert!(len < 16 << 20, "the WAL grew to {len} bytes");
+        if in_transaction {
+            // Stopping a write rolls the event's transaction back, as at a
+            // deadline: nothing more runs in the event.
+            assert!(!db.in_transaction());
+            db.query("SELECT count(*) FROM t", &[]).unwrap_err();
+        } else {
+            db.query("SELECT count(*) FROM t", &[]).unwrap();
+        }
+        // The event's end leaves the actor usable.
+        db.end_event().unwrap();
+        db.take_changes().unwrap();
+        db.exec("INSERT INTO t VALUES (x'01')", &[]).unwrap();
+        db.take_changes().unwrap();
+    }
+    let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(2)]]);
 }
 
 /// A storage of tenant `t`, its databases at `<data_dir>/actors/t/` (where
