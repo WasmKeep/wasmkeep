@@ -200,7 +200,7 @@ impl App {
 pub(crate) mod apps;
 #[cfg(test)]
 mod front_limits_tests;
-mod stall;
+pub(crate) mod stall;
 
 /// The path and query a request arrived with, before routing rewrote it to
 /// what the actor sees; forwarding to another node uses it.

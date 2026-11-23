@@ -465,6 +465,10 @@ impl ServiceInner {
         // a client that ignores the close (pinging on, say) cannot keep
         // the socket and its slot, or drive its actor.
         let mut closed_by_us: Option<tokio::time::Instant> = None;
+        // Set once the writer ended on its own (its client stopped reading
+        // past the write-idle limit, or the connection failed): nothing
+        // more reaches the client, so the socket ends with 1006.
+        let mut writer_ended = false;
         loop {
             // A silent client is pinged, then closed if it stays silent:
             // half-open connections would otherwise live forever.
@@ -483,6 +487,10 @@ impl ServiceInner {
                     () = closing.notified() => {
                         closed_by_us = Some(tokio::time::Instant::now() + self.close_wait);
                         continue;
+                    }
+                    _ = &mut writer => {
+                        writer_ended = true;
+                        break;
                     }
                     next = tokio::time::timeout(wait, stream.next()) => next,
                 },
@@ -560,7 +568,7 @@ impl ServiceInner {
         // dropping the read half releases the descriptor. Only the
         // registry slot waits for `on-close`, which may be held back by
         // capacity for a while.
-        if tokio::time::timeout(self.wall, &mut writer).await.is_err() {
+        if !writer_ended && tokio::time::timeout(self.wall, &mut writer).await.is_err() {
             writer.abort();
             let _ = writer.await;
         }
@@ -677,5 +685,87 @@ mod tests {
         assert_eq!(queued.load(Ordering::Acquire), 0);
         assert_eq!(service.inner.sockets.len(), 0);
         assert_eq!(service.inner.sockets.budget.in_use(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_socket_whose_writes_stall_is_closed_while_its_client_keeps_sending() {
+        let wasm = guests::build_guest("tests/guests/test-actor", "test_actor");
+        let runtime = wasmkeep_runtime::Runtime::new(&Default::default()).unwrap();
+        let component = guests::compile(&runtime, &wasm);
+        let dir = tempfile::tempdir().unwrap();
+        let service = ActorService::new(
+            runtime,
+            ActorConfig::new(dir.path()),
+            vec![("t".into(), component, wasm)],
+        )
+        .unwrap();
+        let address = ActorAddress::new("default", "t", "stalled").unwrap();
+        let permit = Arc::new(service.inner.sockets.reserve().unwrap());
+        // A small pipe, and a write-idle limit as the public port sets.
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server_io = crate::http::stall::WriteIdle::new(server_io, Duration::from_millis(300));
+        let handshake = tokio::spawn(tokio_tungstenite::accept_async(server_io));
+        let (client, _) = tokio_tungstenite::client_async("ws://t/", client_io)
+            .await
+            .unwrap();
+        let ws = handshake.await.unwrap().unwrap();
+        let accepted = service
+            .inner
+            .accept_socket(address.clone(), "/echo".into(), Opener::Outside)
+            .await
+            .unwrap();
+        assert!(accepted.refusal.is_none());
+        let inner = Arc::clone(&service.inner);
+        let server = tokio::spawn(async move {
+            inner.run_socket(accepted, ws, permit).await;
+        });
+        // Sends on (text the actor echoes; no pings, whose answers would
+        // fail on the read side) and never reads: the echoes fill the pipe
+        // and the server's writes wait.
+        let (mut sink, _unread) = client.split();
+        let sending = tokio::spawn(async move {
+            let text = "x".repeat(1024);
+            loop {
+                if sink
+                    .send(WsMessage::Text(text.clone().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("a socket whose writes stalled stayed open")
+            .unwrap();
+        sending.abort();
+        assert_eq!(service.inner.sockets.len(), 0);
+        assert_eq!(service.inner.sockets.budget.in_use(), 0);
+        assert_eq!(service.inner.sockets.reserved_by(&address), 0);
+
+        // The actor saw the close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::http::serve(
+            listener,
+            service,
+            std::future::pending(),
+        ));
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut tcp,
+            b"POST /actor/t/stalled/ws-closed HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut raw = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut tcp, &mut raw)
+            .await
+            .unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        // One close callback (a chunked "1\n").
+        assert!(raw.contains("\r\n\r\n2\r\n1\n\r\n"), "{raw}");
     }
 }

@@ -556,6 +556,7 @@ its own slice, and answers the edges' answers.
 | The directory moves or its node dies | Lookups fail meanwhile, so joins and rejoins back off; open sockets and pushes are unaffected; scale operations wait in their row. No change answered `ok` is lost. |
 | A push is cut by the call deadline | The entries that answered keep their answer; the others are suspect and get the same numbers again. |
 | A client stops reading | Section 5: lagging, then `behind`, then 4802. |
+| A client stops reading and the node's write to it waits past the write-idle limit (60 s, [security](../security.md)) | The node closes the connection before section 5 runs its course: the edge sees the socket end with 1006, not 4802, and the client rejoins as after any abnormal close. |
 
 ### 10. Stats
 
