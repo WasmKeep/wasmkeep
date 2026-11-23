@@ -121,6 +121,27 @@ impl AppRef {
                  switching `current`: nothing was switched"
             ));
         };
+        let failed = format!("renewing the assets deploy marker failed: {error}");
+        // Deleted while this deployed (ADR 0028) comes first, as after a
+        // switch that completed.
+        match self.tombstone().await {
+            Ok(Some(_)) => {
+                return DeployError::Refused(format!(
+                    "{failed}; {} was deleted while this deployed (it was switching `current` \
+                     to {version}): what the deploy wrote stays in the bucket until \
+                     `wasmkeep app delete` is run again",
+                    self.name()
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return DeployError::Bucket(format!(
+                    "{failed}; the deploy was switching `current` to {version}, and whether the \
+                     app was deleted is unknown (reading its tombstone failed: {e}): check \
+                     before deploying again"
+                ));
+            }
+        }
         let outcome = match self.read_current().await {
             Err(e) => format!(
                 "the deploy was switching `current` to {version}, and reading it back failed \
@@ -131,18 +152,29 @@ impl AppRef {
                     "`current` already names the new version {version} (seq {seq}): the deploy took effect"
                 )
             }
-            Ok(now) => format!(
-                "the deploy was switching `current` to {version}, which it does not name yet \
-                 ({}): the switch may still land; check what `current` names before deploying again",
-                now.map_or_else(
+            Ok(now) => {
+                let names = now.as_ref().map_or_else(
                     || "nothing is deployed".to_owned(),
-                    |(now, _)| format!("it names {} (seq {})", now.version, now.seq)
-                )
-            ),
+                    |(now, _)| format!("it names {} (seq {})", now.version, now.seq),
+                );
+                // Still the `current` the deploy read (absent before a first
+                // deploy): a switch sent may still land on it.
+                let base = now.as_ref().map(|(now, _)| now.seq);
+                if base == seq.checked_sub(1).filter(|s| *s > 0) {
+                    format!(
+                        "the deploy was switching `current` to {version}, which it does not \
+                         name yet ({names}): the switch may still land; check what `current` \
+                         names before deploying again"
+                    )
+                } else {
+                    format!(
+                        "`current` moved past the one the deploy read ({names}): the switch to \
+                         {version} lost to another deploy, or landed and was superseded"
+                    )
+                }
+            }
         };
-        DeployError::Bucket(format!(
-            "renewing the assets deploy marker failed: {error}; {outcome}"
-        ))
+        DeployError::Bucket(format!("{failed}; {outcome}"))
     }
 
     pub(super) async fn read_assets_index(&self, hash: &str) -> Result<Index, DeployError> {
@@ -367,9 +399,15 @@ mod tests {
     }
 
     /// Overwrites of the deploy marker (its renewals) fail; everything
-    /// else, its creation included, reaches the bucket.
-    #[derive(Debug)]
-    struct NoRenewal(object_store::memory::InMemory);
+    /// else, its creation included, reaches the bucket. While `hold_current`
+    /// is set, a write of `current` waits 700 s first (past a renewal);
+    /// while `fail_tombstone` is set, reads of the tombstone fail.
+    #[derive(Debug, Default)]
+    struct NoRenewal {
+        inner: object_store::memory::InMemory,
+        hold_current: std::sync::atomic::AtomicBool,
+        fail_tombstone: std::sync::atomic::AtomicBool,
+    }
     impl std::fmt::Display for NoRenewal {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("no-renewal")
@@ -389,21 +427,36 @@ mod tests {
                     source: "renewal refused".into(),
                 });
             }
-            self.0.put_opts(p, b, o).await
+            if p.as_ref().ends_with("/current")
+                && self.hold_current.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_secs(700)).await;
+            }
+            self.inner.put_opts(p, b, o).await
         }
         async fn put_multipart_opts(
             &self,
             p: &object_store::path::Path,
             o: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.0.put_multipart_opts(p, o).await
+            self.inner.put_multipart_opts(p, o).await
         }
         async fn get_opts(
             &self,
             p: &object_store::path::Path,
             o: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            self.0.get_opts(p, o).await
+            if p.as_ref().ends_with(&format!("/{TOMBSTONE}"))
+                && self
+                    .fail_tombstone
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "tombstone read refused".into(),
+                });
+            }
+            self.inner.get_opts(p, o).await
         }
         fn delete_stream(
             &self,
@@ -413,20 +466,20 @@ mod tests {
             >,
         ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
         {
-            self.0.delete_stream(p)
+            self.inner.delete_stream(p)
         }
         fn list(
             &self,
             p: Option<&object_store::path::Path>,
         ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.0.list(p)
+            self.inner.list(p)
         }
         async fn list_with_delimiter(
             &self,
             p: Option<&object_store::path::Path>,
         ) -> object_store::Result<object_store::ListResult> {
-            self.0.list_with_delimiter(p).await
+            self.inner.list_with_delimiter(p).await
         }
         async fn copy_opts(
             &self,
@@ -434,7 +487,7 @@ mod tests {
             b: &object_store::path::Path,
             o: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.0.copy_opts(a, b, o).await
+            self.inner.copy_opts(a, b, o).await
         }
     }
 
@@ -444,8 +497,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     #[allow(clippy::unwrap_used)] // test code
     async fn a_failed_marker_renewal_says_whether_current_was_switched() {
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(NoRenewal(object_store::memory::InMemory::new()));
+        let bucket = Arc::new(NoRenewal::default());
+        let store: Arc<dyn ObjectStore> = bucket.clone();
         let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
         let past_renewal = || tokio::time::sleep(Duration::from_secs(700));
         let markers = || async {
@@ -497,5 +550,97 @@ mod tests {
         assert!(e.contains("may still land"), "{e}");
         assert!(e.contains("it names v1 (seq 1)"), "{e}");
         assert_eq!(markers().await, 0);
+
+        // Another deploy took seq 2: this switch lost, it will not land.
+        let (_, read) = app.read_current().await.unwrap().unwrap();
+        app.swap_current(Some(read), "v9", 2).await.unwrap();
+        let lost = app
+            .with_assets_marker(|marker| async move {
+                marker.switching("v2", 2);
+                past_renewal().await;
+                Ok(())
+            })
+            .await;
+        let e = lost.unwrap_err().to_string();
+        assert!(!e.contains("may still land"), "{e}");
+        assert!(e.contains("lost to another deploy"), "{e}");
+        assert!(e.contains("it names v9 (seq 2)"), "{e}");
+
+        // The tombstone unreadable, then there: said before `current`.
+        bucket
+            .fail_tombstone
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let unknown = app
+            .with_assets_marker(|marker| async move {
+                marker.switching("v3", 3);
+                past_renewal().await;
+                Ok(())
+            })
+            .await;
+        let e = unknown.unwrap_err().to_string();
+        assert!(e.contains("whether the app was deleted is unknown"), "{e}");
+        bucket
+            .fail_tombstone
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        app.put_once(TOMBSTONE, b"deleted".to_vec()).await.unwrap();
+        let deleted = app
+            .with_assets_marker(|marker| async move {
+                marker.switching("v3", 3);
+                past_renewal().await;
+                Ok(())
+            })
+            .await;
+        let e = deleted.unwrap_err().to_string();
+        assert!(e.contains("was deleted while this deployed"), "{e}");
+        assert_eq!(markers().await, 0);
+    }
+
+    /// Through a real deploy: a renewal that fails while its `current`
+    /// write is in flight says the switch may still land, never that
+    /// nothing was switched (the deploy records its target right before
+    /// the switch).
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::unwrap_used)] // test code
+    async fn a_deploy_whose_renewal_fails_during_its_switch_says_it_may_land() {
+        let bucket = Arc::new(NoRenewal::default());
+        bucket
+            .hold_current
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store: Arc<dyn ObjectStore> = bucket.clone();
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let hash = digest(b"abc");
+        let bundle = Bundle {
+            index: Index {
+                files: std::collections::BTreeMap::from([(
+                    "a.bin".into(),
+                    crate::assets::File {
+                        content_type: "application/octet-stream".into(),
+                        identity: crate::assets::Content {
+                            digest: hash.clone(),
+                            size: 3,
+                        },
+                        br: None,
+                        gzip: None,
+                    },
+                )]),
+                ..Index::default()
+            },
+            contents: std::collections::BTreeMap::from([(hash, b"abc".to_vec())]),
+        };
+        let runtime = Runtime::new(&wasmkeep_runtime::RuntimeConfig::default()).unwrap();
+        let deployed = app
+            .deploy_changes(
+                &runtime,
+                Changes {
+                    assets: crate::assets::Change::Set(bundle),
+                    ..Changes::default()
+                },
+            )
+            .await;
+        let e = deployed.unwrap_err().to_string();
+        assert!(e.contains("renewal refused"), "{e}");
+        assert!(e.contains("may still land"), "{e}");
+        assert!(e.contains("nothing is deployed"), "{e}");
+        assert_eq!(app.current().await.unwrap(), None);
     }
 }

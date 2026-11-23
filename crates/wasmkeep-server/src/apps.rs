@@ -53,12 +53,16 @@ fn read_local_marker(path: &std::path::Path) -> Result<Option<Vec<u8>>, DeployEr
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(DeployError::Bucket(format!(
+        Err(e) => Err(DeployError::Local(format!(
             "reading {}: {e}",
             path.display()
         ))),
     }
 }
+
+/// Deploy checks in a row that cannot read this node's local marker files
+/// before the node reports itself not ready.
+const LOCAL_FAILURES_BEHIND: u32 = 3;
 
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +78,11 @@ pub enum DeployError {
     /// The bucket did not answer, or refused a write.
     #[error("bucket: {0}")]
     Bucket(String),
+    /// This node could not read its own local copy of an app marker
+    /// (`.recreated`, `.restored`): not the bucket's, and not a sign the
+    /// app was deleted.
+    #[error("local files: {0}")]
+    Local(String),
     /// Someone else changed `current` at the same moment; nothing changed.
     #[error("another deploy changed the app at the same time; retry")]
     Conflict,
@@ -885,8 +894,7 @@ impl AppRef {
             mode,
             ..PutOptions::default()
         };
-        // Every `current` this version writes is rooted (ADR 0022), which
-        // implies marked.
+        // Rooted (ADR 0022), which implies marked.
         let body = Current {
             version: version.to_owned(),
             seq,
@@ -1700,13 +1708,35 @@ impl AppRef {
         let marked = true;
         let seq = current.seq + 1;
         self.swap_current(Some(read), &previous, seq).await?;
-        // Deleted while this rolled back (ADR 0028), as a deploy checks.
-        if self.tombstone().await?.is_some() {
-            return Err(DeployError::Refused(format!(
-                "{} was deleted while this rolled back: the `current` it wrote stays in the \
-                 bucket until `wasmkeep app delete` is run again",
-                self.name()
-            )));
+        // Deleted while this rolled back (ADR 0028), as a deploy checks. A
+        // rollback is not idempotent: run again after a failed check, it
+        // would go one more version back, so the check is retried, and a
+        // failure says the switch happened.
+        let mut deleted = self.tombstone().await;
+        for wait in [250, 500] {
+            if deleted.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            deleted = self.tombstone().await;
+        }
+        match deleted {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(DeployError::Refused(format!(
+                    "{} was deleted while this rolled back: the `current` it wrote stays in the \
+                     bucket until `wasmkeep app delete` is run again",
+                    self.name()
+                )));
+            }
+            Err(e) => {
+                return Err(DeployError::Bucket(format!(
+                    "{}: `current` was switched to {previous} (seq {seq}); only the check for a \
+                     delete made meanwhile failed ({e}): do not run the rollback again (it would \
+                     go one more version back): check whether the app was deleted",
+                    self.name()
+                )));
+            }
         }
         Ok(Deployed {
             repaired: 0,
@@ -1746,6 +1776,8 @@ impl AppRef {
         // small reads): a deleted app stops being served within a period
         // or two, not at the end of a backoff that reaches minutes.
         let mut backoff: Option<Duration> = None;
+        // Checks in a row that could not read this node's own marker files.
+        let mut local_failures = 0_u32;
         loop {
             match backoff {
                 Some(wait) => {
@@ -1764,6 +1796,7 @@ impl AppRef {
             match self.update(&service).await {
                 Ok(_) => {
                     backoff = None;
+                    local_failures = 0;
                     service.set_deploy_behind(false);
                 }
                 Err(DeployError::Deleted(_)) => {
@@ -1779,6 +1812,17 @@ impl AppRef {
                         DeployError::Invalid(..) | DeployError::Front(_) | DeployError::Corrupt(_)
                     ) {
                         service.set_deploy_behind(true);
+                    }
+                    // This node's own files, unlike a bucket outage: once it
+                    // lasts, the node no longer follows deploys, so it is not
+                    // ready (and ready again at the next good check).
+                    if matches!(e, DeployError::Local(_)) {
+                        local_failures += 1;
+                        if local_failures >= LOCAL_FAILURES_BEHIND {
+                            service.set_deploy_behind(true);
+                        }
+                    } else {
+                        local_failures = 0;
                     }
                     let wait = backoff.map_or(every, |w| (w * 2).min(FOLLOW_BACKOFF_MAX));
                     tracing::warn!(error = %e, retry_in_s = wait.as_secs(), "checking for a new deploy failed");
@@ -3722,7 +3766,7 @@ mod tests {
         std::fs::create_dir(&marker).unwrap();
         let read = app.still_ours(local.path()).await;
         assert!(
-            matches!(&read, Err(DeployError::Bucket(why)) if why.contains(RECREATED_LOCAL)),
+            matches!(&read, Err(DeployError::Local(why)) if why.contains(RECREATED_LOCAL)),
             "{read:?}"
         );
     }
@@ -3752,7 +3796,7 @@ mod tests {
         std::fs::create_dir(local.join(RECREATED_LOCAL)).unwrap();
         let prepared = app.prepare_local(&local).await;
         assert!(
-            matches!(&prepared, Err(DeployError::Bucket(why)) if why.contains(RECREATED_LOCAL)),
+            matches!(&prepared, Err(DeployError::Local(why)) if why.contains(RECREATED_LOCAL)),
             "{prepared:?}"
         );
         assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
