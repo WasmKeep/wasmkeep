@@ -246,6 +246,11 @@ release, unreleased).
   and capture carries on across the log's restart.
 - **A runtime restarted in place no longer stops itself** as a twin of its own
   predecessor.
+- **A node restarted as a new process no longer stops itself** when a read of
+  its own node lease, after its first write, answers with the body that write
+  replaced (its stopped predecessor's, from a bucket replica behind). That
+  copy, or an earlier body of the same instance, is not a twin; any other
+  instance, or a later body of that one, still stops the node.
 - CI: CodeQL also runs on push to `main`, and a speed-sensitive StarlingMonkey
   test moves to the full suite.
 

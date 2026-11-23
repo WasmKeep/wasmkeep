@@ -471,6 +471,10 @@ pub(crate) struct Cluster {
     /// When a heartbeat last reached the bucket (ms since the epoch; 0:
     /// never), and how often one is sent: for readiness.
     heartbeat_ok_ms: std::sync::atomic::AtomicU64,
+    /// The node lease this process's first write replaced, if it was one
+    /// (format 3, naming an instance): that instance and its `written_at`.
+    /// A copy of it read back later is not a twin ([`Cluster::check_twin`]).
+    replaced: Mutex<Option<(String, u64)>>,
     heartbeat_every: Duration,
     /// Woken each time a heartbeat reaches the bucket: a call or a
     /// WebSocket upgrade the peer never read waits for one before it is
@@ -886,6 +890,7 @@ impl Cluster {
             periodic_flights: Arc::default(),
             stop_by: tokio::sync::watch::Sender::new(None),
             heartbeat_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            replaced: Mutex::new(None),
             heartbeat_every: config.heartbeat,
             heartbeat_landed: tokio::sync::Notify::new(),
             identity: tokio::sync::watch::Sender::new(Identity::Checking),

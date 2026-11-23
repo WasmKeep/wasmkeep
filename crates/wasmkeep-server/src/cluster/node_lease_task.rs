@@ -179,11 +179,17 @@ impl Cluster {
             let (guard, checked) = tokio::join!(self.start_guard(), self.check_identity());
             let checked = match guard {
                 Ok(()) => checked,
-                Err(why) => (Stopped::OlderNode.identity(&why), None),
+                Err(why) => (Stopped::OlderNode.identity(&why), None, None),
             };
             let expected = match checked {
-                (Identity::Unique, expected) => expected,
-                (verdict, _) => {
+                (Identity::Unique, expected, replaced) => {
+                    // Before the write: the twin check reads it only once
+                    // a write landed, and that write is this one, made
+                    // over this version (a failed one comes back here).
+                    *self.replaced.lock().unwrap_or_else(|p| p.into_inner()) = replaced;
+                    expected
+                }
+                (verdict, _, _) => {
                     if let Identity::Taken(_, why) = &verdict {
                         tracing::error!("{why}");
                     }

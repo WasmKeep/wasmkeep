@@ -45,6 +45,10 @@
   fenced) nodes; a hello reads its sender by key; `cluster forget` may
   delete a released lease no record names. See "Amendment of 2026-11-20:
   a slow bucket" at the end.
+- Amended 2026-11-23: the running twin check does not take a copy of the
+  node lease a new process's first write replaced, read back after that
+  write, for a twin. See "Amendment of 2026-11-23: a predecessor's body read
+  back" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -1112,3 +1116,59 @@ conservative choice.
   no longer one of its rounds, and a listing's reads are left out of the
   heartbeats read a period (three, as before).
 
+## Amendment of 2026-11-23: a predecessor's body read back
+
+A node restarted as a new process (same id, a new instance) stopped itself
+once in 15 restarts of a three-node cluster during a rolling restart. Its
+start check passed over its predecessor's `released` lease, its first write
+replaced that lease, and it served; half a second later a read of its own
+object answered with the predecessor's `released` body again, and the
+running check took it for another process ("this node's lease was released
+by another process"). Every read of `nodes/` in a new process waits for
+that first write, so the read was most likely answered from a replica behind the write
+the bucket had acknowledged (or landed late).
+
+### The rule
+
+- The start check returns, with the version the first write is conditioned
+  on, the instance and `written_at` of the node lease (format 3) under that
+  version, if it names one: the predecessor that write replaces.
+- After the first write landed, a body of this node's own object that names
+  that instance and is dated no later than that `written_at` is not a twin:
+  it is a copy of the body replaced, or an earlier body of the same writer.
+  The running check ignores it, and the next read shows this process's own
+  write.
+- Everything else is judged as before: another instance (live, `released`
+  or `fenced`, whatever its date), a body of the predecessor's instance
+  dated later than the one replaced, a body in the old format, or one with
+  no instance. A first write that created the object (none existed) replaces
+  no predecessor, and every other body is judged as before.
+
+### Why this hides no twin
+
+- The predecessor can write nothing more under this id: every write of a
+  node lease (renewal, release, a lost reply's retry) is conditional on that
+  process's own last version, which this process's first write replaced. A
+  write it made since would be dated later on its own clock, which is the
+  same clock that dated the body replaced, so no clock skew between nodes
+  enters the comparison.
+- A twin is another instance: a process started at the same moment, whose
+  body names its own instance, or one that writes `released` over this
+  node's lease, is judged as before. Its writes also make this node's next
+  renewal fail its condition, whose re-read stops the node, as before.
+- A process of an older version writes without conditions: its body is never
+  exempt.
+- The rule relies on the conditional writes the bucket check proves at
+  start, as every other part of this record does.
+
+### Tests
+
+- `tests/cluster/node_leases.rs`:
+  `a_predecessors_body_read_after_a_restart_is_not_a_twin` (a clean stop,
+  a new process with the same id, then reads of its own object answer with
+  the predecessor's `released` body, then its last `live` one: the node
+  keeps serving; before, it stopped on the first) and
+  `a_twin_is_found_after_a_restart_whatever_its_body` (the same reads
+  answering with a `live` body of another instance dated before the
+  restart, a `released` body of another instance, or a later body of the
+  predecessor's instance: each still stops the node).
