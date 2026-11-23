@@ -67,3 +67,63 @@ pub fn run_async(
     runtime.shutdown_background();
     result
 }
+
+/// Creates a server's data directory for this account alone if it is
+/// missing, and warns when an existing one is open to other accounts.
+pub fn prepare_data_root(dir: &std::path::Path) -> anyhow::Result<()> {
+    match wasmkeep_storage::prepare_data_root(dir)
+        .with_context(|| format!("preparing the data directory {}", dir.display()))?
+    {
+        wasmkeep_storage::DataRoot::Loose(mode) => tracing::warn!(
+            data_dir = %dir.display(),
+            mode = format!("{mode:o}"),
+            "the data directory is readable by other accounts; consider chmod 700"
+        ),
+        wasmkeep_storage::DataRoot::Created | wasmkeep_storage::DataRoot::Private => {}
+    }
+    Ok(())
+}
+
+/// A scratch directory only this account can open (0700 on Unix), for
+/// copies of actor data: `tempfile::tempdir` leaves the mode to the umask.
+pub fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+    private_builder().tempdir()
+}
+
+/// [`private_tempdir`] under `parent`.
+pub fn private_tempdir_in(
+    parent: impl AsRef<std::path::Path>,
+) -> std::io::Result<tempfile::TempDir> {
+    private_builder().tempdir_in(parent)
+}
+
+fn private_builder() -> tempfile::Builder<'static, 'static> {
+    #[allow(unused_mut)] // only Unix sets a mode
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
+}
+
+#[cfg(all(test, unix))]
+mod private_tempdir_tests {
+    #![allow(clippy::unwrap_used)] // test code
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(dir: &tempfile::TempDir) -> u32 {
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn scratch_directories_are_owner_only() {
+        let parent = tempfile::tempdir().unwrap();
+        assert_eq!(mode(&super::private_tempdir().unwrap()), 0o700);
+        assert_eq!(
+            mode(&super::private_tempdir_in(parent.path()).unwrap()),
+            0o700
+        );
+    }
+}

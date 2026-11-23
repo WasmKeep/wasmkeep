@@ -62,6 +62,17 @@ pub struct Listed {
     pub written_ms: u64,
 }
 
+/// What [`SecretStore::retire_other_keys`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// Objects sealed with another key, deleted.
+    pub deleted: usize,
+    /// Objects it left that the kept key may not have sealed: sealed with
+    /// another key above `current` (a command still running, or one that
+    /// died before moving `current`), or unparseable.
+    pub left: usize,
+}
+
 /// An app's secrets in the bucket.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -324,6 +335,116 @@ impl SecretStore {
         }
         Ok(doomed.len())
     }
+
+    /// The last step of a key change: deletes the sealed objects another
+    /// key sealed, so the old key opens nothing left in the bucket.
+    /// Refused unless `current` opens with `key`; `current` is never
+    /// deleted. Another key's objects:
+    ///
+    /// - below `current` are deleted, except the one just before it while
+    ///   `current` is younger than `grace` (a node starting, a backup or a
+    ///   command that read `current` just before it moved);
+    /// - above `current` (a command still running, or one that stopped
+    ///   before moving `current`) are deleted once older than `retention`,
+    ///   as [`SecretStore::delete_old`] times them.
+    ///
+    /// Everything else of another key's, and every object that cannot be
+    /// parsed or is too large to be one, is left and counted. Without
+    /// `current`, nothing is deleted.
+    pub async fn retire_other_keys(
+        &self,
+        key: &SecretsKey,
+        now_ms: u64,
+        retention: Duration,
+        grace: Duration,
+    ) -> Result<Retired, SecretStoreError> {
+        let current = self.current().await?.map(|(seq, _)| seq);
+        self.retire_from(key, current, now_ms, retention, grace)
+            .await
+    }
+
+    /// [`SecretStore::retire_other_keys`] with `current` as read before.
+    async fn retire_from(
+        &self,
+        key: &SecretsKey,
+        current: Option<u64>,
+        now_ms: u64,
+        retention: Duration,
+        grace: Duration,
+    ) -> Result<Retired, SecretStoreError> {
+        if let Some(current) = current {
+            self.read(std::slice::from_ref(key), current).await?;
+        }
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        let older = |written: u64, by: Duration| now_ms.saturating_sub(written) > ms(by);
+        let listed = self.list().await?;
+        let previous = current.and_then(|c| listed.iter().rev().find(|l| l.seq < c));
+        // While `current` is young, the one before it may still be read.
+        let in_grace = current.is_some_and(|c| {
+            listed
+                .iter()
+                .find(|l| l.seq == c)
+                .is_none_or(|l| !older(l.written_ms, grace))
+        });
+        let mut retired = Retired::default();
+        for l in &listed {
+            if Some(l.seq) == current {
+                continue;
+            }
+            let path = self.path(&secrets::object_name(l.seq));
+            let bytes = match self.fetch(&path).await? {
+                Fetched::Gone => continue,
+                Fetched::TooLarge => {
+                    retired.left += 1;
+                    continue;
+                }
+                Fetched::Bytes(bytes) => bytes,
+            };
+            let Ok(id) = secrets::sealed_with(&bytes) else {
+                retired.left += 1;
+                continue;
+            };
+            if id == key.id() {
+                continue;
+            }
+            let delete = match current {
+                None => false,
+                Some(c) if l.seq > c => older(l.written_ms, retention),
+                Some(_) => !(in_grace && previous == Some(l)),
+            };
+            if !delete {
+                retired.left += 1;
+                continue;
+            }
+            match self.store.delete(&path).await {
+                Ok(()) => retired.deleted += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(bucket(e)),
+            }
+        }
+        Ok(retired)
+    }
+
+    /// An object's bytes, unless it is gone or too large to be one.
+    async fn fetch(&self, path: &StorePath) -> Result<Fetched, SecretStoreError> {
+        match self.store.head(path).await {
+            Ok(meta) if meta.size > secrets::MAX_OBJECT as u64 => return Ok(Fetched::TooLarge),
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(Fetched::Gone),
+            Err(e) => return Err(bucket(e)),
+        }
+        match self.store.get(path).await {
+            Ok(r) => Ok(Fetched::Bytes(r.bytes().await.map_err(bucket)?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(Fetched::Gone),
+            Err(e) => Err(bucket(e)),
+        }
+    }
+}
+
+enum Fetched {
+    Gone,
+    TooLarge,
+    Bytes(bytes::Bytes),
 }
 
 /// How long a node may go without opening the set `current` names before
@@ -610,6 +731,267 @@ mod tests {
                     .1,
                 fresh
             );
+        });
+    }
+
+    /// Seals `n` changes with `with`, opened with `keys`.
+    async fn seal_n(app: &SecretStore, keys: &[SecretsKey], with: &SecretsKey, names: &[&str]) {
+        for name in names {
+            app.change(keys, with, |s| set_one(s, name, "v"))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// The rotation itself: re-seals the current set under `new`.
+    async fn rotate(app: &SecretStore, old: &SecretsKey, new: &SecretsKey) -> u64 {
+        app.change(&[old.clone(), new.clone()], new, |_| {
+            Ok::<(), SecretsError>(())
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn put_raw(store: &Arc<dyn ObjectStore>, app: &SecretStore, seq: u64, bytes: Vec<u8>) {
+        store
+            .put(&app.path(&secrets::object_name(seq)), bytes.into())
+            .await
+            .unwrap();
+    }
+
+    async fn sealed_ids(store: &Arc<dyn ObjectStore>, app: &SecretStore) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        for l in app.list().await.unwrap() {
+            let bytes = store
+                .get(&app.path(&secrets::object_name(l.seq)))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            out.push((
+                l.seq,
+                secrets::sealed_with(&bytes).unwrap_or_else(|_| "unparseable".into()),
+            ));
+        }
+        out
+    }
+
+    fn retired(deleted: usize, left: usize) -> Retired {
+        Retired { deleted, left }
+    }
+
+    /// The time of the newest object, as the bucket wrote it.
+    async fn newest(app: &SecretStore) -> u64 {
+        app.list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|l| l.written_ms)
+            .max()
+            .unwrap()
+    }
+
+    const GRACE: Duration = STALE_AFTER;
+    const PAST_GRACE: u64 = 60_000;
+    const PAST_RETENTION: u64 = 7_200_000;
+
+    #[test]
+    fn retiring_a_key_deletes_every_object_it_sealed() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            seal_n(&app, std::slice::from_ref(&old), &old, &["A", "B"]).await;
+            let now = newest(&app).await + PAST_GRACE;
+            // Not sealed with the key to keep yet: refused, nothing deleted.
+            assert!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(app.list().await.unwrap().len(), 2);
+            assert_eq!(rotate(&app, &old, &new).await, 3);
+            app.delete_old(u64::MAX, RETENTION).await.unwrap();
+            assert!(
+                app.read(std::slice::from_ref(&old), 2).await.is_ok(),
+                "the old key still opens the same set until the key is retired"
+            );
+            let now = newest(&app).await + PAST_GRACE;
+            assert_eq!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(1, 0)
+            );
+            assert_eq!(sealed_ids(&store, &app).await, [(3, new.id().to_owned())]);
+            let (seq, set) = app.read_current(std::slice::from_ref(&new)).await.unwrap();
+            assert_eq!(seq, Some(3));
+            assert_eq!(set.class("api").unwrap().len(), 2);
+            assert!(app.read_current(std::slice::from_ref(&old)).await.is_err());
+            // Again: nothing left to do.
+            assert_eq!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn the_one_before_current_stays_through_the_grace() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            seal_n(&app, std::slice::from_ref(&old), &old, &["A", "B"]).await;
+            rotate(&app, &old, &new).await;
+            let moved = newest(&app).await;
+            // Just after the move: seq 1 goes, the one before current stays.
+            assert_eq!(
+                app.retire_other_keys(&new, moved, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(1, 1)
+            );
+            assert!(app.read(std::slice::from_ref(&old), 2).await.is_ok());
+            assert_eq!(
+                app.retire_other_keys(&new, moved + PAST_GRACE, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(1, 0)
+            );
+            assert_eq!(app.list().await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn objects_the_kept_key_sealed_below_current_stay() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            seal_n(&app, std::slice::from_ref(&old), &old, &["A", "B"]).await;
+            rotate(&app, &old, &new).await;
+            seal_n(&app, std::slice::from_ref(&new), &new, &["C"]).await;
+            let now = newest(&app).await + PAST_GRACE;
+            assert_eq!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(2, 0)
+            );
+            let id = new.id().to_owned();
+            assert_eq!(sealed_ids(&store, &app).await, [(3, id.clone()), (4, id)]);
+        });
+    }
+
+    #[test]
+    fn an_old_key_object_above_current_goes_once_past_the_retention() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            seal_n(&app, std::slice::from_ref(&old), &old, &["A"]).await;
+            rotate(&app, &old, &new).await;
+            // A command that sealed seq 3 with the old key and stopped (or
+            // is still running) before moving current.
+            let orphan = secrets::seal(&old, &app.place(), 3, &SecretSet::default()).unwrap();
+            put_raw(&store, &app, 3, orphan).await;
+            let written = newest(&app).await;
+            assert_eq!(
+                app.retire_other_keys(&new, written + PAST_GRACE, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(1, 1)
+            );
+            assert_eq!(app.list().await.unwrap().len(), 2);
+            // Past the retention, a re-run deletes it and finishes.
+            assert_eq!(
+                app.retire_other_keys(&new, written + PAST_RETENTION, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(1, 0)
+            );
+            assert_eq!(sealed_ids(&store, &app).await, [(2, new.id().to_owned())]);
+        });
+    }
+
+    #[test]
+    fn current_moving_during_the_retirement_deletes_nothing_from_the_new_one() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            seal_n(&app, std::slice::from_ref(&old), &old, &["A", "B"]).await;
+            assert_eq!(rotate(&app, &old, &new).await, 3);
+            // Current is read at 3, then a change sealed with the old key
+            // moves it to 4 before the listing.
+            let both = [old.clone(), new.clone()];
+            seal_n(&app, &both, &old, &["C"]).await;
+            assert_eq!(app.current().await.unwrap().unwrap().0, 4);
+            let now = newest(&app).await + PAST_GRACE;
+            assert_eq!(
+                app.retire_from(&new, Some(3), now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(2, 1)
+            );
+            // The set current names now is still there, and opens.
+            let (seq, set) = app.read_current(std::slice::from_ref(&old)).await.unwrap();
+            assert_eq!(seq, Some(4));
+            assert_eq!(set.class("api").unwrap().len(), 3);
+        });
+    }
+
+    #[test]
+    fn unparseable_and_oversized_objects_are_left_and_counted() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            put_raw(&store, &app, 1, b"not a sealed object\n".to_vec()).await;
+            put_raw(&store, &app, 2, vec![b'x'; secrets::MAX_OBJECT + 1]).await;
+            seal_n(&app, std::slice::from_ref(&new), &new, &["A"]).await;
+            assert_eq!(app.current().await.unwrap().unwrap().0, 3);
+            let now = newest(&app).await + PAST_RETENTION;
+            assert_eq!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(0, 2)
+            );
+            assert_eq!(app.list().await.unwrap().len(), 3);
+        });
+    }
+
+    #[test]
+    fn without_current_other_key_objects_are_counted() {
+        block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let old = SecretsKey::generate().unwrap();
+            let new = SecretsKey::generate().unwrap();
+            let app = app(&store);
+            let sealed = secrets::seal(&old, &app.place(), 1, &SecretSet::default()).unwrap();
+            put_raw(&store, &app, 1, sealed).await;
+            let mine = secrets::seal(&new, &app.place(), 2, &SecretSet::default()).unwrap();
+            put_raw(&store, &app, 2, mine).await;
+            let now = newest(&app).await + PAST_RETENTION;
+            assert_eq!(
+                app.retire_other_keys(&new, now, RETENTION, GRACE)
+                    .await
+                    .unwrap(),
+                retired(0, 1)
+            );
+            assert_eq!(app.list().await.unwrap().len(), 2);
         });
     }
 

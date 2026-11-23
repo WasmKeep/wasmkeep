@@ -52,7 +52,18 @@ Then a system user and its directories:
 
 ```bash
 sudo useradd --system --home-dir /var/lib/wasmkeep --shell /usr/sbin/nologin wasmkeep
-sudo install -d -o wasmkeep -g wasmkeep /var/lib/wasmkeep/{classes,data,cache}
+sudo install -d -o wasmkeep -g wasmkeep /var/lib/wasmkeep/classes/
+sudo install -d -m 0700 -o wasmkeep -g wasmkeep /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
+```
+
+The data directory holds every actor's database: keep it readable by the
+service alone. `serve` creates a missing `--data-dir` with mode 0700 and
+warns at start when an existing one is open to other accounts; it never
+changes the mode of a directory that exists. On an existing install,
+tighten them once:
+
+```bash
+sudo chmod 700 /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
 ```
 
 Copy your components (built as in each SDK's README) into
@@ -95,6 +106,8 @@ ExecStart=/usr/local/bin/wasmkeep serve \
   --listen 127.0.0.1:8080
 Environment=RUST_LOG=info
 Restart=on-failure
+# Files the service creates (databases, scratch copies, logs) are its own.
+UMask=0077
 # SIGTERM: in-flight requests get up to 10 s, then actors finish their
 # queued events (up to 10 s more) and, in a cluster, hand over. Give it room.
 TimeoutStopSec=30

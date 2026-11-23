@@ -234,7 +234,8 @@ async fn poll_inner(
     if scratch.exists() {
         std::fs::remove_dir_all(&scratch)?;
     }
-    std::fs::create_dir_all(&scratch)?;
+    // Copies of actor data land here: this account's alone (0700).
+    wasmkeep_storage::prepare_data_root(&scratch)?;
     let (tenant, app) = &args.app;
     let base = format!(
         "{}apps/{tenant}/{app}",
@@ -789,7 +790,7 @@ async fn read_changed(
     {
         return Ok(None);
     }
-    let temp = tempfile::tempdir_in(scratch)?;
+    let temp = crate::private_tempdir_in(scratch)?;
     let path = temp.path().join("actor.db");
     let (export, objects) =
         history::export_from_listing(store, &actor_prefix, objects, &path, args.max_bytes).await?;

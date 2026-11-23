@@ -1910,11 +1910,81 @@ fn authorize(ctx: &AuthContext<'_>) -> Authorization {
     }
 }
 
+/// What [`prepare_data_root`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataRoot {
+    /// It did not exist: created for this account alone (0700 on Unix).
+    Created,
+    /// It exists and other accounts cannot read it.
+    Private,
+    /// It exists and its group or other accounts may read it (its mode,
+    /// left unchanged).
+    Loose(u32),
+}
+
+/// Creates the data directory for this account alone if it does not exist
+/// yet. An existing one is never changed: it is reported [`DataRoot::Loose`]
+/// when its group or other accounts can read it. Only the directory itself
+/// gets the mode; missing parents are created as usual.
+///
+/// # Errors
+/// It cannot be created or read.
+pub fn prepare_data_root(dir: &Path) -> std::io::Result<DataRoot> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[allow(unused_mut)] // only Unix sets a mode
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => return Ok(DataRoot::Created),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Ok(DataRoot::Loose(mode));
+        }
+    }
+    Ok(DataRoot::Private)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)] // test code
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_data_root_is_owner_only_and_an_existing_one_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("parent/data");
+        assert_eq!(prepare_data_root(&root).unwrap(), DataRoot::Created);
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(prepare_data_root(&root).unwrap(), DataRoot::Private);
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(prepare_data_root(&loose).unwrap(), DataRoot::Loose(0o755));
+        assert_eq!(mode(&loose), 0o755);
+    }
 
     /// A refused `exec-durable("BEGIN")` leaves the connection at
     /// `synchronous = NORMAL` (1; FULL is 2), as every statement outside

@@ -569,7 +569,7 @@ async fn load_with_budget(
         encode_bounded(&complete, INDEX_MAX)?.len() as u64 <= index_limit,
         "backup resident index budget exceeded"
     );
-    let spool = tempfile::tempdir()?;
+    let spool = crate::private_tempdir()?;
     let mut actors = Vec::new();
     let mut pending: Option<std::fs::File> = None;
     let mut actor_bytes = 0;
@@ -779,7 +779,7 @@ async fn check_boundary(
     Ok(())
 }
 async fn replay(dest: &Store, dp: &str, actor: &Value) -> anyhow::Result<history::Export> {
-    let tmp = tempfile::tempdir()?;
+    let tmp = crate::private_tempdir()?;
     let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
         tmp.path(),
     )?);
@@ -890,7 +890,7 @@ async fn verify_ranges(store: &Store, prefix: &str, actor: &Value) -> anyhow::Re
             pending.push((*id, None));
         }
     }
-    let tmp = tempfile::tempdir()?;
+    let tmp = crate::private_tempdir()?;
     let mut sequence = 0u64;
     let mut checked = 0;
     while let Some((id, parent)) = pending.pop() {
@@ -1052,7 +1052,7 @@ async fn verify_mode(
         "manifest actors lack app records"
     );
     // Random sample by fresh entropy, independent of manifest ordering.
-    let nonce = tempfile::tempdir()?;
+    let nonce = crate::private_tempdir()?;
     let mut actors: Vec<_> = run.actors.iter().collect();
     actors.sort_by_key(|a| digest(format!("{}{}", nonce.path().display(), a.display()).as_bytes()));
     let selected = sample.map_or(actors.len(), |n| {
@@ -1404,7 +1404,7 @@ impl Copier<'_> {
             copied.insert(k.clone(), entry);
         }
         check_boundary(self.dest, self.dp, &keys, &copied).await?;
-        let tmp = tempfile::tempdir()?;
+        let tmp = crate::private_tempdir()?;
         let output = tmp.path().join("actor.db");
         let result = if let Some(result) = self
             .cached_replay(prefix, previous, &plan, &listing, &copied, &output)
@@ -1722,7 +1722,7 @@ async fn create_undo(
     undo_fence: Option<&[u8]>,
 ) -> anyhow::Result<String> {
     let started_at = now_ms()?;
-    let nonce = tempfile::tempdir()?;
+    let nonce = crate::private_tempdir()?;
     let seconds = i64::try_from(now_ms()? / 1000)?;
     let stamp = chrono::DateTime::from_timestamp(seconds, 0)
         .context("clock out of range")?
@@ -2223,7 +2223,7 @@ async fn export_actor_from_store(
         wasmkeep_storage::encode_segment(name)
     );
     let expected_prefix = key(source_prefix, &suffix);
-    let tmp = tempfile::tempdir()?;
+    let tmp = crate::private_tempdir()?;
     let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
         tmp.path(),
     )?);

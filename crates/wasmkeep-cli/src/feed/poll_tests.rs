@@ -256,6 +256,12 @@ async fn resume_after_every_publication_step() {
                     }
                 }
                 assert!(files(&state.path().join("scratch")).is_empty());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let scratch = std::fs::metadata(state.path().join("scratch")).unwrap();
+                    assert_eq!(scratch.permissions().mode() & 0o777, 0o700);
+                }
                 let after = files(out.path());
                 for path in after.keys().filter(|p| {
                     p.extension().is_some_and(|e| e == "parquet") && !before.contains_key(*p)

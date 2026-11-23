@@ -268,7 +268,7 @@ async fn alarm_address(
     }
     // Long names are shortened in history keys. The host's address row in
     // the verified database retains the original, including any slashes.
-    let tmp = tempfile::tempdir()?;
+    let tmp = crate::private_tempdir()?;
     let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
         tmp.path(),
     )?);
@@ -344,7 +344,7 @@ async fn verify_target(
                 && plan.head().txid == number(&actor, "txid")?,
             "restored actor {name} has an unexpected head"
         );
-        let tmp = tempfile::tempdir()?;
+        let tmp = crate::private_tempdir()?;
         let local: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
             tmp.path(),
         )?);

@@ -378,7 +378,7 @@ async fn api(
         .context("Hashed actor name cannot be decoded; use actor sql with its original name")?;
     let actor = wasmkeep_runtime::ActorAddress::new(&state.app.0, class, &name)?;
     let sql = input["sql"].as_str().context("Missing SQL")?.to_owned();
-    let dir = tempfile::tempdir()?;
+    let dir = wasmkeep_cli::private_tempdir()?;
     let path = dir.path().join("actor.db");
     let export = history::export(
         &state.store,

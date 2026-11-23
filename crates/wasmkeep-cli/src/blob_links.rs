@@ -135,10 +135,18 @@ pub async fn download_link(
 }
 
 async fn get(http: &reqwest::Client, url: reqwest::Url) -> Result<reqwest::Response, Failed> {
-    http.get(url)
-        .send()
+    http.get(url).send().await.map_err(|e| {
+        Failed(format!(
+            "the link endpoint did not answer: {}",
+            e.without_url()
+        ))
+    })
+}
+
+async fn body(r: reqwest::Response) -> Result<bytes::Bytes, Failed> {
+    r.bytes()
         .await
-        .map_err(|e| Failed(format!("the link endpoint did not answer: {e}")))
+        .map_err(|e| Failed(format!("reading a download: {}", e.without_url())))
 }
 
 async fn cases(
@@ -174,10 +182,7 @@ async fn cases(
             header("content-disposition")
         )));
     }
-    let got = r
-        .bytes()
-        .await
-        .map_err(|e| Failed(format!("reading a download: {e}")))?;
+    let got = body(r).await?;
     if got.as_ref() != body_a {
         return Err(Failed("a download link returned other bytes".into()));
     }

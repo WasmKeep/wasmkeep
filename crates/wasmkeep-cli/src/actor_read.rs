@@ -79,8 +79,8 @@ pub(crate) fn export(args: &ExportArgs) -> anyhow::Result<()> {
 pub(crate) fn sql(args: &SqlArgs) -> anyhow::Result<()> {
     run(async {
         let dir = match &args.source.tmpdir {
-            Some(parent) => tempfile::tempdir_in(parent)?,
-            None => tempfile::tempdir()?,
+            Some(parent) => wasmkeep_cli::private_tempdir_in(parent)?,
+            None => wasmkeep_cli::private_tempdir()?,
         };
         let path = dir.path().join("actor.db");
         let result = read(&args.source, &path).await?;
@@ -470,7 +470,7 @@ pub(crate) fn history(args: &HistoryArgs) -> anyhow::Result<()> {
                 stamps.push(serde_json::json!({"generation":id.generation,"txid":id.txid,"timestamp_ms":header.timestamp_ms}));
             }
             result["capture_times"] = serde_json::json!(stamps);
-            let dir = tempfile::tempdir()?;
+            let dir = wasmkeep_cli::private_tempdir()?;
             let export = history::export(
                 &store,
                 &root,

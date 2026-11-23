@@ -371,3 +371,32 @@ async fn diagnose_runs_the_proof_and_an_expiry() {
         }
     }
 }
+
+/// A refused connection and a cut-short body: neither message carries the
+/// signed query.
+#[tokio::test]
+async fn link_errors_leave_the_signed_url_out() {
+    const MARK: &str = "X-Amz-Signature=deadbeefmarker";
+    let http = reqwest::Client::new();
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let url = reqwest::Url::parse(&format!("http://{addr}/b/a?{MARK}")).unwrap();
+    let e = get(&http, url).await.unwrap_err();
+    assert!(!e.0.contains("deadbeefmarker"), "{e}");
+
+    let short = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = short.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut conn, _) = short.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = conn.read(&mut buf).await;
+        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+            .await
+            .unwrap();
+    });
+    let url = reqwest::Url::parse(&format!("http://{addr}/b/a?{MARK}")).unwrap();
+    let r = get(&http, url).await.unwrap();
+    let e = body(r).await.unwrap_err();
+    assert!(!e.0.contains("deadbeefmarker"), "{e}");
+}

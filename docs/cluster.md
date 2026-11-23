@@ -1084,8 +1084,31 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   re-sealed set and answers 503 for the app until it gets the key, and no
   heartbeat says which keys a node holds. `set` and `unset` given two
   keys seal with the first, and take the same flag when that one is not
-  the key the current set is sealed with. After a key compromise, change
-  the values too: the old key opens the objects it sealed.
+  the key the current set is sealed with.
+- **Finishing a key change.** `rotate-key` keeps the object before
+  `current`, sealed with the old key, for a node that read `current` just
+  before it moved. Once the old key is removed from every node, run
+  `wasmkeep secrets rotate-key --new-key new.key --app acme/shop --finish`
+  (or `--all`). It never deletes `current`, refuses an app whose current
+  set does not open with `--new-key`, and deletes the objects another key
+  sealed:
+  - below `current`, all of them, except the one just before it during
+    the first 30 s after `current` moved (a node starting, a backup or a
+    command may still read it);
+  - above `current` (written by a `secrets` command still running, or one
+    that stopped before moving `current`), once they are an hour old.
+
+  Anything it leaves (those, and objects it cannot parse or that are too
+  large) is counted: it warns and exits with an error, and a later run
+  finishes. With `--all`, an app refused or left unfinished does not stop
+  the others; the run fails at the end. On a bucket with object
+  versioning, the deleted objects stay as noncurrent versions until a
+  lifecycle rule removes them.
+- **Rotating the key does not change the values.** The new key seals the
+  same values. A value the old key could open (a leaked key, an old
+  backup of the bucket, a noncurrent version) is exposed for good: after a
+  key compromise, rotate the values themselves at their source (new API
+  keys, new tokens), then `set` them.
 - **Losing the key.** Give every node the new key, then `wasmkeep secrets
   reset --new-key new.key --from FILE --nodes-have-new-key` writes a whole
   set without opening the current one.

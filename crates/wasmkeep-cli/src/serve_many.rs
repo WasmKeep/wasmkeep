@@ -52,6 +52,14 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         );
         entries.push((args, file.apps[i].hostnames.clone()));
     }
+    // Once per process (not per app start): each distinct data directory.
+    let data_dirs: std::collections::BTreeSet<&std::path::Path> = entries
+        .iter()
+        .map(|(args, _)| args.data_dir.as_path())
+        .collect();
+    for dir in data_dirs {
+        wasmkeep_cli::prepare_data_root(dir)?;
+    }
     let bucket = base.bucket.clone().context("--node-file needs --bucket")?;
     let (store, prefix) = open_bucket(&bucket)?;
     let several = entries.len() > 1;

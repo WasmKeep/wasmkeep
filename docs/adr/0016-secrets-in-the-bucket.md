@@ -148,10 +148,19 @@ they changed, not their names or values.
      `--nodes-have-new-key` to say step 1 is done: no heartbeat says which
      keys a node holds, and a node without the new key answers 503 for the
      app;
-  3. remove the old key from every node.
+  3. remove the old key from every node;
+  4. run `wasmkeep secrets rotate-key --finish --new-key FILE` (same
+     `--app` or `--all`): it deletes every object below `current` sealed
+     with another key, the one before `current` included once `current`
+     is 30 s old, and another key's objects above `current` once they
+     are past the retention window; it refuses an app whose current set
+     does not open with the new key, and fails while it leaves any. It is
+     a separate step because step 2 keeps the one before `current` for a
+     node that read `current` just before it moved.
 
-  Rotating the key does not protect values the old key could open: after
-  a key compromise, change the values too.
+  Rotating the key does not change the values, and does not protect
+  values the old key could open: after a key compromise, rotate the
+  values themselves at their source, then set them.
 - **Losing the key.** `wasmkeep secrets reset --new-key FILE --from
   SECRETS_FILE` writes a whole set, from a file in the plaintext format
   above, as the next `seq`, without opening the current one. Nodes need
