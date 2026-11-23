@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(&buf, b"ab");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn each_accepted_byte_restarts_the_limit() {
         let (mut reader, io) = tokio::io::duplex(1);
         let mut io = WriteIdle::new(io, Duration::from_millis(100));

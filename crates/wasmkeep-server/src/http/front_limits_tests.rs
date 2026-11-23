@@ -94,12 +94,36 @@ async fn a_client_that_stops_reading_is_cut_after_the_write_idle_limit() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_client_that_stops_reading_gives_its_slot_back() {
+    let addr = start(ServeLimits {
+        max_connections: 1,
+        write_idle_timeout: Duration::from_millis(500),
+        ..ServeLimits::default()
+    })
+    .await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let stalled = socket.connect(addr).await.unwrap();
+    // Pipelines requests and never reads an answer: once the socket
+    // buffers fill, the server's writes wait.
+    let (_unread, mut writer) = stalled.into_split();
+    let _pipelining = tokio::spawn(async move {
+        let request = format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: t\r\n\r\n").repeat(256);
+        while writer.write_all(request.as_bytes()).await.is_ok() {}
+    });
+    // The only slot is the stalled connection's until the limit cuts it.
+    let served =
+        tokio::time::timeout(Duration::from_secs(20), status_of(addr, &health_with(""))).await;
+    assert_eq!(served, Ok(200), "the stalled connection kept its slot");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_slow_reader_that_keeps_reading_is_not_cut() {
     let (mut client, done) = serve_pipe(8, Duration::from_millis(300));
     let request = format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
     client.write_all(request.as_bytes()).await.unwrap();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let mut raw = Vec::new();
     let mut buf = [0u8; 8];
     loop {
