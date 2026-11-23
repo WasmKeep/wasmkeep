@@ -9,9 +9,10 @@
 // acknowledged publish reached every client (`have`). Repeats and new
 // epochs (a room's cold start, ADR 0040, section 3) are counted, never an
 // error. The test front reads the history at epoch 1 only, so after a new
-// epoch it may refuse a catch-up: that is counted (`historyRefused`), and
-// whether the numbers arrived anyway is what the script checks. An
-// unexpected close code is recorded as a problem.
+// epoch it may refuse a client's cursor: that is counted (`historyRefused`)
+// and the client reads the history from the start instead (a refusal of
+// that is counted too, `historyStartRefused`). An unexpected close code is
+// recorded as a problem.
 //
 // Usage: node room-clients.mjs STATE_DIR ROOM PER PORT [PORT...]
 // Stops on SIGTERM (or SIGINT), after writing its state one last time.
@@ -45,7 +46,7 @@ async function history(port, from) {
 function client(port, k) {
   const id = `mv-${port}-${k}`;
   const s = {
-    id, port, last: 0, frames: 0, live: 0, fetched: 0, fetches: 0, historyRefused: 0,
+    id, port, last: 0, frames: 0, live: 0, fetched: 0, fetches: 0, historyRefused: 0, historyStartRefused: 0,
     repeats: 0, reconnects: 0, closes: {}, epochs: [], problems: [], connected: false,
   };
   const have = new Set();
@@ -59,10 +60,19 @@ function client(port, k) {
   // One chain per client, so frames and catch-ups apply in arrival order.
   let chain = Promise.resolve();
   const then = (f) => { chain = chain.then(f).catch((e) => s.problems.push(String(e))); };
+  // From the last number held; when the front refuses that cursor (it
+  // names epoch 1, and the room has moved on), from the start, keeping
+  // what this client lacks.
   const fetchHistory = async () => {
     s.fetches++;
-    const ns = await history(port, s.last);
-    if (ns === null) { s.historyRefused++; return; }
+    let ns = await history(port, s.last);
+    if (ns === null) {
+      s.historyRefused++;
+      ns = await history(port, 0);
+      // The fixture traps on a page that would carry a reset or a void
+      // range; whether the numbers came anyway is the script's check.
+      if (ns === null) { s.historyStartRefused++; return; }
+    }
     for (const n of ns) take(n, "fetched");
   };
   const connect = () => {

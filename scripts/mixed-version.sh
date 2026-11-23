@@ -127,17 +127,20 @@ test_actor=$root/crates/wasmkeep-server/tests/guests/test-actor/$rel/test_actor.
 # ---------------------------------------------------------------- the run
 rm -rf "$run"; mkdir -p "$run"; chmod 700 "$run"
 : > "$report"
-moto_pid=; clients_pid=; probe_pid=
+moto_pid=; clients_pid=; probe_pid=; bg_pid=
 cleanup() {
   local n
-  for p in $probe_pid $clients_pid; do kill "$p" 2>/dev/null || true; done
+  for p in $probe_pid $bg_pid $clients_pid; do kill "$p" 2>/dev/null || true; done
   for n in "${NODES[@]}"; do
     [ -z "${pid[$n]:-}" ] || kill -9 "${pid[$n]}" 2>/dev/null || true
   done
   # SIGTERM, which uvx passes on to moto (a SIGKILL would leave it running).
   [ -z "$moto_pid" ] || kill "$moto_pid" 2>/dev/null || true
   wait 2>/dev/null || true
-  [ "${MIXED_VERSION_KEEP:-0}" = 1 ] || rm -rf "$run"
+  # Kept for a look when asked, or when an upgrade check failed.
+  if [ "${MIXED_VERSION_KEEP:-0}" = 1 ] || [ "${fails:-0}" -gt 0 ]; then
+    echo "kept $run" >&2
+  else rm -rf "$run"; fi
 }
 trap cleanup EXIT
 trap 'exit 143' TERM INT
@@ -233,31 +236,41 @@ req_retry() { # req_retry SECS METHOD NODE PATH [args...]
   while :; do
     req "$@"
     case $RS in 503|000|502) ;; *) return 0 ;; esac
+    # Every answer retried is kept: a refusal must not hide behind a retry.
+    printf '%s %s via %s (%s): %s %s\n' "$(date -u +%T.%3N)" "$1 $3" "$2" \
+      "$(label "${bin[$2]:-}")" "$RS" "$(head -c 100 "$run/resp.body" | tr '\n' ' ')" >> "$run/retries-$step.txt"
     [ $SECONDS -lt $deadline ] || return 0
     sleep 0.5
   done
+}
+retries() { # the answers retried in this step, counted by status
+  [ -s "$run/retries-$step.txt" ] || return 0
+  note "retried: $(awk '{ print $7 }' "$run/retries-$step.txt" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')(first: $(head -1 "$run/retries-$step.txt" | cut -c1-160))"
 }
 holder() { # holder CLASS/NAME: the node owning it, or -
   new actor where --app "$APP" --bucket "$BUCKET" --json "$1" 2>/dev/null \
     | jq -r '.[0].owner // "-"' 2>/dev/null || echo -
 }
-# Have node N hold t/at-N: an actor move, checked through the answer header.
-pin() { # pin ID
-  local n=$1 deadline=$((SECONDS + 40))
-  new actor move --app "$APP" --bucket "$BUCKET" "t/at-$n" --to "$n" >/dev/null 2>&1 || true
+# Have node N hold test-actor NAME: an actor move, checked through the
+# answer header of a read.
+pin_actor() { # pin_actor NAME ID
+  local a=$1 n=$2 deadline=$((SECONDS + 40))
+  new actor move --app "$APP" --bucket "$BUCKET" "t/$a" --to "$n" >/dev/null 2>&1 || true
   while [ $SECONDS -lt $deadline ]; do
-    req GET "$n" "/actor/t/at-$n/durable"
+    req GET "$n" "/actor/t/$a/fired"
     [ "$RNODE" = "$n" ] && return 0
     sleep 1
   done
-  fail "t/at-$n is not on $n after a move (answered by '${RNODE}', $RS)"
+  fail "t/$a is not on $n after a move (answered by '${RNODE}', $RS)"
   return 1
 }
+pin() { pin_actor "at-$1" "$1"; }
 
 # ---------------------------------------------------------------- checks
 ctr=0             # the shared durable counter's acknowledged value
 declare -A fired  # alarms armed: actor -> fired count expected
 published=0       # the room's highest acknowledged number
+secret2=0         # 1 once main's CLI has sealed MV_SECRET2
 
 check_status() {
   local out
@@ -343,20 +356,35 @@ check_secrets() {
   done
 }
 
-# Alarms armed on actors spread over the nodes, some to fire during the
-# next hand-over and some after the restart; each must fire exactly once.
+check_secret2() { # the secret main's CLI sealed, on every node
+  local n
+  for n in "${NODES[@]}"; do
+    req_retry 20 GET "$n" "/actor/t/at-$n/env?name=MV_SECRET2"
+    if [ "$RS" = 200 ] && [ "$RB" = "main-sealed wasi=unset" ]; then
+      pass "secret sealed by main's CLI via $n ($(label "${bin[$n]}")) on ${RNODE}"
+    else fail "secret sealed by main's CLI via $n ($(label "${bin[$n]}")) on '${RNODE}': $RS '$RB'"; fi
+  done
+}
+
+# Alarms armed on actors held by each node (moved there, and armed through
+# that node, which must answer), one to fire during the next hand-over and
+# one after the restart; each must fire exactly once. Every alarm armed is
+# read again at the end of the run, for a late second run.
+declare -A every_alarm
 arm_alarms() { # arm_alarms TAG DELAY_MS
   local n
   for n in "${NODES[@]}"; do
     local a="al-$1-$n"
+    pin_actor "$a" "$n" || continue
     req_retry 20 POST "$n" "/actor/t/$a/alarm?in=$2"
-    if [ "$RS" = 200 ]; then fired[$a]=1; else fail "arming $a via $n: $RS $RB"; fi
+    if [ "$RS" = 200 ] && [ "$RNODE" = "$n" ]; then fired[$a]=1; every_alarm[$a]=$n
+    else fail "arming $a on $n: $RS $RB (ran on '${RNODE}')"; fi
   done
 }
-check_alarms() {
+check_alarms() { # check_alarms [WAIT_SECS]
   local a
   for a in "${!fired[@]}"; do
-    local deadline=$((SECONDS + 60)) f="" at=""
+    local deadline=$((SECONDS + ${1:-60})) f="" at=""
     while :; do
       req_retry 20 GET a "/actor/t/$a/fired"; f=$RB
       [ "$f" = "${fired[$a]}" ] && break
@@ -364,8 +392,9 @@ check_alarms() {
       sleep 1
     done
     req_retry 20 GET a "/actor/t/$a/attempts"; at=$RB
-    if [ "$f" = "${fired[$a]}" ] && [ "$at" = "${fired[$a]}" ]; then pass "alarm $a fired once (on ${RNODE})"
-    else fail "alarm $a: fired '$f', attempts '$at', expected ${fired[$a]}"; fi
+    if [ "$f" = "${fired[$a]}" ] && [ "$at" = "${fired[$a]}" ]; then
+      pass "alarm $a, armed on ${every_alarm[$a]}, fired once (read on ${RNODE})"
+    else fail "alarm $a, armed on ${every_alarm[$a]}: fired '$f', attempts '$at', expected ${fired[$a]}"; fi
     unset "fired[$a]"
   done
 }
@@ -412,7 +441,7 @@ check_room() { # check_room WHAT: every client holds every acknowledged number
   if [ -z "$missing" ] && [ "$count" -gt 0 ]; then pass "room ($1): all $count clients hold 1..$published"
   else fail "room ($1): of 1..$published: ${missing:-no clients}"; fi
   [ -z "$problems" ] || fail "room ($1): $problems"
-  note "room clients: $(client_state | jq -c '{epochs: ([.[].epochs[]] | unique), live: ([.[].live] | add), fetched: ([.[].fetched] | add), repeats: ([.[].repeats] | add), fetches: ([.[].fetches] | add), historyRefused: ([.[].historyRefused] | add), reconnects: ([.[].reconnects] | add), closes: ([.[].closes | to_entries[]] | group_by(.key) | map({(.[0].key): (map(.value) | add)}) | add)}' || true)"
+  note "room clients: $(client_state | jq -c '{epochs: ([.[].epochs[]] | unique), live: ([.[].live] | add), fetched: ([.[].fetched] | add), repeats: ([.[].repeats] | add), fetches: ([.[].fetches] | add), historyRefused: ([.[].historyRefused] | add), historyStartRefused: ([.[].historyStartRefused] | add), reconnects: ([.[].reconnects] | add), closes: ([.[].closes | to_entries[]] | group_by(.key) | map({(.[0].key): (map(.value) | add)}) | add)}' || true)"
 }
 # Where the room, its pusher and its edges are (#261, #265).
 check_apart() {
@@ -429,6 +458,7 @@ check_all() {
   check_counter
   check_calls
   check_secrets
+  [ "$secret2" = 0 ] || check_secret2
   publish 3
   check_room "live"
   check_apart
@@ -470,12 +500,42 @@ end_probe() {
   [ -z "$floor" ] || note "node $1: $floor"
 }
 
+# Publishes through the other nodes, one a second, while node N is
+# drained, stopped and started again: the clients connected through N are
+# away for some of them and must catch up. Only acknowledged numbers count.
+bg_pub_start() { # bg_pub_start ID
+  local n=$1 out=$run/bg-$step.txt
+  (
+    k=0
+    while :; do
+      for m in "${NODES[@]}"; do
+        [ "$m" != "$n" ] || continue
+        k=$((k + 1))
+        code=$(curl -s -m 10 -o "$run/bg-body" -w '%{http_code}' \
+          "http://127.0.0.1:${port[$m]}/r6/publish?room=quiet&id=bg-$step-$k" || echo 000)
+        echo "$code $(head -c 60 "$run/bg-body" | tr '\n' ' ')"
+        sleep 0.5
+      done
+    done
+  ) > "$out" 2>&1 &
+  bg_pid=$!
+}
+bg_pub_stop() {
+  kill "$bg_pid" 2>/dev/null; wait "$bg_pid" 2>/dev/null; bg_pid=
+  local out=$run/bg-$step.txt acked max
+  acked=$(awk '$1 == 200 && $2 ~ /^[0-9]+$/' "$out" | wc -l)
+  max=$(awk '$1 == 200 && $2 ~ /^[0-9]+$/ { if ($2 > m) m = $2 } END { print m + 0 }' "$out")
+  [ "$max" -le "$published" ] || published=$max
+  note "publishes during the step: $acked acknowledged, others $(awk '$1 != 200 { print $1 }' "$out" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')(highest $max)"
+}
+
 # Drain, stop, swap, start, ready, undrain, status.
 swap() { # swap ID BINARY
   local n=$1 b=$2 from; from=$(label "${bin[$n]}")
   log "---- step $step: node $n $from -> $(label "$b")"
-  arm_alarms "$step-handover" 4000
   arm_alarms "$step-after" 45000
+  arm_alarms "$step-handover" 6000
+  bg_pub_start "$n"
   if ! new cluster drain "$n" --bucket "$BUCKET" >/dev/null; then fail "drain $n refused"; fi
   wait_state "$n" drained 90 || true
   stop_node "$n"
@@ -489,11 +549,13 @@ swap() { # swap ID BINARY
   done
   start_probe "$n"
   if wait_ready "$n" 90; then pass "node $n ($(label "$b")) ready $((SECONDS - t0))s after its start"
-  else end_probe "$n"; return 1; fi
+  else end_probe "$n"; bg_pub_stop; return 1; fi
   wait_state "$n" serving 60 || true
   end_probe "$n"
+  bg_pub_stop
   check_all
   check_alarms
+  retries
 }
 
 # ---------------------------------------------------------------- 0. all 0.7.0
@@ -552,9 +614,27 @@ for spec in "97 10" "120 10"; do
   note "actors.call 0.7.0 -> 0.7.0 with $hn headers of $hv bytes: $RS '$RB'"
 done
 
+# The first publish after a quiet spell (#274), all of it 0.7.0: the
+# control for the same after main's pusher is deployed. Where the room and
+# pusher are just before the publish ("-": hibernated and released).
+quiet_publish() {
+  note "quiet: 40 s with no publish, so the room, pusher and edges can hibernate"
+  sleep 40
+  note "before the publish: room/quiet on $(holder room/quiet), pusher/quiet on $(holder pusher/quiet)"
+  local before after
+  before=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
+  publish 1
+  check_room "first publish after a quiet spell"
+  after=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
+  note "history fetches for the first publish after a quiet spell, pusher $1: $((after - before))"
+}
+step=quiet-0.7.0
+quiet_publish "0.7.0 SDK"
+
 # A database written by 0.7.0 (#263), opened by main after the upgrade: a
 # table under the prefix 0.8 reserves (0.7.0 may refuse it already), a
 # plain one, and one big enough that sorting it is a long statement.
+step=sqlite-0.7.0
 big_sort="SELECT x FROM big ORDER BY x DESC LIMIT 1"
 for sql in "CREATE TABLE _wasmkeep_legacy (x INTEGER)" \
            "CREATE TABLE plain_t (x INTEGER)" "INSERT INTO plain_t VALUES (1)" \
@@ -579,16 +659,15 @@ if new deploy --no-project --app "$APP" --bucket "$BUCKET" \
   > "$run/deploy-2.txt" 2>&1; then
   pass "main CLI deploy on a mixed cluster: $(tail -n 1 "$run/deploy-2.txt")"
 else fail "main CLI deploy: $(tr '\n' ' ' < "$run/deploy-2.txt")"; fi
+# A secret sealed by main's CLI, read on every node, 0.7.0 ones included.
+if printf 'main-sealed\n' | new secrets set --app "$APP" --bucket "$BUCKET" \
+  --key "$run/etc/secrets.key" --class t MV_SECRET2 > "$run/secrets-2.txt" 2>&1; then secret2=1
+else fail "main CLI secrets set: $(tr '\n' ' ' < "$run/secrets-2.txt")"; fi
 sleep 8
+check_secret2
 publish 2
 check_room "after the pusher redeploy"
-note "quiet: 40 s with no publish, so the room, pusher and edges hibernate"
-sleep 40
-before=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
-publish 1
-check_room "first publish after hibernation"
-after=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
-note "history fetches for the first publish after hibernation: $((after - before)) (#274: 0 expected with every child at the head)"
+quiet_publish "main SDK"
 
 # #268: request heads and calls across a 0.7.0 -> main hop (t/at-a on a).
 step=limits
@@ -632,7 +711,22 @@ phase=downgrade
 step=downgrade-c; swap c "$old_bin"
 
 step=end
+# Every alarm armed in the run, read again: still exactly one run each.
+late=0
+for a in "${!every_alarm[@]}"; do
+  case $a in *downgrade*) phase=downgrade ;; *) phase=upgrade ;; esac
+  req_retry 20 GET a "/actor/t/$a/attempts"
+  if [ "$RS" != 200 ] || [ "$RB" != 1 ]; then
+    fail "alarm $a (armed on ${every_alarm[$a]}) has run '$RB' times by the end"; late=$((late + 1))
+  fi
+done
+[ "$late" -gt 0 ] || pass "every alarm armed (${#every_alarm[@]}) ran once by the end"
 kill "$clients_pid" 2>/dev/null || true; wait "$clients_pid" 2>/dev/null || true; clients_pid=
+# What the nodes warned about, by message, per node.
+for n in "${NODES[@]}"; do
+  sed -nE 's/^[0-9T:.Z-]+ +(WARN|ERROR) +([^ ]+): ([^=]{1,90}).*/\1 \2: \3/p' "$run/$n.log" \
+    | sort | uniq -c | sort -rn | head -8 | while read -r line; do note "node $n log: $line"; done
+done
 log "upgrade checks: $fails failed; upgrade part ${upgrade_secs}s, whole run $((SECONDS - started_at))s"
 log "report: $report; node logs: $run/<node>.log (kept with MIXED_VERSION_KEEP=1)"
 [ "$fails" -eq 0 ]
