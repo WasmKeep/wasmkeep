@@ -206,40 +206,107 @@ impl Links {
 
 /// The node's own node-link secret, without a bucket: 32 random bytes in
 /// `<app dir>/.blob-link-key`, made once (mode 0600) and kept, so links
-/// outlive a restart.
+/// outlive a restart. A new key is written whole to a file of its own and
+/// then linked into place, never replacing a file there: of two starts at
+/// once, one key wins and both read it, checked alike.
 ///
 /// # Errors
 /// The file cannot be read or made, or is not 32 bytes.
 pub(crate) fn local_key(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    local_key_with(app_dir, |from, to| std::fs::hard_link(from, to))
+}
+
+/// [`local_key`], linking with `link`.
+fn local_key_with(
+    app_dir: &std::path::Path,
+    link: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<Vec<u8>, String> {
     use ring::rand::SecureRandom as _;
     let path = app_dir.join(".blob-link-key");
-    match std::fs::read(&path) {
-        Ok(k) if k.len() == 32 => return Ok(k),
-        Ok(_) => return Err(format!("{} is not 32 bytes", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+    remove_stale_temporaries(app_dir);
+    if let Some(k) = read_key(&path)? {
+        return Ok(k);
     }
     let mut k = vec![0u8; 32];
     ring::rand::SystemRandom::new()
         .fill(&mut k)
         .map_err(|_| "no randomness".to_owned())?;
     std::fs::create_dir_all(app_dir).map_err(|e| e.to_string())?;
+    let id = super::random_id().map_err(|_| "no randomness".to_owned())?;
+    let tmp = app_dir.join(format!(".blob-link-key.{id}.tmp"));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    match options.open(&path) {
-        Ok(mut f) => {
+    let write = |at: &std::path::Path| {
+        options.open(at).and_then(|mut f| {
             use std::io::Write as _;
-            f.write_all(&k)
-                .and_then(|()| f.sync_all())
-                .map_err(|e| e.to_string())?;
+            f.write_all(&k).and_then(|()| f.sync_all())
+        })
+    };
+    // A hard link, unlike a rename, never replaces a file already there.
+    let linked = write(&tmp).and_then(|()| link(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    let exists = std::io::ErrorKind::AlreadyExists;
+    let linked = match linked {
+        // Refused for another reason (a file system without hard links),
+        // with no key there yet: written in place, where a start that
+        // reads it half-written refuses it (32 bytes, checked).
+        Err(e) if e.kind() != exists && !path.exists() => {
+            tracing::debug!(error = %e, "no hard link for the node-link key: writing it in place");
+            write(&path)
+        }
+        // Refused, but another start's key is there: that one is read.
+        Err(e) if e.kind() != exists => Err(std::io::Error::new(exists, e)),
+        other => other,
+    };
+    match linked {
+        Ok(()) => {
+            if let Ok(dir) = std::fs::File::open(app_dir) {
+                let _ = dir.sync_all();
+            }
             Ok(k)
         }
         // Made meanwhile by another start: read that one.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::read(&path).map_err(|e| e.to_string())
+        Err(e) if e.kind() == exists => {
+            read_key(&path)?.ok_or_else(|| format!("{} vanished as it was made", path.display()))
         }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Removes the temporary key files of starts that stopped midway: older
+/// than a minute, so never one another start is writing now.
+fn remove_stale_temporaries(app_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(app_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(".blob-link-key.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60));
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The key file at `path`, if there is one, checked to be 32 bytes.
+fn read_key(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(k) if k.len() == 32 => Ok(Some(k)),
+        Ok(_) => Err(format!("{} is not 32 bytes", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
@@ -322,6 +389,7 @@ pub(crate) fn disposition(inline: bool, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // test code
     use super::*;
 
     #[test]
@@ -370,6 +438,98 @@ mod tests {
         assert!(matches!(life(Some(3_600), DOWNLOAD_SECS), Ok(3_600)));
         assert!(life(Some(0), UPLOAD_SECS).is_err());
         assert!(life(Some(3_601), UPLOAD_SECS).is_err());
+    }
+
+    #[test]
+    fn a_key_file_is_always_32_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = local_key(tmp.path()).unwrap();
+        assert_eq!(k.len(), 32);
+        assert_eq!(local_key(tmp.path()).unwrap(), k, "kept across starts");
+        for short in [&b""[..], &[7u8; 31][..], &[7u8; 33][..]] {
+            std::fs::write(tmp.path().join(".blob-link-key"), short).unwrap();
+            assert!(local_key(tmp.path()).is_err(), "{} bytes", short.len());
+        }
+    }
+
+    fn no_links(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    #[test]
+    fn without_hard_links_a_key_is_still_made_and_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = local_key_with(tmp.path(), no_links).unwrap();
+        assert_eq!(k.len(), 32);
+        assert_eq!(local_key_with(tmp.path(), no_links).unwrap(), k);
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [".blob-link-key"]);
+    }
+
+    #[test]
+    fn a_key_made_meanwhile_is_read_when_the_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = [9u8; 32];
+        // Another start publishes its key, then this one's link is
+        // refused (a file system without hard links).
+        let k = local_key_with(tmp.path(), |_, to| {
+            std::fs::write(to, theirs)?;
+            no_links(to, to)
+        })
+        .unwrap();
+        assert_eq!(k, theirs);
+    }
+
+    #[test]
+    fn a_stale_temporary_key_file_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join(".blob-link-key.0123456789abcdef.tmp");
+        let fresh = tmp.path().join(".blob-link-key.fedcba9876543210.tmp");
+        std::fs::write(&stale, [1u8; 32]).unwrap();
+        std::fs::write(&fresh, [2u8; 32]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .unwrap();
+        local_key(tmp.path()).unwrap();
+        assert!(!stale.exists(), "left by a start that stopped midway");
+        assert!(fresh.exists(), "maybe another start's, under way");
+    }
+
+    #[test]
+    fn starts_at_once_agree_on_one_whole_key() {
+        for _ in 0..200 {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("app");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (dir, barrier) = (dir.clone(), std::sync::Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        local_key(&dir)
+                    })
+                })
+                .collect();
+            let keys: Vec<Vec<u8>> = threads
+                .into_iter()
+                .map(|t| t.join().unwrap().unwrap())
+                .collect();
+            assert!(
+                keys.iter().all(|k| k.len() == 32 && *k == keys[0]),
+                "every start reads the one whole key"
+            );
+            let names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [".blob-link-key"], "no temporary file is left");
+        }
     }
 
     #[test]

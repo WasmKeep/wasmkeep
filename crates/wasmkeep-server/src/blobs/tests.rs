@@ -948,3 +948,394 @@ async fn a_bucket_count_is_written_for_every_node_and_other_epochs_are_not_count
     stale.blobs.note_usage(&wrong);
     assert!(!stale.blobs.over_quota());
 }
+
+type Body = http_body_util::StreamBody<
+    futures_util::stream::BoxStream<
+        'static,
+        Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+    >,
+>;
+
+/// Files on disk with node links, spooling under budgets of their own.
+fn spooling(app: u64, node: &Arc<streams::Budget>) -> (tempfile::TempDir, Arc<Blobs>) {
+    let (tmp, blobs) = with_links(disk_with(DEFAULT_MAX_FILE), false);
+    let blobs = Arc::into_inner(blobs)
+        .unwrap()
+        .with_spool_budgets(Arc::new(streams::Budget::new(app)), Arc::clone(node));
+    (tmp, Arc::new(blobs))
+}
+
+/// An upload link's path for `size` bytes at `key`.
+fn upload_path(blobs: &Blobs, key: &str, size: u64) -> String {
+    let (url, _) = blobs
+        .link_upload(&Namespace::front(), key, size, "image/png", 60)
+        .unwrap();
+    url.strip_prefix("https://shop.example.com")
+        .unwrap()
+        .to_owned()
+}
+
+fn frame(n: u64) -> Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible> {
+    Ok(hyper::body::Frame::data(bytes::Bytes::from(vec![
+        1u8;
+        n as usize
+    ])))
+}
+
+/// A PUT of all `size` bytes to `path`.
+fn put(path: &str, size: u64) -> hyper::Request<Body> {
+    use futures_util::StreamExt as _;
+    request(
+        path,
+        size,
+        futures_util::stream::iter([frame(size)]).boxed(),
+    )
+}
+
+/// A PUT of `size` bytes to `path` that sends one and then nothing more,
+/// and the signal of its body asked for a second: the first is spooled.
+fn put_stalled(
+    path: &str,
+    size: u64,
+) -> (hyper::Request<Body>, tokio::sync::oneshot::Receiver<()>) {
+    use futures_util::StreamExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let rest = futures_util::stream::poll_fn(move |_| {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(());
+        }
+        std::task::Poll::Pending
+    });
+    let stream = futures_util::stream::iter([frame(1)]).chain(rest).boxed();
+    (request(path, size, stream), rx)
+}
+
+fn request(
+    path: &str,
+    size: u64,
+    stream: futures_util::stream::BoxStream<
+        'static,
+        Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+    >,
+) -> hyper::Request<Body> {
+    hyper::Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-length", size.to_string())
+        .header("content-type", "image/png")
+        .body(http_body_util::StreamBody::new(stream))
+        .unwrap()
+}
+
+async fn send(blobs: &Blobs, req: hyper::Request<Body>) -> hyper::StatusCode {
+    serve::serve(blobs, false, req).await.status()
+}
+
+/// Starts an upload that stalls after its first byte, holding its spool.
+async fn stalled(
+    blobs: &Arc<Blobs>,
+    path: &str,
+    size: u64,
+    node: &streams::Budget,
+) -> tokio::task::JoinHandle<hyper::StatusCode> {
+    let before = node.used();
+    let (req, spooled) = put_stalled(path, size);
+    let b = Arc::clone(blobs);
+    let task = tokio::spawn(async move { send(&b, req).await });
+    spooled.await.unwrap();
+    assert_eq!(
+        node.used(),
+        before + size,
+        "the stalled upload holds its size"
+    );
+    task
+}
+
+#[tokio::test]
+async fn an_upload_link_sent_again_while_its_body_arrives_is_refused() {
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (tmp, blobs) = spooling(1 << 30, &node);
+    let tmp_dir = tmp.path().join("blobs/00112233aabbccdd/_front/main/0/tmp");
+    let spools = || std::fs::read_dir(&tmp_dir).map_or(0, |d| d.count());
+    let path = upload_path(&blobs, "u/1", 1_000);
+    let first = stalled(&blobs, &path, 1_000, &node).await;
+    let replays =
+        futures_util::future::join_all((0..8).map(|_| send(&blobs, put(&path, 1_000)))).await;
+    assert!(
+        replays.iter().all(|s| *s == hyper::StatusCode::CONFLICT),
+        "{replays:?}"
+    );
+    assert_eq!(spools(), 1, "only the first body is spooled");
+    assert_eq!(node.used(), 1_000);
+    // The first gone (its client went away), the link works again.
+    first.abort();
+    assert!(first.await.is_err());
+    assert_eq!(
+        (node.used(), spools()),
+        (0, 0),
+        "released with the upload: {:?}",
+        std::fs::read_dir(&tmp_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        send(&blobs, put(&path, 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+    assert_eq!(node.used(), 0, "released once committed");
+    assert_eq!(
+        send(&blobs, put(&path, 1_000)).await,
+        hyper::StatusCode::PRECONDITION_FAILED
+    );
+}
+
+#[tokio::test]
+async fn the_spool_budgets_refuse_past_their_limit_and_recover() {
+    // The node's budget, shared by two apps.
+    let node = Arc::new(streams::Budget::new(1_500));
+    let (_a, one) = spooling(1 << 30, &node);
+    let (_b, two) = spooling(1 << 30, &node);
+    let first = stalled(&one, &upload_path(&one, "a", 1_000), 1_000, &node).await;
+    let other = upload_path(&two, "b", 1_000);
+    assert_eq!(
+        send(&two, put(&other, 1_000)).await,
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        "past the node's budget, before any byte is read"
+    );
+    assert_eq!(
+        send(&two, put(&upload_path(&two, "c", 400), 400)).await,
+        hyper::StatusCode::CREATED,
+        "what fits is taken"
+    );
+    first.abort();
+    let _ = first.await;
+    assert_eq!(node.used(), 0);
+    assert_eq!(
+        send(&two, put(&other, 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+
+    // An app's share, under a node budget with room.
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_c, app) = spooling(1_500, &node);
+    let first = stalled(&app, &upload_path(&app, "a", 1_000), 1_000, &node).await;
+    assert_eq!(
+        send(&app, put(&upload_path(&app, "b", 1_000), 1_000)).await,
+        hyper::StatusCode::SERVICE_UNAVAILABLE
+    );
+    first.abort();
+    let _ = first.await;
+    assert_eq!(node.used(), 0);
+
+    // A guest's streamed write is charged as it is written.
+    let node = Arc::new(streams::Budget::new(100_000));
+    let (_d, blobs) = spooling(1 << 30, &node);
+    let f = Fixture {
+        _tmp: tempfile::tempdir().unwrap(),
+        blobs,
+    };
+    let mut c = caller(&f, Namespace::front());
+    let mut table = ResourceTable::new();
+    let upload = c
+        .open_write(&mut table, "big".into(), any())
+        .await
+        .unwrap()
+        .unwrap();
+    let stream = c.body(&mut table, &upload).unwrap().unwrap();
+    let s = table.get_mut(&stream).unwrap();
+    s.write(bytes::Bytes::from(vec![0u8; 100_000])).unwrap();
+    assert!(s.write(bytes::Bytes::from_static(b"x")).is_err());
+    assert!(matches!(
+        c.finish(&mut table, upload).await.unwrap(),
+        Err(BlobError::Unavailable(_))
+    ));
+    assert_eq!(node.used(), 0, "given back when the write fails");
+    assert!(c.head("big".into()).await.unwrap().is_none());
+    let info = write_streamed(&mut c, &mut table, "fits", &[1; 50_000], any())
+        .await
+        .unwrap();
+    assert_eq!((info.size, node.used()), (50_000, 0));
+}
+
+#[tokio::test]
+async fn a_guest_opens_at_most_16_streamed_writes_at_once() {
+    let f = disk_with(DEFAULT_MAX_FILE);
+    let mut c = caller(&f, Namespace::front());
+    let mut table = ResourceTable::new();
+    let mut open = Vec::new();
+    for i in 0..MAX_OPEN_WRITES {
+        open.push(
+            c.open_write(&mut table, format!("k{i}"), any())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(matches!(
+        c.open_write(&mut table, "one-more".into(), any())
+            .await
+            .unwrap(),
+        Err(BlobError::NotAllowed(_))
+    ));
+    // One dropped, another may open; one finished, likewise.
+    c.drop_upload(&mut table, open.pop().unwrap()).unwrap();
+    c.open_write(&mut table, "again".into(), any())
+        .await
+        .unwrap()
+        .unwrap();
+    c.finish(&mut table, open.pop().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    c.open_write(&mut table, "again2".into(), any())
+        .await
+        .unwrap()
+        .unwrap();
+    // The next event starts with none open.
+    c.new_event(Gate::Free);
+    for i in 0..MAX_OPEN_WRITES {
+        c.open_write(&mut table, format!("n{i}"), any())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// Files on disk with node links and a largest file of `max`, their
+/// share taken of `node`.
+fn sharing(node: &Arc<streams::Budget>, max: u64) -> (tempfile::TempDir, Arc<Blobs>) {
+    let (tmp, blobs) = with_links(disk_with(max), false);
+    let blobs = Arc::into_inner(blobs)
+        .unwrap()
+        .with_node_spool(Arc::clone(node));
+    (tmp, Arc::new(blobs))
+}
+
+/// A PUT of `size` bytes sent `chunk` bytes every `every`.
+fn put_paced(
+    path: &str,
+    size: u64,
+    chunk: u64,
+    every: std::time::Duration,
+) -> hyper::Request<Body> {
+    use futures_util::StreamExt as _;
+    let stream = futures_util::stream::unfold(size, move |left| async move {
+        if left == 0 {
+            return None;
+        }
+        tokio::time::sleep(every).await;
+        let n = left.min(chunk);
+        Some((frame(n), left - n))
+    })
+    .boxed();
+    request(path, size, stream)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trickling_upload_is_aborted_and_gives_its_budget_back() {
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    let size = 1_000_000;
+    // One byte a minute less a second: never idle for 60 s.
+    let start = tokio::time::Instant::now();
+    let status = send(
+        &blobs,
+        put_paced(
+            &upload_path(&blobs, "slow", size),
+            size,
+            1,
+            std::time::Duration::from_secs(59),
+        ),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "aborted by its rate, not after the link's expiry: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(node.used(), 0, "given back");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_but_steady_upload_completes() {
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    // 20 KiB a second for a minute: a poor mobile link.
+    let size = 60 * 20 * 1024;
+    let status = send(
+        &blobs,
+        put_paced(
+            &upload_path(&blobs, "steady", size),
+            size,
+            20 * 1024,
+            std::time::Duration::from_secs(1),
+        ),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::CREATED);
+    assert_eq!(node.used(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_body_that_stops_is_aborted_after_60_s() {
+    use futures_util::StreamExt as _;
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    // Half the body at once, ahead of any rate, then nothing more.
+    let size = 8 << 20;
+    let stream = futures_util::stream::iter([frame(size / 2)])
+        .chain(futures_util::stream::pending())
+        .boxed();
+    let start = tokio::time::Instant::now();
+    let status = send(
+        &blobs,
+        request(&upload_path(&blobs, "stops", size), size, stream),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::REQUEST_TIMEOUT);
+    let took = start.elapsed();
+    assert!(
+        took >= std::time::Duration::from_secs(60) && took < std::time::Duration::from_secs(61),
+        "{took:?}"
+    );
+    assert_eq!(node.used(), 0);
+}
+
+#[tokio::test]
+async fn one_app_cannot_take_the_whole_node_budget() {
+    let node = Arc::new(streams::Budget::new(4_000));
+    let (_a, one) = sharing(&node, 1_000);
+    let (_b, two) = sharing(&node, 1_000);
+    // The first app's links take its share, half the node's.
+    let first = stalled(&one, &upload_path(&one, "a", 1_000), 1_000, &node).await;
+    let second = stalled(&one, &upload_path(&one, "b", 1_000), 1_000, &node).await;
+    assert_eq!(
+        send(&one, put(&upload_path(&one, "c", 1_000), 1_000)).await,
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        "past the app's share"
+    );
+    // The other app still has the rest.
+    assert_eq!(
+        send(&two, put(&upload_path(&two, "a", 1_000), 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+    for t in [first, second] {
+        t.abort();
+        let _ = t.await;
+    }
+    assert_eq!(node.used(), 0);
+    // A node budget below twice an app's largest file is raised to it.
+    let node = Arc::new(streams::Budget::new(10));
+    let (_c, big) = sharing(&node, 1_000);
+    let first = stalled(&big, &upload_path(&big, "a", 1_000), 1_000, &node).await;
+    let (_d, other) = sharing(&node, 1_000);
+    assert_eq!(
+        send(&other, put(&upload_path(&other, "a", 1_000), 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+    first.abort();
+    let _ = first.await;
+}

@@ -245,7 +245,14 @@ impl Caller {
             let write = write(options)?;
             let blobs = self.blobs()?;
             self.may_write()?;
-            let spool = blobs.spool(&self.ns).await?;
+            self.open.retain(Spool::is_open);
+            if self.open.len() >= super::MAX_OPEN_WRITES {
+                return Err(BlobError::NotAllowed(format!(
+                    "at most {} streamed writes open at once: finish or drop one first",
+                    super::MAX_OPEN_WRITES
+                )));
+            }
+            let spool = blobs.spool(&self.ns, None).await?;
             Ok::<_, BlobError>((write, spool))
         }
         .await;
@@ -253,7 +260,6 @@ impl Caller {
             Ok(v) => v,
             Err(e) => return Ok(Err(e)),
         };
-        self.open.retain(Spool::is_open);
         self.open.push(spool.clone());
         let entry = table.push(UploadEntry {
             key,

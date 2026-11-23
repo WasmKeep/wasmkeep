@@ -1710,6 +1710,9 @@ impl ActorState {
         let delete = live.store.data().delete_requested;
         // `delete-self-durable` already recorded the delete (ADR 0028).
         let host = live.store.data_mut();
+        // The event's file streams stop now, and a write it left open
+        // gives back its spool file and budget (ADR 0030, section 3).
+        host.blob.end_event();
         // A single node's durable delete that could not remove the files:
         // removed now, as for `delete-self`.
         let durable = host
