@@ -363,7 +363,7 @@ fn a_full_record_tells_full_from_used() {
 #[test]
 fn a_clock_set_back_after_the_start_lowers_the_start_floor() {
     let start = 10_000_000;
-    let seen = SeenSignatures::default().from_now(0);
+    let seen = SeenSignatures::default().started_now(0);
     assert!(seen.used([1; 32], start - 5, start));
     // The clock is set back an hour (no signature was spent meanwhile:
     // ahead by more than the window, every one was refused unchecked).
@@ -379,7 +379,7 @@ fn a_clock_set_back_after_the_start_lowers_the_start_floor() {
 #[test]
 fn the_start_floor_covers_a_sender_whose_clock_is_ahead() {
     let start = 10_000_000;
-    let seen = SeenSignatures::default().from_now(1_000);
+    let seen = SeenSignatures::default().started_now(1_000);
     assert_eq!(seen.spend([1; 32], start + 500, start), Spent::BeforeStart);
     assert_eq!(seen.spend([2; 32], start + 1_000, start), Spent::Fresh);
 }
@@ -389,7 +389,7 @@ fn the_start_floor_covers_a_sender_whose_clock_is_ahead() {
 #[test]
 fn the_start_floor_follows_a_clock_stepping_forward() {
     let start = 10_000_000;
-    let seen = SeenSignatures::default().from_now(0);
+    let seen = SeenSignatures::default().started_now(0);
     let now = start + 10_000;
     assert_eq!(seen.spend([1; 32], start + 5_000, now), Spent::BeforeStart);
     assert_eq!(seen.spend([2; 32], now, now), Spent::Fresh);

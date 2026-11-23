@@ -814,12 +814,12 @@ impl Cluster {
         let skew = config.lease.max_skew_ms();
         let cluster = Arc::new(Self {
             serves: serves.to_owned(),
-            seen: SeenSignatures::named("calls").from_now(skew),
+            seen: SeenSignatures::named("calls").started_now(skew),
             seen_control: SeenSignatures::with_cap("control", signing::MAX_SEEN_CONTROL)
-                .from_now(skew),
+                .started_now(skew),
             seen_ingress: SeenSignatures::with_cap("ingress", signing::MAX_SEEN_INGRESS)
-                .from_now(0),
-            seen_public: SeenSignatures::public().from_now(skew),
+                .started_now(0),
+            seen_public: SeenSignatures::public().started_now(skew),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
             owners: Owners::new(

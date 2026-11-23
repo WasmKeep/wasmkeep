@@ -119,7 +119,7 @@ pub(crate) enum Spent {
     Used,
     /// The record is full: refused, though it may be fresh.
     Full,
-    /// Signed before this record was started ([`SeenSignatures::from_now`]):
+    /// Signed before this record was started ([`SeenSignatures::started_now`]):
     /// a record from before (another process, or runtime, under this node
     /// id) may have seen it, so it is refused.
     BeforeStart,
@@ -275,7 +275,7 @@ impl SeenSignatures {
     /// The same record, refusing every signature made before now plus
     /// `skew_ms` ([`Seen::floor`]): a new process or runtime cannot know
     /// which of those its predecessor had used.
-    pub(super) fn from_now(self, skew_ms: u64) -> Self {
+    pub(super) fn started_now(self, skew_ms: u64) -> Self {
         self.seen.lock().unwrap_or_else(|p| p.into_inner()).started =
             Some((std::time::Instant::now(), skew_ms));
         self
