@@ -199,6 +199,40 @@ async fn an_idle_pass_leaves_the_snapshot_and_its_segment_and_the_same_database(
     );
 }
 
+/// ADR 0042, Tests, "Readers": an export that listed before the pass and
+/// reads while it deletes (its segment reads held back) still publishes
+/// the same database. What it plans from (the snapshot at the head and the
+/// segment there) is never in the pass's set.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_export_racing_a_pass_publishes_the_same_database() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let a = compacting("a", da.path(), &store, Duration::from_millis(500)).await;
+    settle().await;
+    writes(&a, "e", 0, 6).await;
+    hibernated(&a).await;
+    let (head, _) = export(&store, "e", Point::Head).await;
+    let slow = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    slow.delay_wal_get_ms.store(1_500, Ordering::SeqCst);
+    let reader: Arc<dyn ObjectStore> = Arc::clone(&slow) as Arc<dyn ObjectStore>;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let pass = async {
+        // The export has listed; its segment read waits.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let outcome = run_passes(&a).await;
+        (outcome, actor_keys(&store, "e").await.len())
+    };
+    let ((raced, n), (outcome, left)) = tokio::join!(export(&reader, "e", Point::Head), pass);
+    assert_eq!((outcome, left), ("done", 2));
+    assert_eq!(
+        (raced.position, raced.raw_checksum, n),
+        (head.position, head.raw_checksum, 6)
+    );
+}
+
 /// A wake before the pass, even one that only reads, rewrites the record:
 /// the pass finds it changed and leaves every object.
 #[tokio::test(flavor = "multi_thread")]
@@ -309,6 +343,41 @@ async fn a_pass_deletes_nothing_of_a_recreated_app() {
     assert_eq!(outcome, "refused");
     let r = send(c.addr, "GET", "/actor/t/r/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "8"), "{}", r.body);
+}
+
+/// ADR 0042, constraint 8: a class with an idle limit is never compacted,
+/// since the pass's two rewrites of the record would restart the actor's
+/// idle clock (as built, in either record format: see the ADR).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_class_with_an_idle_limit_is_not_compacted() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let a = node_configured(
+        "a",
+        da.path(),
+        &store,
+        IDLE,
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |c: &mut ActorConfig| {
+            no_placement(c);
+            c.expire_after_idle
+                .insert("t".into(), Duration::from_secs(3600));
+            c.cluster.as_mut().unwrap().history_retention = Duration::from_millis(500);
+        },
+    )
+    .await;
+    a.service.pause_idle_passes(true);
+    settle().await;
+    writes(&a, "l", 0, 4).await;
+    hibernated(&a).await;
+    let before = actor_keys(&store, "l").await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let outcome = run_passes(&a).await;
+    assert_eq!(actor_keys(&store, "l").await, before);
+    assert_eq!(outcome, "refused");
 }
 
 /// With idle compaction off, a release remembers nothing.
