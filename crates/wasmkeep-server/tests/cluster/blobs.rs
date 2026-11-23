@@ -697,6 +697,45 @@ async fn the_rust_sdk_keeps_files_and_streams_them() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_write_left_open_goes_when_its_event_ends() {
+    if over_tls() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let node = class_node(None, d.path(), "files", files_rust_wasm()).await;
+    let spooled = || {
+        walk(d.path())
+            .into_iter()
+            .filter(|p| p.parent().and_then(|p| p.file_name()) == Some("tmp".as_ref()))
+            .count()
+    };
+    let r = call(
+        node.addr,
+        "POST",
+        "/actor/files/alice/stream/open?n=300000&leave=1",
+        "",
+        b"",
+    )
+    .await;
+    assert_eq!((r.status, r.body.as_str()), (200, "left"));
+    // Gone once the event ended (the answer may arrive just before), not
+    // at the actor's next event.
+    for _ in 0..250 {
+        if spooled() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        spooled(),
+        0,
+        "the open write's spool file outlived its event"
+    );
+    let r = call(node.addr, "GET", "/actor/files/alice/info/open", "", b"").await;
+    assert_eq!(r.status, 404, "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_typescript_sdk_keeps_files_on_quickjs() {
     if let Some(wasm) = files_ts_wasm("files.wasm") {
         sdk_contract(&wasm).await;

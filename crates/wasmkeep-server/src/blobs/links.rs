@@ -213,8 +213,17 @@ impl Links {
 /// # Errors
 /// The file cannot be read or made, or is not 32 bytes.
 pub(crate) fn local_key(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    local_key_with(app_dir, |from, to| std::fs::hard_link(from, to))
+}
+
+/// [`local_key`], linking with `link`.
+fn local_key_with(
+    app_dir: &std::path::Path,
+    link: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<Vec<u8>, String> {
     use ring::rand::SecureRandom as _;
     let path = app_dir.join(".blob-link-key");
+    remove_stale_temporaries(app_dir);
     if let Some(k) = read_key(&path)? {
         return Ok(k);
     }
@@ -236,15 +245,19 @@ pub(crate) fn local_key(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
         })
     };
     // A hard link, unlike a rename, never replaces a file already there.
-    let linked = write(&tmp).and_then(|()| std::fs::hard_link(&tmp, &path));
+    let linked = write(&tmp).and_then(|()| link(&tmp, &path));
     let _ = std::fs::remove_file(&tmp);
-    // A file system without hard links: the key is written in place, and
-    // a start that reads it half-written refuses it (32 bytes, checked).
+    let exists = std::io::ErrorKind::AlreadyExists;
     let linked = match linked {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+        // Refused for another reason (a file system without hard links),
+        // with no key there yet: written in place, where a start that
+        // reads it half-written refuses it (32 bytes, checked).
+        Err(e) if e.kind() != exists && !path.exists() => {
             tracing::debug!(error = %e, "no hard link for the node-link key: writing it in place");
             write(&path)
         }
+        // Refused, but another start's key is there: that one is read.
+        Err(e) if e.kind() != exists => Err(std::io::Error::new(exists, e)),
         other => other,
     };
     match linked {
@@ -255,10 +268,36 @@ pub(crate) fn local_key(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
             Ok(k)
         }
         // Made meanwhile by another start: read that one.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(e) if e.kind() == exists => {
             read_key(&path)?.ok_or_else(|| format!("{} vanished as it was made", path.display()))
         }
         Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Removes the temporary key files of starts that stopped midway: older
+/// than a minute, so never one another start is writing now.
+fn remove_stale_temporaries(app_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(app_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(".blob-link-key.") && name.ends_with(".tmp")) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60));
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -411,6 +450,55 @@ mod tests {
             std::fs::write(tmp.path().join(".blob-link-key"), short).unwrap();
             assert!(local_key(tmp.path()).is_err(), "{} bytes", short.len());
         }
+    }
+
+    fn no_links(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    #[test]
+    fn without_hard_links_a_key_is_still_made_and_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = local_key_with(tmp.path(), no_links).unwrap();
+        assert_eq!(k.len(), 32);
+        assert_eq!(local_key_with(tmp.path(), no_links).unwrap(), k);
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [".blob-link-key"]);
+    }
+
+    #[test]
+    fn a_key_made_meanwhile_is_read_when_the_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = [9u8; 32];
+        // Another start publishes its key, then this one's link is
+        // refused (a file system without hard links).
+        let k = local_key_with(tmp.path(), |_, to| {
+            std::fs::write(to, theirs)?;
+            no_links(to, to)
+        })
+        .unwrap();
+        assert_eq!(k, theirs);
+    }
+
+    #[test]
+    fn a_stale_temporary_key_file_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join(".blob-link-key.0123456789abcdef.tmp");
+        let fresh = tmp.path().join(".blob-link-key.fedcba9876543210.tmp");
+        std::fs::write(&stale, [1u8; 32]).unwrap();
+        std::fs::write(&fresh, [2u8; 32]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .unwrap();
+        local_key(tmp.path()).unwrap();
+        assert!(!stale.exists(), "left by a start that stopped midway");
+        assert!(fresh.exists(), "maybe another start's, under way");
     }
 
     #[test]

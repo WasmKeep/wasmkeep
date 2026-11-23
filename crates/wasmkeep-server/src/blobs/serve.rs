@@ -4,11 +4,14 @@
 //! token is used before its MAC is checked, and a token is refused before
 //! any body is read.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::{Request, Response, StatusCode};
+use tokio::time::Instant;
 use wasmkeep_wit::wasmkeep::actor::blobs::{BlobError, Condition};
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
@@ -22,7 +25,15 @@ use crate::http::text_response;
 /// How long past its expiry an upload that started in time may run.
 const UPLOAD_GRACE_MS: u64 = 60 * 60 * 1_000;
 /// How long an upload's body may send nothing before it is aborted.
-const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const UPLOAD_IDLE: Duration = Duration::from_secs(60);
+/// The slowest average an upload's body may arrive at, in bytes a second,
+/// once [`UPLOAD_RATE_GRACE`] has passed: 16 KiB/s (128 kbit/s), below a
+/// poor mobile link, so its whole size is not held for a client that
+/// trickles.
+const UPLOAD_MIN_RATE: u64 = 16 * 1024;
+/// How long an upload's body may take before its average rate counts:
+/// for a connection's slow start and a phone between cells.
+const UPLOAD_RATE_GRACE: Duration = Duration::from_secs(30);
 
 fn refuse(status: StatusCode, text: &str) -> Response<HyperOutgoingBody> {
     let mut r = text_response(status, text);
@@ -273,7 +284,56 @@ where
             "an upload to this link is already under way\n",
         );
     };
-    match blobs.head(ns, &token.key).await {
+    // Everything from here, the commit included, ends by the link's expiry
+    // plus the grace: dropped then, the spool and its budget go with it.
+    let deadline_ms = token.expires_at_ms.saturating_add(UPLOAD_GRACE_MS);
+    let left = Duration::from_millis(deadline_ms.saturating_sub(now_ms()));
+    let req_body = req.into_body();
+    match tokio::time::timeout(
+        left,
+        receive(blobs, ns, &token.key, size, content_type, req_body),
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(_) => refuse(
+            StatusCode::REQUEST_TIMEOUT,
+            "the upload ran past its link's time\n",
+        ),
+    }
+}
+
+/// Why an upload's body was refused while it arrived.
+enum Refused {
+    /// Nothing for [`UPLOAD_IDLE`], or slower on average than
+    /// [`UPLOAD_MIN_RATE`] once [`UPLOAD_RATE_GRACE`] has passed.
+    Slow,
+    WrongBody,
+    Unavailable,
+}
+
+/// When an upload that started at `start` and has `got` bytes must have
+/// sent its next: within [`UPLOAD_IDLE`] of now, and soon enough to keep
+/// its average at [`UPLOAD_MIN_RATE`] after [`UPLOAD_RATE_GRACE`].
+fn next_frame_by(start: Instant, got: u64) -> Instant {
+    let credit = Duration::from_millis(got.saturating_mul(1_000) / UPLOAD_MIN_RATE);
+    (Instant::now() + UPLOAD_IDLE).min(start + UPLOAD_RATE_GRACE + credit)
+}
+
+/// Reads exactly `size` bytes of `body` into a new spool, then commits it
+/// as `key` if no file has that key.
+async fn receive<B>(
+    blobs: &Blobs,
+    ns: &Namespace,
+    key: &str,
+    size: u64,
+    content_type: &str,
+    mut body: B,
+) -> Response<HyperOutgoingBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    match blobs.head(ns, key).await {
         Ok(None) => {}
         Ok(Some(_)) => {
             crate::metrics::blob_node_link(blobs.labels(), "exists");
@@ -298,63 +358,61 @@ where
             );
         }
     };
-    let deadline_ms = token.expires_at_ms.saturating_add(UPLOAD_GRACE_MS);
-    let left_ms = deadline_ms.saturating_sub(now_ms());
-    let received = tokio::time::timeout(std::time::Duration::from_millis(left_ms), async {
-        let mut body = req.into_body();
+    let start = Instant::now();
+    let received = async {
         let mut got = 0u64;
         loop {
-            let Ok(frame) = tokio::time::timeout(UPLOAD_IDLE, body.frame()).await else {
-                return Err(StatusCode::REQUEST_TIMEOUT);
+            let Ok(frame) = tokio::time::timeout_at(next_frame_by(start, got), body.frame()).await
+            else {
+                return Err(Refused::Slow);
             };
             let Some(frame) = frame else {
                 break;
             };
             let Ok(frame) = frame else {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(Refused::WrongBody);
             };
             let Ok(data) = frame.into_data() else {
                 // Trailers: an upload has none.
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(Refused::WrongBody);
             };
             got += data.len() as u64;
             if got > size {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(Refused::WrongBody);
             }
             if spool.append(data).await.is_err() {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                return Err(Refused::Unavailable);
             }
         }
         if got == size {
             Ok(())
         } else {
-            Err(StatusCode::BAD_REQUEST)
+            Err(Refused::WrongBody)
         }
-    })
+    }
     .await;
-    match received {
-        Ok(Ok(())) => {}
-        Ok(Err(StatusCode::REQUEST_TIMEOUT)) => {
-            spool.abandon();
-            return refuse(
-                StatusCode::REQUEST_TIMEOUT,
-                "the upload's body stopped arriving\n",
-            );
-        }
-        Ok(Err(status)) => {
-            if status == StatusCode::BAD_REQUEST {
-                crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
+    if let Err(why) = received {
+        spool.abandon();
+        return match why {
+            Refused::Slow => {
+                crate::metrics::blob_node_link(blobs.labels(), "slow");
+                refuse(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "the upload's body stopped arriving, or arrived too slowly\n",
+                )
             }
-            spool.abandon();
-            return refuse(status, "the upload's body is not the one this link takes\n");
-        }
-        Err(_) => {
-            spool.abandon();
-            return refuse(
-                StatusCode::REQUEST_TIMEOUT,
-                "the upload ran past its link's time\n",
-            );
-        }
+            Refused::WrongBody => {
+                crate::metrics::blob_node_link(blobs.labels(), "wrong_size");
+                refuse(
+                    StatusCode::BAD_REQUEST,
+                    "the upload's body is not the one this link takes\n",
+                )
+            }
+            Refused::Unavailable => refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the file cannot be written now; retry\n",
+            ),
+        };
     }
     let spooled = match spool.finish().await {
         Ok(s) => s,
@@ -369,7 +427,7 @@ where
         content_type: content_type.to_owned(),
         condition: Condition::Absent,
     };
-    match blobs.commit(ns, &token.key, spooled, write).await {
+    match blobs.commit(ns, key, spooled, write).await {
         Ok(_) => {
             crate::metrics::blob_node_link(blobs.labels(), "ok");
             refuse(StatusCode::CREATED, "created\n")

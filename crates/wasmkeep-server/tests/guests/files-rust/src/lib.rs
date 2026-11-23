@@ -11,7 +11,8 @@
 //! - `GET /page?prefix=P&limit=N[&after=A]`: one page, then `next=KEY|-`
 //! - `GET /link/KEY`, `GET /upload-link/KEY`: a download or upload link
 //! - Rust only: `POST /stream/KEY?n=N` writes N bytes (`i % 251`) through
-//!   `open_write`; `GET /stream/KEY[?start=S&len=L]` reads through
+//!   `open_write` (with `&leave=1`, returns `left` with the write still
+//!   open); `GET /stream/KEY[?start=S&len=L]` reads through
 //!   `open_read`: `read=N sum=SUM`
 //!
 //! A missing file answers 404 `none`; an error `err:KIND` with 400, 403,
@@ -141,6 +142,12 @@ fn route(
             };
             if let Err(e) = w.write_all(&bytes) {
                 return (500, format!("err:write:{e}").into_bytes());
+            }
+            if query(q, "leave").is_some() {
+                // Returns with the write still open: neither finished nor
+                // dropped.
+                std::mem::forget(w);
+                return (200, b"left".to_vec());
             }
             return text(w.finish().map(|i| format!("ok {}", i.size)));
         }

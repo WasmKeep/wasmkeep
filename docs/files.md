@@ -61,8 +61,9 @@ key order, 1,000 at most per page.
 | `get`, `put` | 16 MiB, one call's body |
 | one file, streamed | `--max-blob-bytes` (the process's), 1 GiB by default, at most 5 GiB |
 | one upload link | 16 MiB on a bucket; `--max-blob-bytes` on a node without one |
-| bytes being spooled, one app | 1 GiB, or one file of `--max-blob-bytes` if that is more |
-| bytes being spooled, the process | 4 GiB, or one file of the largest `--max-blob-bytes` if that is more |
+| streamed writes and upload links being spooled, one app | 1 GiB, or one file of `--max-blob-bytes` if that is more; at most half the process's |
+| streamed writes and upload links being spooled, the process | 4 GiB, or two files of the largest `--max-blob-bytes` if that is more |
+| an upload link's body | nothing for 60 s, or slower than 16 KiB/s on average after its first 30 s: aborted |
 | streamed writes open at once | 16 per actor instance (and per front instance) |
 | bodies of one upload link at once | 1 per node |
 | a listing page | 1,000 |
@@ -144,8 +145,11 @@ const up = blobs.linkUpload("uploads/7f3a9c", { size, contentType: "image/jpeg" 
   `unavailable`: retry later. While one body of an upload link is
   arriving on a node, the same link sent to that node again answers
   `409`; on a cluster each node checks its own. A body that sends
-  nothing for 60 s is aborted (`408`), and every upload must end by its
-  link's expiry plus one hour.
+  nothing for 60 s, or arrives slower than 16 KiB/s on average once its
+  first 30 s have passed, is aborted (`408`), and every upload, its
+  commit included, must end by its link's expiry plus one hour. One
+  app's spooled writes never take more than half the process's budget.
+  A whole-file `put` (16 MiB at most) is not counted in these budgets.
 
 `--blob-links auto` (the default) presigns downloads on a bucket whose
 start proof passed and uses node links otherwise; `node` uses node

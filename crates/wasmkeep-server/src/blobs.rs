@@ -41,11 +41,11 @@ pub const MAX_FILE_CEILING: u64 = 5 * 1024 * 1024 * 1024;
 /// A listing page's longest.
 pub(crate) const MAX_PAGE: u32 = 1_000;
 /// Bytes all spool files of the process may hold at once (streamed writes
-/// and upload links before they become files): 4 GiB, or one file of the
+/// and upload links before they become files): 4 GiB, or two files of the
 /// largest `--max-blob-bytes` if that is more.
 pub(crate) const NODE_SPOOL: u64 = 4 * 1024 * 1024 * 1024;
 /// Bytes one app's spool files may hold at once: 1 GiB, or one file of
-/// its `--max-blob-bytes` if that is more.
+/// its `--max-blob-bytes` if that is more; at most half the process's.
 pub(crate) const APP_SPOOL: u64 = 1024 * 1024 * 1024;
 /// Streamed writes one instance may have open at once.
 pub(crate) const MAX_OPEN_WRITES: usize = 16;
@@ -54,6 +54,17 @@ pub(crate) const MAX_OPEN_WRITES: usize = 16;
 fn node_spool() -> Arc<streams::Budget> {
     static NODE: std::sync::OnceLock<Arc<streams::Budget>> = std::sync::OnceLock::new();
     Arc::clone(NODE.get_or_init(|| Arc::new(streams::Budget::new(NODE_SPOOL))))
+}
+
+/// An app's spool budget, of `node`'s: [`APP_SPOOL`] or one file of
+/// `max_file`, whichever is more, and never more than half the node's, so
+/// one app's uploads always leave room for the others. The node's is
+/// raised to two such files if it is less.
+fn app_share(max_file: u64, node: &streams::Budget) -> Arc<streams::Budget> {
+    node.raise_to(max_file.saturating_mul(2));
+    Arc::new(streams::Budget::new(
+        APP_SPOOL.max(max_file).min(node.limit() / 2),
+    ))
 }
 
 /// A bucket prefix longer than this leaves no room for the longest key
@@ -139,17 +150,25 @@ impl Blobs {
     fn new(backend: Backend, max_file: u64) -> Self {
         let max_file = max_file.min(MAX_FILE_CEILING);
         let spool_node = node_spool();
-        spool_node.raise_to(max_file);
         Self {
             backend,
             max_file,
             links: None,
             usage: usage::Usage::default(),
             labels: Arc::from(""),
-            spool_app: Arc::new(streams::Budget::new(APP_SPOOL.max(max_file))),
+            spool_app: app_share(max_file, &spool_node),
             spool_node,
             uploading: std::sync::Mutex::default(),
         }
+    }
+
+    /// The same files, their share taken of `node` rather than of the
+    /// process's budget.
+    #[cfg(test)]
+    pub(crate) fn with_node_spool(mut self, node: Arc<streams::Budget>) -> Self {
+        self.spool_app = app_share(self.max_file, &node);
+        self.spool_node = node;
+        self
     }
 
     /// Files on disk, under `app_dir` (`<data_dir>/state/<t>/<a>`).

@@ -1202,3 +1202,140 @@ async fn a_guest_opens_at_most_16_streamed_writes_at_once() {
             .unwrap();
     }
 }
+
+/// Files on disk with node links and a largest file of `max`, their
+/// share taken of `node`.
+fn sharing(node: &Arc<streams::Budget>, max: u64) -> (tempfile::TempDir, Arc<Blobs>) {
+    let (tmp, blobs) = with_links(disk_with(max), false);
+    let blobs = Arc::into_inner(blobs)
+        .unwrap()
+        .with_node_spool(Arc::clone(node));
+    (tmp, Arc::new(blobs))
+}
+
+/// A PUT of `size` bytes sent `chunk` bytes every `every`.
+fn put_paced(
+    path: &str,
+    size: u64,
+    chunk: u64,
+    every: std::time::Duration,
+) -> hyper::Request<Body> {
+    use futures_util::StreamExt as _;
+    let stream = futures_util::stream::unfold(size, move |left| async move {
+        if left == 0 {
+            return None;
+        }
+        tokio::time::sleep(every).await;
+        let n = left.min(chunk);
+        Some((frame(n), left - n))
+    })
+    .boxed();
+    request(path, size, stream)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trickling_upload_is_aborted_and_gives_its_budget_back() {
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    let size = 1_000_000;
+    // One byte a minute less a second: never idle for 60 s.
+    let start = tokio::time::Instant::now();
+    let status = send(
+        &blobs,
+        put_paced(
+            &upload_path(&blobs, "slow", size),
+            size,
+            1,
+            std::time::Duration::from_secs(59),
+        ),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "aborted by its rate, not after the link's expiry: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(node.used(), 0, "given back");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_but_steady_upload_completes() {
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    // 20 KiB a second for a minute: a poor mobile link.
+    let size = 60 * 20 * 1024;
+    let status = send(
+        &blobs,
+        put_paced(
+            &upload_path(&blobs, "steady", size),
+            size,
+            20 * 1024,
+            std::time::Duration::from_secs(1),
+        ),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::CREATED);
+    assert_eq!(node.used(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_body_that_stops_is_aborted_after_60_s() {
+    use futures_util::StreamExt as _;
+    let node = Arc::new(streams::Budget::new(1 << 30));
+    let (_t, blobs) = spooling(1 << 30, &node);
+    // Half the body at once, ahead of any rate, then nothing more.
+    let size = 8 << 20;
+    let stream = futures_util::stream::iter([frame(size / 2)])
+        .chain(futures_util::stream::pending())
+        .boxed();
+    let start = tokio::time::Instant::now();
+    let status = send(
+        &blobs,
+        request(&upload_path(&blobs, "stops", size), size, stream),
+    )
+    .await;
+    assert_eq!(status, hyper::StatusCode::REQUEST_TIMEOUT);
+    let took = start.elapsed();
+    assert!(
+        took >= std::time::Duration::from_secs(60) && took < std::time::Duration::from_secs(61),
+        "{took:?}"
+    );
+    assert_eq!(node.used(), 0);
+}
+
+#[tokio::test]
+async fn one_app_cannot_take_the_whole_node_budget() {
+    let node = Arc::new(streams::Budget::new(4_000));
+    let (_a, one) = sharing(&node, 1_000);
+    let (_b, two) = sharing(&node, 1_000);
+    // The first app's links take its share, half the node's.
+    let first = stalled(&one, &upload_path(&one, "a", 1_000), 1_000, &node).await;
+    let second = stalled(&one, &upload_path(&one, "b", 1_000), 1_000, &node).await;
+    assert_eq!(
+        send(&one, put(&upload_path(&one, "c", 1_000), 1_000)).await,
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        "past the app's share"
+    );
+    // The other app still has the rest.
+    assert_eq!(
+        send(&two, put(&upload_path(&two, "a", 1_000), 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+    for t in [first, second] {
+        t.abort();
+        let _ = t.await;
+    }
+    assert_eq!(node.used(), 0);
+    // A node budget below twice an app's largest file is raised to it.
+    let node = Arc::new(streams::Budget::new(10));
+    let (_c, big) = sharing(&node, 1_000);
+    let first = stalled(&big, &upload_path(&big, "a", 1_000), 1_000, &node).await;
+    let (_d, other) = sharing(&node, 1_000);
+    assert_eq!(
+        send(&other, put(&upload_path(&other, "a", 1_000), 1_000)).await,
+        hyper::StatusCode::CREATED
+    );
+    first.abort();
+    let _ = first.await;
+}

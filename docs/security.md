@@ -139,14 +139,18 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   Capture reads the log frame by frame and holds only the newest version of
   each changed page, so rewriting the same rows costs no memory (a
   transaction touching many distinct pages still holds them all).
-- [Files](files.md#limits) being written are spooled to the node's disk
-  within a budget: 1 GiB per app and 4 GiB per process (each at least
-  one file of `--max-blob-bytes`). An upload link holds its whole size
-  before it reads its body, one body per link and node at a time, and a
-  body that sends nothing for 60 s is aborted; a streamed write holds
-  each byte as it is written, and an instance has at most 16 open at
-  once. Without a bucket, the node-link key file is written whole and
-  linked into place, and refused unless it is 32 bytes.
+- [Files](files.md#limits) written by streamed writes and upload links
+  are spooled to the node's disk within a budget: 1 GiB per app (at
+  least one file of `--max-blob-bytes`, at most half the process's) and
+  4 GiB per process (at least two such files). An upload link holds its
+  whole size before it reads its body, one body per link and node at a
+  time, and a body that sends nothing for 60 s or averages under
+  16 KiB/s after its first 30 s is aborted. A streamed write holds each
+  byte as it is written, an instance has at most 16 open at once, and
+  one left open goes when its event ends. A whole-file `put` (16 MiB at
+  most) is outside these budgets. Without a bucket, the node-link key
+  file is written whole and linked into place, and refused unless it is
+  32 bytes.
 
 **Between nodes** (`crates/wasmkeep-server/src/cluster.rs`)
 - Calls carry an HMAC-SHA256 signature (secret from the bucket, never sent)

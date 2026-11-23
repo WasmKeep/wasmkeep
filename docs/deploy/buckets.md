@@ -29,11 +29,11 @@ cases a download link relies on at start, and uses node links when that
 proof fails. Two lifecycle rules are worth setting on a bucket that
 holds files: abort incomplete multipart uploads after a day, and, if no
 file must live that long, expire old objects under `state/*/*/blobs/`
-([the bucket's own rules](../files.md#the-buckets-own-rules)). A write
-reaches the bucket only once it is complete: until then it is spooled on
-the node's data disk, within 1 GiB per app and 4 GiB per process
-([limits](../files.md#limits)), so leave that much free beside the
-databases.
+([the bucket's own rules](../files.md#the-buckets-own-rules)). A streamed
+write or an upload link reaches the bucket only once it is complete:
+until then it is spooled on the node's data disk, within 1 GiB per app
+and 4 GiB per process by default ([limits](../files.md#limits)), so leave
+that much free beside the databases.
 
 Every node also proves the first two at start, on a throwaway object
 under `probe/`, and refuses to run on a store that ignores them. `cluster

@@ -52,6 +52,11 @@ impl Budget {
         self.limit.fetch_max(limit, Ordering::AcqRel);
     }
 
+    /// The most it holds.
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Acquire)
+    }
+
     /// Bytes charged now.
     #[cfg(test)]
     pub(crate) fn used(&self) -> u64 {
@@ -71,6 +76,7 @@ impl Budget {
         let _ = self
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                debug_assert!(used >= n, "giving back {n} of {used} bytes charged");
                 Some(used.saturating_sub(n))
             });
     }
@@ -266,6 +272,18 @@ struct SpoolState {
 }
 
 impl SpoolState {
+    /// Nothing more becomes of this spool: its file goes now, even while
+    /// a write holds it or after a write lost it, and so does its budget.
+    fn discard(&mut self) {
+        self.closed = true;
+        self.pending = Vec::new();
+        self.file = None;
+        if !self.handed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        self.held = None;
+    }
+
     /// Charges `total` bytes in all, or records why not.
     fn charge(&mut self, total: u64) -> bool {
         let ok = self.held.as_mut().is_some_and(|h| h.hold(total));
@@ -323,26 +341,36 @@ impl Spool {
     /// each charged to `held` before it is written.
     pub(crate) async fn create(path: PathBuf, max: u64, held: Held) -> Result<Self, BlobError> {
         // Dropped before the file is ours (the request went away): the
-        // file goes, whether it was made before or after.
+        // file goes if this call made it, whether before or after. Of the
+        // two flags each side sets one and then reads the other, so at
+        // least one side removes it; a path already taken is never ours.
         struct Unmade {
             path: PathBuf,
             gone: Arc<AtomicBool>,
+            created: Arc<AtomicBool>,
             made: bool,
         }
         impl Drop for Unmade {
             fn drop(&mut self) {
                 if !self.made {
                     self.gone.store(true, Ordering::SeqCst);
-                    let _ = std::fs::remove_file(&self.path);
+                    if self.created.load(Ordering::SeqCst) {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
                 }
             }
         }
         let mut unmade = Unmade {
             path: path.clone(),
             gone: Arc::new(AtomicBool::new(false)),
+            created: Arc::new(AtomicBool::new(false)),
             made: false,
         };
-        let (p, gone) = (path.clone(), Arc::clone(&unmade.gone));
+        let (p, gone, created) = (
+            path.clone(),
+            Arc::clone(&unmade.gone),
+            Arc::clone(&unmade.created),
+        );
         let file = tokio::task::spawn_blocking(move || {
             if let Some(dir) = p.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -351,6 +379,7 @@ impl Spool {
                 .write(true)
                 .create_new(true)
                 .open(&p)?;
+            created.store(true, Ordering::SeqCst);
             if gone.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&p);
             }
@@ -394,12 +423,15 @@ impl Spool {
 
     /// Abandons the write: its file goes, and its stream takes nothing.
     pub(crate) fn abandon(&self) {
-        let mut s = self.lock();
-        s.closed = true;
-        s.pending = Vec::new();
-        if s.file.take().is_some() {
-            let _ = std::fs::remove_file(&s.path);
-            s.held = None;
+        self.lock().discard();
+    }
+
+    /// Marks the spool failed unless [`Writing::done`] is called: a write
+    /// to its file whose future was dropped took the file with it.
+    fn writing(&self) -> Writing<'_> {
+        Writing {
+            spool: self,
+            done: false,
         }
     }
 
@@ -424,20 +456,29 @@ impl Spool {
                 .ok_or_else(|| BlobError::Unavailable("the spool file is busy".into()))?
         };
         let n = data.len() as u64;
+        let writing = self.writing();
         let wrote = tokio::task::spawn_blocking(move || {
             let mut file = file;
             file.write_all(&data).map(|()| file)
         })
         .await;
+        writing.done();
         let mut s = self.lock();
         match wrote {
-            Ok(Ok(file)) => {
+            Ok(Ok(file)) if !s.closed => {
                 s.written += n;
                 s.file = Some(file);
                 Ok(())
             }
-            Ok(Err(e)) => Err(unavailable(e)),
-            Err(e) => Err(unavailable(e)),
+            Ok(Ok(_)) => Err(BlobError::NotAllowed("the upload is closed".into())),
+            Ok(Err(e)) => {
+                s.failure = Some(Fail::Io(e.to_string()));
+                Err(unavailable(e))
+            }
+            Err(e) => {
+                s.failure = Some(Fail::Io(e.to_string()));
+                Err(unavailable(e))
+            }
         }
     }
 
@@ -458,15 +499,13 @@ impl Spool {
             if let Some(e) = failed {
                 // Nothing becomes of it: the file and its budget go now,
                 // not when the guest drops its stream.
-                s.pending = Vec::new();
-                if s.file.take().is_some() {
-                    let _ = std::fs::remove_file(&s.path);
-                    s.held = None;
-                }
+                s.discard();
                 return Err(e);
             }
             let Some(file) = s.file.take() else {
-                return Err(BlobError::Unavailable("the spool file is gone".into()));
+                // A write still holds it: nothing to finish.
+                s.discard();
+                return Err(BlobError::Unavailable("the spool file is busy".into()));
             };
             let pending = std::mem::take(&mut s.pending);
             s.handed = true;
@@ -488,6 +527,31 @@ impl Spool {
         .map_err(unavailable)?
         .map_err(unavailable)?;
         Ok(spooled)
+    }
+}
+
+/// A write to a spool's file on the blocking pool, which took the file.
+struct Writing<'a> {
+    spool: &'a Spool,
+    done: bool,
+}
+
+impl Writing<'_> {
+    /// The write came back, with the file or an error.
+    fn done(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Its future was dropped: the file never comes back, so the
+            // spool cannot become a file; its stream fails rather than
+            // wait for it.
+            let mut s = self.spool.lock();
+            s.failure = Some(Fail::Io("a write to the spool file was cancelled".into()));
+        }
     }
 }
 
@@ -532,22 +596,22 @@ impl Pollable for SpoolStream {
             (file, std::mem::take(&mut s.pending))
         };
         let n = pending.len() as u64;
+        let spool = self.spool.clone();
+        let writing = spool.writing();
         let wrote = tokio::task::spawn_blocking(move || {
             let mut file = file;
             file.write_all(&pending).map(|()| file)
         })
         .await;
+        writing.done();
         let mut s = self.spool.lock();
         match wrote {
             Ok(Ok(file)) => {
                 s.written += n;
-                if s.closed {
-                    // Abandoned while writing: the file goes now.
-                    let _ = std::fs::remove_file(&s.path);
-                    s.held = None;
-                } else {
+                if !s.closed {
                     s.file = Some(file);
                 }
+                // Else abandoned while writing: its file went then.
             }
             Ok(Err(e)) => s.failure = Some(Fail::Io(e.to_string())),
             Err(e) => s.failure = Some(Fail::Io(e.to_string())),
@@ -597,5 +661,107 @@ impl OutputStream for SpoolStream {
             return Ok(0);
         }
         Ok(WRITE_BUFFER - s.pending.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)] // test code
+    use super::*;
+
+    type Budgets = (Arc<Budget>, Arc<Budget>);
+
+    fn budgets() -> Budgets {
+        (
+            Arc::new(Budget::new(4 << 20)),
+            Arc::new(Budget::new(4 << 20)),
+        )
+    }
+
+    fn held(b: &Budgets) -> Held {
+        Held::none(Arc::clone(&b.0), Arc::clone(&b.1))
+    }
+
+    fn used(b: &Budgets) -> (u64, u64) {
+        (b.0.used(), b.1.used())
+    }
+
+    async fn spool_at(path: &std::path::Path, b: &Budgets) -> Spool {
+        let mut h = held(b);
+        assert!(h.hold(100));
+        Spool::create(path.to_path_buf(), 4 << 20, h).await.unwrap()
+    }
+
+    /// What a failed write to the spool file leaves: its handle gone
+    /// with the error.
+    fn fail_write(spool: &Spool) {
+        let mut s = spool.lock();
+        s.file = None;
+        s.failure = Some(Fail::Io("no space left on device".into()));
+    }
+
+    #[tokio::test]
+    async fn a_spool_whose_write_failed_goes_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = budgets();
+        // Abandoned, while the guest's stream still holds the spool.
+        let path = tmp.path().join("abandoned");
+        let spool = spool_at(&path, &b).await;
+        let _stream = spool.clone();
+        fail_write(&spool);
+        spool.abandon();
+        assert!(!path.exists());
+        assert_eq!(used(&b), (0, 0));
+        // Finished.
+        let path = tmp.path().join("finished");
+        let spool = spool_at(&path, &b).await;
+        let _stream = spool.clone();
+        fail_write(&spool);
+        assert!(matches!(
+            spool.finish().await,
+            Err(BlobError::Unavailable(_))
+        ));
+        assert!(!path.exists());
+        assert_eq!(used(&b), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_fails_the_spool_and_it_goes() {
+        use futures_util::FutureExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = budgets();
+        for attempt in 0..1_000 {
+            let path = tmp.path().join(attempt.to_string());
+            let spool = spool_at(&path, &b).await;
+            let mut stream = spool.stream(Arc::new(AtomicBool::new(true)));
+            stream.write(Bytes::from(vec![0u8; WRITE_BUFFER])).unwrap();
+            // Polled once, then dropped while its write is on the
+            // blocking pool: the event's wall clock, say.
+            if stream.ready().now_or_never().is_some() {
+                continue;
+            }
+            assert!(
+                stream.check_write().is_err(),
+                "the stream fails rather than wait for a file that never comes back"
+            );
+            assert!(matches!(
+                spool.finish().await,
+                Err(BlobError::Unavailable(_))
+            ));
+            assert!(!path.exists());
+            assert_eq!(used(&b), (0, 0));
+            return;
+        }
+        panic!("no write was ever caught on the blocking pool");
+    }
+
+    #[tokio::test]
+    async fn a_spool_path_taken_already_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = budgets();
+        let path = tmp.path().join("s");
+        std::fs::write(&path, b"another's").unwrap();
+        assert!(Spool::create(path.clone(), 10, held(&b)).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"another's");
     }
 }
