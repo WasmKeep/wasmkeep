@@ -115,22 +115,23 @@ impl AppRef {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let outcome = match (target, self.read_current().await) {
-            (None, _) => {
-                "the deploy stopped before switching `current`: nothing was switched".to_owned()
-            }
-            (Some((version, _)), Err(e)) => format!(
+        let Some((version, seq)) = target else {
+            return DeployError::Bucket(format!(
+                "renewing the assets deploy marker failed: {error}; the deploy stopped before \
+                 switching `current`: nothing was switched"
+            ));
+        };
+        let outcome = match self.read_current().await {
+            Err(e) => format!(
                 "the deploy was switching `current` to {version}, and reading it back failed \
                  ({e}): check what `current` names before deploying again"
             ),
-            (Some((version, seq)), Ok(Some((now, _))))
-                if now.version == version && now.seq == seq =>
-            {
+            Ok(Some((now, _))) if now.version == version && now.seq == seq => {
                 format!(
                     "`current` already names the new version {version} (seq {seq}): the deploy took effect"
                 )
             }
-            (Some((version, _)), Ok(now)) => format!(
+            Ok(now) => format!(
                 "the deploy was switching `current` to {version}, which it does not name yet \
                  ({}): the switch may still land; check what `current` names before deploying again",
                 now.map_or_else(
