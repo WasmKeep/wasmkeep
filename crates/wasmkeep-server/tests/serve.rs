@@ -327,3 +327,32 @@ async fn a_large_chunked_body_the_component_does_not_read_still_gets_its_answer(
         );
     }
 }
+
+/// A guest that holds more host resources than its store allows, or
+/// builds headers past the size allowed, fails that request; the server
+/// keeps serving. The table already holds the request's own resources, so
+/// the passing case leaves a margin under the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_held_resources_and_header_size_are_capped() {
+    use wasmkeep_server::{MAX_GUEST_FIELDS_BYTES, MAX_GUEST_RESOURCES};
+    let (addr, _stop) = start(misbehave_component(Duration::from_secs(5))).await;
+
+    let under = MAX_GUEST_RESOURCES - 32;
+    let (status, text) = request(addr, "GET", &format!("/fields?n={under}&bytes=16")).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains(&format!("held {under}\n")), "{text}");
+    let over = MAX_GUEST_RESOURCES + 1;
+    let (status, text) = request(addr, "GET", &format!("/fields?n={over}&bytes=16")).await;
+    assert_eq!(status, 500, "{text}");
+
+    let (status, text) = request(addr, "GET", "/fields?n=1&bytes=16384").await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("held 1\n"), "{text}");
+    let path = format!("/fields?n=1&bytes={MAX_GUEST_FIELDS_BYTES}");
+    let (status, text) = request(addr, "GET", &path).await;
+    assert_eq!(status, 500, "{text}");
+
+    let (status, text) = request(addr, "GET", "/").await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("ok\n"), "{text}");
+}

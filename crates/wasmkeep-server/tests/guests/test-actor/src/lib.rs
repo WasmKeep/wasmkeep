@@ -75,6 +75,9 @@
 //!   `http::fetch_all`, one answer per line as `/fetch` words it; with
 //!   `seq=1`, one `http::fetch` after the other instead
 //! - `GET /env?name=N`: `env.get(N)`, and whether WASI saw N
+//! - `POST /fields?n=N&bytes=B`: holds N `wasi:http` `fields` of one
+//!   B-byte header each, then drops them; answers `held N`, or `err:E` for
+//!   the first one refused (past the store's table, the call traps)
 
 use wasmkeep_sdk::actors::{self, CallError};
 use wasmkeep_sdk::http::{self, IncomingRequest, Method, ResponseOutparam};
@@ -855,6 +858,10 @@ impl http::Guest for TestActor {
                 storage::delete_self();
                 "ok".to_owned()
             }
+            (Method::Post, "/fields") => hold_fields(
+                usize::try_from(num("n")).unwrap_or(0),
+                usize::try_from(num("bytes")).unwrap_or(0),
+            ),
             _ => {
                 http::respond(out, 404, "text/plain", b"no route\n");
                 return;
@@ -862,6 +869,19 @@ impl http::Guest for TestActor {
         };
         http::respond(out, 200, "text/plain", format!("{body}\n").as_bytes());
     }
+}
+
+/// `POST /fields`: N `fields` held at once, then dropped.
+fn hold_fields(n: usize, bytes: usize) -> String {
+    let value = vec![b'v'; bytes];
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        match http::Fields::from_list(&[("x-fill".to_owned(), value.clone())]) {
+            Ok(fields) => held.push(fields),
+            Err(e) => return format!("err:{e:?}"),
+        }
+    }
+    format!("held {}", held.len())
 }
 
 wasmkeep_sdk::export!(TestActor);

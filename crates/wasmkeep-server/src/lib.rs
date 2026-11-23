@@ -23,6 +23,7 @@ mod error;
 pub mod fds;
 mod front;
 pub mod guest_log;
+mod guest_tables;
 mod http;
 mod local_layout;
 mod logging;
@@ -36,6 +37,7 @@ mod shares;
 mod socket_limits;
 mod supervisor;
 mod websocket;
+pub use guest_tables::{MAX_GUEST_FIELDS_BYTES, MAX_GUEST_RESOURCES};
 pub use socket_limits::{SocketBudget, SocketLimits};
 pub use supervisor::{
     AppSpec, BuildRuntime, Listeners, Runtime, Supervisor, nodes_without_multi_app,
