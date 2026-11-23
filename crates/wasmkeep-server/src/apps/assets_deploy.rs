@@ -9,8 +9,18 @@ pub(super) struct Marker {
     last: tokio::sync::watch::Receiver<Instant>,
     start: Instant,
     bucket_ms: i64,
+    /// The version and `seq` the deploy is about to write to `current`, set
+    /// right before it does: what a failed renewal compares `current` with.
+    switching: Arc<std::sync::Mutex<Option<(String, u64)>>>,
 }
 impl Marker {
+    /// The deploy is about to point `current` at `version` with `seq`.
+    pub(super) fn switching(&self, version: &str, seq: u64) {
+        *self
+            .switching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((version.to_owned(), seq));
+    }
     pub(super) fn check(&self) -> Result<(), DeployError> {
         if self.last.borrow().elapsed() > Duration::from_secs(30 * 60) {
             return Err(DeployError::Refused(
@@ -45,26 +55,39 @@ impl AppRef {
             )
             .await
             .map_err(bucket)?;
+        let switching = Arc::new(std::sync::Mutex::new(None));
+        // `Err`: the renewal failed, and the operation was stopped.
         let result = async {
-            let meta = self.store.head(&key).await.map_err(bucket)?;
+            let meta = match self.store.head(&key).await {
+                Ok(meta) => meta,
+                Err(e) => return Ok(Err(bucket(e))),
+            };
             let (last, receiver) = tokio::sync::watch::channel(start);
-            let marker = Marker { last: receiver, start: Instant::now(), bucket_ms: meta.last_modified.timestamp_millis() };
+            let marker = Marker { last: receiver, start: Instant::now(), bucket_ms: meta.last_modified.timestamp_millis(), switching: Arc::clone(&switching) };
             let operation = run(marker);
             tokio::pin!(operation);
             let mut timer = tokio::time::interval_at(Instant::now() + Duration::from_secs(600), Duration::from_secs(600));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    result = &mut operation => break result,
+                    result = &mut operation => break Ok(result),
                     _ = timer.tick() => {
                         let sent = Instant::now();
                         // A changing body makes the acknowledged renewal observable in tests.
-                        self.store.put(&key, wasmkeep_cluster::control::new_request_id().into_bytes().into()).await.map_err(bucket)?;
+                        if let Err(e) = self.store.put(&key, wasmkeep_cluster::control::new_request_id().into_bytes().into()).await {
+                            break Err(e);
+                        }
                         last.send_replace(sent);
                     }
                 }
             }
         }.await;
+        // The operation is dropped by now: what `current` names is what it
+        // did, unless a switch it sent is still in flight.
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => Err(self.renewal_failed(&switching, &error).await),
+        };
         // No detached task: cancelling/killing this future leaves the marker.
         // Ordinary errors, including a failed renewal, always pass this cleanup.
         let cleanup = self.store.delete(&key).await.map_err(bucket);
@@ -79,6 +102,46 @@ impl AppRef {
                 Ok(value)
             }
         }
+    }
+
+    /// The renewal of an assets marker failed and the deploy was stopped:
+    /// the error, and whether `current` was switched.
+    async fn renewal_failed(
+        &self,
+        switching: &std::sync::Mutex<Option<(String, u64)>>,
+        error: &object_store::Error,
+    ) -> DeployError {
+        let target = switching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outcome = match (target, self.read_current().await) {
+            (None, _) => {
+                "the deploy stopped before switching `current`: nothing was switched".to_owned()
+            }
+            (Some((version, _)), Err(e)) => format!(
+                "the deploy was switching `current` to {version}, and reading it back failed \
+                 ({e}): check what `current` names before deploying again"
+            ),
+            (Some((version, seq)), Ok(Some((now, _))))
+                if now.version == version && now.seq == seq =>
+            {
+                format!(
+                    "`current` already names the new version {version} (seq {seq}): the deploy took effect"
+                )
+            }
+            (Some((version, _)), Ok(now)) => format!(
+                "the deploy was switching `current` to {version}, which it does not name yet \
+                 ({}): the switch may still land; check what `current` names before deploying again",
+                now.map_or_else(
+                    || "nothing is deployed".to_owned(),
+                    |(now, _)| format!("it names {} (seq {})", now.version, now.seq)
+                )
+            ),
+        };
+        DeployError::Bucket(format!(
+            "renewing the assets deploy marker failed: {error}; {outcome}"
+        ))
     }
 
     pub(super) async fn read_assets_index(&self, hash: &str) -> Result<Index, DeployError> {
@@ -294,10 +357,144 @@ mod tests {
             last: receiver,
             start: Instant::now(),
             bucket_ms: 0,
+            switching: Arc::default(),
         };
         tokio::time::advance(Duration::from_secs(1801)).await;
         assert!(marker.check().is_err());
         last.send_replace(Instant::now());
         assert!(marker.check().is_ok());
+    }
+
+    /// Overwrites of the deploy marker (its renewals) fail; everything
+    /// else, its creation included, reaches the bucket.
+    #[derive(Debug)]
+    struct NoRenewal(object_store::memory::InMemory);
+    impl std::fmt::Display for NoRenewal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("no-renewal")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for NoRenewal {
+        async fn put_opts(
+            &self,
+            p: &object_store::path::Path,
+            b: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if p.as_ref().contains("/_assets/deploying/") && matches!(o.mode, PutMode::Overwrite) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "renewal refused".into(),
+                });
+            }
+            self.0.put_opts(p, b, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.0.put_multipart_opts(p, o).await
+        }
+        async fn get_opts(
+            &self,
+            p: &object_store::path::Path,
+            o: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.0.get_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            p: futures_util::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.0.delete_stream(p)
+        }
+        fn list(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.0.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(p).await
+        }
+        async fn copy_opts(
+            &self,
+            a: &object_store::path::Path,
+            b: &object_store::path::Path,
+            o: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(a, b, o).await
+        }
+    }
+
+    /// A failed renewal still stops the deploy, and says whether `current`
+    /// was switched: not started, done, or sent and not seen yet. The
+    /// marker is removed in every case.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::unwrap_used)] // test code
+    async fn a_failed_marker_renewal_says_whether_current_was_switched() {
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(NoRenewal(object_store::memory::InMemory::new()));
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let past_renewal = || tokio::time::sleep(Duration::from_secs(700));
+        let markers = || async {
+            store
+                .list(Some(&app.path("_assets/deploying/")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len()
+        };
+
+        let before = app
+            .with_assets_marker(|_marker| async move {
+                past_renewal().await;
+                Ok(())
+            })
+            .await;
+        let e = before.unwrap_err().to_string();
+        assert!(e.contains("renewal refused"), "{e}");
+        assert!(e.contains("nothing was switched"), "{e}");
+        assert_eq!(markers().await, 0);
+
+        let done = app
+            .with_assets_marker(|marker| {
+                let app = &app;
+                async move {
+                    marker.switching("v1", 1);
+                    app.swap_current(None, "v1", 1).await?;
+                    past_renewal().await;
+                    Ok(())
+                }
+            })
+            .await;
+        let e = done.unwrap_err().to_string();
+        assert!(
+            e.contains("already names the new version v1 (seq 1)"),
+            "{e}"
+        );
+        assert_eq!(markers().await, 0);
+
+        let in_flight = app
+            .with_assets_marker(|marker| async move {
+                marker.switching("v2", 2);
+                past_renewal().await;
+                Ok(())
+            })
+            .await;
+        let e = in_flight.unwrap_err().to_string();
+        assert!(e.contains("may still land"), "{e}");
+        assert!(e.contains("it names v1 (seq 1)"), "{e}");
+        assert_eq!(markers().await, 0);
     }
 }

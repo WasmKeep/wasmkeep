@@ -858,7 +858,6 @@ impl AppRef {
         read: Option<UpdateVersion>,
         version: &str,
         seq: u64,
-        marked: bool,
     ) -> Result<(), DeployError> {
         let mode = match read {
             None => PutMode::Create,
@@ -870,7 +869,6 @@ impl AppRef {
         };
         // Every `current` this version writes is rooted (ADR 0022), which
         // implies marked.
-        debug_assert!(marked, "a rooted current is marked");
         let body = Current {
             version: version.to_owned(),
             seq,
@@ -1606,8 +1604,9 @@ impl AppRef {
             let previous = read.as_ref().map(|(c, _)| c.version.clone());
             if let Some(marker) = &marker {
                 marker.check()?;
+                marker.switching(&version, seq);
             }
-            self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
+            self.swap_current(read.map(|(_, v)| v), &version, seq)
                 .await?;
             // Deleted while this deployed (ADR 0028): what it wrote is left to
             // `app delete`, which removes everything but the tombstone.
@@ -1682,8 +1681,15 @@ impl AppRef {
         // Rooted, so marked (ADR 0022).
         let marked = true;
         let seq = current.seq + 1;
-        self.swap_current(Some(read), &previous, seq, marked)
-            .await?;
+        self.swap_current(Some(read), &previous, seq).await?;
+        // Deleted while this rolled back (ADR 0028), as a deploy checks.
+        if self.tombstone().await?.is_some() {
+            return Err(DeployError::Refused(format!(
+                "{} was deleted while this rolled back: the `current` it wrote stays in the \
+                 bucket until `wasmkeep app delete` is run again",
+                self.name()
+            )));
+        }
         Ok(Deployed {
             repaired: 0,
             current: Current {
@@ -1829,12 +1835,25 @@ impl AppRef {
             return Ok(false);
         }
         for (remote, file) in [(RECREATED, RECREATED_LOCAL), ("restored", ".restored")] {
-            if let Some((marker, _)) = self.get(remote).await?
-                && !marker_matches(
-                    Some(marker.as_slice()),
-                    std::fs::read(local.join(file)).ok().as_deref(),
-                )
-            {
+            let Some((marker, _)) = self.get(remote).await? else {
+                continue;
+            };
+            // Only a missing file, or other bytes, is a mismatch. Any other
+            // error (EMFILE under socket load, EIO, EACCES) says nothing
+            // about the app: an error, so the caller retries rather than
+            // stopping the app and removing its local files.
+            let path = local.join(file);
+            let ours = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(DeployError::Bucket(format!(
+                        "reading {}: {e}",
+                        path.display()
+                    )));
+                }
+            };
+            if !marker_matches(Some(marker.as_slice()), ours.as_deref()) {
                 return Ok(false);
             }
         }
@@ -3673,5 +3692,34 @@ mod tests {
         let big = vec![b'#'; usize::try_from(crate::env::MAX_FILE).unwrap() + 1];
         assert!(parse_config(&big).is_err());
         assert!(parse_config(&[0xff, 0xfe]).is_err());
+    }
+
+    /// A local marker this node cannot read (here a directory where the
+    /// file should be; in production EMFILE, EIO, EACCES) is not a
+    /// mismatch: `still_ours` fails, and the follow loop retries, rather
+    /// than stopping the app and removing its local files. Only a missing
+    /// marker, or one with other bytes, says the app is no longer ours.
+    #[tokio::test]
+    async fn an_unreadable_local_marker_is_an_error_not_a_mismatch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let local = tempfile::tempdir().unwrap();
+        let marker = local.path().join(RECREATED_LOCAL);
+        // No remote marker: the legacy app's files are kept.
+        assert!(app.still_ours(local.path()).await.unwrap());
+        app.put_once(RECREATED, b"one".to_vec()).await.unwrap();
+        // Missing locally: recreated since this node prepared its files.
+        assert!(!app.still_ours(local.path()).await.unwrap());
+        std::fs::write(&marker, b"two").unwrap();
+        assert!(!app.still_ours(local.path()).await.unwrap());
+        std::fs::write(&marker, b"one").unwrap();
+        assert!(app.still_ours(local.path()).await.unwrap());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let read = app.still_ours(local.path()).await;
+        assert!(
+            matches!(&read, Err(DeployError::Bucket(why)) if why.contains(RECREATED_LOCAL)),
+            "{read:?}"
+        );
     }
 }

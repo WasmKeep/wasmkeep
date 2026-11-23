@@ -1309,3 +1309,109 @@ async fn a_slow_compile_holds_back_no_event_and_no_lease() {
     let r = send(node.addr, "POST", "/actor/u/y/plain", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
 }
+
+/// `app delete` lands its tombstone while a rollback switches `current`:
+/// once armed, writes the tombstone right after the next successful write
+/// of the app's `current`.
+#[derive(Debug)]
+struct DeletedAtSwap(Arc<dyn ObjectStore>, AtomicBool);
+impl std::fmt::Display for DeletedAtSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deleted-at-swap")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for DeletedAtSwap {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use object_store::ObjectStoreExt as _;
+        let put = self.0.put_opts(p, b, o).await?;
+        if p.as_ref() == "apps/default/shop/current" && self.1.swap(false, Ordering::SeqCst) {
+            self.0
+                .put(
+                    &"apps/default/shop/deleted".into(),
+                    b"deleted by a test".to_vec().into(),
+                )
+                .await?;
+        }
+        Ok(put)
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.0.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.0.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.0.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(a, b, o).await
+    }
+}
+
+/// A rollback racing `app delete` (ADR 0028) is refused as a deploy is:
+/// its `current` may land after the tombstone, and it never reports a
+/// deleted app rolled back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_racing_app_delete_is_refused() {
+    use wasmkeep_server::apps::{Changes, DeployError};
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let racing = Arc::new(DeletedAtSwap(Arc::clone(&inner), AtomicBool::new(false)));
+    let store: Arc<dyn ObjectStore> = racing.clone();
+    let app = AppRef::new(store, "", "default", "shop");
+    let rt = deploy_runtime();
+    app.deploy(&rt, vec![("c".into(), counter_wasm().to_vec())])
+        .await
+        .unwrap();
+    app.deploy_changes(
+        &rt,
+        Changes {
+            access: vec![("c".into(), "internal".into())],
+            ..Changes::default()
+        },
+    )
+    .await
+    .unwrap();
+    racing.1.store(true, Ordering::SeqCst);
+    let rolled = app.rollback(true).await;
+    assert!(!racing.1.load(Ordering::SeqCst), "the swap was reached");
+    assert!(
+        matches!(&rolled, Err(DeployError::Refused(why)) if why.contains("deleted while")),
+        "{rolled:?}"
+    );
+}
