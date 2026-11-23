@@ -200,25 +200,17 @@ fn trim(ctx: &Context<'_>, budget: &Budget, sides: Sides) -> Result<Option<RawTe
     // SQLITE_SKIP_UTF8 does: a byte, and if it is 0xc0 or above, every
     // continuation byte after it.
     let set = &set[..set.iter().position(|&b| b == 0).unwrap_or(set.len())];
-    let mut chars: Vec<&[u8]> = Vec::new();
-    let mut z = 0;
-    while z < set.len() {
-        let start = z;
-        z += 1;
-        if set[start] >= 0xc0 {
-            while z < set.len() && set[z] & 0xc0 == 0x80 {
-                z += 1;
-            }
-        }
-        chars.push(&set[start..z]);
-    }
     let (mut lo, mut hi) = (0, input.len());
-    if chars.iter().all(|c| c.len() == 1) {
+    // A character is longer than a byte only where a byte of 0xc0 or above
+    // is followed by a continuation byte.
+    let multibyte = set.windows(2).any(|w| w[0] >= 0xc0 && w[1] & 0xc0 == 0x80);
+    if !multibyte {
         // Each character one byte: a match consumes that byte, whichever
-        // character of the set it is.
+        // character of the set it is. Nothing allocated: the set can be
+        // as large as a value.
         let mut member = [false; 256];
-        for c in &chars {
-            member[usize::from(c[0])] = true;
+        for &b in set {
+            member[usize::from(b)] = true;
         }
         if sides.0 & 1 != 0 {
             while lo < hi && member[usize::from(input[lo])] {
@@ -232,10 +224,25 @@ fn trim(ctx: &Context<'_>, budget: &Budget, sides: Sides) -> Result<Option<RawTe
         }
         return Ok(Some(RawText(input[lo..hi].to_vec())));
     }
+    // Each character as (offset, length) in the set: 8 bytes each, outside
+    // SQLite's heap cap.
+    let mut chars: Vec<(u32, u32)> = Vec::new();
+    let mut z = 0;
+    while z < set.len() {
+        let start = z;
+        z += 1;
+        if set[start] >= 0xc0 {
+            while z < set.len() && set[z] & 0xc0 == 0x80 {
+                z += 1;
+            }
+        }
+        let span = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        chars.push((span(start), span(z - start)));
+    }
     let mut meter = Meter { budget, work: 0 };
     if sides.0 & 1 != 0 {
         while lo < hi {
-            match first_match(&chars, &mut meter, &input[lo..hi], false)? {
+            match first_match(set, &chars, &mut meter, &input[lo..hi], false)? {
                 Some(len) => lo += len,
                 None => break,
             }
@@ -243,7 +250,7 @@ fn trim(ctx: &Context<'_>, budget: &Budget, sides: Sides) -> Result<Option<RawTe
     }
     if sides.0 & 2 != 0 {
         while lo < hi {
-            match first_match(&chars, &mut meter, &input[lo..hi], true)? {
+            match first_match(set, &chars, &mut meter, &input[lo..hi], true)? {
                 Some(len) => hi -= len,
                 None => break,
             }
@@ -255,19 +262,22 @@ fn trim(ctx: &Context<'_>, budget: &Budget, sides: Sides) -> Result<Option<RawTe
 /// The length of the first character of `chars`, in order, that `rest`
 /// starts with (or ends with, from the right).
 fn first_match(
-    chars: &[&[u8]],
+    set: &[u8],
+    chars: &[(u32, u32)],
     meter: &mut Meter<'_>,
     rest: &[u8],
     right: bool,
 ) -> Result<Option<usize>> {
-    for c in chars {
+    for &(at, len) in chars {
+        let (at, len) = (at as usize, len as usize);
+        let c = &set[at..at + len];
         meter.charge(c.len())?;
         let here = if right {
             rest.len().checked_sub(c.len()).map(|at| &rest[at..])
         } else {
             rest.get(..c.len())
         };
-        if here == Some(*c) {
+        if here == Some(c) {
             return Ok(Some(c.len()));
         }
     }

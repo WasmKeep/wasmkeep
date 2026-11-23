@@ -384,6 +384,12 @@ pub struct ActorDb {
     /// restarts the WAL at the next write once the reader leaves, which
     /// loses nothing: the next capture starts over on the new WAL.
     wal_restart_ok: bool,
+    /// The last checkpoint was blocked by a reader: later ones try without
+    /// waiting out the busy timeout, until one succeeds.
+    checkpoint_blocked: bool,
+    /// Checkpoints after a capture that failed for another reason than a
+    /// reader (an I/O error, say): the changes were returned anyway.
+    failed_checkpoints: u64,
     batch_hold: Option<std::sync::Weak<()>>,
     segment_byte_cap: u64,
     /// Last, so it is released after the connection has closed.
@@ -414,23 +420,41 @@ impl Drop for ActorDb {
 /// control counts as read-only, so a guest can still commit or roll back.
 fn refuse_writes_if(
     wal_full: impl FnOnce() -> bool,
-    batched: bool,
+    why: WalFull,
     stmt: rusqlite::Statement<'_>,
 ) -> Result<rusqlite::Statement<'_>, SqlError> {
     if !stmt.readonly() && wal_full() {
-        return Err(wal_full_error(batched));
+        return Err(wal_full_error(why));
     }
     Ok(stmt)
 }
 
-fn wal_full_error(batched: bool) -> SqlError {
+/// Why the write-ahead log would be full.
+#[derive(Debug, Clone, Copy)]
+enum WalFull {
+    /// Batched capture has not drained it yet.
+    Batched,
+    /// Another connection reads the database, so it cannot be emptied.
+    CheckpointBlocked,
+    /// This event wrote too much.
+    Writes,
+}
+
+fn wal_full_error(why: WalFull) -> SqlError {
     SqlError::new(
         crate::SqlErrorKind::QuotaExceeded,
-        if batched {
-            "the write-ahead log is full; hold new events until batched capture drains and checkpoints"
-        } else {
-            "too many writes in one event: the write-ahead log is full until the \
-             event ends; split the work across events"
+        match why {
+            WalFull::Batched => {
+                "the write-ahead log is full; hold new events until batched capture drains and checkpoints"
+            }
+            WalFull::CheckpointBlocked => {
+                "the write-ahead log is full: another connection is reading the database, \
+                 so the log cannot be emptied; writes resume once it stops"
+            }
+            WalFull::Writes => {
+                "too many writes in one event: the write-ahead log is full until the \
+                 event ends; split the work across events"
+            }
         },
     )
 }
@@ -461,9 +485,11 @@ fn prepare_guest<'c>(
 fn names_reserved(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let prefix = RESERVED_PREFIX.as_bytes();
-    // SQLite's identifier characters: ASCII letters and digits, `_`, `$`,
-    // and every byte of a non-ASCII character.
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    // ASCII identifier characters only. SQLite also counts every byte of a
+    // non-ASCII character as one, but reads a byte-order mark as white
+    // space: any non-ASCII byte is a boundary here, which fails closed
+    // (`é_wasmkeep_x` is refused too).
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     bytes
         .windows(prefix.len())
         .enumerate()
@@ -737,6 +763,8 @@ impl ActorDb {
             cpu_deadline,
             capture: None,
             wal_restart_ok: false,
+            checkpoint_blocked: false,
+            failed_checkpoints: 0,
             batch_hold: None,
             segment_byte_cap: crate::wal::DEFAULT_SEGMENT_BYTES,
             open_guard: None,
@@ -958,13 +986,18 @@ impl ActorDb {
         let size = capture.wal_bytes().max(capture.wal_len());
         // Checkpointing is maintenance: once consumed, the changes are
         // returned even if it fails (a reader still on the WAL, say). The
-        // WAL stays over the threshold, so the next call tries again.
-        if size >= threshold
-            && self.conn.is_autocommit()
-            && self.checkpoint().is_ok()
-            && let Some(c) = self.capture.as_mut()
-        {
-            c.wal_truncated();
+        // WAL stays over the threshold, so the next call tries again, without
+        // waiting for the reader while it stays.
+        if size >= threshold && self.conn.is_autocommit() {
+            match self.try_checkpoint(!self.checkpoint_blocked) {
+                Ok(true) => {
+                    if let Some(c) = self.capture.as_mut() {
+                        c.wal_truncated();
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => self.failed_checkpoints += 1,
+            }
         }
         Ok(changes)
     }
@@ -1016,9 +1049,12 @@ impl ActorDb {
             .as_mut()
             .ok_or(CaptureError::Sql("capture not started".into()))?;
         let changes = match capture.capture() {
-            // A restart rewrites the header in place; anything else (the
-            // file shrank, say) is someone else's doing and stays an error.
-            Err(CaptureError::Lost(why)) if restart_ok && why == "the WAL header changed" => {
+            // Exactly one restart (SQLite adds one to salt-1 at each). Any
+            // other change is someone else's doing and stays an error.
+            Err(CaptureError::WalRestarted {
+                captured_salt,
+                found_salt,
+            }) if restart_ok && found_salt == captured_salt.wrapping_add(1) => {
                 capture.wal_truncated();
                 self.wal_restart_ok = false;
                 capture.capture()?
@@ -1036,22 +1072,68 @@ impl ActorDb {
     /// Moves everything into the main file and empties the WAL. Call with
     /// every commit captured.
     fn checkpoint(&mut self) -> Result<(), CaptureError> {
+        if self.try_checkpoint(true)? {
+            Ok(())
+        } else {
+            Err(CaptureError::Sql("checkpoint blocked".into()))
+        }
+    }
+
+    /// [`Self::checkpoint`]: `false` when a reader blocked it. Without
+    /// `wait`, a reader is not waited for (the busy timeout).
+    fn try_checkpoint(&mut self, wait: bool) -> Result<bool, CaptureError> {
         self.check_batched_checkpoint()?;
+        #[cfg(feature = "fault-injection")]
+        if crate::faults::take("checkpoint") {
+            return Err(CaptureError::Sql("disk I/O error (injected)".into()));
+        }
         let (busy, log, moved): (i64, i64, i64) = self
             .internal(|conn| {
-                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                if !wait {
+                    conn.busy_timeout(Duration::ZERO)?;
+                }
+                let counts = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
+                });
+                if !wait {
+                    conn.busy_timeout(BUSY_TIMEOUT)?;
+                }
+                counts
             })
             .map_err(|e| CaptureError::Sql(e.to_string()))?;
         if busy != 0 {
-            // Strict capture only: boundary capture holds events until a
-            // checkpoint succeeds, and does not keep this flag up to date.
-            self.wal_restart_ok = log >= 0 && log == moved && self.batch_hold.is_none();
-            return Err(CaptureError::Sql("checkpoint blocked".into()));
+            self.checkpoint_blocked = true;
+            // Every frame moved, and every one of them captured: SQLite may
+            // restart the WAL at the next write, losing nothing. Strict
+            // capture only: boundary capture holds events until a checkpoint
+            // succeeds, and does not keep this flag up to date.
+            let all_captured = match (&self.capture, u64::try_from(log)) {
+                (Some(c), Ok(frames)) => {
+                    c.wal_bytes()
+                        == WAL_HEADER_BYTES
+                            + frames * (WAL_FRAME_HEADER_BYTES + u64::from(c.page_size()))
+                }
+                _ => false,
+            };
+            self.wal_restart_ok = log == moved && all_captured && self.batch_hold.is_none();
+            return Ok(false);
         }
+        self.checkpoint_blocked = false;
         self.wal_restart_ok = false;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether capture would follow a WAL restart (after a blocked
+    /// checkpoint that had moved every captured frame). For tests.
+    #[doc(hidden)]
+    pub fn wal_restart_expected(&self) -> bool {
+        self.wal_restart_ok
+    }
+
+    /// Checkpoints after a capture that failed for another reason than a
+    /// reader on the WAL; the captured changes were returned all the same.
+    pub fn failed_checkpoints(&self) -> u64 {
+        self.failed_checkpoints
     }
 
     /// Whether a transaction is open.
@@ -1073,12 +1155,12 @@ impl ActorDb {
             return Ok(0);
         }
         let wal = self.wal_limit();
-        let batched = self.batch_hold.is_some();
+        let why = self.wal_full_why();
         let ddl_seen = Arc::clone(&self.ddl_seen);
         let wal_cap = Arc::clone(&self.wal_cap);
         self.guest(|conn| {
             let stmt = prepare_guest(conn, sql, &ddl_seen)?;
-            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
+            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), why, stmt)?;
             watch_wal(&stmt, wal.as_ref(), &wal_cap);
             let changed = stmt.execute(bind(params))?;
             Ok(u64::try_from(changed).unwrap_or(u64::MAX))
@@ -1090,6 +1172,17 @@ impl ActorDb {
     fn is_rollback(&self, sql: &str) -> bool {
         self.rollback_seen.store(false, Ordering::Relaxed);
         self.conn.prepare(sql).is_ok() && self.rollback_seen.load(Ordering::Relaxed)
+    }
+
+    /// Why the WAL would be full, for the error.
+    fn wal_full_why(&self) -> WalFull {
+        if self.batch_hold.is_some() {
+            WalFull::Batched
+        } else if self.checkpoint_blocked {
+            WalFull::CheckpointBlocked
+        } else {
+            WalFull::Writes
+        }
     }
 
     /// The WAL file and its cap, while capturing (otherwise SQLite
@@ -1140,12 +1233,14 @@ impl ActorDb {
         let wal_stopped = self.wal_stopped.swap(false, Ordering::Relaxed);
         result.map_err(|e| {
             if wal_stopped && e.message.contains("interrupted") {
-                wal_full_error(self.batch_hold.is_some())
+                wal_full_error(self.wal_full_why())
             } else if e.message.contains("out of memory") {
+                // Also what SQLite answers for a statement compiled to more
+                // instructions than its cap.
                 SqlError::new(
                     crate::SqlErrorKind::QuotaExceeded,
-                    "the statement needs more memory than SQLite may use on this node; \
-                     work on less at once",
+                    "the statement is too large, or needs more memory than SQLite may use \
+                     on this node; work on less at once",
                 )
             } else if e.message.contains("interrupted") && self.sql_cpu_used >= self.max_sql_cpu {
                 self.sql_cpu_spent()
@@ -1336,12 +1431,12 @@ impl ActorDb {
     pub fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Rows, SqlError> {
         let max = self.max_result_bytes;
         let wal = self.wal_limit();
-        let batched = self.batch_hold.is_some();
+        let why = self.wal_full_why();
         let ddl_seen = Arc::clone(&self.ddl_seen);
         let wal_cap = Arc::clone(&self.wal_cap);
         self.guest(|conn| {
             let stmt = prepare_guest(conn, sql, &ddl_seen)?;
-            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), batched, stmt)?;
+            let mut stmt = refuse_writes_if(|| wal_over(wal.as_ref()), why, stmt)?;
             watch_wal(&stmt, wal.as_ref(), &wal_cap);
             let mut remaining = max;
             let mut charge = |bytes: usize| {
@@ -1545,34 +1640,73 @@ impl ActorDb {
         let triggers = self
             .conn
             .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
-        self.conn
-            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)?;
-        let off = self
-            .conn
-            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false);
         let in_transaction = !self.conn.is_autocommit();
         let limit = u64::try_from(self.max_statement_time.as_millis()).unwrap_or(u64::MAX);
-        self.internal.store(true, Ordering::Relaxed);
-        self.deadline
-            .store(clock_ms().saturating_add(limit).max(1), Ordering::Relaxed);
-        let result = off.and_then(|_| f(&self.conn));
-        self.deadline.store(0, Ordering::Relaxed);
-        self.internal.store(false, Ordering::Relaxed);
+        let (result, restored) = {
+            // Restores the settings, the flag and the deadline even if `f`
+            // panics.
+            let mut host = HostMode {
+                conn: &self.conn,
+                internal: &self.internal,
+                deadline: &self.deadline,
+                fkeys,
+                triggers,
+                restored: false,
+            };
+            self.internal.store(true, Ordering::Relaxed);
+            self.deadline
+                .store(clock_ms().saturating_add(limit).max(1), Ordering::Relaxed);
+            let result = self
+                .conn
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)
+                .and_then(|_| {
+                    self.conn
+                        .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+                })
+                .and_then(|_| f(&self.conn));
+            (result, host.restore())
+        };
         // As for a guest statement: an interrupted host statement rolls the
         // guest's transaction back.
         if result.is_err() && in_transaction && self.conn.is_autocommit() {
             self.transaction_aborted = true;
         }
-        let restored = self
-            .conn
-            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, triggers)
-            .and_then(|_| {
-                self.conn
-                    .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, fkeys)
-            });
         let value = result?;
         restored?;
         Ok(value)
+    }
+}
+
+/// What [`ActorDb::internal`] changes for a host statement, restored when
+/// dropped (also on a panic) if not before.
+struct HostMode<'a> {
+    conn: &'a Connection,
+    internal: &'a AtomicBool,
+    deadline: &'a AtomicU64,
+    fkeys: bool,
+    triggers: bool,
+    restored: bool,
+}
+
+impl HostMode<'_> {
+    fn restore(&mut self) -> rusqlite::Result<()> {
+        use rusqlite::config::DbConfig;
+        self.restored = true;
+        self.deadline.store(0, Ordering::Relaxed);
+        self.internal.store(false, Ordering::Relaxed);
+        self.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, self.triggers)?;
+        self.conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, self.fkeys)?;
+        Ok(())
+    }
+}
+
+impl Drop for HostMode<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = self.restore();
+        }
     }
 }
 
@@ -1600,18 +1734,27 @@ const PROGRESS_STEPS: std::ffi::c_int = 10_000;
 /// Columns in a table, index or result: SQLite's own maximum (2000), as
 /// set explicitly; lower, a wider existing table would fail to load.
 const GUEST_MAX_COLUMNS: i32 = 2000;
-/// Arguments to one function call (SQLite: 1000 since 3.48, 127 before).
-const GUEST_MAX_FUNCTION_ARGS: i32 = 127;
+/// Arguments to one function call: SQLite's default (1000), as set
+/// explicitly.
+const GUEST_MAX_FUNCTION_ARGS: i32 = 1000;
 /// Depth of an expression tree: SQLite's default (1000), as set explicitly.
 const GUEST_MAX_EXPR_DEPTH: i32 = 1000;
-/// Terms of a compound `SELECT` (SQLite: 500).
-const GUEST_MAX_COMPOUND_SELECT: i32 = 100;
-/// Instructions in one compiled statement (SQLite: 250,000,000).
-const GUEST_MAX_VDBE_OPS: i32 = 250_000;
-/// Bytes in a `LIKE` or `GLOB` pattern (SQLite: 50,000). A match costs up
-/// to the value's length times the pattern's, in one step the progress
-/// handler cannot interrupt: about a second on a 16 MiB value at this cap.
-const GUEST_MAX_LIKE_PATTERN: i32 = 100;
+/// Terms of a compound `SELECT`: SQLite's default (500), as set explicitly
+/// (SQLite applies it to stored views and triggers as it loads them).
+const GUEST_MAX_COMPOUND_SELECT: i32 = 500;
+/// Instructions in one compiled statement (SQLite: 250,000,000). Past it
+/// SQLite answers "out of memory".
+const GUEST_MAX_VDBE_OPS: i32 = 2_000_000;
+/// Bytes in a `LIKE` or `GLOB` pattern: SQLite's default (50,000), as set
+/// explicitly. A match costs up to the value's length times the pattern's,
+/// in one step the progress handler cannot interrupt.
+const GUEST_MAX_LIKE_PATTERN: i32 = 50_000;
+/// rusqlite's busy timeout, which a checkpoint that does not wait for
+/// readers sets aside for a moment.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The WAL's header and each frame's header, in bytes.
+const WAL_HEADER_BYTES: u64 = 32;
+const WAL_FRAME_HEADER_BYTES: u64 = 24;
 /// SQLite's heap, for the whole process (`PRAGMA hard_heap_limit`): past it
 /// an allocation fails and the statement with it, instead of the process
 /// running out of memory. Room for the default 1,000 resident actors' page
@@ -1864,14 +2007,18 @@ mod tests {
             "CREATE TABLE g (a REFERENCES main._wasmkeep_alarm)",
             "CREATE TABLE g (a REFERENCES\n_wasmkeep_alarm)",
             "CREATE TABLE g (a REFERENCES/**/_wasmkeep_alarm)",
+            // A byte-order mark is white space to SQLite.
+            "CREATE TABLE g (a REFERENCES \u{FEFF}_wasmkeep_alarm(id))",
+            "ALTER TABLE t RENAME TO \u{FEFF}_wasmkeep_x",
+            // Any non-ASCII byte before it counts as a boundary (fails closed).
+            "é_wasmkeep_",
         ] {
             assert!(names_reserved(sql), "{sql}");
         }
         for sql in [
             "CREATE TABLE app_wasmkeep_state (x)",
             "x__wasmkeep_",
-            "é_wasmkeep_",
-            "$_wasmkeep_",
+            "x$_wasmkeep_",
         ] {
             assert!(!names_reserved(sql), "{sql}");
         }

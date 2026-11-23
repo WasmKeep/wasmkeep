@@ -153,14 +153,20 @@ fn what_was_committed_is_what_is_restored() {
     assert_eq!((v.as_str(), rows), ("changed", 21 + 6 - 8));
 }
 
-/// A checkpoint that cannot run (another connection still reads the WAL)
-/// does not cost the changes the capture already consumed: they are
-/// returned, and the checkpoint is left for a later capture.
-#[test]
-fn a_blocked_checkpoint_does_not_drop_captured_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = open(dir.path());
-    let mut shipped = Shipped::start(&mut db);
+/// Salt-1 of the WAL's header: SQLite adds one each time it restarts the
+/// WAL.
+fn wal_salt1(db: &Path) -> u32 {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let h = std::fs::read(&wal).unwrap();
+    u32::from_be_bytes([h[16], h[17], h[18], h[19]])
+}
+
+/// An actor past the checkpoint threshold, with another connection reading
+/// the WAL as of its last commit.
+fn pinned(dir: &Path) -> (ActorDb, Shipped, rusqlite::Connection) {
+    let mut db = open(dir);
+    let shipped = Shipped::start(&mut db);
     exec(
         &mut db,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)",
@@ -172,24 +178,88 @@ fn a_blocked_checkpoint_does_not_drop_captured_changes() {
     reader
         .execute_batch("BEGIN; SELECT count(*) FROM t;")
         .unwrap();
+    (db, shipped, reader)
+}
+
+fn assert_restores(dir: &Path, mut db: ActorDb, shipped: &Shipped) {
+    let source_sum = db.captured_checksum().unwrap();
+    let source = db.path().to_owned();
+    assert_eq!(db.snapshot().unwrap().post_apply, source_sum);
+    drop(db);
+    let restored = dir.join("restored.db");
+    assert_eq!(shipped.restore_to(&restored), source_sum);
+    assert_eq!(dump(&restored), dump(&source));
+}
+
+/// A checkpoint that cannot run (another connection still reads the WAL)
+/// does not cost the changes the capture already consumed: they are
+/// returned, and the checkpoint is left for a later capture. It had moved
+/// every captured frame into the main file, so SQLite restarts the WAL at
+/// the next write, and capture carries on on the new WAL.
+#[test]
+fn a_blocked_checkpoint_does_not_drop_captured_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, mut shipped, reader) = pinned(dir.path());
     // The checkpoint waits for the reader (the busy timeout), then gives up.
     let changes = db
         .take_changes()
         .expect("changes returned although the checkpoint was blocked")
         .expect("the insert was captured");
     shipped.ship(&changes);
+    assert!(db.wal_restart_expected());
+    let salt = wal_salt1(db.path());
     reader.execute_batch("COMMIT").unwrap();
     drop(reader);
 
     exec(&mut db, "INSERT INTO t (b) VALUES (x'01')", &[]);
+    assert_eq!(
+        wal_salt1(db.path()),
+        salt.wrapping_add(1),
+        "the WAL restarted"
+    );
     assert!(shipped.capture(&mut db));
-    let source_sum = db.captured_checksum().unwrap();
-    let source = db.path().to_owned();
-    assert_eq!(db.snapshot().unwrap().post_apply, source_sum);
-    drop(db);
-    let restored = dir.path().join("restored.db");
-    assert_eq!(shipped.restore_to(&restored), source_sum);
-    assert_eq!(dump(&restored), dump(&source));
+    assert!(!db.wal_restart_expected());
+    assert_restores(dir.path(), db, &shipped);
+}
+
+/// A reader that started before the last commit keeps the checkpoint from
+/// moving every frame: SQLite cannot restart the WAL then, so capture does
+/// not expect it to, and goes on in the same WAL.
+#[test]
+fn a_partly_blocked_checkpoint_does_not_expect_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, mut shipped, reader) = pinned(dir.path());
+    exec(&mut db, "INSERT INTO t (b) VALUES (x'02')", &[]);
+    assert!(shipped.capture(&mut db));
+    assert!(!db.wal_restart_expected());
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    exec(&mut db, "INSERT INTO t (b) VALUES (x'01')", &[]);
+    assert!(shipped.capture(&mut db));
+    assert_restores(dir.path(), db, &shipped);
+}
+
+/// Two restarts between captures: the WAL between them was never
+/// captured, so its loss is reported.
+#[test]
+fn two_wal_restarts_between_captures_are_a_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut db, mut shipped, reader) = pinned(dir.path());
+    shipped.ship(&db.take_changes().unwrap().unwrap());
+    assert!(db.wal_restart_expected());
+    let salt = wal_salt1(db.path());
+    reader.execute_batch("COMMIT").unwrap();
+    exec(&mut db, "INSERT INTO t (b) VALUES (x'01')", &[]);
+    // Another connection checkpoints everything: the next write restarts
+    // the WAL again, over the commit above.
+    reader
+        .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    drop(reader);
+    exec(&mut db, "INSERT INTO t (b) VALUES (x'02')", &[]);
+    assert_eq!(wal_salt1(db.path()), salt.wrapping_add(2), "two restarts");
+    let err = db.take_changes().unwrap_err();
+    assert!(matches!(err, CaptureError::WalRestarted { .. }), "{err:?}");
 }
 
 #[test]

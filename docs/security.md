@@ -97,20 +97,26 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   overhead, including empty values ([details](concepts.md#storage)). A statement
   is stopped at the event's wall clock and SQL CPU budget, checked between
   steps of SQLite's virtual machine and inside `instr`, `replace` and
-  `trim`; a single step over a large value is not interrupted, so a
-  statement can overrun them. Host statements have the same wall-clock
-  limit.
-- SQLite limits on guest connections: 127 function arguments, 100 terms in
-  a compound `SELECT`, 250,000 instructions per statement, 100 bytes per
-  `LIKE` or `GLOB` pattern (columns and expression depth stay at SQLite's
-  2,000 and 1,000: SQLite checks those when it loads a schema, so lower
-  ones would make existing databases unreadable). SQLite's heap is capped
-  at 4 GiB for the whole process, temporary data (sorts, materialised
+  `trim`. A stop inside one of these functions fails the statement only;
+  it does not roll back the guest's open transaction (a stop between steps
+  of a statement that writes does). A single step over a large value is
+  not interrupted, so a statement can overrun the budgets; `LIKE` and
+  `GLOB` are the costliest, their time growing with the value's length
+  times the pattern's (up to SQLite's 50,000-byte patterns). Host
+  statements have the same wall-clock limit.
+- At most 2,000,000 instructions per compiled statement (past it,
+  `quota-exceeded`). SQLite's own limits on columns, function arguments,
+  expression depth and compound `SELECT` terms are kept, set explicitly:
+  SQLite also applies them when it loads a stored schema, so lower ones
+  would make existing databases unreadable. SQLite's heap is capped at
+  4 GiB for the whole process, temporary data (sorts, materialised
   subqueries) included, as it stays in memory: a statement that needs more
   fails with `quota-exceeded`. The cap is shared, so while one statement
   holds most of it, others can fail too.
 - 256 MB of write-ahead log between two captures: past it, statements that
-  write fail until the event ends (reads, commit and rollback still run).
+  write fail until the event ends (reads, commit and rollback still run),
+  or, when another connection reading the database keeps the log from
+  being emptied, until it stops.
   Checked before a statement that writes and while it runs; one stopped
   while it runs rolls back the event's open transaction, as at a deadline,
   and can have written past the cap by what it wrote since the last check.

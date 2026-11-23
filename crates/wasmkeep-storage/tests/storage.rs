@@ -1157,6 +1157,11 @@ fn reserved_names_are_refused_for_every_guest_object() {
         "CREATE TABLE g (a REFERENCES \"_WASMKEEP_ALARM\")",
         "CREATE TABLE g (a, FOREIGN KEY (a) REFERENCES `_wasmkeep_meta` (key))",
         "ALTER TABLE t ADD COLUMN y REFERENCES _wasmkeep_alarm (id)",
+        // SQLite reads a byte-order mark as white space.
+        "CREATE TABLE g (a REFERENCES \u{FEFF}_wasmkeep_alarm(id) ON DELETE CASCADE)",
+        "ALTER TABLE t RENAME TO \u{FEFF}_wasmkeep_x",
+        // Fails closed: any non-ASCII byte before the prefix.
+        "CREATE TABLE é_wasmkeep_x (a)",
     ] {
         let err = db.exec(sql, &[]).unwrap_err();
         assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{sql}: {err:?}");
@@ -1187,9 +1192,9 @@ fn guest_connections_have_sqlite_limits() {
     db.query(&format!("SELECT {}", columns(2001)), &[])
         .unwrap_err();
     let args = |n: usize| (0..n).map(|_| "1").collect::<Vec<_>>().join(",");
-    db.query(&format!("SELECT max({})", args(127)), &[])
+    db.query(&format!("SELECT max({})", args(1000)), &[])
         .unwrap();
-    db.query(&format!("SELECT max({})", args(128)), &[])
+    db.query(&format!("SELECT max({})", args(1001)), &[])
         .unwrap_err();
     let union = |n: usize| {
         (0..n)
@@ -1197,34 +1202,54 @@ fn guest_connections_have_sqlite_limits() {
             .collect::<Vec<_>>()
             .join(" UNION ALL ")
     };
-    db.query(&union(100), &[]).unwrap();
-    db.query(&union(101), &[]).unwrap_err();
+    db.query(&union(500), &[]).unwrap();
+    db.query(&union(501), &[]).unwrap_err();
     let depth = |n: usize| format!("SELECT {}", vec!["1"; n].join(" + "));
     db.query(&depth(900), &[]).unwrap();
     db.query(&depth(1100), &[]).unwrap_err();
     let pattern = |n: usize| V::Text("a".repeat(n));
-    db.query("SELECT 'a' LIKE ?1", &[pattern(100)]).unwrap();
-    let err = db.query("SELECT 'a' LIKE ?1", &[pattern(101)]).unwrap_err();
+    db.query("SELECT 'a' LIKE ?1", &[pattern(50_000)]).unwrap();
+    let err = db
+        .query("SELECT 'a' LIKE ?1", &[pattern(50_001)])
+        .unwrap_err();
     assert!(err.message.contains("too complex"), "{err:?}");
-    let err = db.query("SELECT 'a' GLOB ?1", &[pattern(101)]).unwrap_err();
-    assert!(err.message.contains("too complex"), "{err:?}");
+    // A statement compiled to more instructions than the cap.
+    db.exec("CREATE TABLE v (a, b, c)", &[]).unwrap();
+    let values = |n: usize| {
+        format!(
+            "INSERT INTO v VALUES {}",
+            vec!["(random(), random(), random())"; n].join(",")
+        )
+    };
+    db.exec(&values(1000), &[]).unwrap();
+    let err = db.exec(&values(600_000), &[]).unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.contains("too large"), "{err:?}");
     drop(db);
-    // SQLite applies the column and argument limits while loading the
-    // schema: a database whose schema uses what SQLite itself allows (here
-    // a table as wide as it can be) still opens.
+    // SQLite applies the column, argument, depth and compound limits while
+    // loading the schema: a database whose schema uses what SQLite itself
+    // allows still opens.
     let raw = rusqlite::Connection::open(dir.path().join("actors/t/c/a.db")).unwrap();
     raw.execute_batch(&format!(
-        "CREATE TABLE wide ({}); CREATE TABLE ch (x CHECK (max({}) > 0));",
+        "CREATE TABLE wide ({});
+         CREATE TABLE ch (x CHECK (max({}) > 0));
+         CREATE VIEW many AS {};
+         CREATE TRIGGER many_tr AFTER INSERT ON ch BEGIN SELECT * FROM ({}); END;",
         (0..2000)
             .map(|i| format!("c{i}"))
             .collect::<Vec<_>>()
             .join(","),
-        args(127),
+        args(1000),
+        union(500),
+        union(500),
     ))
     .unwrap();
     drop(raw);
     let mut db = storage(&dir).open("c", "a").unwrap();
     db.query("SELECT count(*) FROM wide", &[]).unwrap();
+    let rows = db.query("SELECT count(*) FROM many", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(500)]]);
+    db.exec("INSERT INTO ch VALUES (1)", &[]).unwrap();
 }
 
 /// `instr`, `replace` and the two-argument `trim`, `ltrim` and `rtrim` are
@@ -1405,6 +1430,101 @@ fn one_statement_cannot_write_far_past_the_wal_cap() {
     }
     let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
     assert_eq!(rows.values, vec![vec![V::Integer(2)]]);
+}
+
+/// A budget stop inside one of the host's string functions fails the
+/// statement, not the guest's open transaction.
+#[test]
+fn a_stop_inside_a_string_function_keeps_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_statement_time = std::time::Duration::from_millis(200);
+    let mut db = rooted(config).open("c", "a").unwrap();
+    db.exec("CREATE TABLE t (x)", &[]).unwrap();
+    db.exec("BEGIN", &[]).unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    let err = db
+        .exec(
+            "INSERT INTO t SELECT instr(printf('%.*c', 4000000, 'a'), \
+             printf('%.*c', 2000000, 'a') || 'b')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(db.in_transaction());
+    db.exec("COMMIT", &[]).unwrap();
+    let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(1)]]);
+}
+
+/// While another connection keeps reading the WAL, the capture does not
+/// wait out the busy timeout at every event to try checkpointing again,
+/// and once the WAL fills up, the error says why.
+#[test]
+fn a_reader_that_stays_blocks_checkpoints_without_stalling_every_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = rooted(StorageConfig {
+        max_wal_bytes: 1024 * 1024,
+        ..StorageConfig::new(dir.path())
+    });
+    let mut db = s.open("c", "a").unwrap();
+    db.start_capture().unwrap();
+    db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
+    db.take_changes().unwrap();
+    let reader = rusqlite::Connection::open(db.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM t;")
+        .unwrap();
+    let blob = V::Blob(vec![7; 300 * 1024]);
+    let mut slow = 0;
+    let err = loop {
+        match db.exec("INSERT INTO t VALUES (?1)", std::slice::from_ref(&blob)) {
+            Ok(_) => {}
+            Err(e) => break e,
+        }
+        let started = std::time::Instant::now();
+        db.take_changes().unwrap();
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            slow += 1;
+        }
+        db.end_event().unwrap();
+    };
+    assert!(slow <= 1, "{slow} captures waited for the reader");
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.contains("reading"), "{err:?}");
+    // Once the reader leaves, the next capture checkpoints and writes work.
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    db.end_event().unwrap();
+    // The retry may be spaced out: try for a while.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        db.take_changes().unwrap();
+        if db.exec("INSERT INTO t VALUES (x'01')", &[]).is_ok() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "writes never resumed");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A checkpoint that fails for another reason than a reader (an I/O error)
+/// still returns the captured changes, and is counted.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failed_checkpoint_is_counted_and_keeps_the_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.start_capture().unwrap();
+    db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
+    db.exec("INSERT INTO t VALUES (zeroblob(5000000))", &[])
+        .unwrap();
+    wasmkeep_storage::faults::fail_next("checkpoint");
+    assert!(db.take_changes().unwrap().is_some());
+    assert_eq!(db.failed_checkpoints(), 1);
+    db.exec("INSERT INTO t VALUES (x'01')", &[]).unwrap();
+    assert!(db.take_changes().unwrap().is_some());
+    assert_eq!(db.failed_checkpoints(), 1);
 }
 
 /// A storage of tenant `t`, its databases at `<data_dir>/actors/t/` (where
