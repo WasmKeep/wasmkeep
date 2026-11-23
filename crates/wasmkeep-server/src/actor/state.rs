@@ -818,7 +818,7 @@ impl ActorState {
             Err(cut) => Err(format!("event {cut}")),
         };
         if let Err(e) = &result {
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "guest trapped; instance discarded");
+            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %crate::logging::text(e), "guest trapped; instance discarded");
         }
         self.finish_event(result.is_err()).await;
     }

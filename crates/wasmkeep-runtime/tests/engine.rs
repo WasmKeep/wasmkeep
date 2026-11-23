@@ -218,4 +218,55 @@ fn the_cache_directory_is_created_private() {
     assert!(cache.dir().is_absolute());
     let mode = std::fs::metadata(cache.dir()).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    // Opened through a symlink, the cache names the real directory.
+    std::os::unix::fs::symlink(dir.path().join("a/cache"), dir.path().join("link")).unwrap();
+    let linked = ComponentCache::new(small_runtime(), dir.path().join("link")).unwrap();
+    assert_eq!(linked.dir(), cache.dir().canonicalize().unwrap());
+}
+
+/// An entry that is a symlink is not followed, even to a private file:
+/// the component is compiled again and the link replaced by a file.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_cache_entry_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = small_runtime();
+    let cache = ComponentCache::new(runtime.clone(), dir.path().join("cache")).unwrap();
+    let answer = answer_wasm();
+    let other = wat::parse_str(ANSWER_WAT.replace("i32.const 42", "i32.const 7")).unwrap();
+    cache.get_or_compile(&other).unwrap();
+    let elsewhere = dir.path().join("elsewhere.cwasm");
+    std::fs::rename(cache.path_for(&other), &elsewhere).unwrap();
+    let path = cache.path_for(&answer);
+    std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+    let component = cache.get_or_compile(&answer).unwrap();
+    assert_eq!(call_run(&runtime, &component), 42);
+    assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+}
+
+/// An artefact an older version wrote readable by others (0644) is still
+/// this user's: it is loaded, and made the owner's alone.
+#[cfg(unix)]
+#[test]
+fn an_older_readable_artefact_is_loaded_and_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = small_runtime();
+    let cache = ComponentCache::new(runtime.clone(), dir.path().join("cache")).unwrap();
+    let answer = answer_wasm();
+    cache.get_or_compile(&answer).unwrap();
+    let path = cache.path_for(&answer);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let component = cache.get_or_compile(&answer).unwrap();
+    assert_eq!(call_run(&runtime, &component), 42);
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        meta.modified().unwrap(),
+        written,
+        "loaded, not compiled again"
+    );
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 }

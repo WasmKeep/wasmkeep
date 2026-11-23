@@ -8,12 +8,14 @@
 //! listing them (`tenant/{blog,shop}`) when it serves several, so it never
 //! names one app for another (ADR 0038, section 9).
 //!
-//! Text from outside the node (actor names, what guests print) is escaped
-//! ([`push_escaped`]): Unicode controls (Cc), format characters such as the
-//! bidi controls and zero-width ones (Cf), and the line and paragraph
-//! separators (Zl, Zp) appear as `\u{202e}`, so such text cannot start a
-//! line of its own, reorder what a terminal shows or colour it. A name with
-//! a space, `=`, `"` or `\` is quoted, so it cannot add fields to its line.
+//! Text from outside the node (actor names, what guests print, errors they
+//! cause) is escaped ([`push_escaped`]) with logfmt's escapes: Unicode
+//! controls (Cc, tab included), format characters such as the bidi
+//! controls and zero-width ones (Cf), and the line and paragraph
+//! separators (Zl, Zp) appear as `\t`, `\n` or four hex digits after `\u`,
+//! so such text cannot start a line of its own, reorder what a terminal
+//! shows or colour it. A value with whitespace, `=`, `"` or `\` is quoted
+//! ([`text`]), so it cannot add fields to its line.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -85,19 +87,46 @@ pub(crate) struct Actor<'a>(pub(crate) &'a ActorAddress);
 impl fmt::Display for Actor<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = self.0.name();
-        let plain = !name
-            .chars()
-            .any(|c| matches!(c, ' ' | '=' | '"' | '\\') || escaped(c));
-        if plain {
+        if plain(name) {
             return write!(f, "{}/{name}", self.0.class());
         }
-        let mut out = format!("\"{}/", self.0.class());
-        for c in name.chars() {
+        text(format_args!("{}/{name}", self.0.class())).fmt(f)
+    }
+}
+
+/// A log field's value that may carry text from outside the node (an
+/// error a guest caused, a key naming an actor): shown as it is when that
+/// is safe, else quoted and escaped (see the module docs).
+pub(crate) fn text<T: fmt::Display>(value: T) -> Text<T> {
+    Text(value)
+}
+
+/// See [`text`].
+pub(crate) struct Text<T>(T);
+
+impl<T: fmt::Display> fmt::Display for Text<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0.to_string();
+        if plain(&value) {
+            return f.write_str(&value);
+        }
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for c in value.chars() {
             push_escaped(&mut out, c);
         }
         out.push('"');
         f.write_str(&out)
     }
+}
+
+/// Whether `value` may stand unquoted: not empty, and no whitespace, `=`,
+/// `"`, `\` or character the log escapes.
+fn plain(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '=' | '"' | '\\') || escaped(c))
 }
 
 /// Unicode's format characters (category Cf), as of Unicode 16.0.
@@ -125,22 +154,33 @@ const FORMAT: [(char, char); 21] = [
     ('\u{e0020}', '\u{e007f}'),
 ];
 
-/// Whether the log shows `c` escaped: a control (Cc) other than tab, a
+/// Whether the log shows `c` escaped: a control (Cc, tab included), a
 /// format character (Cf), or the line or paragraph separator (Zl, Zp).
 pub(crate) fn escaped(c: char) -> bool {
-    (c.is_control() && c != '\t')
+    c.is_control()
         || c == '\u{2028}'
         || c == '\u{2029}'
         || (c >= '\u{ad}' && FORMAT.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)))
 }
 
-/// Appends `c` as a quoted log value shows it: escaped (`\u{1b}`, `\r`) if
-/// [`escaped`], `"` and `\` after a backslash, anything else as it is.
+/// Appends `c` as a quoted log value shows it, with the escapes logfmt and
+/// JSON read: `\t`, `\n`, `\r`, `\"` and `\\`, and `\u001b` (four hex
+/// digits, a surrogate pair above U+FFFF) for any other character
+/// [`escaped`] names; anything else as it is.
 pub(crate) fn push_escaped(out: &mut String, c: char) {
-    if escaped(c) || c == '"' || c == '\\' {
-        out.extend(c.escape_default());
-    } else {
-        out.push(c);
+    match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\t' => out.push_str("\\t"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        c if escaped(c) => {
+            let mut units = [0; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+        c => out.push(c),
     }
 }
 
@@ -162,9 +202,50 @@ mod tests {
         let plain = ActorAddress::new("logging-esc", "chat", "room-1").unwrap();
         assert_eq!(Actor(&plain).to_string(), "chat/room-1");
         let bidi = ActorAddress::new("logging-esc", "chat", "a\u{202e}b\u{2028}c").unwrap();
-        assert_eq!(Actor(&bidi).to_string(), r#""chat/a\u{202e}b\u{2028}c""#);
+        assert_eq!(Actor(&bidi).to_string(), r#""chat/a\u202eb\u2028c""#);
         let spoof = ActorAddress::new("logging-esc", "chat", "x level=error \"q\"").unwrap();
         assert_eq!(Actor(&spoof).to_string(), r#""chat/x level=error \"q\"""#);
+        // Any whitespace, not only the ASCII space, separates fields to
+        // some readers.
+        for space in ['\u{a0}', '\u{3000}', '\u{2003}'] {
+            let name = format!("x{space}level=error");
+            let address = ActorAddress::new("logging-esc", "chat", name).unwrap();
+            let shown = Actor(&address).to_string();
+            assert!(shown.starts_with('"') && shown.ends_with('"'), "{shown}");
+        }
+    }
+
+    /// Escapes as logfmt and JSON read them: `\uXXXX`, with a surrogate
+    /// pair above the BMP, and `\t`, `\n`, `\r`, `\"`, `\\`.
+    #[test]
+    fn escapes_are_logfmt_escapes() {
+        let mut out = String::new();
+        for c in [
+            '\u{1b}',
+            '\t',
+            '\n',
+            '\r',
+            '"',
+            '\\',
+            '\u{202e}',
+            '\u{e0001}',
+            'é',
+        ] {
+            push_escaped(&mut out, c);
+        }
+        assert_eq!(out, r#"\u001b\t\n\r\"\\\u202e\udb40\udc01é"#);
+    }
+
+    /// Other values that may carry outside text (an error from a guest, a
+    /// key naming an actor) go through the same rules.
+    #[test]
+    fn text_values_are_quoted_when_they_need_it() {
+        assert_eq!(text("plain-key/a").to_string(), "plain-key/a");
+        assert_eq!(
+            text("trap: x\nlevel=error \u{202e}").to_string(),
+            r#""trap: x\nlevel=error \u202e""#
+        );
+        assert_eq!(text("").to_string(), r#""""#);
     }
 
     #[test]
@@ -176,10 +257,11 @@ mod tests {
             '\u{2066}',
             '\u{feff}',
             '\u{e0041}',
+            '\t',
         ] {
             assert!(escaped(c), "{c:?}");
         }
-        for c in ['a', 'é', '\t', ' ', '\u{2027}', '\u{2070}', '\u{1f600}'] {
+        for c in ['a', 'é', ' ', '\u{2027}', '\u{2070}', '\u{1f600}'] {
             assert!(!escaped(c), "{c:?}");
         }
         assert!(FORMAT.windows(2).all(|w| w[0].1 < w[1].0));

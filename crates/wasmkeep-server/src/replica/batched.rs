@@ -1244,7 +1244,7 @@ impl Ticket {
                 && alarm_index::may_delete(&stale, a.generation)
                 && let Err(e) = (a.index.delete)(stale).await
             {
-                tracing::debug!(prefix = %target.prefix, error = %e, "retiring an alarm entry failed");
+                tracing::debug!(prefix = %crate::logging::text(&target.prefix), error = %e, "retiring an alarm entry failed");
             }
         });
         Ok(id)
@@ -1252,7 +1252,7 @@ impl Ticket {
 
     /// Records a failed hand-off: the flag now, the outcome in the cell.
     fn fail(&mut self, reason: String) -> ReplicaError {
-        tracing::error!(prefix = %self.target.prefix, segment = ?self.segment.id, %reason, "a batched capture failed: replication stops");
+        tracing::error!(prefix = %crate::logging::text(&self.target.prefix), segment = ?self.segment.id, %reason, "a batched capture failed: replication stops");
         self.reported = true;
         self.shared.failed(
             self.segment.id,

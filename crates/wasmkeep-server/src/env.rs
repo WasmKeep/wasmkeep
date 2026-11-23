@@ -63,17 +63,32 @@ impl ActorEnv {
 }
 
 /// Reads an env file of configuration and secrets (`--env`,
-/// `--front-env`, `wasmkeep dev`'s local values). On Unix, a file its group
-/// or others can read or write is refused, as the secrets key is: it must
-/// be the server's user's alone (`chmod 600`). Symlinks are followed (the
-/// target's mode counts), and the file is checked and read through one
-/// handle, so the path cannot be swapped in between.
+/// `--front-env`). On Unix it is refused, as the secrets key is, if other
+/// users can open it, if its group can write it, or if its group can read
+/// it while it is the server's user's own file; see [`private_enough`].
+/// So `0600` or `0400` the server's user's, or `0640` or `0440` root's
+/// with the server's group (the service then cannot rewrite its own
+/// secrets). Symlinks are followed (the target's mode counts, as for a
+/// mounted secret), a fifo or other non-file is refused before it is
+/// opened, and the file is checked and read through one handle, so the
+/// path cannot be swapped in between.
 ///
 /// # Errors
 /// The file cannot be read, is too large, is open to others, or has a
 /// malformed line.
 pub fn read_file(path: &Path) -> Result<Vars, String> {
-    read(path, true)
+    read(path, Check::Private).map(|(vars, _)| vars)
+}
+
+/// Reads `wasmkeep dev`'s local values (`[dev] env`, `.env.local`) as
+/// [`read_file`] does, except on a filesystem that keeps no file modes
+/// (`chmod` has no effect there): the file is read, with the warning
+/// returned.
+///
+/// # Errors
+/// As [`read_file`].
+pub fn read_local_file(path: &Path) -> Result<(Vars, Option<String>), String> {
+    read(path, Check::Local)
 }
 
 /// Reads a file of plain deployed configuration (`wasmkeep deploy
@@ -83,12 +98,83 @@ pub fn read_file(path: &Path) -> Result<Vars, String> {
 /// # Errors
 /// The file cannot be read, is too large, or has a malformed line.
 pub fn read_config_file(path: &Path) -> Result<Vars, String> {
-    read(path, false)
+    read(path, Check::None).map(|(vars, _)| vars)
 }
 
-fn read(path: &Path, private: bool) -> Result<Vars, String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    None,
+    Private,
+    Local,
+}
+
+/// Whether a file of secrets with `mode`, owned by `owner`, may be read by
+/// a server running as `euid`: `Err` says why not and how to fix it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn private_enough(mode: u32, owner: u32, euid: u32) -> Result<(), String> {
+    let shown = mode & 0o777;
+    if mode & 0o007 != 0 {
+        return Err(format!(
+            "other users can open it (mode {shown:o}); it may hold secrets (chmod o= FILE)"
+        ));
+    }
+    if mode & 0o020 != 0 {
+        return Err(format!(
+            "its group can write it (mode {shown:o}); it may hold secrets (chmod g-w FILE)"
+        ));
+    }
+    if mode & 0o040 != 0 && owner == euid && owner != 0 {
+        return Err(format!(
+            "its group can read it (mode {shown:o}) and it is the server's own file; it may \
+             hold secrets (chmod 600 FILE, or make root its owner and the server's group \
+             its group)"
+        ));
+    }
+    Ok(())
+}
+
+/// `refused` for local values: a warning instead when the filesystem keeps
+/// no modes (`modes_kept` false).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn local_verdict(refused: Result<(), String>, modes_kept: bool) -> Result<Option<String>, String> {
+    match refused {
+        Ok(()) => Ok(None),
+        Err(why) if !modes_kept => Ok(Some(format!(
+            "{why}; read anyway, since its filesystem keeps no file modes"
+        ))),
+        Err(why) => Err(why),
+    }
+}
+
+/// Whether the filesystem holding `dir` keeps the modes files are created
+/// with: a probe file made `0600` there, checked, then removed.
+#[cfg(unix)]
+fn modes_kept(dir: &Path) -> bool {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let probe = dir.join(format!(".wasmkeep-mode-probe-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let Ok(file) = options.open(&probe) else {
+        // Cannot tell: keep the rule.
+        return true;
+    };
+    let kept = file
+        .metadata()
+        .map(|m| m.permissions().mode() & 0o777 == 0o600)
+        .unwrap_or(true);
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    kept
+}
+
+fn read(path: &Path, check: Check) -> Result<(Vars, Option<String>), String> {
     use std::io::Read as _;
     let shown = path.display();
+    // Before opening: opening a fifo would block.
+    let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown}: not a file"));
+    }
     let file = std::fs::File::open(path).map_err(|e| format!("{shown}: {e}"))?;
     let meta = file.metadata().map_err(|e| format!("{shown}: {e}"))?;
     if !meta.is_file() {
@@ -97,20 +183,24 @@ fn read(path: &Path, private: bool) -> Result<Vars, String> {
     if meta.len() > MAX_FILE {
         return Err(format!("{shown}: larger than {MAX_FILE} bytes"));
     }
+    let mut warning = None;
     #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(format!(
-                "{shown}: its group or other users can open it (mode {:o}); it may hold \
-                 secrets, so it must be the server's user's alone (chmod 600)",
-                mode & 0o777
-            ));
-        }
+    if check != Check::None {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = rustix::process::geteuid().as_raw();
+        let verdict = private_enough(meta.permissions().mode(), meta.uid(), euid);
+        let verdict = if check == Check::Local && verdict.is_err() {
+            let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+            local_verdict(verdict, modes_kept(dir.unwrap_or(Path::new("."))))
+        } else {
+            verdict.map(|()| None)
+        };
+        warning = verdict
+            .map_err(|why| format!("{shown}: {why}"))?
+            .map(|w| format!("{shown}: {w}"));
     }
     #[cfg(not(unix))]
-    let _ = private;
+    let _ = check;
     let mut text = String::new();
     file.take(MAX_FILE + 1)
         .read_to_string(&mut text)
@@ -118,7 +208,8 @@ fn read(path: &Path, private: bool) -> Result<Vars, String> {
     if text.len() as u64 > MAX_FILE {
         return Err(format!("{shown}: larger than {MAX_FILE} bytes"));
     }
-    parse(&text).map_err(|e| format!("{shown}:{e}"))
+    let vars = parse(&text).map_err(|e| format!("{shown}:{e}"))?;
+    Ok((vars, warning))
 }
 
 /// Parses `NAME=value` lines, as systemd's `EnvironmentFile=` and most
@@ -246,26 +337,112 @@ mod tests {
         );
     }
 
+    /// Who may open a file of secrets: never other users, never its group
+    /// for writing, its group for reading only when the file is root's (or
+    /// another user's: a mounted secret with a group) rather than the
+    /// server's own.
+    #[test]
+    fn the_mode_rule() {
+        const ROOT: u32 = 0;
+        const ME: u32 = 1000;
+        const OTHER: u32 = 2000;
+        for (mode, owner, euid) in [
+            (0o600, ME, ME),
+            (0o400, ME, ME),
+            (0o640, ROOT, ME),
+            (0o440, ROOT, ME),
+            (0o640, OTHER, ME),
+            (0o440, OTHER, ME),
+            (0o640, ROOT, ROOT),
+            (0o600, ROOT, ROOT),
+        ] {
+            assert!(
+                private_enough(mode, owner, euid).is_ok(),
+                "{mode:o} {owner} {euid}"
+            );
+        }
+        for (mode, owner, euid) in [
+            (0o640, ME, ME),
+            (0o440, ME, ME),
+            (0o604, ME, ME),
+            (0o644, ROOT, ME),
+            (0o601, ROOT, ME),
+            (0o660, ROOT, ME),
+            (0o620, ME, ME),
+            (0o620, ROOT, ME),
+            (0o666, OTHER, ME),
+        ] {
+            let e = private_enough(mode, owner, euid).unwrap_err();
+            assert!(e.contains("chmod"), "{mode:o} {owner} {euid}: {e}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn files_others_can_read_are_refused() {
+    fn files_others_can_open_are_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hub.env");
         std::fs::write(&path, "TOKEN=secret-value\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let vars = read_file(&path).unwrap();
-        assert_eq!(vars.get("TOKEN").unwrap(), "secret-value");
-        for mode in [0o640, 0o604, 0o644, 0o620] {
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let vars = read_file(&path).unwrap();
+            assert_eq!(vars.get("TOKEN").unwrap(), "secret-value");
+        }
+        let mut refused = vec![0o604, 0o644, 0o620];
+        // This test's files are its own user's: group read is refused
+        // unless that user is root.
+        if rustix::process::geteuid().as_raw() != 0 {
+            refused.push(0o640);
+        }
+        for mode in refused {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             let e = read_file(&path).unwrap_err();
-            assert!(e.contains("chmod 600"), "{mode:o}: {e}");
+            assert!(e.contains("chmod"), "{mode:o}: {e}");
             assert!(!e.contains("secret-value"), "{e}");
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&path, "BAD LINE\n").unwrap();
         let e = read_file(&path).unwrap_err();
         assert!(e.ends_with(":1: expected NAME=value"), "{e}");
+    }
+
+    /// A fifo (or any other non-file) is refused before it is opened, so
+    /// the start does not block on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.env");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        let read = path.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(read_file(&read));
+        });
+        let e = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a fifo blocked")
+            .unwrap_err();
+        assert!(e.ends_with("not a file"), "{e}");
+    }
+
+    /// `wasmkeep dev`'s local values on a filesystem that keeps no modes
+    /// (a mounted Windows drive, say) are read with a warning.
+    #[test]
+    fn local_values_where_modes_are_not_kept_warn() {
+        let refused = Err("its group can read it".to_owned());
+        assert!(local_verdict(refused.clone(), true).is_err());
+        let warning = local_verdict(refused, false).unwrap().unwrap();
+        assert!(warning.contains("keeps no file modes"), "{warning}");
+        assert_eq!(local_verdict(Ok(()), true).unwrap(), None);
     }
 
     /// Deployed configuration is plain by design (it goes to the bucket in

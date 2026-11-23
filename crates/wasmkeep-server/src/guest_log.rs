@@ -8,8 +8,8 @@
 //! and the next line logged says how many were.
 //!
 //! Limits: lines per second per instance (the operator's rate, with a burst
-//! of twice that), [`APP_RATE`] for each app of the process, and
-//! [`MAX_LINE`] bytes a line, escapes included.
+//! of twice that), [`APP_RATE`] for each app of the process, [`NODE_RATE`]
+//! for the whole process, and [`MAX_LINE`] bytes a line, escapes included.
 //!
 //! The text is the line's last field, `line="..."`, after a fixed message
 //! and the real fields; quotes and backslashes in it are escaped, and so
@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -32,42 +32,96 @@ pub const DEFAULT_RATE: u32 = 50;
 /// Lines a second for every guest of one app together: each app of the
 /// process has its own, so a chatty app cannot use up another's.
 pub const APP_RATE: u32 = 1_000;
+/// Lines a second for every guest of the process together, over the
+/// apps' own budgets.
+pub const NODE_RATE: u32 = 5 * APP_RATE;
 /// Longest line logged, in bytes, quoted and escaped; the rest of a longer
 /// one is cut.
 pub const MAX_LINE: usize = 4_096;
 
+type Shared = Arc<Mutex<Bucket>>;
+
 /// How much of what guests print reaches the node's log. Cheap to clone:
-/// clones share the apps' budgets.
+/// clones share the budgets.
 #[derive(Debug, Clone)]
 pub struct GuestLog {
     rate: u32,
-    /// Each app's budget (`tenant/app`), made on its first instance.
-    apps: Arc<Mutex<HashMap<String, Arc<Mutex<Bucket>>>>>,
+    budgets: Arc<Budgets>,
+    /// The budget of the app this clone was made for, `(app, budget)`.
+    held: Option<Arc<(String, Shared)>>,
+}
+
+/// What every clone shares.
+#[derive(Debug)]
+struct Budgets {
+    node: Shared,
+    /// Each app's budget (`tenant/app`). The app's runtime holds it
+    /// ([`GuestLog::for_app`]); it goes when that runtime does.
+    apps: Mutex<HashMap<String, Weak<Mutex<Bucket>>>>,
 }
 
 impl GuestLog {
     /// At most `rate` lines a second per instance (bursts of twice that),
-    /// and [`APP_RATE`] for each app; 0 discards everything, as WasmKeep
-    /// did before guest output was logged.
+    /// [`APP_RATE`] for each app and [`NODE_RATE`] for the process; 0
+    /// discards everything, as WasmKeep did before guest output was logged.
     pub fn new(rate: u32) -> Self {
         Self {
             rate,
-            apps: Arc::default(),
+            budgets: Arc::new(Budgets {
+                node: Arc::new(Mutex::new(Bucket::new(NODE_RATE))),
+                apps: Mutex::default(),
+            }),
+            held: None,
         }
     }
 
-    /// The budget every instance of `app` shares.
-    fn app_bucket(&self, app: &str) -> Arc<Mutex<Bucket>> {
+    /// This log for the runtime of `app` (`tenant/app`): the clone holds
+    /// the app's budget, so its instances share one budget for as long as
+    /// the runtime lives, however short-lived they are.
+    pub(crate) fn for_app(&self, app: &str) -> Self {
+        let bucket = self.app_bucket(app);
+        Self {
+            held: Some(Arc::new((app.to_owned(), bucket))),
+            ..self.clone()
+        }
+    }
+
+    /// The budgets an instance of `app` takes from.
+    fn budget(&self, app: &str) -> Budget {
+        Budget {
+            app: self.app_bucket(app),
+            node: Arc::clone(&self.budgets.node),
+        }
+    }
+
+    /// The budget every instance of `app` shares, while something holds it.
+    fn app_bucket(&self, app: &str) -> Shared {
+        if let Some(held) = &self.held
+            && held.0 == app
+        {
+            return Arc::clone(&held.1);
+        }
         let mut apps = self
+            .budgets
             .apps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(bucket) = apps.get(app) {
-            return Arc::clone(bucket);
+        if let Some(bucket) = apps.get(app).and_then(Weak::upgrade) {
+            return bucket;
         }
+        // The apps that went with their runtimes.
+        apps.retain(|_, bucket| bucket.strong_count() > 0);
         let bucket = Arc::new(Mutex::new(Bucket::new(APP_RATE)));
-        apps.insert(app.to_owned(), Arc::clone(&bucket));
+        apps.insert(app.to_owned(), Arc::downgrade(&bucket));
         bucket
+    }
+
+    /// How many apps have a budget (for tests).
+    #[cfg(test)]
+    fn apps_known(&self) -> usize {
+        let mut apps = self.budgets.apps.lock().unwrap();
+        apps.retain(|_, bucket| bucket.strong_count() > 0);
+        apps.len()
     }
 
     /// The WASI context for one instance of `who` (an actor as its app
@@ -77,13 +131,13 @@ impl GuestLog {
     pub(crate) fn wasi(&self, app: String, who: String) -> wasmtime_wasi::WasiCtx {
         let mut builder = crate::egress::guest_wasi_builder();
         if self.rate > 0 {
-            let node = self.app_bucket(&app);
+            let shared = self.budget(&app);
             let output = Arc::new(Mutex::new(Output {
                 app,
                 who,
                 pending: [Vec::new(), Vec::new()],
                 bucket: Bucket::new(self.rate),
-                node,
+                shared,
                 dropped: 0,
             }));
             builder
@@ -148,8 +202,28 @@ struct Output {
     who: String,
     pending: [Vec<u8>; 2],
     bucket: Bucket,
-    node: Arc<Mutex<Bucket>>,
+    shared: Budget,
     dropped: u64,
+}
+
+/// The budgets an instance shares with others: its app's, then the
+/// process's. In that order, so an app over its own budget never takes
+/// from the others' share of the process's.
+struct Budget {
+    app: Shared,
+    node: Shared,
+}
+
+impl Budget {
+    fn take(&self) -> bool {
+        let take = |bucket: &Shared| {
+            bucket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        };
+        take(&self.app) && take(&self.node)
+    }
 }
 
 impl Output {
@@ -167,12 +241,7 @@ impl Output {
     }
 
     fn emit(&mut self, which: usize, line: &[u8]) {
-        let allowed = self.bucket.take()
-            && self
-                .node
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+        let allowed = self.bucket.take() && self.shared.take();
         if !allowed {
             self.dropped += 1;
             crate::metrics::inc(&crate::metrics::METRICS.guest_log_dropped);
@@ -303,9 +372,9 @@ mod tests {
 
     #[test]
     fn control_characters_are_escaped_and_lines_cut() {
-        assert_eq!(clean(b"plain\ttab"), "\"plain\ttab\"");
+        assert_eq!(clean(b"plain\ttab"), "\"plain\\ttab\"");
         assert_eq!(clean(b"line\r"), "\"line\"");
-        assert_eq!(clean(b"a\rb\x1b[31mc"), "\"a\\rb\\u{1b}[31mc\"");
+        assert_eq!(clean(b"a\rb\x1b[31mc"), "\"a\\rb\\u001b[31mc\"");
         assert_eq!(clean(&[b'x'; MAX_LINE + 10]).len(), MAX_LINE);
         assert_eq!(clean(b"bad \xff byte"), "\"bad \u{fffd} byte\"");
     }
@@ -319,7 +388,7 @@ mod tests {
             assert!(!text.contains(c), "{c:?} passed through: {text:?}");
         }
         assert!(
-            text.contains("\\u{202e}") && text.contains("\\u{2028}"),
+            text.contains("\\u202e") && text.contains("\\u2028"),
             "{text}"
         );
     }
@@ -332,10 +401,14 @@ mod tests {
         let bidi = clean("\u{202e}".repeat(MAX_LINE).as_bytes());
         assert!(bidi.len() <= MAX_LINE, "{}", bidi.len());
         // Cut between characters and escapes, never inside one.
-        assert!(escapes.ends_with("\\u{1b}\""), "{escapes}");
-        assert!(bidi.ends_with("\\u{202e}\""), "{bidi}");
+        assert!(escapes.ends_with("\\u001b\""), "{escapes}");
+        assert!(bidi.ends_with("\\u202e\""), "{bidi}");
         let wide = clean("\u{e9}".repeat(MAX_LINE).as_bytes());
         assert!(wide.len() <= MAX_LINE, "{}", wide.len());
+        // Above U+FFFF, a surrogate pair, never half of one.
+        let tag = clean("\u{e0001}".repeat(MAX_LINE).as_bytes());
+        assert!(tag.len() <= MAX_LINE, "{}", tag.len());
+        assert!(tag.ends_with("\\udb40\\udc01\""), "{tag}");
     }
 
     #[test]
@@ -349,11 +422,42 @@ mod tests {
     #[test]
     fn each_app_has_its_own_budget() {
         let log = GuestLog::new(1);
-        let a = log.app_bucket("t/a");
-        let taken = (0..10_000).filter(|_| a.lock().unwrap().take()).count();
+        let (a, b) = (log.for_app("t/a"), log.for_app("t/b"));
+        let first = a.budget("t/a");
+        let taken = (0..10_000).filter(|_| first.take()).count();
         assert_eq!(taken, APP_RATE as usize * 2);
-        assert!(!log.app_bucket("t/a").lock().unwrap().take());
-        assert!(log.app_bucket("t/b").lock().unwrap().take());
+        // A later instance of the app, or its front, shares that budget.
+        assert!(!a.budget("t/a").take());
+        assert!(!log.budget("t/a").take());
+        assert!(b.budget("t/b").take());
+    }
+
+    #[test]
+    fn the_node_caps_every_app_together() {
+        let log = GuestLog::new(1);
+        let apps: Vec<_> = (0..10).map(|i| log.for_app(&format!("t/a{i}"))).collect();
+        let taken: usize = apps
+            .iter()
+            .enumerate()
+            .map(|(i, app)| {
+                let budget = app.budget(&format!("t/a{i}"));
+                (0..10_000).filter(|_| budget.take()).count()
+            })
+            .sum();
+        // The node's burst, and what it refilled while the loop ran: far
+        // under the ten apps' own budgets together.
+        let burst = NODE_RATE as usize * 2;
+        assert!((burst..burst + 500).contains(&taken), "{taken}");
+    }
+
+    #[test]
+    fn an_apps_budget_goes_with_its_runtime() {
+        let log = GuestLog::new(1);
+        let app = log.for_app("t/gone");
+        let instance = app.budget("t/gone");
+        assert_eq!(log.apps_known(), 1);
+        drop((app, instance));
+        assert_eq!(log.apps_known(), 0);
     }
 
     #[test]

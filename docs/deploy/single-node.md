@@ -63,12 +63,13 @@ leave the chat lines out to serve the counter alone.
 
 Configuration and secrets for a class (API keys, webhook URLs: see
 [Configuration and secrets](../concepts.md#configuration-and-secrets)) go in
-a file only the service can read (the server refuses one its group or
-other users can open):
+a file only the service can read, and cannot rewrite: root's, readable by
+the service's group. The server refuses a file other users can open, or
+its group can write:
 
 ```bash
 sudo install -d -m 750 -o root -g wasmkeep /etc/wasmkeep
-sudo install -m 600 -o wasmkeep -g wasmkeep /dev/null /etc/wasmkeep/chat.env
+sudo install -m 640 -o root -g wasmkeep /dev/null /etc/wasmkeep/chat.env
 sudoedit /etc/wasmkeep/chat.env       # NAME=value lines
 ```
 

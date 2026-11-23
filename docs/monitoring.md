@@ -629,8 +629,9 @@ INFO wasmkeep::guest: guest output app=acme/shop actor=orders/42 stream="stdout"
 ```
 
 - **Limits:** `--guest-log-rate` lines a second per actor instance (50 by
-  default, with bursts of twice that) and 1,000 a second for each app the
-  process serves. Past them, lines are dropped and counted
+  default, with bursts of twice that), 1,000 a second for each app the
+  process serves and 5,000 for the process. Past them, lines are dropped
+  and counted
   (`wasmkeep_guest_log_dropped_total`), and the actor's next logged line is
   preceded by a warning saying how many were. `--guest-log-rate 0`
   discards everything.
@@ -638,7 +639,8 @@ INFO wasmkeep::guest: guest output app=acme/shop actor=orders/42 stream="stdout"
   it is logged when the instance ends (hibernation, a trap). The text is
   the last field, quoted, with `"` and `\` escaped (`\"`), and so are
   controls, format characters such as bidi controls, and line separators
-  (`\u{1b}`, `\u{202e}`, `\u{2028}`); an actor name that needs it is
+  (as logfmt and JSON write them: `\t`, `\n`, `\u001b`, `\u202e`); an
+  actor name, or an error a guest caused, that needs it is
   escaped and quoted the same way. A line is cut at 4 KB once escaped. So
   a guest cannot forge entries or fields, reorder or colour a terminal. Writes never block or fail the guest.
 - **Filtering:** the usual `RUST_LOG`, e.g. `RUST_LOG=info,wasmkeep::guest=warn`

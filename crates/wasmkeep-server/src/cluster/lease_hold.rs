@@ -942,7 +942,7 @@ impl LeaseHold {
                 Released::Pending | Released::Unchanged
                     if tokio::time::Instant::now() >= deadline =>
                 {
-                    tracing::warn!(key = %hold.key, "releasing an actor failed; retried in the background");
+                    tracing::warn!(key = %crate::logging::text(&hold.key), "releasing an actor failed; retried in the background");
                     cluster.pending.push(PendingEntry::Release(hold));
                     return LeaseReturn::Pending;
                 }

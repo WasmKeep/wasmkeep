@@ -748,17 +748,17 @@ impl PeriodicSnapshot {
                     Ok(()) => PeriodicOutcome::Created,
                     Err(ReplicaError::Exists) => PeriodicOutcome::Existed,
                     Err(e) => {
-                        tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot failed");
+                        tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot failed");
                         PeriodicOutcome::Failed
                     }
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot could not be encoded");
+                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot could not be encoded");
                 PeriodicOutcome::Failed
             }
             Err(e) => {
-                tracing::warn!(prefix = %target.prefix, ?position, error = %e, "a periodic snapshot's encoding stopped");
+                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot's encoding stopped");
                 PeriodicOutcome::Failed
             }
         };
@@ -1187,7 +1187,7 @@ impl Replica {
                     // the bucket (ADR 0035, S4): set aside, as the download
                     // installs its result; the replay judges the history.
                     Proof::Conflict => {
-                        tracing::warn!(prefix = %replica.prefix, head = ?plan.head(), "the local database at the recorded head has another checksum; downloading instead");
+                        tracing::warn!(prefix = %crate::logging::text(&replica.prefix), head = ?plan.head(), "the local database at the recorded head has another checksum; downloading instead");
                         false
                     }
                     Proof::Missing | Proof::NeedsReplay => false,
@@ -1195,7 +1195,7 @@ impl Replica {
                 _ => true,
             };
             if usable {
-                tracing::debug!(prefix = %replica.prefix, head = ?plan.head(), "local database is current");
+                tracing::debug!(prefix = %crate::logging::text(&replica.prefix), head = ?plan.head(), "local database is current");
                 replica.checksum = sum;
                 return Ok(replica);
             }
@@ -1412,7 +1412,7 @@ impl Replica {
                 }
                 if deadline + time.lifted() <= tokio::time::Instant::now() {
                     let lifted = lifted.saturating_add(time.lifted());
-                    tracing::warn!(prefix = %self.prefix, object = %key, ?allowed, ?lifted, objects, "a restore ran out of time");
+                    tracing::warn!(prefix = %crate::logging::text(&self.prefix), object = %key, ?allowed, ?lifted, objects, "a restore ran out of time");
                     return Err(ReplicaError::Bucket(format!(
                         "{}: the restore ran out of time ({allowed:?} for {objects} objects, {lifted:?} for other restores' reads) reading {key}",
                         self.prefix
@@ -1470,7 +1470,7 @@ impl Replica {
         .await
         .map_err(|e| ReplicaError::Local(e.to_string()))??;
         cleanup.0 = None; // renamed into place
-        tracing::info!(prefix = %self.prefix, head = ?plan.head(), segments = plan.segments.len(), "restored from the bucket");
+        tracing::info!(prefix = %crate::logging::text(&self.prefix), head = ?plan.head(), segments = plan.segments.len(), "restored from the bucket");
         Ok(sum)
     }
 
@@ -1896,7 +1896,7 @@ impl Replica {
 
     /// Stops replication for `reason`, a refused snapshot or reset.
     fn refuse(&mut self, reason: String) -> ReplicaError {
-        tracing::error!(prefix = %self.prefix, head = ?self.head, %reason, "refused: replication stops");
+        tracing::error!(prefix = %crate::logging::text(&self.prefix), head = ?self.head, %reason, "refused: replication stops");
         self.fail(format!("refused: {reason}"));
         ReplicaError::Refused(reason)
     }

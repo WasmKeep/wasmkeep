@@ -89,7 +89,7 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   `--allow-outbound-port` opens one. 16 requests in flight per actor, 256
   per node.
 - What a guest prints reaches the node's log within a line rate per
-  instance and per app (`--guest-log-rate`; past it, lines are dropped
+  instance, per app and per process (`--guest-log-rate`; past it, lines are dropped
   and counted), as the last field of its line (`line="..."`, after the
   app, the actor and the stream), cut at 4 KB a line once escaped.
   Quotes and backslashes are escaped, and so are controls, format
@@ -252,10 +252,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 
 ## Configuration and secrets
 
-`--env CLASS=FILE` (`NAME=value` files, readable only by the server's user:
-on Unix, a file its group or others can read or write is refused at start,
-as the secrets key is, and so are `--front-env` files and `wasmkeep dev`'s
-local values; `chmod 600` fixes it).
+`--env CLASS=FILE` (`NAME=value` files, readable only by the server: on
+Unix a file is refused at start if other users can open it, if its group
+can write it, or if its group can read it while it is the server's user's
+own. So `0600` the server's user's, or `0640` root's with the server's
+group, which the service cannot rewrite. The same holds for `--front-env`
+files and for `wasmkeep dev`'s local values, which are read with a
+warning on a filesystem that keeps no file modes).
 Values never reach the data directory, the bucket or the logs; parse errors
 name the file and line, never the value.
 
