@@ -1333,3 +1333,182 @@ async fn escaped_actor_names_keep_their_names() {
         .collect();
     assert_eq!(got, names.iter().map(|n| (*n).to_owned()).collect());
 }
+
+/// A store that records the key of every GET (and HEAD) it is sent.
+#[derive(Debug)]
+struct CountingGets {
+    inner: Arc<dyn ObjectStore>,
+    gets: std::sync::Mutex<Vec<String>>,
+}
+impl std::fmt::Display for CountingGets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("counting memory store")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for CountingGets {
+    async fn put_opts(
+        &self,
+        p: &Key,
+        v: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(p, v, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &Key,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &Key,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.gets.lock().unwrap().push(p.to_string());
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        l: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(l)
+    }
+    async fn copy_opts(
+        &self,
+        f: &Key,
+        t: &Key,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(f, t, o).await
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    fn list(
+        &self,
+        p: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(p)
+    }
+}
+
+/// ADR 0042, Tests, "The feed": an idle pass leaves the head position and
+/// the head object as they were, so the next poll sees the actor
+/// unchanged. Poll, compact the history as the pass does
+/// (`idle_collectable` of the released generation), poll again: the
+/// second poll reads nothing but the app's four markers and commits no
+/// batch.
+#[tokio::test]
+async fn a_poll_after_an_idle_pass_reads_nothing_but_the_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = wasmkeep_storage::Storage::new(
+        wasmkeep_storage::StorageConfig::new(dir.path()),
+        wasmkeep_storage::StateDir {
+            dir: "actors".into(),
+            scratch: "scratch".into(),
+            tenant: "t".into(),
+        },
+    );
+    let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let prefix = "state/t/a/actors/c/a/";
+    let mut actor = storage.open("c", "a").unwrap();
+    actor.exec("CREATE TABLE items(value)", &[]).unwrap();
+    actor.start_capture().unwrap();
+    let put = async |key: String, bytes: Vec<u8>| {
+        inner
+            .put(&Key::from(format!("{prefix}{key}")), bytes.into())
+            .await
+            .unwrap();
+    };
+    let first = actor.snapshot().unwrap().to_ltx(1, 1, 100).unwrap();
+    put(
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1,
+        }),
+        first,
+    )
+    .await;
+    // A burst, then the idle snapshot at its head.
+    for txid in 2..=5_u64 {
+        actor
+            .exec(
+                "INSERT INTO items VALUES(?)",
+                &[SqlValue::Integer(txid as i64)],
+            )
+            .unwrap();
+        let changes = actor.take_changes().unwrap().unwrap();
+        let segment = wasmkeep_cluster::replication::Segment {
+            id: SegmentId {
+                generation: 1,
+                txid,
+            },
+            parent_generation: 1,
+        };
+        put(
+            segment_key(&segment),
+            changes.to_ltx(txid, txid, 100).unwrap(),
+        )
+        .await;
+    }
+    let idle = actor.snapshot().unwrap().to_ltx(1, 5, 100).unwrap();
+    put(
+        snapshot_key(SegmentId {
+            generation: 1,
+            txid: 5,
+        }),
+        idle,
+    )
+    .await;
+    let counting = Arc::new(CountingGets {
+        inner: Arc::clone(&inner),
+        gets: std::sync::Mutex::default(),
+    });
+    let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+    let out = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let args = args(out.path(), state.path());
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let published = files(out.path());
+    assert!(!published.is_empty());
+
+    // The idle pass: one listing, `idle_collectable` of generation 1.
+    let keys: Vec<String> = inner
+        .list(Some(&Key::from(prefix.trim_end_matches('/'))))
+        .map_ok(|m| m.location.to_string())
+        .try_collect()
+        .await
+        .unwrap();
+    let listing = Listing::from_keys(keys.iter().filter_map(|k| k.strip_prefix(prefix)));
+    let (snapshot, gone) = wasmkeep_cluster::replication::idle_collectable(&listing, 1).unwrap();
+    assert_eq!(
+        snapshot,
+        SegmentId {
+            generation: 1,
+            txid: 5
+        }
+    );
+    assert_eq!(gone.len(), 4, "{gone:?}");
+    for key in gone {
+        inner
+            .delete(&Key::from(format!("{prefix}{key}")))
+            .await
+            .unwrap();
+    }
+
+    counting.gets.lock().unwrap().clear();
+    assert_eq!(poll(&args, &store, "").await.unwrap(), 0);
+    let read = std::mem::take(&mut *counting.gets.lock().unwrap());
+    assert!(
+        read.iter().all(|k| k.starts_with("apps/t/a/")),
+        "the second poll read history: {read:?}"
+    );
+    assert_eq!(read.len(), 4, "{read:?}");
+    assert_eq!(files(out.path()), published, "a batch was committed");
+}
