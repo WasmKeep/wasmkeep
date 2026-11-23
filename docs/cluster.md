@@ -1092,7 +1092,9 @@ wasmkeep secrets list --bucket s3://acme-wasmkeep/prod --app acme/shop --key sec
   (or `--all`): it deletes every object below `current` that another key
   sealed, and refuses an app whose current set does not open with
   `--new-key`. Run it while no other `secrets` command is running for the
-  app. On a bucket with object versioning, the deleted objects stay as
+  app: an object above `current` sealed with another key (a command still
+  running, or one that stopped before moving `current`) is left, and
+  `--finish` warns and exits with an error. On a bucket with object versioning, the deleted objects stay as
   noncurrent versions until a lifecycle rule removes them.
 - **Rotating the key does not change the values.** The new key seals the
   same values. A value the old key could open (a leaked key, an old

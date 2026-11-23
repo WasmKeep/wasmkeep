@@ -440,20 +440,47 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
                 Some(one) => vec![one.clone()],
                 None => rt.block_on(secret_store::apps_with_secrets(&store, &prefix))?,
             };
+            let mut unfinished = false;
             for (tenant, app) in apps {
                 let one = SecretStore::new(Arc::clone(&store), &prefix, &tenant, &app);
-                let deleted = rt.block_on(one.retire_other_keys(&new)).map_err(|e| {
-                    anyhow::anyhow!(
-                        "{tenant}/{app}: {e} (--finish deletes nothing unless the current \
-                         set opens with --new-key: run rotate-key without --finish first)"
-                    )
-                })?;
-                println!(
-                    "{tenant}/{app}: deleted {deleted} object(s) sealed with another key; \
-                     only key {} opens what is left.",
-                    new.id()
-                );
+                let retired = rt
+                    .block_on(one.retire_other_keys(&new))
+                    .map_err(|e| match e {
+                        secret_store::SecretStoreError::Sealed(..) => anyhow::anyhow!(
+                            "{tenant}/{app}: {e} (--finish deletes nothing unless the \
+                             current set opens with --new-key: run rotate-key without \
+                             --finish first)"
+                        ),
+                        e => anyhow::anyhow!("{tenant}/{app}: {e}"),
+                    })?;
+                if retired.left == 0 {
+                    println!(
+                        "{tenant}/{app}: deleted {} object(s) sealed with another key; \
+                         only key {} opens what is left.",
+                        retired.deleted,
+                        new.id()
+                    );
+                } else {
+                    println!(
+                        "{tenant}/{app}: deleted {} object(s) sealed with another key.",
+                        retired.deleted
+                    );
+                    eprintln!(
+                        "warning: {tenant}/{app}: left {} object(s) that are unreadable, or \
+                         sealed with another key above the current set (a secrets command \
+                         still running, or one that stopped before moving it). Run --finish \
+                         again once no other secrets command is running; an object a \
+                         stopped command left goes with the next secrets change an hour \
+                         after it was written.",
+                        retired.left
+                    );
+                    unfinished = true;
+                }
             }
+            anyhow::ensure!(
+                !unfinished,
+                "some objects sealed with another key are still in the bucket"
+            );
             Ok(())
         }
         SecretsCommand::RotateKey(args) => {

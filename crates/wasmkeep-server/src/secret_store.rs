@@ -62,6 +62,17 @@ pub struct Listed {
     pub written_ms: u64,
 }
 
+/// What [`SecretStore::retire_other_keys`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// Objects sealed with another key, deleted.
+    pub deleted: usize,
+    /// Objects it left that the kept key may not have sealed: sealed with
+    /// another key above `current` (a command still running, or one that
+    /// died before moving `current`), or unparseable.
+    pub left: usize,
+}
+
 /// An app's secrets in the bucket.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -330,34 +341,33 @@ impl SecretStore {
     /// included, so the old key opens nothing left in the bucket. Refused
     /// unless `current` opens with `key`. `current` itself, objects above
     /// it (a command that may still be running) and objects that cannot
-    /// be parsed are left. Returns how many were deleted.
-    pub async fn retire_other_keys(&self, key: &SecretsKey) -> Result<usize, SecretStoreError> {
+    /// be parsed are left, and counted.
+    pub async fn retire_other_keys(&self, key: &SecretsKey) -> Result<Retired, SecretStoreError> {
+        let mut retired = Retired::default();
         let Some((current, _)) = self.current().await? else {
-            return Ok(0);
+            return Ok(retired);
         };
         self.read(std::slice::from_ref(key), current).await?;
-        let mut deleted = 0;
         for l in self.list().await? {
-            if l.seq >= current {
+            if l.seq == current {
                 continue;
             }
             let path = self.path(&secrets::object_name(l.seq));
-            let bytes = match self.fetch(&path).await {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
-                Err(e) => return Err(e),
+            let Some(bytes) = self.fetch(&path).await? else {
+                continue;
             };
             match secrets::sealed_with(&bytes) {
                 Ok(id) if id == key.id() => {}
+                Ok(_) if l.seq > current => retired.left += 1,
                 Ok(_) => match self.store.delete(&path).await {
-                    Ok(()) => deleted += 1,
+                    Ok(()) => retired.deleted += 1,
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => return Err(bucket(e)),
                 },
-                Err(_) => {}
+                Err(_) => retired.left += 1,
             }
         }
-        Ok(deleted)
+        Ok(retired)
     }
 
     /// An object's bytes, `None` if it is gone or too large to be one.
@@ -692,7 +702,8 @@ mod tests {
                 app.read(std::slice::from_ref(&old), 2).await.is_ok(),
                 "the old key still opens the same set until the key is retired"
             );
-            assert_eq!(app.retire_other_keys(&new).await.unwrap(), 1);
+            let retired = |deleted, left| Retired { deleted, left };
+            assert_eq!(app.retire_other_keys(&new).await.unwrap(), retired(1, 0));
             let left = app.list().await.unwrap();
             assert_eq!(left.iter().map(|l| l.seq).collect::<Vec<_>>(), [3]);
             for l in left {
@@ -710,7 +721,16 @@ mod tests {
             assert_eq!(set.class("api").unwrap().len(), 2);
             assert!(app.read_current(std::slice::from_ref(&old)).await.is_err());
             // Again: nothing left to do.
-            assert_eq!(app.retire_other_keys(&new).await.unwrap(), 0);
+            assert_eq!(app.retire_other_keys(&new).await.unwrap(), retired(0, 0));
+            // An old-key object above current (a command still running, or
+            // one that died before moving current) is left, and counted.
+            let orphan = secrets::seal(&old, &app.place(), 4, &SecretSet::default()).unwrap();
+            store
+                .put(&app.path(&secrets::object_name(4)), orphan.into())
+                .await
+                .unwrap();
+            assert_eq!(app.retire_other_keys(&new).await.unwrap(), retired(0, 1));
+            assert_eq!(app.list().await.unwrap().len(), 2);
         });
     }
 
