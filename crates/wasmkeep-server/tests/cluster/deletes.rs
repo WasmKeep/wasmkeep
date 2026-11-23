@@ -100,11 +100,24 @@ async fn an_operator_delete_of_a_resident_actor_is_done_once_recorded() {
     // job returns. Only uploads after the reset may follow it, such as
     // the fence of a node that read the same request before it was done,
     // took the actor once it was released and found the delete already
-    // carried out (ADR 0007).
-    let (snapshots, segments) = history_of(&store, "res").await;
-    let [reset] = snapshots[..] else {
-        panic!("one snapshot, at the reset: {snapshots:?} {segments:?}");
-    };
+    // carried out (ADR 0007). At most one snapshot above the reset's, at
+    // one of those uploads: an idle snapshot (ADR 0042, section 2), which a
+    // hold takes only after a guest event ran under it, so not a fence's
+    // job alone.
+    let (mut snapshots, segments) = history_of(&store, "res").await;
+    snapshots.sort_unstable();
+    let (&reset, above) = snapshots
+        .split_first()
+        .unwrap_or_else(|| panic!("no snapshot at the reset: {segments:?}"));
+    assert_eq!(
+        segments.iter().min(),
+        Some(&reset),
+        "the lowest snapshot is not at the reset: {snapshots:?} {segments:?}"
+    );
+    assert!(
+        above.len() <= 1 && above.iter().all(|t| *t > reset && segments.contains(t)),
+        "snapshots above the reset not at one listed upload: {snapshots:?} {segments:?}"
+    );
     assert!(
         segments.contains(&reset) && segments.iter().all(|&txid| txid >= reset),
         "history below the reset {reset} left: {segments:?}"

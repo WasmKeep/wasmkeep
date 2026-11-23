@@ -570,6 +570,9 @@ pub(crate) struct Metrics {
     /// still land later): a periodic one is tried again, see
     /// `Replica::snapshot_due`.
     pub(crate) snapshot_upload_failures: AtomicU64,
+    /// Idle snapshots taken at hibernation (ADR 0042, section 2), by
+    /// `outcome` ([`IDLE_SNAPSHOT_OUTCOMES`]).
+    pub(crate) idle_snapshots: Family<AtomicU64>,
     /// Node calls refused because the record of used signatures was full,
     /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
@@ -930,6 +933,19 @@ pub(crate) const BUCKET_STATUSES: [&str; 4] = ["ok", "not_found", "precondition"
 pub(crate) const CUT_REASONS: [&str; 4] = ["wall", "lease", "replica", "stop"];
 /// `kind` of `wasmkeep_forwards_total`.
 pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
+/// `outcome` of `wasmkeep_idle_snapshots_total` (ADR 0042, section 2):
+/// created and acknowledged, already there, not acknowledged (given up,
+/// refused by the bucket, landed after the hold ended), refused before
+/// any upload (not at the head's database: replication stops), not
+/// taken because the node's idle snapshots were all under way.
+pub(crate) const IDLE_SNAPSHOT_OUTCOMES: [&str; 5] =
+    ["created", "existed", "failed", "refused", "busy"];
+
+/// One idle snapshot ended with `outcome` ([`IDLE_SNAPSHOT_OUTCOMES`]).
+pub(crate) fn idle_snapshot(outcome: &str) {
+    inc(&METRICS.idle_snapshots.get(&[("outcome", outcome)]));
+}
+
 /// `record` of `wasmkeep_signatures_refused_full_total`.
 pub(crate) const SIGNATURE_RECORDS: [&str; 3] = ["calls", "control", "ingress"];
 /// `reason` of `wasmkeep_websocket_owner_closes_total`.
@@ -1136,6 +1152,7 @@ impl Metrics {
         one(&m.cuts, "reason", &CUT_REASONS);
         one(&m.forwards, "kind", &FORWARD_KINDS);
         one(&m.signatures_refused_full, "record", &SIGNATURE_RECORDS);
+        one(&m.idle_snapshots, "outcome", &IDLE_SNAPSHOT_OUTCOMES);
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
         one(&m.actor_deletes, "how", &DELETE_HOWS);
         one(&m.actor_delete_failures, "how", &DELETE_HOWS);
@@ -1663,6 +1680,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_snapshot_upload_failures_total",
         "Snapshot uploads not acknowledged; a periodic one is tried again.",
         m.snapshot_upload_failures.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_idle_snapshots_total",
+        "Snapshots at the head taken when an actor hibernates, by outcome.",
+        &m.idle_snapshots,
     );
     family(
         &mut out,

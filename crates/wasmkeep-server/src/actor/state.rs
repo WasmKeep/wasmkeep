@@ -127,6 +127,10 @@ pub(super) struct ActorState {
     /// The step before a drop last found the hold at its barrier: a drop
     /// with anything still pending is then `unbarriered`, not a panic's.
     pub(super) stepped: bool,
+    /// The generation of the hold under which a guest event last ran:
+    /// only such a hold takes an idle snapshot (ADR 0042, section 2), not
+    /// one a maintenance job took (a delete's fence, a blob sweep).
+    pub(super) event_hold: Option<u64>,
 }
 
 /// The database drops before its reservation, including on a blocking thread
@@ -253,8 +257,17 @@ impl ActorState {
 
     /// The mailbox's step before this state is dropped (ADR 0034, section
     /// 6): waits for the hold to reach its barrier, by the site's deadline.
-    /// A strict hold is there at once, so this is ready at once and the
-    /// drop goes on as before (`Drop for ActorState` releases or parks).
+    /// A strict hold is there once no snapshot of it is uploading off the
+    /// mailbox, and the drop goes on as before (`Drop for ActorState`
+    /// releases or parks).
+    ///
+    /// For a hibernation or an eviction (never a stop), at the barrier, the
+    /// hold then takes its idle snapshot if one is wanted (ADR 0042,
+    /// section 2, [`Self::idle_snapshot`]), waits for its one attempt, and
+    /// collects what it makes unnecessary. A job arriving meanwhile cancels
+    /// the step, not the upload; whatever the step is, no upload outlives
+    /// the hold that started it unwaited (a late snapshot of erased data
+    /// must not land after another node's erasure).
     ///
     /// Past a clean stop's deadline the hold gives up (`GaveUp(stop)`),
     /// counted and released here; past a hibernation's, it stays resident.
@@ -264,7 +277,23 @@ impl ActorState {
         Box::pin(async move {
             let _timed = self.timing.work(super::timing::Work::Hibernate);
             self.stepped = false;
+            let idle = matches!(cause, DropCause::Idle | DropCause::Evicted);
             if self.batched_replica().is_none() {
+                if let DropCause::Stop { deadline, flush } = cause {
+                    // A snapshot uploading sends no request it has not
+                    // started, and the one under way ends first.
+                    self.cancel_periodic_upload();
+                    if !self.settle_flight(deadline).await && flush {
+                        self.give_up_at_stop();
+                        return StepOutcome::GaveUp;
+                    }
+                    return StepOutcome::Ready;
+                }
+                if let Some(finish) = self.idle_snapshot(false).await {
+                    finish.await;
+                }
+                // Bounded by the upload's one attempt.
+                self.settle_flight(None).await;
                 return StepOutcome::Ready;
             }
             let (deadline, stopping) = match cause {
@@ -279,7 +308,17 @@ impl ActorState {
             };
             match self.flush_to_barrier(deadline).await {
                 Some(Barrier::Flushed) => {
+                    // Copied while batched capture still holds the head,
+                    // uploaded while the capture ends.
+                    let finish = if idle {
+                        self.idle_snapshot(true).await
+                    } else {
+                        None
+                    };
                     self.end_capture_at_barrier().await;
+                    if let Some(finish) = finish {
+                        finish.await;
+                    }
                     self.stepped = true;
                     StepOutcome::Ready
                 }
@@ -294,6 +333,141 @@ impl ActorState {
                 None => StepOutcome::Keep,
             }
         })
+    }
+
+    /// The idle snapshot of a hold that hibernates at its barrier (ADR 0042,
+    /// section 2): in a cluster with idle compaction on, a hold under which
+    /// a guest event ran, that may still act and wrote the head, with no
+    /// snapshot at the head, enough written since the last one and no
+    /// periodic snapshot waiting out a failure
+    /// ([`Replica::start_idle_snapshot`]), while the node has one of its
+    /// [`IDLE_SNAPSHOTS_AT_ONCE`] free (`busy` otherwise). An upload a
+    /// step cut short left ends first.
+    ///
+    /// The database is copied here, in the step (`batched`: as of its
+    /// captured position, which at a `Flushed` barrier is the acknowledged
+    /// head); its encoding and upload run in a task of their own, recorded
+    /// as a flight. Returns what the step then waits for: that upload's
+    /// end, its outcome taken into the replica, and once it is created (or
+    /// found there) ADR 0012's collection below it under this same hold,
+    /// within one upload budget, honouring the retention window. Without
+    /// that collection an actor that writes a little at each wake would
+    /// never be collected: the idle snapshot restarts the count a periodic
+    /// snapshot, and its collection, waits for. `None` if none started.
+    ///
+    /// [`Replica::start_idle_snapshot`]: crate::replica::Replica::start_idle_snapshot
+    /// [`IDLE_SNAPSHOTS_AT_ONCE`]: crate::replica::IDLE_SNAPSHOTS_AT_ONCE
+    pub(super) async fn idle_snapshot(&mut self, batched: bool) -> Option<BoxFuture<'static, ()>> {
+        use crate::replica::{IdleSkip, PeriodicOutcome};
+        let cluster = self.cluster.clone()?;
+        if !cluster.idle_compaction {
+            return None;
+        }
+        let generation = self.hold_generation()?;
+        if self.event_hold != Some(generation) {
+            return None;
+        }
+        let hold = self.held.as_ref()?;
+        if !hold.is_valid() {
+            return None;
+        }
+        let slot = hold.replica()?.clone();
+        self.settle_flight(None).await;
+        // The checks that need nothing of the database first: most
+        // hibernations want none.
+        if let Err(skip) = slot.lock().await.idle_snapshot_possible() {
+            self.no_idle_snapshot(&skip);
+            return None;
+        }
+        let bytes = match self.db_at().run(|db| db.captured_bytes()).await {
+            Ok(Some(Some(bytes))) => bytes,
+            _ => return None,
+        };
+        if let Err(skip) = slot.lock().await.idle_snapshot_wanted(bytes) {
+            self.no_idle_snapshot(&skip);
+            return None;
+        }
+        let Ok(permit) = Arc::clone(&cluster.idle_snapshot_slots).try_acquire_owned() else {
+            crate::metrics::idle_snapshot("busy");
+            return None;
+        };
+        let copied = self
+            .db_at()
+            .run(move |db| {
+                if batched {
+                    db.snapshot_at_captured()
+                } else {
+                    db.snapshot()
+                }
+            })
+            .await;
+        let all = match copied {
+            Ok(Some(Ok(all))) => all,
+            // Commits not shipped: as `replicate` treats them, replication
+            // stops and the actor is given up.
+            Ok(Some(Err(wasmkeep_storage::wal::CaptureError::Pending(_)))) => {
+                let reason = "changes appeared during an idle snapshot";
+                slot.lock().await.fail(reason);
+                self.abandon(reason);
+                return None;
+            }
+            other => {
+                let error = match other {
+                    Ok(Some(Err(e))) => e.to_string(),
+                    Err(e) => e,
+                    _ => "no database".to_owned(),
+                };
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %error, "an idle snapshot could not be copied");
+                return None;
+            }
+        };
+        let mut replica = slot.lock().await;
+        let job = match replica.start_idle_snapshot(all).await {
+            Ok(job) => job,
+            Err(IdleSkip::Refused(reason)) => {
+                crate::metrics::idle_snapshot("refused");
+                drop(replica);
+                self.abandon(&format!("idle snapshot refused: {reason}"));
+                return None;
+            }
+            Err(skip) => {
+                drop(replica);
+                self.no_idle_snapshot(&skip);
+                return None;
+            }
+        };
+        drop(replica);
+        let (position, collector) = (job.position(), job.collector());
+        let upload = tokio::spawn(async move {
+            let _permit = permit;
+            job.run().await
+        });
+        let (address, retention) = (self.address.clone(), cluster.history_retention);
+        Some(Box::pin(async move {
+            let outcome = upload.await.unwrap_or(PeriodicOutcome::Failed);
+            let budget = {
+                let mut replica = slot.lock().await;
+                replica.settle_periodic();
+                replica.upload_budget()
+            };
+            if matches!(outcome, PeriodicOutcome::Created | PeriodicOutcome::Existed) {
+                let request = CollectRequest {
+                    collector,
+                    snapshot: position,
+                    retention,
+                    erase: false,
+                };
+                let collected =
+                    tokio::time::timeout(budget, run_collection(&address, &request)).await;
+                if collected.is_err() {
+                    tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), "collection after an idle snapshot cut at its budget; the next pass collects");
+                }
+            }
+        }))
+    }
+
+    fn no_idle_snapshot(&self, skip: &crate::replica::IdleSkip) {
+        tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?skip, "no idle snapshot");
     }
 
     /// Whether the actor's database holds commits after its last boundary,
@@ -1689,6 +1863,7 @@ impl ActorState {
         trapped: bool,
         sync_alarm: bool,
     ) -> Option<Option<Entry>> {
+        self.event_hold = self.hold_generation().or(self.event_hold);
         let live = self.live.as_mut()?;
         live.record_event(&self.app_labels, self.address.class(), trapped);
         // A wall-clock cut cancels the guest future, not spawn_blocking.

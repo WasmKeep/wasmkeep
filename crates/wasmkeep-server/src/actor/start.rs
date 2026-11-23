@@ -241,6 +241,7 @@ impl ActorService {
                         residency,
                         collecting: Arc::default(),
                         stepped: false,
+                        event_hold: None,
                         secrets_blocked,
                         moves: Arc::clone(&factory_moves),
                     })

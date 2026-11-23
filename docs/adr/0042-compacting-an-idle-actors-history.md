@@ -1,7 +1,8 @@
 # 0042. Compacting an idle actor's history
 
 - Status: proposed (2026-11-23). Slices 1 to 3 done: this record, the
-  rule (`idle_collectable`) and the simulation; no server code yet.
+  rule (`idle_collectable`) and the simulation. Slice 4, the idle
+  snapshot, built (see "As built: the idle snapshot"); the pass is next.
 - Milestone: `0.8.0`, item 4 under Now in [ROADMAP.md](../../ROADMAP.md)
 - Follows: ADR 0007 (chained segments), ADR 0012 (collection), ADR 0020 (holds and generations), ADR 0028 (idle expiry's acquisition), ADR 0033 (offline readers, the retention window), ADR 0034 (barriers, snapshots only at the acknowledged head), ADR 0035 (recorded head), ADR 0039 (the change feed)
 - Amends, once accepted: ADR 0012, decision 3 on idle actors ("acceptable for now")
@@ -57,7 +58,7 @@ It is a new `SnapshotKind::Idle`. Like `AfterDelete`, it leaves the periodic sch
 
 It must run as an upload flight off the mailbox, as a batched hold's periodic snapshot does (`start_periodic_snapshot`, `PeriodicSnapshot::run`, `PeriodicFlights`), in both modes. Reason: the step is cancelled when a job arrives, and a cancelled inline PUT can still land. Recorded as a flight, the upload goes on, and the node's resets, deletes and barriers wait for it (ADR 0034, section 7), so a snapshot of erased data cannot land after the erasure on that node. If a job arrives, hibernation is abandoned as today and the outcome is taken in at the next apply (`settle_periodic`).
 
-Not taken on a drain's hand-over, a move, or a clean stop: the actor is not idle there, or the deadline is the stop's. (Inferred: I did not read `drain.rs` or `moving.rs`; the barrier table of ADR 0034, section 6, says they flush and release from their own jobs.)
+Not taken on a drain's hand-over, a move, or a clean stop: the actor is not idle there, or the deadline is the stop's. (Checked in slice 4; see "As built: the idle snapshot". A drain and a move do reach `before_drop` with `Evicted`, but only after their own job ended the hold, so there is no hold to take it.)
 
 Nothing is deleted at hibernation.
 
@@ -183,6 +184,7 @@ One step smaller exists: the idle snapshot plus an immediate pass under the writ
 
 Known limits, stated rather than fixed here:
 
+- **An actor that writes a little at each wake** is collected at each hibernation by the hold that wrote it (slice 4, "As built"): down to the snapshot at its head, the segment under it, and what the retention window keeps. The pass is for what that window kept.
 - **An actor woken within the window without writing keeps its leftovers.** The wake rewrites the record, so the pass is dropped, and a hold that only read cannot collect. It is compacted after it next writes and then rests for a window. A fix needs evidence that survives read-only holds; ADR 0035's released `complete` head is the candidate, but as built nothing reads completeness and the format is off by default. It deserves its own record.
 - **A restart loses the queue.** Actors hibernated within the last window before a restart keep their leftovers until they next write and rest. A local file in the data directory, or a slow sweep over `owners/`, could recover them; neither is in this design.
 - **An actor whose node crashed is not compacted** until a later owner writes.
@@ -231,7 +233,7 @@ Other sims:
 
 ### Golden trace (`crates/wasmkeep-server/tests/cluster/golden_trace.rs`)
 
-The script has a hibernation after writes. If the threshold is met there, one snapshot PUT appears at that hibernation. Re-record with `WASMKEEP_RECORD_TRACE=1` and review that this is the only difference: no other operation, key or order moves. The script wakes the actor well inside the window, so no pass appears.
+The script has a hibernation after writes. If the threshold is met there, one snapshot PUT appears at that hibernation. Re-record with `WASMKEEP_RECORD_TRACE=1` and review that this is the only difference: no other operation, key or order moves. The script wakes the actor well inside the window, so no pass appears. (As re-recorded in slice 4, the PUT is not the only difference, and cannot be: two operations follow from it. The move's restore on the other node reads the new snapshot instead of the periodic snapshot and the three segments after it, and the erasure after the `delete-self` deletes it too. Nothing else moved.)
 
 Add a second, separate scripted trace for the pass (acquisition, listing, deletes, release, in that order), so the 0.4.2 trace stays a comparison with 0.4.2.
 
@@ -251,6 +253,53 @@ Add a second, separate scripted trace for the pass (acquisition, listing, delete
   - A release whose write landed with its reply lost comes back as a conflict, then `still_this_hold` reads a record naming nobody and answers `Superseded`, which never reaches `release_landed`. Such an actor is not queued. That costs leftovers, not safety: one more entry for the known limits.
   - The server compares versions by ETag (`expiry::etag`, the first line of the version `object_store.rs` encodes). On S3 the ETag of a plain PUT is a hash of the body, and a version 1 released record at generation `g` has the same bytes in every incarnation of the app. So the version check alone cannot tell a recreated app's record at the same generation from the remembered one (constraint 7). Safety does not rest on it: the pass applies the rule to the record and listing it reads itself. The "tied to the app's current incarnation" argument in section 3 therefore cannot rest on the version alone (see "Not confirmed").
 - **The simulation's answer on the version check:** see "Simulation results" below.
+
+## As built: the idle snapshot (slice 4)
+
+Revised after its adversarial review: two must-fix findings, M1 and M2, and the should-fix ones.
+
+- **The replica.** `SnapshotKind::Idle` and `Replica::start_idle_snapshot` (`replica.rs`). The conditions are split in two:
+  - `Replica::idle_snapshot_possible`, the checks that need nothing of the database:
+    - it first takes in an upload that ended, so a step cut short does not hold back every later one;
+    - replication has not stopped;
+    - the hold wrote the head;
+    - no segment is in flight;
+    - no snapshot is at the head (`since_snapshot` is 0 exactly then);
+    - no periodic or idle snapshot of the actor is uploading;
+    - no failed periodic snapshot is waiting out its back-off, since the bucket refuses snapshots then.
+  - `Replica::idle_snapshot_wanted`, the size rule, read from the captured size without copying:
+    - `IDLE_SNAPSHOT_EVERY` (8) segments since the last snapshot, or at least one for a database of at most `IDLE_SNAPSHOT_SMALL_BYTES` (256 KiB);
+    - never above `IDLE_SNAPSHOT_MAX_BYTES` (64 MiB). Such an actor keeps its periodic snapshots and their collection.
+- **The flight.** It is recorded in `PeriodicFlights` and `Uploads::periodic` in both modes, reusing `start_periodic_snapshot`'s machinery rather than generalising it. It does not call `snapshot_failed()`, so a failure changes nothing of the periodic schedule. `settle_periodic` takes the outcome in, and a success counts as a snapshot at its label.
+- **Only after a guest event.** `ActorState::event_hold` is the generation of the hold under which a guest event last ran (set in `finish`). A hold a maintenance job took and that wrote only a fence takes none: a delete found carried out, a blob sweep.
+- **At most 8 at once per node** (`IDLE_SNAPSHOTS_AT_ONCE`, a semaphore taken with `try_acquire`). A hibernation finding none free takes none, counted `busy`, so a burst of evictions is not held behind a queue of uploads. On by default. Eviction churn is to be measured in the benchmark pass.
+- **The step.** `ActorState::idle_snapshot` (`actor/state.rs`), called from `before_drop` for `DropCause::Idle` and `DropCause::Evicted` only.
+  - A strict hold: copied with `ActorDb::snapshot`.
+  - A batched hold: at its `Flushed` barrier, with `snapshot_at_captured` before the capture ends.
+  - Commits not shipped (`CaptureError::Pending`) stop replication and give the actor up, as `replicate` does.
+  - The upload runs in a task of its own. The step waits for its one attempt, so in the common case the snapshot lands, and is acknowledged under the hold, before the release.
+- **No upload outlives the hold that started it unwaited (M1).** A late PUT of a strict hold's idle snapshot could otherwise land a database after another node erased it.
+  - A step cut short leaves the flight. The next hibernation's step waits for it first (`settle_flight`), and a strict hold's step waits for any flight before it is ready.
+  - A strict hold's flush to its barrier (a drain's hand-over, a move) waits for it within its deadline, and is not at its barrier past it.
+  - A strict hold's clean stop cancels it (no request not yet started is sent) and waits for it within the stop's deadline, then gives up.
+  - Batched holds already waited at their barrier (ADR 0034, section 7).
+- **Collection under the same hold (M2).** Once the idle snapshot is created, or found there at the head, the step runs ADR 0012's collection below it (`collectable` with the hold's own generation and that snapshot, honouring the retention window), within one upload budget, before the release. No new rule is needed: this hold wrote the snapshot.
+  - Without it, history grew without bound. A landed idle snapshot zeroes the count a periodic snapshot waits for (64 segments), so an actor that writes a little at each wake uploaded a snapshot and a segment per wake, and nothing was ever collected.
+  - The cluster test `snapshots::an_actor_that_writes_once_per_wake_keeps_a_bounded_history` writes once and hibernates 70 times with a window of zero. The prefix never holds more than 4 objects, and ends as the snapshot at the head and the segment under it.
+  - With the default window, what is younger than an hour stays until a later pass. That is the window's promise, and the pass of slice 5 is for it.
+  - Two alternatives were weighed and not taken:
+    - counting the objects below the plan's base at a restore collects only at the next wake and puts work on the restore path;
+    - a count of segments since the last collection cannot be rebuilt from a listing at the next hold, as `since_snapshot` is.
+- **Metrics.** `wasmkeep_idle_snapshots_total{outcome}`, with outcomes `created`, `existed`, `failed`, `refused` and `busy`. A failure also counts in `wasmkeep_snapshot_upload_failures_total`.
+- **The switch.** `serve --no-idle-compaction` and `[process] idle-compaction = false` in a node file (`ClusterConfig::idle_compaction`). It is one switch for the whole of this record: the pass will obey it too.
+- **Which paths reach `before_drop` with `Evicted`.** `Mailboxes::hibernate` sends it for a capacity eviction, and also from a drain's hand-over, a move (both ends), an idle expiry, a delete request, a blob sweep, an upgrade or a call that found another owner, an alarm stub, and an activation that was cut.
+  - Holds ended first, so no snapshot: a drain's hand-over and the move's source release their hold in their own job before `hibernate`. The stubs hold nothing, and a cut activation dropped its hold.
+  - Holds kept until the drop, so the conditions decide:
+    - an operator delete request and an idle expiry keep their hold until `hibernate`. After their reset and the snapshot at it, a snapshot is at the head, so none is taken.
+    - a delete found carried out and a blob sweep write a fence, but ran no guest event under that hold, so none is taken.
+  - A clean stop and an app delete are `DropCause::Stop`.
+- **Parked holds.** A parked hold (a room with sockets open, ADR 0024) also takes it: `before_drop` runs before `Drop` decides between parking and releasing. The pass of slice 5 follows releases only, so for a parked room this snapshot only shortens the next restore.
+- **Simulation.** `madsim_batched.rs` models it at a hibernation's barrier: `idle_snapshots_at_hibernation_keep_every_restore_whole`. One taken with a segment in flight (the database as it is, labelled at the acknowledged head) is caught as a restore that is not the owner's prefix: `an_idle_snapshot_labelled_with_a_segment_in_flight_is_caught`.
 
 ## Simulation results
 
@@ -294,6 +343,5 @@ At 2,000 seeds (30 simulated seconds each):
 ## Not confirmed
 
 - What ties a pass to the app's current incarnation when the app was deleted and recreated while the node that queued the entry kept running. Every acquisition checks the app's tombstone (`app_refusal` in `LeaseHold::acquire_with`), but I did not check what that check sees after a recreate. The version alone does not settle it (ETags, see "Confirmed in the code"). For slice 5's review.
-- That drains and moves never reach `before_drop` with `Idle` or `Evicted`.
 - How `ensure_owner_with` can acquire without restoring.
 - The thresholds (8 segments, 256 KiB, 100,000 entries, 4 at once) are proposals with no measurement behind them.

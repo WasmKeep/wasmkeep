@@ -756,6 +756,33 @@ fn blob_link_base_is_an_apps_field() {
     );
 }
 
+/// ADR 0042: `[process] idle-compaction = false` turns idle compaction off
+/// for every app of the process, as `serve --no-idle-compaction` does; on
+/// by default, and a value that is not a boolean is refused.
+#[test]
+fn idle_compaction_is_a_process_switch_on_by_default() {
+    let on = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert_eq!(on.process.idle_compaction, None);
+    assert!(!through_file(&on).no_idle_compaction);
+    let off = parse(
+        &format!(
+            "[process]\nidle-compaction = false\n{LISTEN}{}",
+            app("acme/shop", "shop-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(off.process.idle_compaction, Some(false));
+    assert!(through_file(&off).no_idle_compaction);
+    let e = err(&format!(
+        "[process]\nidle-compaction = 0\n{LISTEN}{}",
+        app("acme/shop", "shop-1", "")
+    ));
+    assert!(e.contains("idle-compaction"), "{e}");
+    assert!(serve(&["--no-idle-compaction"]).unwrap().no_idle_compaction);
+    assert!(!serve(&[]).unwrap().no_idle_compaction);
+}
+
 /// ADR 0041, section 9: `[process] placement = false` turns placement off
 /// for every app of the process, as `serve --no-placement` does; on by
 /// default, and a value that is not a boolean is refused.

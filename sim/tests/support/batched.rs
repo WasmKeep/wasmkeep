@@ -93,7 +93,18 @@ pub(crate) enum Switch {
     /// A reset does not wait for a periodic snapshot uploading on its node,
     /// this hold's or one a given-up hold left: it lands after the erasure.
     ResetSkipsSnapshot,
+    /// Safe, with ADR 0042's idle snapshot: a hibernation, at its barrier,
+    /// copies the acknowledged head and uploads it off the mailbox, waits
+    /// for it, and collects below it once acknowledged, before the release.
+    IdleSafe,
+    /// The idle snapshot taken with a segment in flight: the database as
+    /// it is now, labelled at the acknowledged head.
+    IdleSnapshotInFlight,
 }
+
+/// The handover kind that is a hibernation, in the order the sites are
+/// listed at [`World::handover`]: drain, move, hibernate, park, stop.
+const HIBERNATE: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Violation {
@@ -310,6 +321,8 @@ pub(crate) struct Counts {
     pub(crate) snapshots_cancelled: u64,
     pub(crate) resets_after_given_up_snapshot: u64,
     pub(crate) snapshots_after_foreign_reset: u64,
+    /// Idle snapshots started at a hibernation (ADR 0042).
+    pub(crate) idle_snapshots: u64,
 }
 
 impl Counts {
@@ -330,6 +343,7 @@ impl Counts {
             *a += b;
         }
         self.unhealthy_handoffs += other.unhealthy_handoffs;
+        self.idle_snapshots += other.idle_snapshots;
         self.blocked_events += other.blocked_events;
         self.retired += other.retired;
         self.fenced += other.fenced;
@@ -1288,6 +1302,9 @@ impl World {
             u64::from(!h.flights.is_empty() && !h.pending.is_empty());
         let wanted = h.local.rows.clone();
         let start = self.now;
+        if kind == HIBERNATE && self.rule == Switch::IdleSnapshotInFlight {
+            self.start_idle_snapshot(actor);
+        }
         if self.rule != Switch::ReleaseWithoutBarrier {
             for _ in 0..STOP_BUDGET {
                 if self.actors[actor]
@@ -1301,6 +1318,18 @@ impl World {
                 // `to_barrier` awaits `landed` and applies it itself.
                 self.apply_landed(actor);
                 self.advance(1).await;
+            }
+            // ADR 0042: at the barrier, a hibernation's idle snapshot,
+            // waited for (one attempt) before the release.
+            if kind == HIBERNATE && self.rule == Switch::IdleSafe {
+                self.start_idle_snapshot(actor);
+                for _ in 0..STOP_BUDGET {
+                    if !self.snapshot_uploading(actor) {
+                        break;
+                    }
+                    self.apply_landed(actor);
+                    self.advance(1).await;
+                }
             }
             if kind != 4
                 && (self.actors[actor]
@@ -1437,6 +1466,49 @@ impl World {
             self.collect(actor, &listing, generation, at);
         }
         self.check();
+    }
+
+    /// A hibernation's idle snapshot (ADR 0042, section 2): as a periodic
+    /// one off the mailbox, at the barrier only (refused with anything in
+    /// flight); the broken variant copies the database as it is with a
+    /// segment in flight, labelled at the acknowledged head.
+    fn start_idle_snapshot(&mut self, actor: usize) {
+        if self.snapshot_uploading(actor) {
+            return;
+        }
+        let a = &mut self.actors[actor];
+        let Some(h) = &a.hold else { return };
+        if self.rule == Switch::IdleSnapshotInFlight && !h.flights.is_empty() {
+            let (at, generation, node, db) = (h.head, h.generation, h.node, h.local.clone());
+            if at == EMPTY {
+                return;
+            }
+            let path = a.position_paths[&at].clone();
+            let due = self.now + 1 + self.snapshot_rng.below(30);
+            self.snapshot_uploads.push(SnapshotUpload {
+                actor,
+                hold: generation,
+                node,
+                started: self.now,
+                at,
+                db,
+                path,
+                due,
+                requested: false,
+                put: false,
+                created: false,
+                done: false,
+            });
+            self.outcome.counts.snapshots_started += 1;
+            self.outcome.counts.idle_snapshots += 1;
+            self.check();
+            return;
+        }
+        if h.head == EMPTY || !h.flights.is_empty() || !h.pending.is_empty() {
+            return;
+        }
+        self.start_snapshot(actor);
+        self.outcome.counts.idle_snapshots += 1;
     }
 
     /// One tick of the periodic snapshots uploading: a PUT lands (a
@@ -3539,6 +3611,30 @@ pub(crate) fn snapshots_safe() {
         assert!(value >= count, "{name}: {value} < {count}; {totals:?}");
     }
     eprintln!("staged snapshots: {count} seeds: {totals:?}");
+}
+
+/// ADR 0042: hibernations take idle snapshots at their barrier among the
+/// staged snapshots' crashes, cuts, hand-overs and resets; every restore
+/// stays whole.
+pub(crate) fn idle_snapshots_safe() {
+    let count = seeds();
+    let mut totals = Counts::default();
+    for seed in 0..count {
+        let out = simulate_snapshots(seed, Switch::IdleSafe);
+        assert!(
+            out.violations.is_empty(),
+            "seed {seed}: {:?}; scenarios={:?}",
+            out.violations,
+            out.per
+        );
+        totals.add(out.counts);
+    }
+    assert!(
+        totals.idle_snapshots >= count,
+        "idle snapshots: {} < {count}; {totals:?}",
+        totals.idle_snapshots
+    );
+    eprintln!("staged idle snapshots: {count} seeds: {totals:?}");
 }
 
 pub(crate) fn snapshots_caught(rule: Switch, expected: Violation) {

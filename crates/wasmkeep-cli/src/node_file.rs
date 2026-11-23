@@ -30,6 +30,10 @@ pub(crate) struct Process {
     /// `placement` (ADR 0041, section 9): `Some(false)` turns placement at
     /// wake-up off for every app of the process; `None`: on.
     pub(crate) placement: Option<bool>,
+    /// `idle-compaction` (ADR 0042): `Some(false)` turns idle compaction
+    /// off for every app of the process, as `serve --no-idle-compaction`
+    /// does; `None`: on.
+    pub(crate) idle_compaction: Option<bool>,
 }
 
 /// `[listen]`: the three listeners, and the addresses peers use.
@@ -98,7 +102,7 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<NodeFile, String> {
 
 /// The top-level tables, and the keys of each.
 const TOP: &[&str] = &["process", "listen", "limits", "app"];
-const PROCESS: &[&str] = &["id", "data-dir", "placement"];
+const PROCESS: &[&str] = &["id", "data-dir", "placement", "idle-compaction"];
 const LISTEN: &[&str] = &[
     "public",
     "public-advertise",
@@ -172,6 +176,9 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
             string_at(&src, t, "data-dir", "[process]")?.map(|(p, _)| dir.join(p));
         if crate::project::get(t, "placement").is_some() {
             file.process.placement = Some(boolean(&src, t, "placement", "[process]")?);
+        }
+        if crate::project::get(t, "idle-compaction").is_some() {
+            file.process.idle_compaction = Some(boolean(&src, t, "idle-compaction", "[process]")?);
         }
     }
 
@@ -730,6 +737,7 @@ impl NodeFile {
                 id: None,
                 data_dir: Some(args.data_dir.clone()),
                 placement: args.no_placement.then_some(false),
+                idle_compaction: args.no_idle_compaction.then_some(false),
             },
             listen: Listen {
                 public: Some(args.listen),
@@ -813,6 +821,10 @@ impl NodeFile {
         // The process's switch, for each of its apps (ADR 0041).
         if self.process.placement == Some(false) {
             args.no_placement = true;
+        }
+        // ADR 0042's switch, the same way.
+        if self.process.idle_compaction == Some(false) {
+            args.no_idle_compaction = true;
         }
         args.advertise.clone_from(&self.listen.public_advertise);
         if let Some(public) = self.listen.public {
