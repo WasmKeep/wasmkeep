@@ -85,9 +85,9 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   fills its table with requests it never sends, each with full headers
   and a full queue, holds about 512 MiB per instance (4,096 × 128 KiB)
   in the worst case. A request it was sent carries the headers its client
-  sent, bounded by the HTTP parser (100 headers in about 400 KiB); one
-  that keeps those requests instead of dropping them holds up to that
-  each.
+  sent, bounded by the front door (100 headers in 64 KiB of head, see
+  above); one that keeps those requests instead of dropping them holds up
+  to that each.
 - Outbound HTTP: public addresses only (the host resolves, checks and
   connects to the checked address; TLS verified against the name);
   `--allow-outbound` and `--outbound-ca` open specific internal services.

@@ -271,9 +271,10 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Largest request head (request line and headers) the public port
-/// reads, the size a guest's header fields may reach: a request a guest
-/// holds keeps at most this much in host memory. Over it: 431.
-pub(crate) const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+/// reads: the size of the fields a guest may build
+/// ([`crate::MAX_GUEST_FIELDS_BYTES`]), so a request a guest holds keeps
+/// no more in host memory than fields it builds itself. Over it: 431.
+pub(crate) const MAX_REQUEST_HEAD_BYTES: usize = crate::MAX_GUEST_FIELDS_BYTES;
 
 /// Most header fields a request may carry on the public port (hyper's
 /// default, which keeps them on the stack). Over it: 431.
