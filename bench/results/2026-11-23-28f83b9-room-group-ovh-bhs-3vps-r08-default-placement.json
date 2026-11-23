@@ -191,7 +191,7 @@
       "generators": 6,
       "generators_valid": true,
       "target_met": false,
-      "placement": "default placement, no actor move. actor where 20 s into the hold and near its end: room on node c, pusher on node b, edges 29 on a, 22 on b, 14 on c",
+      "placement": "default placement, no actor move. actor where 42 s into the hold and 49 s before its end: room on node c, pusher on node b, edges 29 on a, 22 on b, 14 on c",
       "publish_failures_by_status": {
         "network": 1
       },
@@ -329,7 +329,7 @@
       "generators": 6,
       "generators_valid": false,
       "target_met": false,
-      "placement": "default placement, no actor move. actor where 20 s into the hold and near its end: room on node a, pusher on node b, edges 45 on a, 39 on b, 44 on c",
+      "placement": "default placement, no actor move. actor where 26 s into the hold and 40 s before its end: room on node a, pusher on node b, edges 45 on a, 39 on b, 44 on c",
       "publish_failures_by_status": {
         "network": 13,
         "503": 1
