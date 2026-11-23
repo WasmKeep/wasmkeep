@@ -9,6 +9,34 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+**A room and its pusher wake on different nodes, by default.** In a
+version with classes named `room` and `pusher` (the broadcast SDKs'
+default names), a wake-up of `pusher/<name>`, which nobody holds, on the
+node that holds `room/<name>` goes to another node, and the other way
+round. This applies to a request, a call, an alarm and a drain's
+hand-over. Nothing to configure, and nothing changes in the bucket.
+`--no-placement` turns it off with the load rule.
+
+With one node alive, or every other node draining, both wake where they
+land: a wake-up is never refused. A wake-up sent apart that the peer did
+not run (a `503` before the actor) runs here.
+
+It moves nothing running, so a pair that lands together stays together
+until one hibernates or is moved. With two nodes, a rolling restart
+always leaves them together. Moving the pusher by hand is now the
+fallback
+([designing for hot actors](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node),
+[ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
+
+New metric `wasmkeep_placement_apart_total{outcome}`. A placed wake-up
+refused by a node holding the actor's companion counts as
+`outcome="apart"` in `wasmkeep_placements_received_total`, and does not
+back that node off. An event sent on by a drain that the actor itself
+answers with a `5xx`, or that traps, no longer marks the peer suspect.
+
+Upgrading: nothing to deploy. Nodes of 0.7.0 keep what they wake and
+acquire what is sent to them.
+
 ## 0.7.0
 
 **Big rooms, a cluster that keeps its peers on a slow bucket, and the

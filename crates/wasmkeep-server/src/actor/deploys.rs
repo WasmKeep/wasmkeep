@@ -212,6 +212,7 @@ impl ActorService {
             );
             let required = Arc::new(requires.get(&name).cloned().unwrap_or_default());
             let writes = writes_of(batched, &name);
+            let apart = wasmkeep_cluster::placement::companion(&names, &name);
             built.insert(
                 name,
                 Arc::new(ActorClass {
@@ -220,6 +221,7 @@ impl ActorService {
                     env,
                     requires: required,
                     writes,
+                    apart,
                     ..class
                 }),
             );

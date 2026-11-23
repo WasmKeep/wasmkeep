@@ -59,6 +59,11 @@ pub(super) struct EventLimits {
     pub(super) max_unsent_age: Duration,
 }
 
+/// The longest a draining node waits for the record of an actor's
+/// companion before choosing its peer without it (ADR 0041, amendment of
+/// 2026-11-22).
+const COMPANION_READ: Duration = Duration::from_secs(1);
+
 /// Per-actor state owned by its mailbox task.
 pub(super) struct ActorState {
     pub(super) timing: Arc<super::timing::Timing>,
@@ -346,6 +351,7 @@ impl ActorState {
         response_tx: oneshot::Sender<Outcome<B>>,
         chain: Chain,
         outside: bool,
+        apart: bool,
     ) where
         B: hyper::body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
@@ -378,7 +384,9 @@ impl ActorState {
                 return;
             }
         }
-        let ownership = self.ensure_owner().await;
+        // `apart`: a wake-up of this node's own, of an actor nobody holds
+        // (ADR 0041, amendment of 2026-11-22); any other is acquired here.
+        let ownership = self.ensure_owner_with(None, apart).await;
         match ownership {
             // Asked again after the wait for ownership (a takeover's restore
             // can be long): whoever sent it may have gone meanwhile.
@@ -495,16 +503,47 @@ impl ActorState {
     /// the instance (it may be stale: another node may have run events since)
     /// and is acquired again.
     pub(super) async fn ensure_owner(&mut self) -> Result<(), OwnershipError> {
-        self.ensure_owner_with(None).await
+        self.ensure_owner_with(None, false).await
+    }
+
+    /// The node that holds `companion` now: this one from memory, another
+    /// from its record (one read, bounded). Read only while this node
+    /// drains an actor kept apart (ADR 0041, amendment of 2026-11-22).
+    pub(super) async fn companion_owner(
+        companion: Option<ActorAddress>,
+        cluster: &Cluster,
+    ) -> Vec<String> {
+        let Some(companion) = companion.filter(|_| cluster.placement_on()) else {
+            return Vec::new();
+        };
+        if cluster.holds_here(&companion) {
+            return vec![cluster.node_id.clone()];
+        }
+        use wasmkeep_cluster::node_lease::Route;
+        match tokio::time::timeout(COMPANION_READ, cluster.route(&companion)).await {
+            Ok(Ok(Route::Owner(owner))) => vec![owner],
+            _ => Vec::new(),
+        }
     }
 
     /// [`Self::ensure_owner`]; with `listed` (an idle expiry, ADR 0028), the
     /// acquisition takes the record only if it names nobody and is still
     /// the version the listing showed, and a hold already here or a learned
     /// owner is never taken as one (the caller refuses those first).
+    ///
+    /// `apart`: a wake-up of this node's own (an unforwarded request, a
+    /// call from an actor or the front here, an alarm nobody handed here)
+    /// whose route read answered that nobody holds the actor. An actor kept
+    /// apart from a companion this node holds (ADR 0041, amendment of
+    /// 2026-11-22) is then not acquired here while a peer can take it:
+    /// `Elsewhere`, as a drain of this one actor, and the peer acquires the
+    /// event it is sent (it never sends it on). `false` for everything
+    /// else: an event another node sent, a handed alarm, a take, an
+    /// upgrade, the operator passes.
     pub(super) async fn ensure_owner_with(
         &mut self,
         listed: Option<(&str, u64)>,
+        apart: bool,
     ) -> Result<(), OwnershipError> {
         let blocked = self
             .secrets_blocked
@@ -555,8 +594,15 @@ impl ActorState {
         // the close above, so a lapsed hold is released, not kept renewing.
         // With no eligible peer it claims as usual: draining never makes an
         // actor unreachable.
+        // An actor kept apart from a companion goes to a peer that does
+        // not hold it, if there is one (ADR 0041, amendment of 2026-11-22).
+        let avoid = if cluster.draining() {
+            Self::companion_owner(companion_of(&self.class, &self.address), &cluster).await
+        } else {
+            Vec::new()
+        };
         if cluster.draining()
-            && let Some(peer) = cluster.chosen_peer(&self.address)
+            && let Some(peer) = cluster.chosen_peer_apart(&self.address, &avoid)
         {
             // Parked here (ADR 0024): released now, so the peer can take it
             // instead of finding it held by this node until the drain's
@@ -565,6 +611,27 @@ impl ActorState {
                 cluster.release_parked(&self.address, "drain").await;
             }
             return Err(OwnershipError::Elsewhere { peer });
+        }
+        // Kept apart from a companion this node holds (ADR 0041, amendment
+        // of 2026-11-22): a wake-up of this node's own goes to a peer, as
+        // a drain sends it. No peer (one node alive, every peer draining
+        // or suspected): acquired here, as without the rule.
+        // Off with placement (`--no-placement`). Not for an actor parked
+        // here (ADR 0024): its record names this node.
+        if apart && listed.is_none() && cluster.placement_on() && !cluster.is_parked(&self.address)
+        {
+            let here =
+                companion_of(&self.class, &self.address).is_some_and(|c| cluster.holds_here(&c));
+            if here {
+                match cluster.apart_peer(&self.address, true) {
+                    Some(peer) => {
+                        crate::metrics::placement_apart(&self.app_labels, "sent");
+                        tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %peer, "wake-up sent apart from its companion");
+                        return Err(OwnershipError::Elsewhere { peer });
+                    }
+                    None => crate::metrics::placement_apart(&self.app_labels, "alone"),
+                }
+            }
         }
         // A drain claims when no peer can take the actor; a node that
         // cannot open the secrets refuses instead (ADR 0016).

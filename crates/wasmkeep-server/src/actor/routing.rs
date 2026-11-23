@@ -125,6 +125,24 @@ impl ServiceInner {
         }
     }
 
+    /// Whether this node holds an actor `address` is kept apart from (ADR
+    /// 0041, amendment of 2026-11-22), by the class it takes now: from
+    /// memory, no read.
+    /// Off with placement (`--no-placement`).
+    pub(super) fn companion_here(&self, cluster: &Cluster, address: &ActorAddress) -> bool {
+        cluster.placement_on()
+            && self
+                .companion(address)
+                .is_some_and(|c| cluster.holds_here(&c))
+    }
+
+    /// The actor `address` is kept apart from, by the class it takes now
+    /// ([`companion_of`]).
+    pub(super) fn companion(&self, address: &ActorAddress) -> Option<ActorAddress> {
+        let class = read(&self.classes).get(address.class()).cloned()?;
+        companion_of(&class, address)
+    }
+
     pub(super) fn owner_hints(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<ActorAddress, (String, u64)>> {
@@ -229,6 +247,10 @@ impl ServiceInner {
                 Cold::Owner(owner) => Some(owner.clone()),
                 Cold::Nobody | Cold::Here => None,
             };
+            // Nobody holds it, by the last route read: only then is an
+            // actor kept apart from a companion held here sent to a peer
+            // (ADR 0041, amendment of 2026-11-22).
+            let mut nobody = route == Cold::Nobody;
             // Nobody holds it: placement may send it to a lighter node,
             // once (ADR 0041). After a refusal it runs here: the record is
             // read again.
@@ -244,7 +266,12 @@ impl ServiceInner {
                         let (back, read_again) = *back;
                         req = back;
                         if read_again {
-                            owner = self.remote_owner(&target).await;
+                            let again = self.cold_route(&target).await;
+                            nobody = again == Cold::Nobody;
+                            owner = match again {
+                                Cold::Owner(owner) => Some(owner),
+                                Cold::Nobody | Cold::Here => None,
+                            };
                         }
                     }
                 }
@@ -260,78 +287,102 @@ impl ServiceInner {
                     }
                 };
             }
-            let (response_tx, response_rx) = oneshot::channel();
-            let event = self.mailboxes.submit_wait_timed(
-                &target,
-                ADMISSION_WAIT,
-                move |state: &mut ActorState, waited| {
-                    state.record_mailbox_wait(waited);
-                    Box::pin(
-                        async move { state.owned_request(req, response_tx, chain, false).await },
-                    )
-                },
-            );
-            let event = tokio::spawn(event);
+            let (mut apart, mut req) = (nobody, req);
+            loop {
+                let (response_tx, response_rx) = oneshot::channel();
+                let chain = Arc::clone(&chain);
+                let event = self.mailboxes.submit_wait_timed(
+                    &target,
+                    ADMISSION_WAIT,
+                    move |state: &mut ActorState, waited| {
+                        state.record_mailbox_wait(waited);
+                        Box::pin(async move {
+                            state
+                                .owned_request(req, response_tx, chain, false, apart)
+                                .await
+                        })
+                    },
+                );
+                let event = tokio::spawn(event);
 
-            match response_rx.await {
-                Ok(Outcome::Served(response)) => collect_response(response, budget, head).await,
-                Ok(Outcome::Failed(e)) => Err(CallError::Failed(e)),
-                Ok(Outcome::Refused(e)) => {
-                    crate::metrics::refused(crate::metrics::Refusal::Unavailable);
-                    Err(CallError::Failed(e))
-                }
-                Ok(Outcome::Missing) => {
-                    crate::metrics::refused(crate::metrics::Refusal::Access);
-                    Err(CallError::Failed("no such actor".into()))
-                }
-                Ok(Outcome::Forbidden) => {
-                    crate::metrics::refused(crate::metrics::Refusal::Access);
-                    Err(CallError::Failed("refused".into()))
-                }
-                Ok(Outcome::NotOwner(owner, req)) => {
-                    self.mailboxes.hibernate(&target);
-                    self.remember_owner(&target, &owner);
-                    match &self.cluster {
-                        Some(cluster) => match cluster.call(&owner, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response, budget, head).await,
-                            Err(e) => {
-                                self.forget_owner(&target);
-                                Err(CallError::Failed(e))
-                            }
-                        },
-                        None => Err(CallError::Failed("no cluster".into())),
+                return match response_rx.await {
+                    Ok(Outcome::Served(response)) => collect_response(response, budget, head).await,
+                    Ok(Outcome::Failed(e)) => Err(CallError::Failed(e)),
+                    Ok(Outcome::Refused(e)) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                        Err(CallError::Failed(e))
                     }
-                }
-                // Draining: the chosen peer claims (ADR 0014); not an owner
-                // hint, and not chosen again for a while if it fails.
-                Ok(Outcome::Elsewhere(peer, req)) => {
-                    self.mailboxes.hibernate(&target);
-                    match &self.cluster {
-                        Some(cluster) => match cluster.call(&peer, &target, &waiting, req).await {
-                            Ok(response) => collect_response(response, budget, head).await,
+                    Ok(Outcome::Missing) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Access);
+                        Err(CallError::Failed("no such actor".into()))
+                    }
+                    Ok(Outcome::Forbidden) => {
+                        crate::metrics::refused(crate::metrics::Refusal::Access);
+                        Err(CallError::Failed("refused".into()))
+                    }
+                    Ok(Outcome::NotOwner(owner, req)) => {
+                        self.mailboxes.hibernate(&target);
+                        self.remember_owner(&target, &owner);
+                        match &self.cluster {
+                            Some(cluster) => {
+                                match cluster.call(&owner, &target, &waiting, req).await {
+                                    Ok(response) => collect_response(response, budget, head).await,
+                                    Err(e) => {
+                                        self.forget_owner(&target);
+                                        Err(CallError::Failed(e))
+                                    }
+                                }
+                            }
+                            None => Err(CallError::Failed("no cluster".into())),
+                        }
+                    }
+                    // Draining, or kept apart (ADR 0014, ADR 0041): the chosen
+                    // peer claims; not an owner hint, and not chosen again for
+                    // a while if it fails. Sent apart and not run there: run
+                    // here, once.
+                    Ok(Outcome::Elsewhere(peer, sent)) => {
+                        self.mailboxes.hibernate(&target);
+                        let Some(cluster) = &self.cluster else {
+                            return Err(CallError::Failed("no cluster".into()));
+                        };
+                        let copy = apart.then(|| copy_request(&sent));
+                        match cluster.call(&peer, &target, &waiting, sent).await {
+                            Ok(response) if not_run_by_peer(&response) => {
+                                cluster.suspect(&peer);
+                                if let Some(copy) = copy {
+                                    (apart, req) = (false, copy);
+                                    continue;
+                                }
+                                collect_response(response, budget, head).await
+                            }
+                            Ok(response) => {
+                                if peer_failed(&response) {
+                                    cluster.suspect(&peer);
+                                }
+                                collect_response(response, budget, head).await
+                            }
                             Err(e) => {
                                 cluster.suspect(&peer);
                                 Err(CallError::Failed(e))
                             }
-                        },
-                        None => Err(CallError::Failed("no cluster".into())),
+                        }
                     }
-                }
-                Err(_) => match event.await {
-                    Ok(Err(MailboxError::Capacity(_))) => {
-                        crate::metrics::refused(crate::metrics::Refusal::Capacity);
-                        collect_response(capacity_response(), budget, false).await
-                    }
-                    Ok(Err(MailboxError::Full(_))) => {
-                        crate::metrics::refused(crate::metrics::Refusal::Overloaded);
-                        Err(CallError::Failed("callee overloaded".to_owned()))
-                    }
-                    Ok(Err(e)) => {
-                        crate::metrics::refused(crate::metrics::Refusal::Unavailable);
-                        Err(CallError::Failed(e.to_string()))
-                    }
-                    _ => Err(CallError::Failed("callee unavailable".to_owned())),
-                },
+                    Err(_) => match event.await {
+                        Ok(Err(MailboxError::Capacity(_))) => {
+                            crate::metrics::refused(crate::metrics::Refusal::Capacity);
+                            collect_response(capacity_response(), budget, false).await
+                        }
+                        Ok(Err(MailboxError::Full(_))) => {
+                            crate::metrics::refused(crate::metrics::Refusal::Overloaded);
+                            Err(CallError::Failed("callee overloaded".to_owned()))
+                        }
+                        Ok(Err(e)) => {
+                            crate::metrics::refused(crate::metrics::Refusal::Unavailable);
+                            Err(CallError::Failed(e.to_string()))
+                        }
+                        _ => Err(CallError::Failed("callee unavailable".to_owned())),
+                    },
+                };
             }
         };
         tokio::time::timeout(limit, call)
@@ -386,8 +437,12 @@ impl ServiceInner {
                 }
                 Ok(collect_response(response, budget, head).await)
             }
-            Hop::Refused | Hop::Unsent => {
-                cluster.placement_backoff(&node);
+            Hop::Refused | Hop::Unsent | Hop::Apart => {
+                // A refusal because the receiver holds the actor's
+                // companion says nothing of its load: no backoff.
+                if !matches!(sent, Hop::Apart) {
+                    cluster.placement_backoff(&node);
+                }
                 Err(Box::new((
                     Request::from_parts(parts, http_body_util::Full::new(body)),
                     true,
@@ -399,6 +454,40 @@ impl ServiceInner {
             }
         }
     }
+}
+
+/// A copy of a call's buffered request, to run it here after a peer did
+/// not: method, path, version, headers and body.
+fn copy_request(
+    req: &Request<http_body_util::Full<bytes::Bytes>>,
+) -> Request<http_body_util::Full<bytes::Bytes>> {
+    let mut copy = Request::new(req.body().clone());
+    *copy.method_mut() = req.method().clone();
+    *copy.uri_mut() = req.uri().clone();
+    *copy.version_mut() = req.version();
+    *copy.headers_mut() = req.headers().clone();
+    copy
+}
+
+/// Whether a peer's answer to an event sent to it (by a drain, or kept
+/// apart) says the event did not run there: a host's `503` before the
+/// actor, neither answered by it (`x-wasmkeep-node`) nor of unknown outcome
+/// (a draining peer, no slot, ownership changing).
+pub(super) fn not_run_by_peer<B>(response: &Response<B>) -> bool {
+    response.status() == StatusCode::SERVICE_UNAVAILABLE
+        && !response.headers().contains_key(SERVED_BY)
+        && !response.headers().contains_key(crate::cluster::OUTCOME)
+}
+
+/// Whether a peer's answer to an event sent to it says the peer failed, so
+/// it is suspected for a while: a host's `5xx` that its actor did not
+/// answer. A `500` is the actor's error (a trap, a restore that failed) and
+/// a `5xx` with `x-wasmkeep-node` the actor's own answer: neither is the
+/// node's.
+pub(super) fn peer_failed<B>(response: &Response<B>) -> bool {
+    response.status().is_server_error()
+        && response.status() != StatusCode::INTERNAL_SERVER_ERROR
+        && !response.headers().contains_key(SERVED_BY)
 }
 
 /// Headers `actors.call` drops from a guest's request.
@@ -625,5 +714,47 @@ mod budget_tests {
         // A single call still takes its whole 16 MiB.
         let r = collect_response(answer(MAX_CALL_BODY, Some(MAX_CALL_BODY)), &budget, false).await;
         assert_eq!(r.unwrap().body.len(), MAX_CALL_BODY);
+    }
+}
+
+#[cfg(test)]
+mod peer_answer_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code
+
+    use super::*;
+
+    fn answer(status: StatusCode, headers: &[(&'static str, &'static str)]) -> Response<()> {
+        let mut r = Response::new(());
+        *r.status_mut() = status;
+        for (k, v) in headers {
+            r.headers_mut()
+                .insert(*k, hyper::header::HeaderValue::from_static(v));
+        }
+        r
+    }
+
+    /// ADR 0041, amendment of 2026-11-22: a peer's host `503` before the
+    /// actor (draining, no slot, ownership changing) is "not run": run it
+    /// here, the peer suspected. The actor's own answer, an unknown outcome
+    /// or an actor error (`500`, a trap) never is, and a `500` never
+    /// suspects the peer.
+    #[test]
+    fn a_peers_answer_says_whether_it_ran_and_whether_the_node_failed() {
+        let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+        let host = answer(unavailable, &[("retry-after", "1")]);
+        assert!(not_run_by_peer(&host) && peer_failed(&host));
+        let actor = answer(unavailable, &[("x-wasmkeep-node", "b")]);
+        assert!(!not_run_by_peer(&actor) && !peer_failed(&actor));
+        let unknown = answer(unavailable, &[("x-wasmkeep-outcome", "unknown")]);
+        assert!(!not_run_by_peer(&unknown) && peer_failed(&unknown));
+        let trap = answer(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+        assert!(!not_run_by_peer(&trap) && !peer_failed(&trap));
+        let late = answer(
+            StatusCode::GATEWAY_TIMEOUT,
+            &[("x-wasmkeep-outcome", "unknown")],
+        );
+        assert!(!not_run_by_peer(&late) && peer_failed(&late));
+        let ok = answer(StatusCode::OK, &[("x-wasmkeep-node", "b")]);
+        assert!(!not_run_by_peer(&ok) && !peer_failed(&ok));
     }
 }

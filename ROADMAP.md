@@ -16,9 +16,11 @@ rooms (what each brings is under [Built](#built); the limits known at
 release are in the [changelog](CHANGELOG.md)), but keeping a room and its
 pusher on different nodes is still the operator's. In this order:
 
-1. **A room and its pusher kept apart at wake-up** (S/M): placement
-   considers load only, so an operator moves the pusher of a large room
-   by hand ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
+1. **A room and its pusher kept apart at wake-up** (S/M): built, by
+   default for the SDKs' class names, with moving the pusher by hand as
+   the fallback ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node));
+   its fleet measure, with default placement and after a rolling
+   restart, is still to run.
 2. **A room's edges on several nodes** (M): today a room's tree stays
    on one node ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)).
 3. **The upload tail** (M): a large room's delivery tail depends on

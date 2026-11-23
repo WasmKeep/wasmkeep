@@ -256,6 +256,57 @@ pub fn receive(
     }
 }
 
+/// The pair kept apart by default (ADR 0041, amendment of 2026-11-22):
+/// the broadcast SDKs' pusher and room, under their default class names
+/// (ADR 0040, section 13). The room `room/lobby` has the pusher
+/// `pusher/lobby`.
+pub const DEFAULT_APART: (&str, &str) = ("pusher", "room");
+
+/// The class whose actor of the same name `class`'s actor is kept apart
+/// from (ADR 0041, amendment of 2026-11-22), if any: the other class of
+/// [`DEFAULT_APART`], when `classes` (the version's) has both. Symmetric:
+/// `room/x` and `pusher/x` are kept apart from each other. Only the
+/// built-in pair: a setting naming other classes is future work.
+pub fn companion(classes: &[&str], class: &str) -> Option<&'static str> {
+    let (a, b) = DEFAULT_APART;
+    if !(classes.contains(&a) && classes.contains(&b)) {
+        return None;
+    }
+    match class {
+        c if c == a => Some(b),
+        c if c == b => Some(a),
+        _ => None,
+    }
+}
+
+/// Where a wake-up of an actor kept apart from a companion goes instead
+/// of here (ADR 0041, amendment of 2026-11-22). `companion_here`: this
+/// node holds the companion now. `eligible`: the peers a drain chooses
+/// from (ADR 0014; never this node). `None` means wake here as usual: the
+/// companion is not held here, or no peer can take it (one node alive,
+/// every peer draining or suspected). It never refuses a wake-up.
+pub fn apart<'a>(companion_here: bool, eligible: &[&'a str], key: &str) -> Option<&'a str> {
+    if !companion_here {
+        return None;
+    }
+    best(key, eligible.iter().copied())
+}
+
+/// The drain's choice (ADR 0014) for an actor kept apart from companions
+/// held by the nodes `avoid`: the rendezvous choice among `eligible`
+/// without them, or among all of them when that leaves none (fall back,
+/// never refuse). With nothing to avoid, the drain's plain choice.
+pub fn peer_apart<'a>(eligible: &[&'a str], key: &str, avoid: &[&str]) -> Option<&'a str> {
+    best(key, eligible.iter().copied().filter(|p| !avoid.contains(p)))
+        .or_else(|| best(key, eligible.iter().copied()))
+}
+
+/// The highest rendezvous weight, ties by node id: server
+/// `cluster.rs::rendezvous`'s choice.
+fn best<'a>(key: &str, nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    nodes.max_by_key(|node| (weight(key, node), *node))
+}
+
 fn capacity(count: u64, room: u64) -> u128 {
     u128::from(count) + u128::from(room)
 }
@@ -635,5 +686,48 @@ mod tests {
             decide(local(900), &huge, "k", PERIOD, &Budget::default()),
             forward("a")
         );
+    }
+
+    #[test]
+    fn the_room_and_its_pusher_are_apart_by_default_both_ways() {
+        let classes = ["directory", "edge", "pusher", "relay", "room"];
+        assert_eq!(companion(&classes, "pusher"), Some("room"));
+        assert_eq!(companion(&classes, "room"), Some("pusher"));
+        assert_eq!(companion(&classes, "edge"), None);
+        // Only with both classes in the version.
+        assert_eq!(companion(&["room", "edge"], "room"), None);
+        assert_eq!(companion(&["pusher"], "pusher"), None);
+    }
+
+    #[test]
+    fn apart_sends_only_when_the_companion_is_here_and_never_refuses() {
+        let key = "default/pusher/lobby";
+        // Not held here: wake here, as without the rule.
+        assert_eq!(apart(false, &["a", "b"], key), None);
+        // Held here: the rendezvous choice among the eligible peers, the
+        // same one on every node and on every try.
+        let chosen = apart(true, &["a", "b"], key).unwrap();
+        assert_eq!(chosen, best(key, ["b", "a"].into_iter()).unwrap());
+        assert_eq!(apart(true, &["b", "a"], key), Some(chosen));
+        // One node alive, or every peer excluded: wake here (fallback).
+        assert_eq!(apart(true, &[], key), None);
+    }
+
+    #[test]
+    fn a_drain_avoids_the_companions_node_unless_it_is_the_only_one() {
+        let key = "default/pusher/lobby";
+        for avoid in ["a", "b", "c"] {
+            let chosen = peer_apart(&["a", "b", "c"], key, &[avoid]).unwrap();
+            assert_ne!(chosen, avoid);
+        }
+        assert_eq!(peer_apart(&["a", "b", "c"], key, &["a", "b"]), Some("c"));
+        // Without a companion's node, the plain rendezvous choice.
+        assert_eq!(
+            peer_apart(&["a", "b", "c"], key, &[]),
+            best(key, ["a", "b", "c"].into_iter())
+        );
+        // Every peer holds a companion: still taken, by the plain choice.
+        assert_eq!(peer_apart(&["a"], key, &["a"]), Some("a"));
+        assert_eq!(peer_apart(&[], key, &["a"]), None);
     }
 }

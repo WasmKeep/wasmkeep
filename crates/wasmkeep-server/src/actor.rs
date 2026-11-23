@@ -418,8 +418,11 @@ impl ServiceInner {
         }
     }
 
-    /// A draining node handed this node `address`'s alarm.
-    fn note_handed(&self, address: &ActorAddress) {
+    /// A node handed this node `address`'s alarm, due at `at`: remembered
+    /// until the window after it is due, so the delivery here acquires the
+    /// actor and never sends it on again (ADR 0041, amendment of
+    /// 2026-11-22).
+    fn note_handed(&self, address: &ActorAddress, at: u64) {
         let now = now_ms();
         let window = self
             .cluster
@@ -439,7 +442,7 @@ impl ServiceInner {
                 handed.remove(&oldest);
             }
         }
-        handed.insert(address.clone(), now.saturating_add(window));
+        handed.insert(address.clone(), now.max(at).saturating_add(window));
     }
 
     /// Whether a draining node handed this node `address`'s alarm lately.

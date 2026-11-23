@@ -19,6 +19,13 @@ pub(crate) const PLACED: &str = "x-wasmkeep-placed";
 /// The answer mark: the placed event did not run on the receiver.
 pub(crate) const PLACED_REFUSED: &str = "refused";
 
+/// Beside the refusal mark: why, when the receiver holds the actor's
+/// companion (`apart`, ADR 0041, amendment of 2026-11-22). Its sender does
+/// not back the receiver off for it: it says nothing of its load. A sender
+/// that does not know it backs off, as for any refusal. Set by the host
+/// only: removed from a guest's response.
+pub(crate) const PLACED_REASON: &str = "x-wasmkeep-placed-reason";
+
 /// The largest declared body a placed request may have (ADR 0041, section
 /// 1): it is read into memory before the hop, so a refusal can run it here.
 pub(crate) const MAX_PLACED_BODY: u64 = 64 * 1024;
@@ -66,6 +73,9 @@ pub(crate) enum Hop<T> {
     Answered(T),
     /// `503` with the refusal mark: it did not run there; run it here.
     Refused,
+    /// The same, because the receiver holds the actor's companion: run it
+    /// here, the receiver not backed off.
+    Apart,
     /// Never read by the node: run it here.
     Unsent,
     /// Ambiguous (it may have run): answered as a failed forward is.
@@ -77,7 +87,7 @@ impl<T> Hop<T> {
     pub(crate) fn outcome(&self) -> &'static str {
         match self {
             Self::Answered(_) => "placed",
-            Self::Refused => "refused",
+            Self::Refused | Self::Apart => "refused",
             Self::Unsent => "unsent",
             Self::Failed(_) => "failed",
         }
@@ -167,6 +177,29 @@ pub(crate) fn mark_refused(
 /// A refusal of a placed event: `503`, `Retry-After`, the mark.
 pub(crate) fn placed_refusal(text: &str) -> Response<HyperOutgoingBody> {
     mark_refused(unavailable(text))
+}
+
+/// A refusal's kind: [`Hop::Apart`] with the `apart` reason.
+fn refusal<T, B>(response: &Response<B>) -> Hop<T> {
+    if response
+        .headers()
+        .get(PLACED_REASON)
+        .is_some_and(|v| v.as_bytes() == b"apart")
+    {
+        Hop::Apart
+    } else {
+        Hop::Refused
+    }
+}
+
+/// `503` refusing a placed event because this node holds its companion.
+pub(crate) fn apart_refusal(text: &str) -> Response<HyperOutgoingBody> {
+    let mut response = placed_refusal(text);
+    response.headers_mut().insert(
+        PLACED_REASON,
+        hyper::header::HeaderValue::from_static("apart"),
+    );
+    response
 }
 
 /// Whether an answer is a placed event's refusal: `503` with the mark.
@@ -420,7 +453,7 @@ impl Cluster {
         let client = self.clients().call.clone();
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
             Ok(Ok(response)) => match self.trusted_response(&base, node, response) {
-                Some(r) if is_placed_refusal(&r) => Hop::Refused,
+                Some(r) if is_placed_refusal(&r) => refusal(&r),
                 Some(r) => Hop::Answered(r),
                 None => Hop::Failed(format!("node {node} is no longer trusted")),
             },
@@ -454,7 +487,7 @@ impl Cluster {
         req.headers_mut()
             .insert(PLACED, hyper::header::HeaderValue::from(fill));
         match self.call_once(node, target, chain, req).await {
-            Ok(r) if is_placed_refusal(&r) => Hop::Refused,
+            Ok(r) if is_placed_refusal(&r) => refusal(&r),
             Ok(r) => Hop::Answered(r),
             Err(CallFailure::HandshakeRefused) => Hop::Unsent,
             Err(CallFailure::Other(e)) => Hop::Failed(e),
