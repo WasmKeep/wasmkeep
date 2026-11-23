@@ -258,6 +258,8 @@ struct SpoolState {
     failure: Option<Fail>,
     /// Finished or abandoned: takes nothing more.
     closed: bool,
+    /// `finish` made the file a [`Spooled`]'s, which removes it.
+    handed: bool,
     /// The budget this spool's bytes are charged to; moved to the
     /// [`Spooled`] at `finish`, dropped with the file otherwise.
     held: Option<Held>,
@@ -276,7 +278,9 @@ impl SpoolState {
 
 impl Drop for SpoolState {
     fn drop(&mut self) {
-        if !self.closed || self.file.is_some() {
+        // Whatever `finish` did not hand to a `Spooled` goes, even when it
+        // was abandoned while a write held the file.
+        if !self.handed {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -365,6 +369,7 @@ impl Spool {
                 max,
                 failure: None,
                 closed: false,
+                handed: false,
                 held: Some(held),
             })),
         })
@@ -464,6 +469,7 @@ impl Spool {
                 return Err(BlobError::Unavailable("the spool file is gone".into()));
             };
             let pending = std::mem::take(&mut s.pending);
+            s.handed = true;
             let size = s.written + pending.len() as u64;
             (file, pending, s.path.clone(), size, s.held.take())
         };

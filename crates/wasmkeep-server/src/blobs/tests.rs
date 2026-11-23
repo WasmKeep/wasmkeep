@@ -975,23 +975,50 @@ fn upload_path(blobs: &Blobs, key: &str, size: u64) -> String {
         .to_owned()
 }
 
-/// A PUT of `size` bytes to `path`: all of them, or, `stall`, one and
-/// then nothing more, the body never ending.
-fn put(path: &str, size: u64, stall: bool) -> hyper::Request<Body> {
+fn frame(n: u64) -> Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible> {
+    Ok(hyper::body::Frame::data(bytes::Bytes::from(vec![
+        1u8;
+        n as usize
+    ])))
+}
+
+/// A PUT of all `size` bytes to `path`.
+fn put(path: &str, size: u64) -> hyper::Request<Body> {
     use futures_util::StreamExt as _;
-    let frame = |n: u64| {
-        Ok(hyper::body::Frame::data(bytes::Bytes::from(vec![
-            1u8;
-            n as usize
-        ])))
-    };
-    let stream = if stall {
-        futures_util::stream::iter([frame(1)])
-            .chain(futures_util::stream::pending())
-            .boxed()
-    } else {
-        futures_util::stream::iter([frame(size)]).boxed()
-    };
+    request(
+        path,
+        size,
+        futures_util::stream::iter([frame(size)]).boxed(),
+    )
+}
+
+/// A PUT of `size` bytes to `path` that sends one and then nothing more,
+/// and the signal of its body asked for a second: the first is spooled.
+fn put_stalled(
+    path: &str,
+    size: u64,
+) -> (hyper::Request<Body>, tokio::sync::oneshot::Receiver<()>) {
+    use futures_util::StreamExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let rest = futures_util::stream::poll_fn(move |_| {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(());
+        }
+        std::task::Poll::Pending
+    });
+    let stream = futures_util::stream::iter([frame(1)]).chain(rest).boxed();
+    (request(path, size, stream), rx)
+}
+
+fn request(
+    path: &str,
+    size: u64,
+    stream: futures_util::stream::BoxStream<
+        'static,
+        Result<hyper::body::Frame<bytes::Bytes>, std::convert::Infallible>,
+    >,
+) -> hyper::Request<Body> {
     hyper::Request::builder()
         .method("PUT")
         .uri(path)
@@ -1013,14 +1040,10 @@ async fn stalled(
     node: &streams::Budget,
 ) -> tokio::task::JoinHandle<hyper::StatusCode> {
     let before = node.used();
-    let (b, req) = (Arc::clone(blobs), put(path, size, true));
+    let (req, spooled) = put_stalled(path, size);
+    let b = Arc::clone(blobs);
     let task = tokio::spawn(async move { send(&b, req).await });
-    for _ in 0..100_000 {
-        if node.used() > before {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    spooled.await.unwrap();
     assert_eq!(
         node.used(),
         before + size,
@@ -1037,15 +1060,8 @@ async fn an_upload_link_sent_again_while_its_body_arrives_is_refused() {
     let spools = || std::fs::read_dir(&tmp_dir).map_or(0, |d| d.count());
     let path = upload_path(&blobs, "u/1", 1_000);
     let first = stalled(&blobs, &path, 1_000, &node).await;
-    for _ in 0..100_000 {
-        if spools() == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
     let replays =
-        futures_util::future::join_all((0..8).map(|_| send(&blobs, put(&path, 1_000, false))))
-            .await;
+        futures_util::future::join_all((0..8).map(|_| send(&blobs, put(&path, 1_000)))).await;
     assert!(
         replays.iter().all(|s| *s == hyper::StatusCode::CONFLICT),
         "{replays:?}"
@@ -1065,12 +1081,12 @@ async fn an_upload_link_sent_again_while_its_body_arrives_is_refused() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        send(&blobs, put(&path, 1_000, false)).await,
+        send(&blobs, put(&path, 1_000)).await,
         hyper::StatusCode::CREATED
     );
     assert_eq!(node.used(), 0, "released once committed");
     assert_eq!(
-        send(&blobs, put(&path, 1_000, false)).await,
+        send(&blobs, put(&path, 1_000)).await,
         hyper::StatusCode::PRECONDITION_FAILED
     );
 }
@@ -1084,12 +1100,12 @@ async fn the_spool_budgets_refuse_past_their_limit_and_recover() {
     let first = stalled(&one, &upload_path(&one, "a", 1_000), 1_000, &node).await;
     let other = upload_path(&two, "b", 1_000);
     assert_eq!(
-        send(&two, put(&other, 1_000, false)).await,
+        send(&two, put(&other, 1_000)).await,
         hyper::StatusCode::SERVICE_UNAVAILABLE,
         "past the node's budget, before any byte is read"
     );
     assert_eq!(
-        send(&two, put(&upload_path(&two, "c", 400), 400, false)).await,
+        send(&two, put(&upload_path(&two, "c", 400), 400)).await,
         hyper::StatusCode::CREATED,
         "what fits is taken"
     );
@@ -1097,7 +1113,7 @@ async fn the_spool_budgets_refuse_past_their_limit_and_recover() {
     let _ = first.await;
     assert_eq!(node.used(), 0);
     assert_eq!(
-        send(&two, put(&other, 1_000, false)).await,
+        send(&two, put(&other, 1_000)).await,
         hyper::StatusCode::CREATED
     );
 
@@ -1106,7 +1122,7 @@ async fn the_spool_budgets_refuse_past_their_limit_and_recover() {
     let (_c, app) = spooling(1_500, &node);
     let first = stalled(&app, &upload_path(&app, "a", 1_000), 1_000, &node).await;
     assert_eq!(
-        send(&app, put(&upload_path(&app, "b", 1_000), 1_000, false)).await,
+        send(&app, put(&upload_path(&app, "b", 1_000), 1_000)).await,
         hyper::StatusCode::SERVICE_UNAVAILABLE
     );
     first.abort();

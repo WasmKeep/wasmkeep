@@ -229,13 +229,24 @@ pub(crate) fn local_key(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options.open(&tmp).and_then(|mut f| {
-        use std::io::Write as _;
-        f.write_all(&k).and_then(|()| f.sync_all())
-    });
+    let write = |at: &std::path::Path| {
+        options.open(at).and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(&k).and_then(|()| f.sync_all())
+        })
+    };
     // A hard link, unlike a rename, never replaces a file already there.
-    let linked = written.and_then(|()| std::fs::hard_link(&tmp, &path));
+    let linked = write(&tmp).and_then(|()| std::fs::hard_link(&tmp, &path));
     let _ = std::fs::remove_file(&tmp);
+    // A file system without hard links: the key is written in place, and
+    // a start that reads it half-written refuses it (32 bytes, checked).
+    let linked = match linked {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+            tracing::debug!(error = %e, "no hard link for the node-link key: writing it in place");
+            write(&path)
+        }
+        other => other,
+    };
     match linked {
         Ok(()) => {
             if let Ok(dir) = std::fs::File::open(app_dir) {
