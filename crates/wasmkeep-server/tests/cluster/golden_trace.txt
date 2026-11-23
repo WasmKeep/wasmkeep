@@ -91,6 +91,7 @@ a GET history/wal/0000000000000043-0000000000000001-0000000000000001.ltx -> ok
 a LIST history/ -> -
 a PUT history/wal/0000000000000044-0000000000000002-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=68..68 pre=C67 post=C68 wal=0/0/0/0 node=0 pages=[7:a1aacfaae59e4e22])
 ## hibernation: another actor needs a's only slot
+a PUT history/snapshot/0000000000000044-0000000000000002.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=1..68 pre=- post=C68 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:volatile 3:volatile 4:a019bbbaacad6076 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:a1aacfaae59e4e22 8:db35c9fdf5ab1063 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
 a PUT owner [update] -> ok holder=- generation=2
 ## wake: the local file is the bucket's head
 a PUT owner [update] -> ok holder=a generation=3
@@ -100,10 +101,7 @@ a PUT history/wal/0000000000000045-0000000000000003-0000000000000002.ltx [create
 a PUT owner [update] -> ok holder=- generation=3
 b LIST history/ -> -
 b PUT owner [update] -> ok holder=b generation=4
-b GET history/snapshot/0000000000000041-0000000000000001.ltx -> ok
-b GET history/wal/0000000000000042-0000000000000001-0000000000000001.ltx -> ok
-b GET history/wal/0000000000000043-0000000000000001-0000000000000001.ltx -> ok
-b GET history/wal/0000000000000044-0000000000000002-0000000000000001.ltx -> ok
+b GET history/snapshot/0000000000000044-0000000000000002.ltx -> ok
 b GET history/wal/0000000000000045-0000000000000003-0000000000000002.ltx -> ok
 b LIST history/ -> -
 b PUT history/wal/0000000000000046-0000000000000004-0000000000000003.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=70..70 pre=C69 post=C70 wal=0/0/0/0 node=0 pages=[7:a2cacfaae59e4e22])
@@ -115,6 +113,7 @@ b DELETE alarms/T2/t.t/78/1-N2 -> -
 b LIST history/ -> -
 b DELETE history/snapshot/0000000000000001-0000000000000001.ltx -> -
 b DELETE history/snapshot/0000000000000041-0000000000000001.ltx -> -
+b DELETE history/snapshot/0000000000000044-0000000000000002.ltx -> -
 b DELETE history/wal/0000000000000002-0000000000000001-0000000000000001.ltx -> -
 b DELETE history/wal/0000000000000003-0000000000000001-0000000000000001.ltx -> -
 b DELETE history/wal/0000000000000004-0000000000000001-0000000000000001.ltx -> -

@@ -168,6 +168,11 @@ pub struct ClusterConfig {
     /// collection could delete it (ADR 0012): objects younger than this
     /// are kept for a later pass. Not applied after a delete.
     pub history_retention: Duration,
+    /// Whether idle actors' histories are compacted (ADR 0042): on by
+    /// default; `serve --no-idle-compaction` turns it off. As built, a
+    /// hibernation's snapshot at the head (section 2); the pass that
+    /// deletes comes later.
+    pub idle_compaction: bool,
     /// The least time between a periodic snapshot whose upload failed and
     /// the next try: 30 s, the longest bounded wait of a caller queued
     /// behind the actor. Tests shorten it.
@@ -265,6 +270,7 @@ impl ClusterConfig {
             cluster_plaintext: ClusterPlaintext::Accept,
             migrated: false,
             history_retention: Duration::from_secs(3600),
+            idle_compaction: true,
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             restore_budget: crate::replica::RESTORE_BUDGET,
             reads_secrets: true,
@@ -437,6 +443,8 @@ pub(crate) struct Cluster {
     pub(crate) socket_sweep: Duration,
     /// ADR 0012's retention window ([`ClusterConfig::history_retention`]).
     pub(crate) history_retention: Duration,
+    /// [`ClusterConfig::idle_compaction`].
+    pub(crate) idle_compaction: bool,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
     /// [`ClusterConfig::restore_budget`].
@@ -857,6 +865,7 @@ impl Cluster {
             alarm_sweep: config.alarm_sweep,
             socket_sweep: config.socket_sweep,
             history_retention: config.history_retention,
+            idle_compaction: config.idle_compaction,
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),

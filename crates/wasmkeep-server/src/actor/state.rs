@@ -253,8 +253,13 @@ impl ActorState {
 
     /// The mailbox's step before this state is dropped (ADR 0034, section
     /// 6): waits for the hold to reach its barrier, by the site's deadline.
-    /// A strict hold is there at once, so this is ready at once and the
-    /// drop goes on as before (`Drop for ActorState` releases or parks).
+    /// A strict hold is there at once, and the drop goes on as before
+    /// (`Drop for ActorState` releases or parks).
+    ///
+    /// For a hibernation or an eviction (never a stop), at the barrier, the
+    /// hold then takes its idle snapshot if one is wanted (ADR 0042,
+    /// section 2, [`Self::idle_snapshot`]) and waits for its one attempt.
+    /// A job arriving meanwhile cancels the step, not the upload.
     ///
     /// Past a clean stop's deadline the hold gives up (`GaveUp(stop)`),
     /// counted and released here; past a hibernation's, it stays resident.
@@ -264,7 +269,11 @@ impl ActorState {
         Box::pin(async move {
             let _timed = self.timing.work(super::timing::Work::Hibernate);
             self.stepped = false;
+            let idle = matches!(cause, DropCause::Idle | DropCause::Evicted);
             if self.batched_replica().is_none() {
+                if idle && let Some(settled) = self.idle_snapshot(false).await {
+                    settled.await;
+                }
                 return StepOutcome::Ready;
             }
             let (deadline, stopping) = match cause {
@@ -279,7 +288,17 @@ impl ActorState {
             };
             match self.flush_to_barrier(deadline).await {
                 Some(Barrier::Flushed) => {
+                    // Copied while batched capture still holds the head,
+                    // uploaded while the capture ends.
+                    let settled = if idle {
+                        self.idle_snapshot(true).await
+                    } else {
+                        None
+                    };
                     self.end_capture_at_barrier().await;
+                    if let Some(settled) = settled {
+                        settled.await;
+                    }
                     self.stepped = true;
                     StepOutcome::Ready
                 }
@@ -294,6 +313,83 @@ impl ActorState {
                 None => StepOutcome::Keep,
             }
         })
+    }
+
+    /// The idle snapshot of a hold that hibernates at its barrier (ADR 0042,
+    /// section 2): in a cluster with idle compaction on, a hold that may
+    /// still act and wrote the head, with no snapshot at the head and
+    /// enough written since the last one ([`Replica::start_idle_snapshot`]).
+    /// The database is copied here, in the step (`batched`: as of its
+    /// captured position, which at a `Flushed` barrier is the acknowledged
+    /// head); its encoding and upload run in a task of their own, recorded
+    /// as a flight. Returns a wait for that upload to end, which then takes
+    /// its outcome into the replica; `None` if none started. Nothing is
+    /// deleted after it.
+    ///
+    /// [`Replica::start_idle_snapshot`]: crate::replica::Replica::start_idle_snapshot
+    pub(super) async fn idle_snapshot(&mut self, batched: bool) -> Option<BoxFuture<'static, ()>> {
+        use crate::replica::IdleSkip;
+        if !self.cluster.as_ref()?.idle_compaction {
+            return None;
+        }
+        let hold = self.held.as_ref()?;
+        if !hold.is_valid() {
+            return None;
+        }
+        let slot = hold.replica()?.clone();
+        // Asked before the copy: most hibernations want none.
+        let bytes = match self.db_at().run(|db| db.captured_bytes()).await {
+            Ok(Some(Some(bytes))) => bytes,
+            _ => return None,
+        };
+        if let Err(skip) = slot.lock().await.idle_snapshot_wanted(bytes) {
+            tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?skip, "no idle snapshot");
+            return None;
+        }
+        let copied = self
+            .db_at()
+            .run(move |db| {
+                if batched {
+                    db.snapshot_at_captured()
+                } else {
+                    db.snapshot()
+                }
+            })
+            .await;
+        let all = match copied {
+            Ok(Some(Ok(all))) => all,
+            other => {
+                let error = match other {
+                    Ok(Some(Err(e))) => e.to_string(),
+                    Err(e) => e,
+                    _ => "no database".to_owned(),
+                };
+                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %error, "an idle snapshot could not be copied");
+                return None;
+            }
+        };
+        let mut replica = slot.lock().await;
+        let job = match replica.start_idle_snapshot(all).await {
+            Ok(job) => job,
+            Err(IdleSkip::Refused(reason)) => {
+                crate::metrics::idle_snapshot("refused");
+                drop(replica);
+                self.abandon(&format!("idle snapshot refused: {reason}"));
+                return None;
+            }
+            Err(skip) => {
+                tracing::debug!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?skip, "no idle snapshot");
+                return None;
+            }
+        };
+        let settled = replica.periodic_upload_settled();
+        drop(replica);
+        tokio::spawn(job.run());
+        let settled = settled?;
+        Some(Box::pin(async move {
+            settled.await;
+            slot.lock().await.settle_periodic();
+        }))
     }
 
     /// Whether the actor's database holds commits after its last boundary,

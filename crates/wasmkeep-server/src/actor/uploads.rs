@@ -109,7 +109,7 @@ pub(super) enum DbAt<'a> {
 }
 
 impl DbAt<'_> {
-    async fn run<T: Send + 'static>(
+    pub(super) async fn run<T: Send + 'static>(
         &mut self,
         f: impl FnOnce(&mut ActorDb) -> T + Send + 'static,
     ) -> Result<Option<T>, String> {
@@ -656,7 +656,7 @@ impl ActorState {
     }
 
     /// The actor's database, wherever it is now.
-    fn db_at(&mut self) -> DbAt<'_> {
+    pub(super) fn db_at(&mut self) -> DbAt<'_> {
         if let Some(live) = self.live.as_mut() {
             DbAt::Host(live.store.data_mut())
         } else if let Some(db) = self.db.as_mut() {

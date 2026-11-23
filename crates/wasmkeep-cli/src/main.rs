@@ -709,6 +709,11 @@ struct ServeArgs {
     #[arg(long, value_name = "SECS", default_value_t = 3600)]
     history_retention_secs: u64,
 
+    /// Never compact an idle actor's history (ADR 0042): no snapshot at
+    /// the head when an actor hibernates. On by default.
+    #[arg(long)]
+    no_idle_compaction: bool,
+
     /// Seconds a request for an actor whose node died or is stopping is
     /// kept until another node can take the actor over, instead of a 503
     /// at once: a GET or HEAD without a body, or a WebSocket upgrade,
@@ -1946,6 +1951,7 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             let mut cluster = ClusterConfig::new(node_id, advertise, store);
             cluster.prefix = prefix;
             cluster.history_retention = std::time::Duration::from_secs(args.history_retention_secs);
+            cluster.idle_compaction = !args.no_idle_compaction;
             cluster.failover_wait = args.failover_wait_secs.map(std::time::Duration::from_secs);
             // Three quarters of the connections stay for everything else.
             cluster.failover_wait_max = max_connections / 4;

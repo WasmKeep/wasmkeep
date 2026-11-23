@@ -9,6 +9,16 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+**A snapshot at the head when an actor hibernates.** In a cluster, an
+actor that leaves memory because it was idle or evicted first uploads a
+snapshot at its last write, if its node wrote that write and at least 8
+writes were made since the last snapshot (one is enough for a database
+of 256 KiB or less). Its next restore reads one object. It is one short
+attempt that never fails anything, counted in
+`wasmkeep_idle_snapshots_total{outcome}`, and nothing is deleted yet: it
+is the first step of compacting an idle actor's history (ADR 0042).
+`serve --no-idle-compaction` turns it off.
+
 **A room and its pusher wake on different nodes, by default.** In a
 version with classes named `room` and `pusher` (the broadcast SDKs'
 default names), a wake-up of `pusher/<name>`, which nobody holds, on the

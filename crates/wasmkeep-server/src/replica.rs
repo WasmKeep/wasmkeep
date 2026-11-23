@@ -61,6 +61,38 @@ fn history_bytes(
 /// Upload a snapshot after this many segments, so restores stay short.
 const SNAPSHOT_EVERY: u64 = 64;
 
+/// An actor that hibernates gets an idle snapshot at its head after this
+/// many segments since its last snapshot (ADR 0042, section 2), counted
+/// across holds as [`SNAPSHOT_EVERY`]'s are. A proposal, to measure: it
+/// bounds the extra PUTs of an actor that writes once per wake, and an
+/// actor at rest then holds at most 2 + 7 objects once compacted.
+pub(crate) const IDLE_SNAPSHOT_EVERY: u64 = 8;
+
+/// A database at most this large gets an idle snapshot after a single
+/// segment: one cheap PUT (ADR 0042, section 2).
+pub(crate) const IDLE_SNAPSHOT_SMALL_BYTES: u64 = 256 << 10;
+
+/// Why a hibernation took no idle snapshot (ADR 0042, section 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdleSkip {
+    /// This hold did not write the head: a snapshot keyed with an earlier
+    /// generation must come from that generation only.
+    NotWriter,
+    /// A segment is in flight: not at a `Flushed` barrier.
+    InFlight,
+    /// A snapshot is at the head already.
+    AtHead,
+    /// Too few segments since the last snapshot for the database's size.
+    BelowThreshold,
+    /// A periodic or idle snapshot of this actor is uploading.
+    Uploading,
+    /// Replication stopped, or the sidecar could not be finished.
+    Stopped(String),
+    /// Refused as `ship_snapshot` refuses a snapshot that does not hold
+    /// the head's database: a bug, and replication stops.
+    Refused(String),
+}
+
 /// A restore's reads are bounded, so one request the bucket leaves hanging
 /// cannot hold a takeover (one held a restore for 19.8 s in the
 /// real-bucket soak, under the client's 30 s per-request timeout). A read
@@ -694,9 +726,12 @@ pub(crate) struct PeriodicUpload {
     settled: watch::Receiver<Option<PeriodicOutcome>>,
 }
 
-/// A periodic snapshot's upload, run off the actor's mailbox
-/// ([`Replica::start_periodic_snapshot`]): it holds nothing of the replica.
+/// A periodic or idle snapshot's upload, run off the actor's mailbox
+/// ([`Replica::start_periodic_snapshot`], [`Replica::start_idle_snapshot`]):
+/// it holds nothing of the replica.
 pub(crate) struct PeriodicSnapshot {
+    /// [`SnapshotKind::Periodic`] or [`SnapshotKind::Idle`].
+    kind: SnapshotKind,
     target: UploadTarget,
     position: SegmentId,
     all: Changes,
@@ -725,6 +760,7 @@ impl PeriodicSnapshot {
     /// finds the previous snapshot and every segment after it.
     pub(crate) async fn run(self) -> PeriodicOutcome {
         let Self {
+            kind,
             target,
             position,
             all,
@@ -733,6 +769,11 @@ impl PeriodicSnapshot {
             cancelled,
             ..
         } = self;
+        let what = if kind == SnapshotKind::Idle {
+            "an idle snapshot"
+        } else {
+            "a periodic snapshot"
+        };
         let encoded = tokio::task::spawn_blocking(move || {
             all.to_ltx(1, position.txid.max(1), crate::alarm::now_ms_i64())
         })
@@ -748,22 +789,29 @@ impl PeriodicSnapshot {
                     Ok(()) => PeriodicOutcome::Created,
                     Err(ReplicaError::Exists) => PeriodicOutcome::Existed,
                     Err(e) => {
-                        tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot failed");
+                        tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "{what} failed");
                         PeriodicOutcome::Failed
                     }
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot could not be encoded");
+                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "{what} could not be encoded");
                 PeriodicOutcome::Failed
             }
             Err(e) => {
-                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "a periodic snapshot's encoding stopped");
+                tracing::warn!(prefix = %crate::logging::text(&target.prefix), ?position, error = %e, "{what}'s encoding stopped");
                 PeriodicOutcome::Failed
             }
         };
         if result == PeriodicOutcome::Failed {
             crate::metrics::inc(&crate::metrics::METRICS.snapshot_upload_failures);
+        }
+        if kind == SnapshotKind::Idle {
+            crate::metrics::idle_snapshot(match result {
+                PeriodicOutcome::Created => "created",
+                PeriodicOutcome::Existed => "existed",
+                PeriodicOutcome::Failed => "failed",
+            });
         }
         outcome.send_replace(Some(result));
         drop(record);
@@ -784,6 +832,11 @@ pub(crate) enum SnapshotKind {
     /// be erased: sent again as a segment is; a failure is not tried
     /// again, and leaves the periodic snapshot's schedule as it was.
     AfterDelete,
+    /// The one at hibernation, at the head this hold wrote (ADR 0042,
+    /// section 2): one short attempt off the mailbox, as a periodic one
+    /// of a batched hold; a failure is not tried again, and leaves the
+    /// periodic snapshot's schedule as it was.
+    Idle,
     /// A replacement at the head; retains history using the ordinary window.
     AfterRestore,
 }
@@ -1526,9 +1579,10 @@ impl Replica {
                 generation: self.generation,
                 txid: self.next_txid()?,
             },
-            SnapshotKind::Periodic | SnapshotKind::AfterDelete | SnapshotKind::AfterRestore => {
-                self.head
-            }
+            SnapshotKind::Periodic
+            | SnapshotKind::AfterDelete
+            | SnapshotKind::AfterRestore
+            | SnapshotKind::Idle => self.head,
         };
         if let Some(reason) = &self.failed {
             return Err(ReplicaError::Local(format!(
@@ -1543,7 +1597,10 @@ impl Replica {
             .map_err(|e| ReplicaError::Local(e.to_string()))?;
         let key = snapshot_key(position);
         if kind != SnapshotKind::First {
-            let sent = if matches!(kind, SnapshotKind::Periodic | SnapshotKind::AfterRestore) {
+            let sent = if matches!(
+                kind,
+                SnapshotKind::Periodic | SnapshotKind::AfterRestore | SnapshotKind::Idle
+            ) {
                 // Counted as failed until it is known to have succeeded,
                 // so an upload cancelled half-way waits like one that
                 // failed.
@@ -1637,6 +1694,7 @@ impl Replica {
             settled,
         });
         Ok(PeriodicSnapshot {
+            kind: SnapshotKind::Periodic,
             target: self.target(),
             position: self.head,
             all,
@@ -1649,6 +1707,86 @@ impl Replica {
             },
             cancelled,
         })
+    }
+
+    /// Starts the idle snapshot of a hold that hibernates (ADR 0042,
+    /// section 2) from `all`, the database at the acknowledged head with
+    /// nothing in flight: for a strict hold `ActorDb::snapshot`, for a
+    /// batched one at its `Flushed` barrier `ActorDb::snapshot_at_captured`.
+    /// Taken only if this hold wrote the head, no snapshot is at the head
+    /// yet, and it is worth it: [`IDLE_SNAPSHOT_EVERY`] segments since the
+    /// last snapshot, or one and a database of at most
+    /// [`IDLE_SNAPSHOT_SMALL_BYTES`].
+    ///
+    /// Recorded as a flight as a batched hold's periodic snapshot is
+    /// ([`Self::start_periodic_snapshot`]), in both modes: the step before
+    /// a drop that starts it is cancelled when a job arrives, and the
+    /// upload goes on, waited for by this node's resets, other snapshots
+    /// and barriers, and taken in at the next apply
+    /// ([`Self::settle_periodic`]). Unlike a periodic snapshot it leaves
+    /// the periodic schedule as it was: its failure is not a failed try.
+    pub(crate) async fn start_idle_snapshot(
+        &mut self,
+        all: Changes,
+    ) -> Result<PeriodicSnapshot, IdleSkip> {
+        if let Err(e) = self.finish_sidecar().await {
+            return Err(IdleSkip::Stopped(e.to_string()));
+        }
+        let bytes = u64::from(all.commit).saturating_mul(u64::from(all.page_size));
+        self.idle_snapshot_wanted(bytes)?;
+        if let Err(e) = self.refuse_unless_at_head(&all, SnapshotKind::Idle) {
+            return Err(IdleSkip::Refused(e.to_string()));
+        }
+        let (outcome, settled) = watch::channel(None);
+        let Some((id, cancelled)) = self.periodic_flights.start(&self.address, settled.clone())
+        else {
+            return Err(IdleSkip::Uploading);
+        };
+        self.batched.periodic = Some(PeriodicUpload {
+            segments: self.since_snapshot,
+            bytes: self.batched.bytes_since_snapshot,
+            settled,
+        });
+        Ok(PeriodicSnapshot {
+            kind: SnapshotKind::Idle,
+            target: self.target(),
+            position: self.head,
+            all,
+            collector: self.collector(),
+            outcome,
+            record: FlightRecord {
+                flights: Arc::clone(&self.periodic_flights),
+                address: self.address.clone(),
+                id,
+            },
+            cancelled,
+        })
+    }
+
+    /// Whether a hibernation should take an idle snapshot of a database of
+    /// `bytes` ([`Self::start_idle_snapshot`]'s conditions), asked before
+    /// the database is copied, and again by that call.
+    pub(crate) fn idle_snapshot_wanted(&mut self, bytes: u64) -> Result<(), IdleSkip> {
+        if let Some(reason) = &self.failed {
+            return Err(IdleSkip::Stopped(reason.clone()));
+        }
+        if self.head == EMPTY || self.head.generation != self.generation {
+            return Err(IdleSkip::NotWriter);
+        }
+        self.settle_abandoned();
+        if self.in_flight.is_some() {
+            return Err(IdleSkip::InFlight);
+        }
+        if self.since_snapshot == 0 {
+            return Err(IdleSkip::AtHead);
+        }
+        if self.since_snapshot < IDLE_SNAPSHOT_EVERY && bytes > IDLE_SNAPSHOT_SMALL_BYTES {
+            return Err(IdleSkip::BelowThreshold);
+        }
+        if self.batched.periodic.is_some() || self.periodic_flights.uploading(&self.address) {
+            return Err(IdleSkip::Uploading);
+        }
+        Ok(())
     }
 
     /// A periodic snapshot's copy failed before anything was labelled: the
@@ -4404,5 +4542,190 @@ mod tests {
         );
         assert_eq!(RESTORE_SLOT_SHARES.used("a/a"), 0);
         assert_eq!(RESTORE_BYTE_SHARES.used("b/b"), 0);
+    }
+
+    fn idle_snapshots_counted(outcome: &str) -> u64 {
+        crate::metrics::METRICS
+            .idle_snapshots
+            .get(&[("outcome", outcome)])
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The database at `r`'s head, `pages` pages of 512 bytes.
+    fn at_head_of(r: &Replica, pages: u32) -> Changes {
+        Changes {
+            commit: pages,
+            ..at_head(r)
+        }
+    }
+
+    /// ADR 0042, section 2: an idle snapshot only from the hold that wrote
+    /// the head, with nothing in flight, none at the head yet, and enough
+    /// written since the last one. Each refusal uploads nothing, counts
+    /// nothing, leaves the schedule as it was and stops nothing.
+    #[tokio::test]
+    async fn an_idle_snapshot_needs_the_heads_writer_with_nothing_in_flight() {
+        let skipped = async |r: &mut Replica, all: Changes| {
+            let was = untouched(r);
+            let started = r.start_idle_snapshot(all).await;
+            let skip = started.err().expect("no idle snapshot");
+            assert!(r.failed().is_none(), "{skip:?}: replication goes on");
+            assert_eq!(untouched(r), was, "{skip:?}");
+            assert!(r.batched.periodic.is_none(), "{skip:?}");
+            assert!(!r.periodic_flights.uploading(&r.address), "{skip:?}");
+            nothing_uploaded(r).await;
+            skip
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.since_snapshot = IDLE_SNAPSHOT_EVERY;
+        // A segment in flight: not at a flushed barrier.
+        r.in_flight = Some(SegmentId {
+            generation: 1,
+            txid: 2,
+        });
+        let all = at_head(&r);
+        assert_eq!(skipped(&mut r, all).await, IdleSkip::InFlight);
+        r.in_flight = None;
+        // A hold that restored and wrote nothing: the head is the previous
+        // generation's (ADR 0012, condition 2).
+        r.generation = 2;
+        let all = at_head(&r);
+        assert_eq!(skipped(&mut r, all).await, IdleSkip::NotWriter);
+        r.generation = 1;
+        // A snapshot at the head already.
+        r.since_snapshot = 0;
+        let all = at_head(&r);
+        assert_eq!(skipped(&mut r, all).await, IdleSkip::AtHead);
+        // Too few segments for a database above 256 KiB; enough for one
+        // at most that size.
+        r.since_snapshot = IDLE_SNAPSHOT_EVERY - 1;
+        let large = at_head_of(&r, 513);
+        assert_eq!(skipped(&mut r, large).await, IdleSkip::BelowThreshold);
+        r.since_snapshot = 1;
+        assert!(r.idle_snapshot_wanted(512 * 512).is_ok());
+        r.since_snapshot = IDLE_SNAPSHOT_EVERY;
+        assert!(r.idle_snapshot_wanted(1 << 30).is_ok());
+        // A database that is not the head's: refused, and replication
+        // stops, as for any snapshot labelled at the head.
+        let mut wrong = at_head(&r);
+        wrong.post_apply = DbChecksum::from_value(99);
+        let refused = r.start_idle_snapshot(wrong).await;
+        assert!(
+            matches!(&refused, Err(IdleSkip::Refused(_))),
+            "{:?}",
+            refused.err()
+        );
+        assert!(r.failed().is_some());
+        nothing_uploaded(&r).await;
+    }
+
+    /// An idle snapshot leaves the periodic schedule as it was: starting it
+    /// counts no failed try, and one that fails changes nothing; one that
+    /// lands is a snapshot at the head, and the count starts again from it.
+    #[tokio::test]
+    async fn an_idle_snapshot_leaves_the_periodic_schedule_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 0, 0).await;
+        r.since_snapshot = 40;
+        r.snapshot_failures = 1;
+        r.snapshot_retry_at = 41;
+        let was = untouched(&r);
+        store
+            .fail_next
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let failed = idle_snapshots_counted("failed");
+        let job = r.start_idle_snapshot(at_head(&r)).await.unwrap();
+        assert_eq!(job.position(), r.head());
+        assert_eq!(untouched(&r), was, "starting is no failed try");
+        assert_eq!(job.run().await, PeriodicOutcome::Failed);
+        assert_eq!(
+            store.fail_next.load(std::sync::atomic::Ordering::SeqCst),
+            u32::MAX - 1,
+            "one attempt"
+        );
+        r.settle_periodic();
+        assert_eq!(untouched(&r), was, "a failure is no failed try either");
+        assert!(r.failed().is_none(), "replication goes on");
+        assert!(idle_snapshots_counted("failed") > failed);
+        // Landed: the count starts again, the wait is over.
+        store
+            .fail_next
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let created = idle_snapshots_counted("created");
+        let job = r.start_idle_snapshot(at_head(&r)).await.unwrap();
+        assert_eq!(job.run().await, PeriodicOutcome::Created);
+        r.settle_periodic();
+        assert_eq!(
+            (r.since_snapshot, r.snapshot_failures, r.snapshot_retry_at),
+            (0, 0, 0)
+        );
+        assert!(idle_snapshots_counted("created") > created);
+        let keys = list_with(&r.store, &r.prefix, None).await.unwrap();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+    }
+
+    /// A snapshot already at the head is not uploaded again: once one
+    /// landed the count says so, and one already in the bucket (an earlier
+    /// upload given up that landed) is found there, not written over.
+    #[tokio::test]
+    async fn an_idle_snapshot_already_at_the_head_is_not_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = replica(dir.path()).await;
+        r.since_snapshot = 3;
+        let job = r.start_idle_snapshot(at_head(&r)).await.unwrap();
+        assert_eq!(job.run().await, PeriodicOutcome::Created);
+        r.settle_periodic();
+        assert_eq!(
+            r.start_idle_snapshot(at_head(&r)).await.err(),
+            Some(IdleSkip::AtHead)
+        );
+        // The count says otherwise (it landed after its hold gave it up):
+        // the conditional create finds it, and it counts as there.
+        r.since_snapshot = 3;
+        let existed = idle_snapshots_counted("existed");
+        let job = r.start_idle_snapshot(at_head(&r)).await.unwrap();
+        assert_eq!(job.run().await, PeriodicOutcome::Existed);
+        assert!(idle_snapshots_counted("existed") > existed);
+        r.settle_periodic();
+        assert_eq!(r.since_snapshot, 0);
+        let keys = list_with(&r.store, &r.prefix, None).await.unwrap();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+    }
+
+    /// The step before a drop that starts an idle snapshot is cancelled
+    /// when a job arrives, and the upload goes on, recorded as a flight:
+    /// a reset that follows (a delete, which an erasure follows) waits for
+    /// it, so the snapshot of the data cannot land after the reset. Here
+    /// the upload hangs; the reset starts only once its one attempt ends.
+    #[tokio::test]
+    async fn a_cancelled_idle_step_leaves_a_flight_a_following_reset_waits_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, store) = faulty(dir.path(), 1, 0).await;
+        r.since_snapshot = 2;
+        let job = r.start_idle_snapshot(at_head(&r)).await.unwrap();
+        let settled = r.periodic_upload_settled().expect("a flight");
+        // The step is dropped (a job arrived); the upload's own task goes on.
+        let upload = tokio::spawn(job.run());
+        drop(settled);
+        assert!(r.periodic_flights.uploading(&r.address));
+        let started = std::time::Instant::now();
+        r.ship_reset(changes(r.checksum)).await.unwrap();
+        let waited = started.elapsed();
+        assert_eq!(upload.await.unwrap(), PeriodicOutcome::Failed);
+        // Its one attempt: twice the 200 ms this replica allows an idle
+        // bucket.
+        assert!(
+            waited >= std::time::Duration::from_millis(390),
+            "{waited:?}"
+        );
+        assert_eq!(store.hang_next.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!r.periodic_flights.uploading(&r.address));
+        assert!(r.batched.periodic.is_none(), "taken in by the reset");
+        let keys = list_with(&r.store, &r.prefix, None).await.unwrap();
+        assert!(
+            keys.iter().all(|k| !k.contains("snapshot/")),
+            "the hung snapshot never landed: {keys:?}"
+        );
     }
 }

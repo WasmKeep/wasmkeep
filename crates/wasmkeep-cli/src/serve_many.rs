@@ -368,6 +368,7 @@ async fn start_runtime(
     let mut cluster = ClusterConfig::new(&node_id, &advertise, Arc::clone(&shared.store));
     cluster.prefix = shared.prefix.clone();
     cluster.history_retention = std::time::Duration::from_secs(args.history_retention_secs);
+    cluster.idle_compaction = !args.no_idle_compaction;
     cluster.failover_wait = args.failover_wait_secs.map(std::time::Duration::from_secs);
     cluster.failover_wait_max = shared.max_connections / 4;
     cluster.follows_app = true;

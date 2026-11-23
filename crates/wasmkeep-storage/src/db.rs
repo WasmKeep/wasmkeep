@@ -1040,6 +1040,14 @@ impl ActorDb {
         self.capture.as_ref().map(WalCapture::checksum)
     }
 
+    /// The database's size in bytes as of the last capture, if capturing:
+    /// what a snapshot of it would hold, read without copying it.
+    pub fn captured_bytes(&self) -> Option<u64> {
+        self.capture
+            .as_ref()
+            .map(|c| u64::from(c.pages()).saturating_mul(u64::from(c.page_size())))
+    }
+
     /// What was committed since the last capture (strict mode), across a
     /// WAL restart that `wal_restart_ok` allows.
     fn capture_pending(&mut self) -> Result<Option<Changes>, CaptureError> {
