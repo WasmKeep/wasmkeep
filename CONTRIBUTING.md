@@ -74,6 +74,11 @@ Actions) is split so that a pull request waits a minute or two, not ten:
   pastes them) and checks the output the page promises. Run it when you
   change a tutorial or the commands it uses; it skips a tutorial whose
   tools (moto, for the cluster one) are missing, and says so.
+- **By hand, on a release candidate only**: `./scripts/mixed-version.sh`,
+  three nodes moved one at a time from the previous release to the
+  candidate and one moved back
+  ([the mixed-version check](docs/releasing.md#the-mixed-version-check)).
+  It is not part of CI or of `check.sh`.
 - **A release** needs a passing run on its commit.
 
 ## Code rules

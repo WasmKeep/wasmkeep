@@ -31,7 +31,8 @@ registry.
    Merge it, then start the full suite on that commit of `main` by hand
    (`gh workflow run ci.yml --ref main`: tests on Linux x86_64, arm64 and
    macOS, the S3 suites, every language) and wait for it to pass. A push
-   runs the fast jobs only.
+   runs the fast jobs only. On a workstation, run the
+   [mixed-version check](#the-mixed-version-check) on that commit too.
 2. **Tag.** Two signed tags on that commit: `v<version>`, and
    `sdks/go/v<version>` for the Go module. `release.yml` waits for a full CI
    run on the commit (by hand or nightly), builds and signs everything,
@@ -54,6 +55,34 @@ registry.
    `go get github.com/wasmkeep/wasmkeep/sdks/go@v<version>` each give the
    new version, and each registry's page names this repository as the
    source.
+
+## The mixed-version check
+
+A release-candidate step, run by hand on a workstation, never in CI:
+
+```bash
+./scripts/mixed-version.sh
+```
+
+It starts three nodes of the previous release (downloaded with `gh` and
+checked against its `SHA256SUMS` and a SHA-256 pinned in the script) on a
+local moto bucket, deploys a test app with a room and its pusher, moves one
+node at a time to the binary built from the checkout (drain, stop, swap,
+start, undrain), then moves one back. After each step it checks durable
+writes, `actors.call` between every pair of nodes, alarms, secrets, env
+files and WebSocket room delivery. It writes
+`target/mixed-version/report.txt` and exits with 1 if an upgrade check
+failed; what the move back finds is reported only. The same run as an
+ignored test: `WASMKEEP_MIXED_VERSION=1 cargo nextest run -p wasmkeep-cli
+--test mixed_version --run-ignored only --no-capture`.
+
+It tests what a cluster of mixed versions does; it does not make a rolling
+upgrade supported. The rule stays the one in
+[Upgrading WasmKeep](cluster.md#upgrading-wasmkeep): stop every node,
+upgrade them all, start them all, unless the release's upgrading page says
+otherwise. Read what the report notes before writing such a statement. For
+the next release, update the previous version and its SHA-256 at the top of
+the script.
 
 ## If a run stops half-way
 
