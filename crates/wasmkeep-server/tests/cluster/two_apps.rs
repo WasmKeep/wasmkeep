@@ -1451,3 +1451,57 @@ async fn one_app_over_its_file_limit_does_not_refuse_the_other() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Node calls refused so far, in this test process, because their
+/// signature did not hold (`wasmkeep_signatures_bad_total`).
+fn bad_signatures() -> u64 {
+    let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+    page.lines()
+        .find_map(|l| l.strip_prefix("wasmkeep_signatures_bad_total "))
+        .map_or(0, |v| v.trim().parse().unwrap())
+}
+
+/// A node says hello to the peers of its own app only. Two processes each
+/// serving two apps, then one restarted: its runtimes say hello again, and
+/// no peer refuses a call for its signature. A hello to a node of the other
+/// app reached that node's process, which routes a hop by the app it names
+/// (the sender's), to a runtime whose node id the hello was not signed
+/// for: "bad, expired or misaddressed signature" on the peers after every
+/// restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_says_hello_to_its_own_apps_peers_only() {
+    if !over_tls() {
+        return;
+    }
+    const OTHER: [Def; 2] = [
+        def("shop-2", "acme", "shop", &["shop.test"]),
+        def("blog-2", "acme", "blog", &["blog.test"]),
+    ];
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let p1 = process(&store, d1.path(), &SHOP_BLOG).await;
+    let p2 = process(&store, d2.path(), &OTHER).await;
+    for p in [&p1, &p2] {
+        for host in ["shop.test", "blog.test"] {
+            let r = to_reachable(p.public, host, "POST", "/actor/counter/alice").await;
+            assert_eq!(r.status, 200, "{host}: {}", r.body);
+        }
+    }
+    let before = bad_signatures();
+    drop(p2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let p2 = process(&store, d2.path(), &OTHER).await;
+    for host in ["shop.test", "blog.test"] {
+        let r = to_reachable(p2.public, host, "GET", "/actor/counter/alice").await;
+        assert_eq!(r.status, 200, "{host}: {}", r.body);
+    }
+    // The hellos go out once a round found the peers, and again for two
+    // periods while one is not taken.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(
+        bad_signatures(),
+        before,
+        "a peer refused a call from the restarted process for its signature"
+    );
+    drop(p1);
+}

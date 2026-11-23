@@ -246,6 +246,16 @@ release, unreleased).
   and capture carries on across the log's restart.
 - **A runtime restarted in place no longer stops itself** as a twin of its own
   predecessor.
+- **A node restarted as a new process no longer stops itself** when its view,
+  after its first write, shows the node lease that write replaced (its
+  stopped predecessor's): kept by a sibling app's listing in a process serving
+  several apps, or read from a bucket replica behind. That copy, or an earlier
+  body of the same instance, is not a twin; any other instance, or a later body
+  of that one, still stops the node.
+- **A restart no longer leaves "bad, expired or misaddressed signature"
+  warnings on its peers** when processes serve several apps: a node says hello
+  to the peers of its own app only. Such refusals are now counted,
+  `wasmkeep_signatures_bad_total`.
 - CI: CodeQL also runs on push to `main`, and a speed-sensitive StarlingMonkey
   test moves to the full suite.
 

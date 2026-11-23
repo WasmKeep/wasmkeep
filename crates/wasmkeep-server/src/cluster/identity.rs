@@ -168,6 +168,27 @@ impl Cluster {
         {
             return;
         }
+        // A new process (another instance) whose first write replaced its
+        // stopped predecessor's node lease: a read that answers with that
+        // body again after the write (a replica behind the acknowledged
+        // write, or a read that lands late), or with an earlier one of the
+        // same writer, shows the past, not a twin. That writer can put
+        // nothing more under this id: every write of a node lease is
+        // conditional on its own last version, which this process's first
+        // write replaced, and a body of it written since would be dated
+        // later on its own clock. Any other instance, or a later body of
+        // that one, is judged below as before.
+        if listed.lease.is_some()
+            && let Some(instance) = listed.instance.as_deref()
+            && self
+                .replaced
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|(was, at)| was == instance && listed.written_at_ms <= *at)
+        {
+            return;
+        }
         // The same verdict the next lease write's re-read would give.
         let stopped = match listed.lease {
             None => Stopped::OldVersion,
@@ -308,7 +329,9 @@ impl Cluster {
 
     /// Whether another process runs with this node id, checked before this
     /// one writes its first node lease; with the version of the object to
-    /// condition that write on (`None`: there is none, create it).
+    /// condition that write on (`None`: there is none, create it) and, if
+    /// that object is a node lease naming an instance, its instance and
+    /// `written_at` (the predecessor that write replaces).
     ///
     /// The object is read (a versioned GET) every half period for at least
     /// a lease's ttl plus grace from the first read in every case, even
@@ -324,7 +347,9 @@ impl Cluster {
     /// own. Unchanged through a successful read at the end: the predecessor
     /// stopped, and this one goes on. Failed reads are retried and never
     /// count as unchanged; nothing is claimed meanwhile.
-    pub(super) async fn check_identity(&self) -> (Identity, Option<Version>) {
+    pub(super) async fn check_identity(
+        &self,
+    ) -> (Identity, Option<Version>, Option<(String, u64)>) {
         let period = self.heartbeat_every;
         let key = self.node_key();
         let read = async || loop {
@@ -445,12 +470,20 @@ impl Cluster {
                             self.node_id
                         )),
                         None,
+                        None,
                     );
                 }
             }
             last = now;
             if tokio::time::Instant::now() >= deadline {
-                return (Identity::Unique, last.map(|(_, version)| version));
+                // Format 3 only: a process of an older version writes
+                // without conditions, so a copy of its body proves nothing.
+                let replaced = last
+                    .as_ref()
+                    .and_then(|(body, _)| decode(body))
+                    .filter(|i| i.lease.is_some())
+                    .and_then(|i| Some((i.instance?, i.written_at_ms)));
+                return (Identity::Unique, last.map(|(_, version)| version), replaced);
             }
         }
     }
