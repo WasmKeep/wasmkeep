@@ -936,8 +936,10 @@ pub(crate) const FORWARD_KINDS: [&str; 3] = ["request", "websocket", "call"];
 /// `outcome` of `wasmkeep_idle_snapshots_total` (ADR 0042, section 2):
 /// created and acknowledged, already there, not acknowledged (given up,
 /// refused by the bucket, landed after the hold ended), refused before
-/// any upload (not at the head's database: replication stops).
-pub(crate) const IDLE_SNAPSHOT_OUTCOMES: [&str; 4] = ["created", "existed", "failed", "refused"];
+/// any upload (not at the head's database: replication stops), not
+/// taken because the node's idle snapshots were all under way.
+pub(crate) const IDLE_SNAPSHOT_OUTCOMES: [&str; 5] =
+    ["created", "existed", "failed", "refused", "busy"];
 
 /// One idle snapshot ended with `outcome` ([`IDLE_SNAPSHOT_OUTCOMES`]).
 pub(crate) fn idle_snapshot(outcome: &str) {

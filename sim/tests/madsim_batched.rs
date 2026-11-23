@@ -200,3 +200,16 @@ fn a_reset_that_does_not_wait_for_a_snapshot_upload_is_caught() {
 fn a_staged_reset_that_does_not_wait_for_a_snapshot_upload_is_caught() {
     batched::snapshots_caught(Switch::ResetSkipsSnapshot, Violation::ErasedLeft);
 }
+
+/// ADR 0042, section 2: a hibernation's idle snapshot is taken at its
+/// barrier, never with a segment in flight; every restore reads a whole
+/// snapshot at its label. One labelled at the acknowledged head with a
+/// segment in flight, the database as it is, is caught.
+#[test]
+fn idle_snapshots_at_hibernation_keep_every_restore_whole() {
+    batched::idle_snapshots_safe();
+}
+#[test]
+fn an_idle_snapshot_labelled_with_a_segment_in_flight_is_caught() {
+    batched::snapshots_caught(Switch::IdleSnapshotInFlight, Violation::NotOwnerPrefix);
+}

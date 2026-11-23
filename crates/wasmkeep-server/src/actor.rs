@@ -1199,3 +1199,5 @@ mod tests;
 mod admission_tests;
 #[cfg(test)]
 mod batched_state_tests;
+#[cfg(test)]
+mod idle_state_tests;

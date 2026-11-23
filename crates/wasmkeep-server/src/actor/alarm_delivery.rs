@@ -345,7 +345,7 @@ impl ActorState {
 
     /// The lease generation of this actor's hold, `None` without one (a
     /// single node).
-    fn hold_generation(&self) -> Option<u64> {
+    pub(super) fn hold_generation(&self) -> Option<u64> {
         self.held.as_ref().and_then(|h| h.lease().generation())
     }
 

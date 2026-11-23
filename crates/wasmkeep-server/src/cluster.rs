@@ -445,6 +445,10 @@ pub(crate) struct Cluster {
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::idle_compaction`].
     pub(crate) idle_compaction: bool,
+    /// Idle snapshots this node takes at once (ADR 0042, section 2): a
+    /// hibernation finding none free takes none
+    /// ([`crate::replica::IDLE_SNAPSHOTS_AT_ONCE`]).
+    pub(crate) idle_snapshot_slots: Arc<tokio::sync::Semaphore>,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
     /// [`ClusterConfig::restore_budget`].
@@ -866,6 +870,9 @@ impl Cluster {
             socket_sweep: config.socket_sweep,
             history_retention: config.history_retention,
             idle_compaction: config.idle_compaction,
+            idle_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::replica::IDLE_SNAPSHOTS_AT_ONCE,
+            )),
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),

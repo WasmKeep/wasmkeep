@@ -522,7 +522,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 | `--cluster-plaintext` | `refuse` (default) or `accept`: whether plain HTTP between nodes is still used (see below). With `refuse`, a node needs `--cluster-listen` |
 | `--failover-wait-secs` | How long a `GET` or `HEAD` without a body, or a WebSocket upgrade, for an actor whose node died or is stopping is kept until another node took the actor over, instead of a 503 at once; default 25 (from the lease timing), 0 turns it off (see "When a node dies: what a caller sees") |
 | `--history-retention-secs` | How long old actor history stays in the bucket before garbage collection may delete it; default 3600, 0 allowed (see "History in the bucket") |
-| `--no-idle-compaction` | Never take a snapshot at the head when an actor hibernates ([ADR 0042](adr/0042-compacting-an-idle-actors-history.md), see "History in the bucket"); on by default |
+| `--no-idle-compaction` | Never take a snapshot at the head when an actor hibernates ([ADR 0042](adr/0042-compacting-an-idle-actors-history.md), see "History in the bucket"); on by default; `[process] idle-compaction = false` in a node file says the same |
 | `--secrets-key FILE` | With `--app`: the key the app's secrets are sealed with (`wasmkeep secrets new-key`); given twice during a key change (see "Secrets in the bucket") |
 | `--no-placement` | Never send a wake-up of an actor nobody holds to a lighter node, nor receive one ([ADR 0041](adr/0041-placement-at-wake-up.md)): the node keeps every actor it wakes and does not announce `place`. Placement is on by default; `[process] placement = false` in a node file says the same |
 | `--no-alarms` | Never fire an actor's alarms on this node and sweep none from the bucket's index; requests are still served and the alarms stay pending for a node without the flag. For a node on a restored copy (see [backup and restore](deploy/backup-and-restore.md)). The node logs once at start that alarms are off |
@@ -1754,8 +1754,11 @@ idle is designed in
 [ADR 0042](adr/0042-compacting-an-idle-actors-history.md) (proposed). Its
 first step is built: when an actor hibernates or is evicted, the node
 that wrote its last write first uploads a snapshot there (after 8 writes
-since the last snapshot, or one for a database of 256 KiB or less), so
-the next restore reads one object; nothing is deleted after it yet, and
+since the last snapshot, or one for a database of 256 KiB or less, never
+above 64 MiB), so the next restore reads one object, and collects below
+it as after a periodic snapshot, honouring the retention window. An
+actor that writes a little at each wake therefore keeps its last
+snapshot, the write under it and what the window keeps.
 `--no-idle-compaction` turns it off. Late uploads of earlier owners that land
 after a pass stay until the next pass. Old deploy versions are removed
 by `wasmkeep deploy` (see [Deploying](#deploying)).

@@ -16,7 +16,7 @@ use wasmkeep_storage::{Storage, StorageConfig};
 use super::*;
 use crate::cluster::ClusterConfig;
 
-async fn node(store: &Arc<dyn ObjectStore>) -> Arc<Cluster> {
+pub(super) async fn node(store: &Arc<dyn ObjectStore>) -> Arc<Cluster> {
     let mut config = ClusterConfig::new("a", "http://a-drop", Arc::clone(store));
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
@@ -32,7 +32,7 @@ async fn node(store: &Arc<dyn ObjectStore>) -> Arc<Cluster> {
 
 /// A state for `address`, with nothing loaded: a class whose component
 /// exports nothing (no event runs here) and this node's cluster.
-fn state(
+pub(super) fn state(
     address: ActorAddress,
     residency: wasmkeep_runtime::Residency,
     storage: Storage,
@@ -94,12 +94,13 @@ fn state(
         residency,
         collecting: Arc::default(),
         stepped: false,
+        event_hold: None,
     }
 }
 
 /// Restores `s` under a batched hold of this node: its first snapshot
 /// uploaded, its database capturing in batched mode, nothing loaded.
-async fn restored(s: &mut ActorState) {
+pub(super) async fn restored(s: &mut ActorState) {
     let cluster = s.cluster.clone().unwrap();
     let hold = LeaseHold::acquire(&cluster, &s.address).await.unwrap();
     let (view, generation) = (hold.view(), hold.generation().unwrap());

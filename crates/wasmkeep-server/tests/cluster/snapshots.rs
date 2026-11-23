@@ -42,6 +42,17 @@ async fn pair_waiting(idle: Duration, retry_min: Duration) -> Pair {
 
 /// [`pair_waiting`], with idle compaction (ADR 0042) on or off.
 async fn pair_compacting(idle: Duration, retry_min: Duration, idle_compaction: bool) -> Pair {
+    pair_collecting(idle, retry_min, idle_compaction, None).await
+}
+
+/// [`pair_compacting`], with a history retention window of `retention`
+/// (ADR 0012; the node's default if `None`).
+async fn pair_collecting(
+    idle: Duration,
+    retry_min: Duration,
+    idle_compaction: bool,
+    retention: Option<Duration>,
+) -> Pair {
     let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let flaky = Arc::new(Flaky::new(
         Arc::clone(&shared),
@@ -54,6 +65,9 @@ async fn pair_compacting(idle: Duration, retry_min: Duration, idle_compaction: b
         let cluster = config.cluster.as_mut().unwrap();
         cluster.snapshot_retry_min = retry_min;
         cluster.idle_compaction = idle_compaction;
+        if let Some(retention) = retention {
+            cluster.history_retention = retention;
+        }
     };
     let a = node_configured(
         "a",
@@ -473,4 +487,39 @@ async fn a_hibernation_after_a_burst_leaves_a_snapshot_at_the_head() {
         let r = send(p.b.addr, "GET", "/actor/t/x/durable", "").await;
         assert_eq!((r.status, r.body.trim()), (200, "10"), "{}", r.body);
     }
+}
+
+/// ADR 0042: an idle snapshot restarts the count a periodic snapshot (and
+/// its collection) waits for, so the hold that took it collects below it
+/// before its release. An actor that writes once at each wake and then
+/// hibernates, 70 times (more than a periodic snapshot's 64 segments),
+/// keeps a bounded prefix, beyond what the retention window holds (none
+/// here): without that collection it kept a snapshot and a segment per
+/// wake, and nothing was ever collected.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_actor_that_writes_once_per_wake_keeps_a_bounded_history() {
+    let p = pair_collecting(
+        Duration::from_millis(200),
+        Duration::from_secs(30),
+        true,
+        Some(Duration::ZERO),
+    )
+    .await;
+    let mut most = 0;
+    for n in 1..=70 {
+        write(&p, "w", n).await;
+        hibernated(&p).await;
+        let (snapshots, segments) = history_of(&p.flaky.inner, "w").await;
+        most = most.max(snapshots.len() + segments.len());
+    }
+    let (snapshots, segments) = history_of(&p.flaky.inner, "w").await;
+    let head = *segments.iter().max().unwrap();
+    assert_eq!(
+        (snapshots, segments),
+        (vec![head], vec![head]),
+        "not the snapshot at the head and the segment under it"
+    );
+    assert!(most <= 4, "the prefix grew to {most} objects");
+    let r = send(p.b.addr, "GET", "/actor/t/w/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "70"), "{}", r.body);
 }

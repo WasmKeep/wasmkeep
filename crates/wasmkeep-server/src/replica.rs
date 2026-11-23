@@ -72,6 +72,17 @@ pub(crate) const IDLE_SNAPSHOT_EVERY: u64 = 8;
 /// segment: one cheap PUT (ADR 0042, section 2).
 pub(crate) const IDLE_SNAPSHOT_SMALL_BYTES: u64 = 256 << 10;
 
+/// Idle snapshots a node copies and uploads at once: a hibernation that
+/// finds them all taken takes none (counted `busy`), so a burst of
+/// evictions is not held behind a queue of uploads.
+pub(crate) const IDLE_SNAPSHOTS_AT_ONCE: usize = 8;
+
+/// No idle snapshot of a database larger than this, whatever was written:
+/// a hibernation does not copy and upload a large database (it holds an
+/// eviction for its upload's one attempt). Such an actor keeps its
+/// periodic snapshots and their collection.
+pub(crate) const IDLE_SNAPSHOT_MAX_BYTES: u64 = 64 << 20;
+
 /// Why a hibernation took no idle snapshot (ADR 0042, section 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IdleSkip {
@@ -84,6 +95,11 @@ pub(crate) enum IdleSkip {
     AtHead,
     /// Too few segments since the last snapshot for the database's size.
     BelowThreshold,
+    /// The database is above [`IDLE_SNAPSHOT_MAX_BYTES`].
+    TooLarge,
+    /// A periodic snapshot failed and its wait before the next try is not
+    /// over: the bucket refuses snapshots, so none is tried here either.
+    BackingOff,
     /// A periodic or idle snapshot of this actor is uploading.
     Uploading,
     /// Replication stopped, or the sidecar could not be finished.
@@ -672,7 +688,7 @@ impl PeriodicFlights {
     }
 
     /// A wait for `address`'s upload to end; `None` if none is recorded.
-    fn settled(
+    pub(crate) fn settled(
         &self,
         address: &ActorAddress,
     ) -> Option<impl std::future::Future<Output = ()> + Send + use<>> {
@@ -1767,6 +1783,21 @@ impl Replica {
     /// `bytes` ([`Self::start_idle_snapshot`]'s conditions), asked before
     /// the database is copied, and again by that call.
     pub(crate) fn idle_snapshot_wanted(&mut self, bytes: u64) -> Result<(), IdleSkip> {
+        self.idle_snapshot_possible()?;
+        if self.since_snapshot < IDLE_SNAPSHOT_EVERY && bytes > IDLE_SNAPSHOT_SMALL_BYTES {
+            return Err(IdleSkip::BelowThreshold);
+        }
+        if bytes > IDLE_SNAPSHOT_MAX_BYTES {
+            return Err(IdleSkip::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// [`Self::idle_snapshot_wanted`]'s checks that need no size, asked
+    /// before the size is read. An upload that ended is taken in first, so
+    /// a step cut short does not hold back every later one.
+    pub(crate) fn idle_snapshot_possible(&mut self) -> Result<(), IdleSkip> {
+        self.settle_periodic();
         if let Some(reason) = &self.failed {
             return Err(IdleSkip::Stopped(reason.clone()));
         }
@@ -1780,13 +1811,23 @@ impl Replica {
         if self.since_snapshot == 0 {
             return Err(IdleSkip::AtHead);
         }
-        if self.since_snapshot < IDLE_SNAPSHOT_EVERY && bytes > IDLE_SNAPSHOT_SMALL_BYTES {
-            return Err(IdleSkip::BelowThreshold);
-        }
         if self.batched.periodic.is_some() || self.periodic_flights.uploading(&self.address) {
             return Err(IdleSkip::Uploading);
         }
+        if self.snapshot_failures > 0
+            && (self.since_snapshot < self.snapshot_retry_at
+                || tokio::time::Instant::now() < self.snapshot_retry_after)
+        {
+            return Err(IdleSkip::BackingOff);
+        }
         Ok(())
+    }
+
+    /// Makes the replica's database checksum `value`, so that a copy of
+    /// the database no longer matches its head (tests of a refusal).
+    #[cfg(test)]
+    pub(crate) fn set_checksum_for_tests(&mut self, value: u32) {
+        self.checksum = DbChecksum::from_value(value.into());
     }
 
     /// A periodic snapshot's copy failed before anything was labelled: the
@@ -4605,7 +4646,35 @@ mod tests {
         r.since_snapshot = 1;
         assert!(r.idle_snapshot_wanted(512 * 512).is_ok());
         r.since_snapshot = IDLE_SNAPSHOT_EVERY;
-        assert!(r.idle_snapshot_wanted(1 << 30).is_ok());
+        assert!(r.idle_snapshot_wanted(IDLE_SNAPSHOT_MAX_BYTES).is_ok());
+        // Above the cap: never, however much was written.
+        assert_eq!(
+            r.idle_snapshot_wanted(IDLE_SNAPSHOT_MAX_BYTES + 1),
+            Err(IdleSkip::TooLarge)
+        );
+        // While a failed periodic snapshot's wait runs: the bucket refuses
+        // snapshots; by segments, then by time.
+        r.snapshot_failures = 1;
+        r.snapshot_retry_at = IDLE_SNAPSHOT_EVERY + 1;
+        assert_eq!(r.idle_snapshot_wanted(512), Err(IdleSkip::BackingOff));
+        r.snapshot_retry_at = 0;
+        r.snapshot_retry_after = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(r.idle_snapshot_wanted(512), Err(IdleSkip::BackingOff));
+        r.snapshot_retry_after = tokio::time::Instant::now();
+        assert!(r.idle_snapshot_wanted(512).is_ok());
+        r.snapshot_failures = 0;
+        // An upload a cut step left, ended since: taken in by the check,
+        // not counted as uploading for good.
+        let (outcome, settled) = watch::channel(None);
+        r.batched.periodic = Some(PeriodicUpload {
+            segments: 1,
+            bytes: 0,
+            settled,
+        });
+        assert_eq!(r.idle_snapshot_wanted(512), Err(IdleSkip::Uploading));
+        outcome.send_replace(Some(PeriodicOutcome::Failed));
+        assert!(r.idle_snapshot_wanted(512).is_ok());
+        assert!(r.batched.periodic.is_none());
         // A database that is not the head's: refused, and replication
         // stops, as for any snapshot labelled at the head.
         let mut wrong = at_head(&r);
@@ -4628,8 +4697,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut r, store) = faulty(dir.path(), 0, 0).await;
         r.since_snapshot = 40;
+        // A failed periodic try whose wait is over: a schedule to keep.
         r.snapshot_failures = 1;
-        r.snapshot_retry_at = 41;
+        r.snapshot_retry_at = 39;
         let was = untouched(&r);
         store
             .fail_next

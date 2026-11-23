@@ -746,9 +746,14 @@ impl ActorState {
         snapshot: Snapshot,
     ) -> Option<Barrier> {
         let _timed = self.timing.work(super::timing::Work::FlushToBarrier);
-        let hold = self.held.as_ref()?;
+        self.held.as_ref()?;
         let Some(slot) = self.batched_replica() else {
-            return Some(hold.barrier());
+            // A strict hold is at its barrier once a snapshot uploading off
+            // the mailbox (an idle one a cut step left, ADR 0042) ended.
+            if matches!(snapshot, Snapshot::Settled) && !self.settle_flight(deadline).await {
+                return None;
+            }
+            return self.held.as_ref().map(Held::barrier);
         };
         // Every wait of the flush, the database work a cut event left
         // running and the replica's lock included, ends by the deadline:
@@ -770,6 +775,39 @@ impl ActorState {
         match deadline {
             Some(at) => tokio::time::timeout_at(at, flushed).await.unwrap_or(None),
             None => flushed.await,
+        }
+    }
+
+    /// Waits, by `deadline`, for the actor's periodic or idle snapshot
+    /// uploading off the mailbox now to end, this hold's or one an earlier
+    /// hold on this node left ([`crate::replica::PeriodicFlights`]), and
+    /// takes its outcome into the replica. `false` if the deadline came
+    /// first. Cancel-safe.
+    pub(super) fn settle_flight(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> impl std::future::Future<Output = bool> + Send + use<> {
+        let slot = self.replica().cloned();
+        let settled = self
+            .cluster
+            .as_ref()
+            .and_then(|c| c.periodic_flights.settled(&self.address));
+        async move {
+            let wait = async move {
+                if let Some(settled) = settled {
+                    settled.await;
+                }
+                if let Some(slot) = slot {
+                    slot.lock().await.settle_periodic();
+                }
+            };
+            match deadline {
+                Some(at) => tokio::time::timeout_at(at, wait).await.is_ok(),
+                None => {
+                    wait.await;
+                    true
+                }
+            }
         }
     }
 

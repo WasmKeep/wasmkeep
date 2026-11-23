@@ -37,7 +37,9 @@
 //! then review the diff of `golden_trace.txt` like code.
 //!
 //! Changed on purpose since 0.4.2: the hibernation takes an idle snapshot
-//! at the head before its release (ADR 0042, section 2, 0.8.0). The move's
+//! at the head, then lists the history to collect below it (deleting
+//! nothing: all of it is younger than the retention window), before its
+//! release (ADR 0042, section 2, 0.8.0). The move's
 //! restore on the other node then reads that snapshot instead of the
 //! periodic one and the three segments after it, and the erasure after
 //! the `delete-self` deletes it too. Nothing else moved.
