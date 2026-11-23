@@ -710,7 +710,8 @@ struct ServeArgs {
     history_retention_secs: u64,
 
     /// Never compact an idle actor's history (ADR 0042): no snapshot at
-    /// the head when an actor hibernates. On by default;
+    /// the head when an actor hibernates, and no idle pass a retention
+    /// window later. On by default;
     /// `[process] idle-compaction = false` in a node file says the same.
     #[arg(long)]
     no_idle_compaction: bool,

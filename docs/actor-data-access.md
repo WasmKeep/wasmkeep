@@ -53,6 +53,13 @@ capture-time scan. `--txid` selects an exact boundary on that same ancestry. The
 
 A point older than retained history is refused with the available txid range.
 Collection limits how far back you can read; a delete erases prior history.
+An actor that stopped writing no longer keeps more than that: one retention
+window after its last write and hibernation, the node that hibernated it
+compacts its history to the snapshot at its head and the segment there
+([ADR 0042](adr/0042-compacting-an-idle-actors-history.md), see "History in
+the bucket" in [the cluster guide](cluster.md)). Points within the last
+window stay readable; older ones of an idle actor go, as they do for an
+actor that keeps writing.
 Exporting a deleted head gives an empty application database, with host
 metadata. Older writers do not label deletes, so an empty database is
 reported as **probably deleted**. A reset followed by new writes contains

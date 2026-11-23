@@ -2,7 +2,10 @@
 
 - Status: proposed (2026-11-23). Slices 1 to 3 done: this record, the
   rule (`idle_collectable`) and the simulation. Slice 4, the idle
-  snapshot, built (see "As built: the idle snapshot"); the pass is next.
+  snapshot, built (see "As built: the idle snapshot"). Slice 5, the idle
+  pass, built (see "As built: the idle pass"), with its own adversarial
+  review to come; slice 6 (ADR 0012's and ADR 0033's sentences, the feed
+  measured again) is next.
 - Milestone: `0.8.0`, item 4 under Now in [ROADMAP.md](../../ROADMAP.md)
 - Follows: ADR 0007 (chained segments), ADR 0012 (collection), ADR 0020 (holds and generations), ADR 0028 (idle expiry's acquisition), ADR 0033 (offline readers, the retention window), ADR 0034 (barriers, snapshots only at the acknowledged head), ADR 0035 (recorded head), ADR 0039 (the change feed)
 - Amends, once accepted: ADR 0012, decision 3 on idle actors ("acceptable for now")
@@ -190,6 +193,9 @@ Known limits, stated rather than fixed here:
 - **An actor whose node crashed is not compacted** until a later owner writes.
 - **A pass that fails after its acquisition is not retried later**: the record's generation moved.
 - **A release that landed with its reply lost is not queued**: it comes back `Superseded`, not through `release_landed` (see "Confirmed in the code"). The actor keeps its leftovers until it next writes and rests.
+- **An actor whose name the record key shortened with a hash** (an encoded name over 200 bytes) is not compacted: the key cannot be told back to its address, as for idle expiry.
+- **A pass found `busy`** (the actor in use on the node when due) is dropped; the actor is queued again only by its next release after a write.
+- **A class with an idle limit is not compacted**, in either record format (see "As built: the idle pass").
 
 ## Slices
 
@@ -301,6 +307,66 @@ Revised after its adversarial review: two must-fix findings, M1 and M2, and the 
 - **Parked holds.** A parked hold (a room with sockets open, ADR 0024) also takes it: `before_drop` runs before `Drop` decides between parking and releasing. The pass of slice 5 follows releases only, so for a parked room this snapshot only shortens the next restore.
 - **Simulation.** `madsim_batched.rs` models it at a hibernation's barrier: `idle_snapshots_at_hibernation_keep_every_restore_whole`. One taken with a segment in flight (the database as it is, labelled at the acknowledged head) is caught as a restore that is not the owner's prefix: `an_idle_snapshot_labelled_with_a_segment_in_flight_is_caught`.
 
+## As built: the idle pass (slice 5)
+
+- **The release's version.** `Owners::release_written` returns the version its own write's answer gave (`Released::Released` and `Some(version)`; `None` for every other outcome); `Owners::release` wraps it, so its forty callers are unchanged. The three places a release lands in the server (`LeaseHold::release`, `send_release`, and the background retry of a pending release in `retry_pending`) go through `Cluster::release_landed`, which ends the frozen head's entry as before and calls `note_idle_release`.
+- **What is queued.** A hold whose acknowledged head is a position of its own generation (`compaction::wrote`: only a segment it uploaded puts one there), whose release landed with its version, with idle compaction on and the app not refused. A hold that only read and the pass's own hold (it uploads nothing) are not queued, so a pass never queues another. A hold of an expiry or a delete request whose reset wrote a segment is queued like any other; its pass compacts what the erasure left, or finds the record changed.
+- **The queue** (`actor/compaction.rs`, `Queue`, on the `Cluster`, so per app and node, as `idle_snapshot_slots` is): keyed by record key, a later release replacing an earlier entry; at most 100,000 entries (`QUEUE_MAX`), the one due first dropped first; an entry holds the key, the released generation, the version, the release time (the idle origin) and the due time, release + `history_retention` + `max_skew_ms`. A loop (`compaction_loop`) looks every tenth of the window (50 ms to 5 s), takes what is due, and runs at most 4 passes at once (`PASSES_AT_ONCE`). The tombstone (`app_tombstoned`) and idle compaction off clear it.
+- **The job** (`ActorState::idle_pass`), in the actor's mailbox, no guest code. Before submitting (`pass_one`): refused for a class with an idle limit, a draining node, an app refusal; `busy` if the actor is resident, held, parked or has a socket here. In the job: `busy` again if a hold or a live instance appeared, refused if the node drains or moves the actor. Then:
+  1. `LeaseHold::acquire_with(cluster, address, Some((etag, released_ms)))`, the expiry's acquisition: the app gate, the format gate, the local evidence, `acquire_unchanged_prepared` with the `ETag` of the remembered version and the release time as idle origin. The hold is a local, never `self.held`, so no event runs under it; events queue behind the job.
+  2. The released generation is the hold's less one, and must equal the entry's (an equal `ETag` at another generation is another record).
+  3. The incarnation check (below).
+  4. `Collector::idle` (built from the cluster: `history_key`, the released generation, the new hold's `LeaseView`) and `Collector::collect_idle`: one listing, `idle_collectable`, the deletes older than the window by `last_modified`, in batches of 100, the lease checked before each. `collect` and `collect_idle` now share the listing and the deletes (`Collector::list`, `delete_older`). Up to 3 attempts, one second then two apart, while the hold is valid.
+  5. `LeaseHold::release`: unverified, so it freezes the requirement it inherited, and in version 2 the idle origin it carried.
+  The loop then hibernates the job's empty state, as an expiry does.
+- **`ensure_owner_with` is not used.** Settled here, for the review: it drops a hold, restores and verifies, sends a draining node's wake-up to a peer or claims when none is eligible, and applies placement. None of that belongs to a pass. The job calls `LeaseHold::acquire_with` itself, with its own drain and move checks (a cluster test, with those checks removed, saw a drained node compact).
+- **Outcomes**, `wasmkeep_idle_compactions_total{outcome}`: `done`, `changed` (the acquisition found the record changed, or held: `RECORD_CHANGED`, `NotOwner`; or the generation differs), `nothing` (`IdleCollected::NoSnapshot`), `refused`, and `busy`, which the ADR did not list: the actor was in use on this node when the entry came due. A busy entry is dropped, as section 3, step 1 says; its next release after a write queues it again. Deletes count in `wasmkeep_history_collected_total`, failures in `wasmkeep_history_collect_failures_total`.
+- **Classes with an idle limit are not compacted, in either record format.** The record proposed only version 1 (constraint 8). In version 2 the pass does carry the idle origin through both rewrites (`a_pass_keeps_the_idle_origin_on_a_version_2_record` in `madsim_expiry.rs`), but the node that collects expiry reads a record's carried `idle-since` only for actors it refused or judged itself (`carried_idle_since`); for the others it judges by the last-modified time, which the pass moved. The collector is usually another node, so the pass would restart such an actor's idle clock in either format. A fix (reading `idle-since` for every recently modified record, or a cheaper sign) belongs to ADR 0035's expiry rules, not here. A class with an idle limit is expired after it anyway.
+- **The switch.** `--no-idle-compaction` and `[process] idle-compaction = false` stop both the snapshot and the pass: nothing is queued, and the loop clears the queue.
+- **Test hooks**, `#[doc(hidden)]` on `ActorService`: `idle_passes_queued`, `pause_idle_passes`, `idle_passes_due_now`, and `idle_passes_take_current_versions` (the recreate test's stand-in for an `ETag` that is a hash of the body).
+
+### The recreate case, settled
+
+Constraint 7 and "Not confirmed" asked what ties a pass to the app's current incarnation once the app was deleted and recreated while the node that queued the entry kept running.
+
+What the code does without this slice's check:
+
+- A node that sees the tombstone stops serving the app (`stop_for_deleted_app`, which now also clears the queue) and `serve` exits: its memory goes with it.
+- `app delete` removes data only once no live node of the app heartbeats, or after fencing it, and `--recreate` waits 40 s after the tombstone and the last heartbeat. So a node of the old incarnation that is still running through a delete and a recreate was paused or cut off. Its lease then lapses, a node following its app re-arms the tombstone check (`rearm_app_check`), and the check after the lapse compares the `recreated` marker and stops. No acquisition happens in between (`app_refusal`).
+- That leaves nodes that do not follow their app, and any gap in the above. There the version check is all that is left, and on S3 the `ETag` of a version 1 released record at the same generation is the same in both incarnations (a hash of the same bytes).
+
+The design chosen, as the blob sweep already does for files (ADR 0030, `epochs_pass`): **the pass compares the app's epoch read after its acquisition with the one this runtime started with**, and compacts nothing on a difference. The epoch is `blobs::epoch` of the `recreated` and `restored` markers (`ActorConfig::blob_epoch`, from `AppRef::prepare_local`); the pass reads those two markers again, and also `deleted` and `restoring` (refused while either exists). Cost: four small GETs per pass. Read after the acquisition, the check holds for the whole pass: while this node's hold, and so its lease and heartbeat, is live, `app delete` cannot remove anything, and the deletes stop at the next batch once the lease lapses. Dropping the queue at the tombstone was added too; it is not what the proof rests on.
+
+The test, `idle_pass::a_pass_deletes_nothing_of_a_recreated_app` (cluster suite): node `a` writes an actor over two generations and hibernates (one entry queued, passes paused). The test then deletes the actor's history and record and writes the `recreated` marker, as `app delete` and `deploy --recreate` leave them, without a tombstone a test node would see. A new node `c` writes another history for the same actor up to the same generation and releases it. The entry is given the record's current version (`idle_passes_take_current_versions`, what an `ETag` of identical bytes gives), and the pass runs. The acquisition takes the record (version and generation match), the epoch differs, and the outcome is `refused` with every object of the new incarnation still there. With the epoch comparison removed, the same test fails: `a`'s pass deleted the recreated app's objects. A whole-app restore in place changes the `restored` marker and is refused the same way.
+
+### Tests, and whether each was seen failing
+
+Each "fix" below was removed by hand and the test run again.
+
+- **Restore identical** (`an_idle_pass_leaves_the_snapshot_and_its_segment_and_the_same_database`): two bursts on two generations, a window of 3 s, the pass. The prefix is exactly `S` and the segment at `P`; an export after the pass has the position and raw checksum of one taken before it, read at most two objects, and passed SQLite's `integrity_check` (`history::export` verifies); node `b` restores it and reads the same count. `actor export --at` between the bursts gives the first burst's count before the pass. Without the pass the prefix keeps every object (the assertion on two objects is what fails).
+- **Wake** (`a_wake_before_the_pass_leaves_every_object`): a read-only wake before the pass; every object stays and the outcome is `changed`. With both the version check and the generation check removed, the objects still stay (the read-only hold uploaded no snapshot of its generation, so `nothing`), and the test fails on the outcome: the chain's safety does not rest on the version, as the simulation found.
+- **Drain** (`a_draining_node_runs_no_pass`): with the drain checks removed, the drained node compacted; with them, `refused` and nothing deleted.
+- **Lapse**: `replica::tests::an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_lapse`, a unit test with a store that lapses the lease at its first batch of deletes: 100 deleted, then nothing; with the check before each batch removed, it deletes past the lapse and fails. It also checks the kept set (the snapshot at the head, its segment, a later generation's segment), the window, and `NoSnapshot` for a generation that snapshotted nothing.
+- **Readers**: the `--at` read above, and `an_export_racing_a_pass_publishes_the_same_database` (an export whose segment reads are held back 1.5 s while the pass deletes publishes the same database). There is no fix to remove; it checks the invariant. `backup create` during a pass is not tested: the backup command is in the CLI crate, with no server node in its tests.
+- **The feed** (`feed::poll_tests::a_poll_after_an_idle_pass_reads_nothing_but_the_markers`, a store counting GETs): poll, compact with `idle_collectable`, poll again. The second poll reads the four app markers and nothing else, and writes no file. With the segment at `P` also deleted, the second poll reads history and the test fails.
+- **Recreate**: above.
+- **The idle-limit gate** (`a_class_with_an_idle_limit_is_not_compacted`): with the gate removed, the pass compacted; with it, `refused`.
+- **The switch** (`no_pass_is_queued_with_idle_compaction_off`).
+- **Queue** (unit): one entry per actor, due first; a full queue drops the entry due first.
+- **`Owners::release_written`** (unit): the version written is the record's, an acquisition unchanged on it takes the record once, and the pass's own release changes it.
+- **The golden trace of the pass** (`golden_trace::the_bucket_operations_of_an_idle_pass`, fixture `golden_trace_idle_pass.txt`), separate from the 0.4.2 trace, which is unchanged: the writes, the hibernation's snapshot, listing and release, then the pass's `PUT owner [update] holder=a generation=2`, one `LIST`, three `DELETE`s (the first snapshot and two segments below `S`), and `PUT owner [update] holder=- generation=2`.
+
+### The simulations
+
+`madsim_expiry.rs`, at 2,000 seeds:
+
+- `an_idle_pass_and_an_expiry_race_and_the_version_decides`: nodes also queue, after each release of a hold that ran events, the version the release wrote (`LeaseNode::release_written`), and take it back 400 ms later with `acquire_unchanged`. New oracle: no version of one record is taken twice (by expiries, passes, or one of each). 5,327 expiries, 6,418 passes took their record, 48,885 found it changed, 3,324 versions were tried by both an expiry and a pass; no version taken twice, no active or alarmed actor expired.
+- `an_idle_pass_that_acquires_as_an_event_does_is_caught`: caught at seed 0 taking a version an expiry already took.
+- `a_pass_keeps_the_idle_origin_on_a_version_2_record`: scripted, 50 seeds each way. With the release's last-modified time as origin, the record the pass leaves carries it, and an expiry past the limit from the release chooses the actor although the pass rewrote the record; with no origin (the broken variant) it does not.
+- The earlier cases are unchanged (5,862 expiries; the expiry's plain acquisition still caught as an active actor expired, at seed 10).
+
+Not done: a recreate dimension in `madsim_replication.rs`. Its model has no app incarnations, and the epoch check sits outside the chain rule the simulation checks; the cluster test above is its evidence.
+
 ## Simulation results
 
 Slice 3, in `sim/tests/madsim_replication.rs` (the `Idle` dimension of `Rules`). The model:
@@ -342,6 +408,7 @@ At 2,000 seeds (30 simulated seconds each):
 
 ## Not confirmed
 
-- What ties a pass to the app's current incarnation when the app was deleted and recreated while the node that queued the entry kept running. Every acquisition checks the app's tombstone (`app_refusal` in `LeaseHold::acquire_with`), but I did not check what that check sees after a recreate. The version alone does not settle it (ETags, see "Confirmed in the code"). For slice 5's review.
-- How `ensure_owner_with` can acquire without restoring.
+- ~~What ties a pass to the app's current incarnation when the app was deleted and recreated while the node that queued the entry kept running.~~ Settled in slice 5: the app's epoch, read after the acquisition (see "The recreate case, settled").
+- ~~How `ensure_owner_with` can acquire without restoring.~~ Settled in slice 5: it does not; the job calls `LeaseHold::acquire_with` itself (see "As built: the idle pass").
 - The thresholds (8 segments, 256 KiB, 100,000 entries, 4 at once) are proposals with no measurement behind them.
+- Whether a class with an idle limit can be compacted in version 2: not as built, since the expiry collector reads `idle-since` only for actors it refused or judged (see "As built: the idle pass").

@@ -21,6 +21,16 @@ that never fails anything, counted in
 idle actor's history (ADR 0042). `serve --no-idle-compaction`, or
 `[process] idle-compaction = false` in a node file, turns it off.
 
+**An idle actor's history is compacted a retention window after it
+rests.** The node that released an actor after a write takes its record
+again one retention window later, only if nothing changed it since, and
+deletes what the window kept below the snapshot at the head, without
+running or restoring the actor. An actor at rest then holds two objects,
+and the change feed still sees it unchanged. A wake, a move, an expiry, a
+drain, a deleted, restoring or recreated app, or a class with
+`expire-after-idle` makes the pass compact nothing. Counted in
+`wasmkeep_idle_compactions_total{outcome}`; the same switch turns it off.
+
 **A room and its pusher wake on different nodes, by default.** In a
 version with classes named `room` and `pusher` (the broadcast SDKs'
 default names), a wake-up of `pusher/<name>`, which nobody holds, on the

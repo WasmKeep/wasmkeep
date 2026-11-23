@@ -43,6 +43,12 @@
 //! restore on the other node then reads that snapshot instead of the
 //! periodic one and the three segments after it, and the erasure after
 //! the `delete-self` deletes it too. Nothing else moved.
+//!
+//! A second, separate trace (`golden_trace_idle_pass.txt`) records the
+//! idle pass of ADR 0042, section 3: writes, a hibernation, and the pass a
+//! retention window later, whose operations are its acquisition, one
+//! listing, its deletes and its release, in that order. The main trace
+//! wakes its actor well inside the window, so no pass appears in it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
