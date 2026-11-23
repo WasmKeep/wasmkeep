@@ -716,12 +716,15 @@ fn strict_guards_preserve_checksum_and_position() {
     let (mut db, hold) = actor(dir.path(), 1 << 30);
     db.exec("INSERT INTO t VALUES ('only unmarked')", &[])
         .unwrap();
-    let before = (db.captured_checksum(), db.captured_wal_bytes());
+    let before = (db.captured_checksum(), db.has_unmarked_commits().unwrap());
     assert!(matches!(
         db.take_changes(),
         Err(CaptureError::BoundariesPending)
     ));
-    assert_eq!((db.captured_checksum(), db.captured_wal_bytes()), before);
+    assert_eq!(
+        (db.captured_checksum(), db.has_unmarked_commits().unwrap()),
+        before
+    );
     drop(hold);
 
     let (conn, mut c) = raw(&dir.path().join("raw.db"));
@@ -752,7 +755,7 @@ fn reserved_plan_captures_exact_prefix_and_stale_plan_is_refused() {
     assert_eq!(got.oversize, plan.oversize);
     let before = (
         db.captured_checksum(),
-        db.captured_wal_bytes(),
+        db.next_bounded_capture(),
         db.boundaries().collect::<Vec<_>>(),
     );
     assert!(matches!(
@@ -762,7 +765,7 @@ fn reserved_plan_captures_exact_prefix_and_stale_plan_is_refused() {
     assert_eq!(
         (
             db.captured_checksum(),
-            db.captured_wal_bytes(),
+            db.next_bounded_capture(),
             db.boundaries().collect::<Vec<_>>()
         ),
         before

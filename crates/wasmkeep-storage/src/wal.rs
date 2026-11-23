@@ -48,6 +48,19 @@ pub enum CaptureError {
     /// snapshot.
     #[error("the WAL was reset or rewritten underneath the capture: {0}")]
     Lost(&'static str),
+    /// A kind of [`Self::Lost`]: the WAL has a new header, as when SQLite
+    /// restarts it, since the last capture. SQLite adds one to salt-1 at
+    /// each restart, so `found_salt - captured_salt` counts them.
+    #[error(
+        "the WAL was reset or rewritten underneath the capture: it was restarted \
+         (salt-1 {captured_salt:#x}, now {found_salt:#x})"
+    )]
+    WalRestarted {
+        /// Salt-1 of the WAL the capture was reading.
+        captured_salt: u32,
+        /// Salt-1 of the WAL there now.
+        found_salt: u32,
+    },
     /// Changes were committed since the last capture; they are returned here
     /// and must be shipped before a snapshot is taken.
     #[error("changes are pending")]
@@ -213,6 +226,11 @@ impl WalCapture {
         self.offset
     }
 
+    /// The database's page size.
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
     /// The WAL file.
     pub fn wal_path(&self) -> std::sync::Arc<Path> {
         std::sync::Arc::clone(&self.wal_path)
@@ -280,7 +298,14 @@ impl WalCapture {
         let mut h = [0u8; WAL_HEADER];
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         file.read_exact(&mut h).map_err(io)?;
-        if parse_header(&h, self.page_size)? != header {
+        let now = parse_header(&h, self.page_size)?;
+        if now != header {
+            if now.big_endian == header.big_endian && now.salt.0 != header.salt.0 {
+                return Err(CaptureError::WalRestarted {
+                    captured_salt: header.salt.0,
+                    found_salt: now.salt.0,
+                });
+            }
             return Err(CaptureError::Lost("the WAL header changed"));
         }
 

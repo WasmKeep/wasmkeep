@@ -122,6 +122,10 @@ fn sandbox_blocks_attach_pragmas_and_file_escapes() {
         "PRAGMA synchronous = OFF".to_owned(),
         "PRAGMA writable_schema = ON".to_owned(),
         "PRAGMA max_page_count = 999999999".to_owned(),
+        "PRAGMA hard_heap_limit = 0".to_owned(),
+        "PRAGMA soft_heap_limit = 1".to_owned(),
+        "PRAGMA temp_store = FILE".to_owned(),
+        "SELECT * FROM pragma_hard_heap_limit".to_owned(),
         "SELECT load_extension('x')".to_owned(),
     ];
     for sql in &denied {
@@ -684,6 +688,14 @@ fn values_and_results_are_capped() {
         )
         .unwrap_err();
     assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    // A replacement that grows a value past the cap.
+    let err = db
+        .query(
+            "SELECT length(replace(printf('%.*c', 600000, 'a'), 'a', 'bb'))",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
     // Under both caps: fine.
     let ok = db.query("SELECT length(zeroblob(500000))", &[]).unwrap();
     assert_eq!(ok.values, vec![vec![V::Integer(500_000)]]);
@@ -1039,6 +1051,480 @@ fn a_commit_without_a_local_sync_keeps_the_rules_and_skips_the_fsync() {
     }
     let mut db = storage(&dir).open("c", "a").unwrap();
     assert_eq!(db.query("SELECT x FROM t", &[]).unwrap().values.len(), 2);
+}
+
+/// The guest's sequence: a foreign key from a guest table to a host table,
+/// with `ON DELETE CASCADE`, and a trigger on the guest table that copies
+/// host metadata out. The host's own `DELETE` (clearing the alarm) must not
+/// run the cascade or the trigger with the host's privileges.
+#[test]
+fn a_host_delete_does_not_cascade_into_guest_triggers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.set_meta("secret", "s3cr3t").unwrap();
+    let steps = [
+        "PRAGMA foreign_keys=OFF",
+        "CREATE TABLE g (a INTEGER REFERENCES _wasmkeep_alarm(id) ON DELETE CASCADE)",
+        "CREATE TABLE leak(k,v)",
+        "INSERT INTO g VALUES(1)",
+        "PRAGMA foreign_keys=ON",
+        "CREATE TRIGGER tr AFTER DELETE ON g BEGIN \
+         INSERT INTO leak SELECT key,value FROM _wasmkeep_meta; END",
+    ];
+    let results: Vec<_> = steps.iter().map(|sql| db.exec(sql, &[])).collect();
+    // A foreign key to a host table is refused outright.
+    let err = results[1].as_ref().unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{err:?}");
+    db.set_alarm(5_000).unwrap();
+    db.clear_alarm().unwrap();
+    assert_eq!(db.alarm().unwrap(), None);
+    let leaked = db.query("SELECT count(*) FROM leak", &[]).unwrap();
+    assert_eq!(leaked.values, vec![vec![V::Integer(0)]]);
+}
+
+/// The same, with the foreign key and trigger already in the file (written
+/// by an older version, or by hand): host statements still run none of the
+/// guest's triggers or cascades, in or out of a guest transaction, and the
+/// guest's own triggers and foreign keys keep working.
+#[test]
+fn host_statements_run_no_guest_trigger_or_cascade() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = storage(&dir);
+    drop(store.open("c", "a").unwrap());
+    let raw = rusqlite::Connection::open(dir.path().join("actors/t/c/a.db")).unwrap();
+    raw.execute_batch(
+        "CREATE TABLE g (a INTEGER REFERENCES _wasmkeep_alarm(id) ON DELETE CASCADE);
+         CREATE TABLE leak(k, v);
+         CREATE TRIGGER tr AFTER DELETE ON g BEGIN
+             INSERT INTO leak SELECT key, value FROM _wasmkeep_meta;
+         END;
+         CREATE TRIGGER ta AFTER INSERT ON _wasmkeep_meta BEGIN
+             INSERT INTO leak VALUES ('meta', new.value);
+         END;",
+    )
+    .unwrap();
+    let mut db = store.open("c", "a").unwrap();
+    db.set_meta("secret", "s3cr3t").unwrap();
+    for in_transaction in [false, true] {
+        db.set_alarm(5_000).unwrap();
+        // The guest cannot write a row that references a host table (the
+        // foreign key check reads it); this file has one.
+        raw.execute("INSERT INTO g VALUES (1)", []).unwrap();
+        if in_transaction {
+            db.exec("BEGIN", &[]).unwrap();
+        }
+        db.clear_alarm().unwrap();
+        db.set_meta("other", "x").unwrap();
+        if in_transaction {
+            db.exec("COMMIT", &[]).unwrap();
+        }
+        assert_eq!(db.alarm().unwrap(), None);
+        let leaked = db.query("SELECT count(*) FROM leak", &[]).unwrap();
+        assert_eq!(leaked.values, vec![vec![V::Integer(0)]], "{in_transaction}");
+        db.exec("DELETE FROM g", &[]).unwrap_err();
+        db.end_event().unwrap();
+    }
+    // The guest's own trigger and foreign keys still work.
+    db.exec("CREATE TABLE p (id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    db.exec("CREATE TABLE ch (p REFERENCES p(id))", &[])
+        .unwrap();
+    db.exec("CREATE TABLE seen (x)", &[]).unwrap();
+    db.exec(
+        "CREATE TRIGGER mine AFTER INSERT ON p BEGIN INSERT INTO seen VALUES (new.id); END",
+        &[],
+    )
+    .unwrap();
+    db.exec("INSERT INTO p VALUES (7)", &[]).unwrap();
+    let seen = db.query("SELECT x FROM seen", &[]).unwrap();
+    assert_eq!(seen.values, vec![vec![V::Integer(7)]]);
+    let err = db.exec("INSERT INTO ch VALUES (8)", &[]).unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::Constraint, "{err:?}");
+}
+
+#[test]
+fn reserved_names_are_refused_for_every_guest_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.exec("CREATE TABLE t (x)", &[]).unwrap();
+    for sql in [
+        "CREATE VIEW _wasmkeep_v AS SELECT 1",
+        "CREATE VIEW \"_WASMKEEP_META\" AS SELECT 1",
+        "CREATE INDEX _wasmkeep_i ON t (x)",
+        "CREATE TRIGGER _wasmkeep_tr AFTER INSERT ON t BEGIN SELECT 1; END",
+        "ALTER TABLE t RENAME TO _wasmkeep_x",
+        "ALTER TABLE t RENAME TO [_Wasmkeep_x]",
+        "CREATE TABLE g (a REFERENCES \"_WASMKEEP_ALARM\")",
+        "CREATE TABLE g (a, FOREIGN KEY (a) REFERENCES `_wasmkeep_meta` (key))",
+        "ALTER TABLE t ADD COLUMN y REFERENCES _wasmkeep_alarm (id)",
+        // SQLite reads a byte-order mark as white space.
+        "CREATE TABLE g (a REFERENCES \u{FEFF}_wasmkeep_alarm(id) ON DELETE CASCADE)",
+        "ALTER TABLE t RENAME TO \u{FEFF}_wasmkeep_x",
+        // Fails closed: any non-ASCII byte before the prefix.
+        "CREATE TABLE é_wasmkeep_x (a)",
+    ] {
+        let err = db.exec(sql, &[]).unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::NotAllowed, "{sql}: {err:?}");
+    }
+    let schema = db
+        .query(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE name <> 't' AND substr(name, 1, 7) <> 'sqlite_'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        schema.values,
+        vec![vec![V::Integer(2)]],
+        "only the host tables"
+    );
+    // A name that merely contains the prefix is the guest's own.
+    db.exec("CREATE TABLE app_wasmkeep_state (x)", &[]).unwrap();
+    db.exec("CREATE INDEX my_wasmkeep_i ON t (x)", &[]).unwrap();
+}
+
+#[test]
+fn guest_connections_have_sqlite_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    let columns = |n: usize| (0..n).map(|i| format!("{i}")).collect::<Vec<_>>().join(",");
+    db.query(&format!("SELECT {}", columns(2000)), &[]).unwrap();
+    db.query(&format!("SELECT {}", columns(2001)), &[])
+        .unwrap_err();
+    let args = |n: usize| (0..n).map(|_| "1").collect::<Vec<_>>().join(",");
+    db.query(&format!("SELECT max({})", args(1000)), &[])
+        .unwrap();
+    db.query(&format!("SELECT max({})", args(1001)), &[])
+        .unwrap_err();
+    let union = |n: usize| {
+        (0..n)
+            .map(|_| "SELECT 1")
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    };
+    db.query(&union(500), &[]).unwrap();
+    db.query(&union(501), &[]).unwrap_err();
+    let depth = |n: usize| format!("SELECT {}", vec!["1"; n].join(" + "));
+    db.query(&depth(900), &[]).unwrap();
+    db.query(&depth(1100), &[]).unwrap_err();
+    let pattern = |n: usize| V::Text("a".repeat(n));
+    db.query("SELECT 'a' LIKE ?1", &[pattern(50_000)]).unwrap();
+    let err = db
+        .query("SELECT 'a' LIKE ?1", &[pattern(50_001)])
+        .unwrap_err();
+    assert!(err.message.contains("too complex"), "{err:?}");
+    // A statement compiled to more instructions than the cap.
+    db.exec("CREATE TABLE v (a, b, c)", &[]).unwrap();
+    let values = |n: usize| {
+        format!(
+            "INSERT INTO v VALUES {}",
+            vec!["(random(), random(), random())"; n].join(",")
+        )
+    };
+    db.exec(&values(1000), &[]).unwrap();
+    let err = db.exec(&values(600_000), &[]).unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.contains("too large"), "{err:?}");
+    drop(db);
+    // SQLite applies the column, argument, depth and compound limits while
+    // loading the schema: a database whose schema uses what SQLite itself
+    // allows still opens.
+    let raw = rusqlite::Connection::open(dir.path().join("actors/t/c/a.db")).unwrap();
+    raw.execute_batch(&format!(
+        "CREATE TABLE wide ({});
+         CREATE TABLE ch (x CHECK (max({}) > 0));
+         CREATE VIEW many AS {};
+         CREATE TRIGGER many_tr AFTER INSERT ON ch BEGIN SELECT * FROM ({}); END;",
+        (0..2000)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        args(1000),
+        union(500),
+        union(500),
+    ))
+    .unwrap();
+    drop(raw);
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.query("SELECT count(*) FROM wide", &[]).unwrap();
+    let rows = db.query("SELECT count(*) FROM many", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(500)]]);
+    db.exec("INSERT INTO ch VALUES (1)", &[]).unwrap();
+}
+
+/// `instr`, `replace` and the two-argument `trim`, `ltrim` and `rtrim` are
+/// the host's, so they stop at the event's budgets; they answer exactly as
+/// SQLite's own (compared with a plain connection), also for blobs, numbers,
+/// NULLs, empty arguments and invalid UTF-8.
+#[test]
+fn string_functions_answer_as_sqlites_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    let plain = rusqlite::Connection::open_in_memory().unwrap();
+    let values = [
+        V::Null,
+        V::Integer(0),
+        V::Integer(-120),
+        V::Integer(12_012),
+        V::Real(1.5),
+        V::Real(100.0),
+        V::Real(-2.5e-7),
+        V::Real(1e20),
+        V::Text(String::new()),
+        V::Text("a".into()),
+        V::Text("ab".into()),
+        V::Text("banana".into()),
+        V::Text("ana".into()),
+        V::Text("héllo wörld".into()),
+        V::Text("ö".into()),
+        V::Text("  xx  ".into()),
+        V::Text(" x".into()),
+        V::Text("12".into()),
+        V::Text(".5".into()),
+        V::Blob(Vec::new()),
+        V::Blob(vec![0]),
+        V::Blob(vec![b'a', 0, b'n', b'a']),
+        V::Blob(vec![0, b'a']),
+        V::Blob(b"banana".to_vec()),
+        V::Blob(vec![0xc3]),
+        V::Blob(vec![0xa9, b'a', 0xc3, 0xa9, 0x80, 0x80, b'a']),
+        V::Blob(vec![0xc3, 0xa9, 0x80]),
+        V::Blob(vec![0x80, 0xc3]),
+    ];
+    // Invalid UTF-8 as text, too: CAST(blob AS TEXT) keeps the bytes. The
+    // answer is compared as its type and bytes (hex).
+    let plain_eval = |sql: &str, args: &[&V]| -> Option<(String, String)> {
+        let params: Vec<rusqlite::types::Value> = args
+            .iter()
+            .map(|v| rusqlite::types::Value::from(*v))
+            .collect();
+        plain
+            .query_row(sql, rusqlite::params_from_iter(params), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .ok()
+    };
+    let short = |v: &V| match v {
+        V::Text(t) => t.len() <= 2,
+        V::Blob(b) => b.len() <= 2,
+        _ => true,
+    };
+    let mut checked = 0;
+    for (name, arity) in [
+        ("instr", 2),
+        ("replace", 3),
+        ("trim", 2),
+        ("ltrim", 2),
+        ("rtrim", 2),
+    ] {
+        let mut combos: Vec<Vec<&V>> = vec![vec![]];
+        for i in 0..arity {
+            let mut next = Vec::new();
+            for c in &combos {
+                // A shorter list for replace's third argument.
+                for v in values.iter().filter(|v| i < 2 || short(v)) {
+                    let mut c = c.clone();
+                    c.push(v);
+                    next.push(c);
+                }
+            }
+            combos = next;
+        }
+        for args in combos {
+            for cast in [false, true] {
+                let operands: Vec<String> = (1..=arity)
+                    .map(|i| match args[i - 1] {
+                        V::Blob(_) if cast => format!("CAST(?{i} AS TEXT)"),
+                        _ => format!("?{i}"),
+                    })
+                    .collect();
+                let call = format!("{name}({})", operands.join(", "));
+                let sql = format!("SELECT typeof({call}), hex({call})");
+                let expected = plain_eval(&sql, &args);
+                let params: Vec<V> = args.iter().map(|v| (*v).clone()).collect();
+                let got = db.query(&sql, &params).ok().map(|r| {
+                    match (&r.values[0][0], &r.values[0][1]) {
+                        (V::Text(t), V::Text(h)) => (t.clone(), h.clone()),
+                        other => panic!("{other:?}"),
+                    }
+                });
+                assert_eq!(got, expected, "{sql} with {args:?}");
+                checked += 1;
+            }
+        }
+        db.end_event().unwrap();
+    }
+    assert!(checked > 1000, "{checked}");
+}
+
+/// The same functions on inputs that take SQLite's own versions minutes:
+/// stopped at the event's SQL CPU budget.
+#[test]
+fn slow_string_functions_stop_at_the_sql_cpu_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = rooted(StorageConfig {
+        max_sql_cpu_per_event: std::time::Duration::from_millis(100),
+        ..StorageConfig::new(dir.path())
+    });
+    let mut db = s.open("c", "a").unwrap();
+    for sql in [
+        "SELECT instr(printf('%.*c', 4000000, 'a'), printf('%.*c', 2000000, 'a') || 'b')",
+        "SELECT length(replace(printf('%.*c', 4000000, 'a'), printf('%.*c', 2000000, 'a') || 'b', 'x'))",
+        "SELECT length(trim(printf('%.*c', 1000000, 'a'), replace(printf('%.*c', 500000, 'b'), 'b', 'é') || 'a'))",
+        "SELECT length(ltrim(printf('%.*c', 1000000, 'a'), replace(printf('%.*c', 500000, 'b'), 'b', 'é') || 'a'))",
+        "SELECT length(rtrim(printf('%.*c', 1000000, 'a'), replace(printf('%.*c', 500000, 'b'), 'b', 'é') || 'a'))",
+    ] {
+        let started = std::time::Instant::now();
+        let err = db.query(sql, &[]).unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{sql}: {err:?}");
+        assert!(err.message.contains("CPU"), "{sql}: {err:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{sql}: stopped after {:?}",
+            started.elapsed()
+        );
+        db.end_event().unwrap();
+    }
+}
+
+/// One statement that writes far more than the write-ahead log's cap is
+/// stopped while it runs, not only refused once the log is already full.
+#[test]
+fn one_statement_cannot_write_far_past_the_wal_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = rooted(StorageConfig {
+        max_wal_bytes: 1024 * 1024,
+        ..StorageConfig::new(dir.path())
+    });
+    let mut db = s.open("c", "a").unwrap();
+    db.start_capture().unwrap();
+    db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
+    db.take_changes().unwrap();
+    let big = "INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+               WHERE x < 5000) SELECT randomblob(10000) FROM c";
+    let mut wal = db.path().as_os_str().to_owned();
+    wal.push("-wal");
+    for in_transaction in [false, true] {
+        if in_transaction {
+            db.exec("BEGIN", &[]).unwrap();
+            db.exec("INSERT INTO t VALUES (x'02')", &[]).unwrap();
+        }
+        let err = db.exec(big, &[]).unwrap_err();
+        assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+        assert!(err.message.contains("write-ahead log"), "{err:?}");
+        let len = std::fs::metadata(&wal).unwrap().len();
+        assert!(len < 16 << 20, "the WAL grew to {len} bytes");
+        if in_transaction {
+            // Stopping a write rolls the event's transaction back, as at a
+            // deadline: nothing more runs in the event.
+            assert!(!db.in_transaction());
+            db.query("SELECT count(*) FROM t", &[]).unwrap_err();
+        } else {
+            db.query("SELECT count(*) FROM t", &[]).unwrap();
+        }
+        // The event's end leaves the actor usable.
+        db.end_event().unwrap();
+        db.take_changes().unwrap();
+        db.exec("INSERT INTO t VALUES (x'01')", &[]).unwrap();
+        db.take_changes().unwrap();
+    }
+    let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(2)]]);
+}
+
+/// A budget stop inside one of the host's string functions fails the
+/// statement, not the guest's open transaction.
+#[test]
+fn a_stop_inside_a_string_function_keeps_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::new(dir.path());
+    config.max_statement_time = std::time::Duration::from_millis(200);
+    let mut db = rooted(config).open("c", "a").unwrap();
+    db.exec("CREATE TABLE t (x)", &[]).unwrap();
+    db.exec("BEGIN", &[]).unwrap();
+    db.exec("INSERT INTO t VALUES (1)", &[]).unwrap();
+    let err = db
+        .exec(
+            "INSERT INTO t SELECT instr(printf('%.*c', 4000000, 'a'), \
+             printf('%.*c', 2000000, 'a') || 'b')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(db.in_transaction());
+    db.exec("COMMIT", &[]).unwrap();
+    let rows = db.query("SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(rows.values, vec![vec![V::Integer(1)]]);
+}
+
+/// While another connection keeps reading the WAL, the capture does not
+/// wait out the busy timeout at every event to try checkpointing again,
+/// and once the WAL fills up, the error says why.
+#[test]
+fn a_reader_that_stays_blocks_checkpoints_without_stalling_every_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = rooted(StorageConfig {
+        max_wal_bytes: 1024 * 1024,
+        ..StorageConfig::new(dir.path())
+    });
+    let mut db = s.open("c", "a").unwrap();
+    db.start_capture().unwrap();
+    db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
+    db.take_changes().unwrap();
+    let reader = rusqlite::Connection::open(db.path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM t;")
+        .unwrap();
+    let blob = V::Blob(vec![7; 300 * 1024]);
+    let mut slow = 0;
+    let err = loop {
+        match db.exec("INSERT INTO t VALUES (?1)", std::slice::from_ref(&blob)) {
+            Ok(_) => {}
+            Err(e) => break e,
+        }
+        let started = std::time::Instant::now();
+        db.take_changes().unwrap();
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            slow += 1;
+        }
+        db.end_event().unwrap();
+    };
+    assert!(slow <= 1, "{slow} captures waited for the reader");
+    assert_eq!(err.kind, SqlErrorKind::QuotaExceeded, "{err:?}");
+    assert!(err.message.contains("reading"), "{err:?}");
+    // Once the reader leaves, the next capture checkpoints and writes work.
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    db.end_event().unwrap();
+    // The retry may be spaced out: try for a while.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        db.take_changes().unwrap();
+        if db.exec("INSERT INTO t VALUES (x'01')", &[]).is_ok() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "writes never resumed");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A checkpoint that fails for another reason than a reader (an I/O error)
+/// still returns the captured changes, and is counted.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failed_checkpoint_is_counted_and_keeps_the_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = storage(&dir).open("c", "a").unwrap();
+    db.start_capture().unwrap();
+    db.exec("CREATE TABLE t (b BLOB)", &[]).unwrap();
+    db.exec("INSERT INTO t VALUES (zeroblob(5000000))", &[])
+        .unwrap();
+    wasmkeep_storage::faults::fail_next("checkpoint");
+    assert!(db.take_changes().unwrap().is_some());
+    assert_eq!(db.failed_checkpoints(), 1);
+    db.exec("INSERT INTO t VALUES (x'01')", &[]).unwrap();
+    assert!(db.take_changes().unwrap().is_some());
+    assert_eq!(db.failed_checkpoints(), 1);
 }
 
 /// A storage of tenant `t`, its databases at `<data_dir>/actors/t/` (where

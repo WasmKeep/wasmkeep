@@ -13,6 +13,7 @@ mod db;
 mod error;
 #[cfg(feature = "fault-injection")]
 pub mod faults;
+mod guest_functions;
 mod local;
 pub mod ltx;
 mod path;
