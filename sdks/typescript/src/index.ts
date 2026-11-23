@@ -33,7 +33,7 @@ import * as wkAlarms from "wasmkeep:actor/alarms@0.2.0";
 import * as wkSockets from "wasmkeep:actor/websockets@0.2.0";
 import type { Value } from "wasmkeep:actor/types@0.2.0";
 import type { IncomingRequest, ResponseOutparam } from "wasi:http/types@0.2.12";
-import { respond, toRequest } from "./handler";
+import { release, respond, toRequest } from "./handler";
 import type { ActorRequest, ActorResponse } from "./request";
 
 /** A database kept by one actor (`db.define({ migrations })`,
@@ -318,6 +318,7 @@ export function exportsFor(definition: ActorDefinition) {
           response = { status: 500, body: "actor error\n" };
         }
         respond(out, response);
+        release(request);
       },
     },
   };

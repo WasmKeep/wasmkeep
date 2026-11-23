@@ -235,6 +235,7 @@ function start(it: Item): boolean {
       request.setAuthority(authority);
       request.setPathWithQuery(path);
     } catch (e) {
+      dispose(request);
       throw new FetchError(`${url}: invalid request (${describe(e)})`);
     }
     const outgoing = request.body();
@@ -283,7 +284,8 @@ function sendBody(it: Item): void {
       // answered and closed (it had the whole body, or answered early),
       // and that answer is the result.
       dispose(outgoing);
-      it.sending = failure;
+      // Described now: that releases the stream error's handle.
+      it.sending = describeStreamError(failure);
       return;
     }
   }

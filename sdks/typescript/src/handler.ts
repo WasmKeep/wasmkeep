@@ -16,6 +16,7 @@ import { Body, incomingSource, type BodySource } from "./body";
 import type { ActorRequest, ActorResponse } from "./request";
 import { HeaderList, fieldsToPairs, responsePairs } from "./headers";
 import { writeBody } from "./response-body";
+import { dispose } from "./stream-error";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -54,7 +55,12 @@ export function toRequest(request: IncomingRequest): ActorRequest {
     const b = body.read(limit);
     return b === undefined ? undefined : decoder.decode(b);
   }
-  const headerList = fieldsToPairs(request.headers().entries());
+  // Released now (a copy of the request's, not its child): an engine that
+  // drops handles only when its garbage collector runs would otherwise
+  // keep one per request in the host's table.
+  const fields = request.headers();
+  const headerList = fieldsToPairs(fields.entries());
+  dispose(fields);
   const req: ActorRequest = {
     method: methodName(request.method()),
     path: request.pathWithQuery() ?? "/",
@@ -68,6 +74,13 @@ export function toRequest(request: IncomingRequest): ActorRequest {
     json: <T>() => JSON.parse(req.text()) as T,
   };
   return req;
+}
+
+/** Drops `request` once its response is written, for the same reason as
+ * its headers in {@link toRequest}: a resident actor's host table would
+ * otherwise grow by one request per event until its cap. */
+export function release(request: IncomingRequest): void {
+  dispose(request);
 }
 
 /** Writes `response` to `out`. */

@@ -63,7 +63,23 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 - Memory: 128 MiB per linear memory, 2 memories and 32 core instances per
   component; resident actors capped at the instance pool less the front's
   slots (90% by default), the least recently active idle one hibernating
-  to make room.
+  to make room. Outside its linear memory, a guest holds at most 4,096
+  host resources at once (handles: requests, headers, bodies, streams,
+  pollables), and a `wasi:http` `fields` it builds, or copies to change,
+  at most 64 KiB (counting a few dozen bytes per entry on top of its names
+  and values). Past either, the call traps: the event fails, and an
+  actor's instance is replaced by a fresh one at its next event. A
+  response to an outbound request fails past 64 KiB of head (status line
+  and headers), and its body past 64 KiB of trailers. An `actors.call`
+  carries at most 256 headers and 64 KiB of names and values (else
+  `too-large`). A body a guest writes queues at most 64 KiB in the host
+  until it is sent (writes of at most 32 KiB at a time). So a guest that
+  fills its table with requests it never sends, each with full headers
+  and a full queue, holds about 512 MiB per instance (4,096 × 128 KiB)
+  in the worst case. A request it was sent carries the headers its client
+  sent, bounded by the HTTP parser (100 headers in about 400 KiB); one
+  that keeps those requests instead of dropping them holds up to that
+  each.
 - Outbound HTTP: public addresses only (the host resolves, checks and
   connects to the checked address; TLS verified against the name);
   `--allow-outbound` and `--outbound-ca` open specific internal services.

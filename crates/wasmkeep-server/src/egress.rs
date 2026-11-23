@@ -45,6 +45,28 @@ pub const PER_NODE_REQUESTS: usize = 256;
 const PER_NODE_LOOKUPS: usize = 32;
 /// Addresses tried per request.
 const MAX_ADDRESSES: usize = 4;
+/// Bytes of a response's head (status line and headers) on the wire; past
+/// it the request fails with `HTTP-response-header-section-size`. A guest
+/// may hold a response's headers as long as it keeps the response, so
+/// this bounds each like a `fields` it builds (`MAX_GUEST_FIELDS_BYTES`),
+/// instead of the HTTP parser's default of about 400 KiB. The client has
+/// one limit for the head and the trailers, so this also raises the
+/// trailers' from its 16 KiB default to 64 KiB (past it, reading the
+/// body fails).
+pub const MAX_RESPONSE_HEAD_BYTES: usize = crate::guest_tables::MAX_GUEST_FIELDS_BYTES;
+/// Largest write a guest may make to an outgoing body (a request's or a
+/// response's), and so the size of one queued chunk (`wasi:http`'s default
+/// is 1 MiB). The SDKs write 4 KiB at a time.
+const OUTGOING_BODY_CHUNK_BYTES: usize = 32 * 1024;
+/// Chunks an outgoing body queues past the one being sent (the default).
+const OUTGOING_BODY_BUFFER_CHUNKS: usize = 1;
+/// What a body the guest wrote holds in the host until it is sent: its
+/// queue of chunks (one slot more than the buffered ones). A guest can
+/// keep a request or response it never sends, with its body's queue
+/// full, so with [`crate::MAX_GUEST_RESOURCES`] this bounds what unsent
+/// bodies hold: 4,096 × 64 KiB, 256 MiB.
+pub const MAX_UNSENT_BODY_BYTES: usize =
+    OUTGOING_BODY_CHUNK_BYTES * (OUTGOING_BODY_BUFFER_CHUNKS + 1);
 
 /// Ports no outbound request may use unless the operator allows them: the
 /// Fetch standard's "bad ports" (fetch.spec.whatwg.org, "port blocking"),
@@ -358,6 +380,14 @@ type SendResult = wasmtime_wasi_http::Result<(
 )>;
 
 impl WasiHttpHooks for EgressHooks {
+    fn p2_outgoing_body_chunk_size(&mut self) -> usize {
+        OUTGOING_BODY_CHUNK_BYTES
+    }
+
+    fn p2_outgoing_body_buffer_chunks(&mut self) -> usize {
+        OUTGOING_BODY_BUFFER_CHUNKS
+    }
+
     fn send_request(
         &mut self,
         request: ::http::Request<WasiBody>,
@@ -520,7 +550,9 @@ async fn send(
     };
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(stream)),
+        hyper::client::conn::http1::Builder::new()
+            .max_header_size(MAX_RESPONSE_HEAD_BYTES)
+            .handshake(TokioIo::new(stream)),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
@@ -535,7 +567,7 @@ async fn send(
         let mut res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
             .await
             .map_err(|_| Error::ConnectionReadTimeout)?
-            .map_err(Error::from)?;
+            .map_err(head_error)?;
         // The host's range never reaches a guest from outside, as from
         // `actors.call` answers: an upstream cannot speak for the host
         // (a front passing its answer on to an upgrade would otherwise
@@ -558,7 +590,7 @@ async fn send(
             conn = None;
             match result {
                 Ok(()) => send.as_mut().poll(cx),
-                Err(e) => Poll::Ready(Err(Error::from(e))),
+                Err(e) => Poll::Ready(Err(head_error(e))),
             }
         }
     })
@@ -575,6 +607,16 @@ async fn send(
             }
         })
     }))
+}
+
+/// `e`, while reading a response's head: a head past
+/// [`MAX_RESPONSE_HEAD_BYTES`] is reported as such to the guest.
+fn head_error(e: hyper::Error) -> Error {
+    if e.is_parse_too_large() {
+        Error::HttpResponseHeaderSectionSize(u32::try_from(MAX_RESPONSE_HEAD_BYTES).ok())
+    } else {
+        Error::from(e)
+    }
 }
 
 /// A response body that fails when the server pauses longer than the
@@ -731,6 +773,123 @@ mod tests {
         Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) })))
             .await
             .err()
+    }
+
+    /// A response from a local server whose one header is `bytes` long:
+    /// its status, or the request's error.
+    async fn fetch_with_header(bytes: usize) -> Result<u16, Error> {
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nx-big: {}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            "v".repeat(bytes)
+        );
+        fetch_reply(reply).await.map(|(status, _)| status)
+    }
+
+    /// A chunked response from a local server whose one trailer is `bytes`
+    /// long: its status and how reading the body to its end went.
+    async fn fetch_with_trailer(bytes: usize) -> Result<(u16, Result<(), Error>), Error> {
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-big\r\nconnection: close\r\n\r\n2\r\nok\r\n0\r\nx-big: {}\r\n\r\n",
+            "v".repeat(bytes)
+        );
+        fetch_reply(reply).await
+    }
+
+    /// What a local server answering `reply` gives: the status, and how
+    /// reading the body to its end went; or the request's error.
+    async fn fetch_reply(reply: String) -> Result<(u16, Result<(), Error>), Error> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            // The client may hang up partway through a head it refuses.
+            let _ = stream.write_all(reply.as_bytes()).await;
+        });
+        let mut hooks = EgressHooks::new(Arc::new(EgressPolicy::allowing(vec![
+            "127.0.0.1".parse().unwrap(),
+        ])));
+        let req = ::http::Request::builder()
+            .uri(format!("http://127.0.0.1:{port}/"))
+            .body(
+                http_body_util::Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let sent = Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) }))).await;
+        let result = match sent {
+            Ok((res, worker)) => {
+                let worker = tokio::spawn(Pin::from(worker));
+                let status = res.status().as_u16();
+                let read = res.into_body().collect().await.map(|_| ());
+                worker.abort();
+                Ok((status, read))
+            }
+            Err(e) => Err(e),
+        };
+        let _ = server.await;
+        result
+    }
+
+    /// What a body the guest writes and never sends holds in the host: its
+    /// queue, at most [`MAX_UNSENT_BODY_BYTES`] whatever the guest does.
+    #[tokio::test]
+    async fn an_unsent_body_queues_at_most_its_cap() {
+        use wasmtime_wasi_http::p2::body::{HostOutgoingBody, StreamContext};
+        let mut hooks = EgressHooks::default();
+        let (chunk, chunks) = (
+            hooks.p2_outgoing_body_chunk_size(),
+            hooks.p2_outgoing_body_buffer_chunks(),
+        );
+        let (mut body, _unsent) =
+            HostOutgoingBody::new(StreamContext::Request, None, chunks, chunk);
+        let mut out = body.take_output_stream().unwrap();
+        let mut queued = 0;
+        loop {
+            let n = out.check_write().unwrap();
+            if n == 0 {
+                break;
+            }
+            out.write(Bytes::from(vec![0u8; n])).unwrap();
+            queued += n;
+        }
+        assert_eq!(queued, MAX_UNSENT_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_response_head_past_the_limit_fails_the_request() {
+        assert_eq!(fetch_with_header(16 * 1024).await.unwrap(), 200);
+        let refused = fetch_with_header(MAX_RESPONSE_HEAD_BYTES).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::HttpResponseHeaderSectionSize(Some(n))) if n as usize == MAX_RESPONSE_HEAD_BYTES
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// Trailers are held to the same size as the head (the HTTP client
+    /// has one limit for both): 32 KiB passes, past its 16 KiB default.
+    #[tokio::test]
+    async fn trailers_past_the_limit_fail_the_body() {
+        let (status, read) = fetch_with_trailer(32 * 1024).await.unwrap();
+        assert_eq!(status, 200);
+        read.unwrap();
+        let (status, read) = fetch_with_trailer(MAX_RESPONSE_HEAD_BYTES).await.unwrap();
+        assert_eq!(status, 200);
+        // The client reports it as a body error, not by its own kind.
+        assert!(read.is_err(), "{read:?}");
     }
 
     #[tokio::test]

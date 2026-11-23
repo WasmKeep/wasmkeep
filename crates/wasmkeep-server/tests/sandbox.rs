@@ -111,3 +111,66 @@ async fn hostile_sql_fails_safely_and_the_node_keeps_serving() {
     // Other actors on the node were never affected.
     assert_eq!(sql(addr, "b", "", "SELECT 1").await, "ok:1");
 }
+
+/// `POST /actor/t/<name><path>`: the status and the body.
+async fn post(addr: SocketAddr, name: &str, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST /actor/t/{name}{path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {raw:?}"));
+    (status, raw)
+}
+
+/// An actor that holds more host resources than its store allows, or
+/// builds headers past the size allowed, fails that event and loses its
+/// instance (`/memory` counts in the instance's memory: 1 is a new one);
+/// the next event runs on a fresh instance. The table already holds the
+/// event's own resources, so the passing case leaves a margin.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_held_resources_and_header_size_are_capped() {
+    use wasmkeep_server::{MAX_GUEST_FIELDS_BYTES, MAX_GUEST_RESOURCES};
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    // The first line of the (chunked) body.
+    let memory = |text: &str| {
+        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        let mut lines = body.split("\r\n");
+        let first = lines.next().unwrap_or("");
+        let line = if usize::from_str_radix(first.trim(), 16).is_ok() {
+            lines.next().unwrap_or("")
+        } else {
+            first
+        };
+        line.trim_end().to_owned()
+    };
+
+    assert_eq!(memory(&post(addr, "f", "/memory").await.1), "1");
+    let under = MAX_GUEST_RESOURCES - 32;
+    let (status, text) = post(addr, "f", &format!("/fields?n={under}&bytes=16")).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains(&format!("held {under}\n")), "{text}");
+    assert_eq!(memory(&post(addr, "f", "/memory").await.1), "2");
+
+    let over = MAX_GUEST_RESOURCES + 1;
+    let (status, text) = post(addr, "f", &format!("/fields?n={over}&bytes=16")).await;
+    assert_eq!(status, 500, "{text}");
+    assert_eq!(memory(&post(addr, "f", "/memory").await.1), "1");
+
+    let (status, text) = post(addr, "f", "/fields?n=1&bytes=16384").await;
+    assert_eq!(status, 200, "{text}");
+    let path = format!("/fields?n=1&bytes={MAX_GUEST_FIELDS_BYTES}");
+    let (status, text) = post(addr, "f", &path).await;
+    assert_eq!(status, 500, "{text}");
+    assert_eq!(memory(&post(addr, "f", "/memory").await.1), "1");
+
+    // Other actors on the node were never affected.
+    assert_eq!(sql(addr, "g", "", "SELECT 1").await, "ok:1");
+}

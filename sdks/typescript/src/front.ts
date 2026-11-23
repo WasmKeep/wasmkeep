@@ -30,7 +30,7 @@ import "./console";
 import type { ResponseOutparam, IncomingRequest } from "wasi:http/types@0.2.12";
 import { explainMissing } from "./engines";
 import { describeError } from "./errors";
-import { respond, toRequest } from "./handler";
+import { release, respond, toRequest } from "./handler";
 import type { ActorRequest, ActorResponse } from "./request";
 
 export { actors, env, CallError, type ActorAddress, type CallRequest, type CallResponse } from "./actors";
@@ -80,6 +80,7 @@ export function frontExportsFor(definition: FrontDefinition) {
           response = { status: 500, body: "internal error\n" };
         }
         respond(out, response);
+        release(request);
       },
     },
   };

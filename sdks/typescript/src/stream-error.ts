@@ -28,21 +28,28 @@ export function streamErrorTag(e: unknown): string | undefined {
 export type ErrorCodeOf<E> = (error: E) => unknown;
 
 /** A broken stream's cause: the HTTP error code when the host gives one
- * (`codeOf`, `wasi:http`'s `http-error-code`), else its debug text. */
+ * (`codeOf`, `wasi:http`'s `http-error-code`), else its debug text. The
+ * error's handle is released then (an engine that drops handles only
+ * when its garbage collector runs would keep it in the host's table):
+ * describe a stream error once. */
 export function describeStreamError<E extends { toDebugString(): string }>(e: unknown, codeOf?: ErrorCodeOf<E>): string {
   const payload = typeof e === "object" && e !== null && "payload" in e ? (e as { payload: unknown }).payload : e;
   const val = typeof payload === "object" && payload !== null ? (payload as { val?: unknown }).val : undefined;
   if (typeof val === "object" && val !== null && "toDebugString" in val) {
     const error = val as E;
-    if (codeOf !== undefined) {
-      try {
-        const code = codeOf(error);
-        if (code !== undefined && code !== null) return describe(code);
-      } catch {
-        // No code: the debug text below.
+    try {
+      if (codeOf !== undefined) {
+        try {
+          const code = codeOf(error);
+          if (code !== undefined && code !== null) return describe(code);
+        } catch {
+          // No code: the debug text below.
+        }
       }
+      return error.toDebugString();
+    } finally {
+      dispose(error);
     }
-    return error.toDebugString();
   }
   return describe(e);
 }

@@ -685,8 +685,8 @@ impl HttpComponent {
                 ),
                 FRONT_CLASS.to_owned(),
             ),
-            http: WasiHttpCtx::new(),
-            table: ResourceTable::new(),
+            http: crate::guest_tables::http_ctx(),
+            table: crate::guest_tables::resource_table(),
             egress: crate::egress::EgressHooks::new(Arc::clone(&self.egress)),
             tenant: actors.map_or_else(|| "default".to_owned(), |a| a.tenant().to_owned()),
             app: front_app(actors),
@@ -904,6 +904,7 @@ impl HttpComponent {
                 let reason = reason(&e);
                 outcome(&app, reason);
                 observe();
+                log_table_full(&e);
                 tracing::warn!(reason, error = %format!("{e:#}"), "front request failed");
                 internal_error()
             }
@@ -968,6 +969,7 @@ impl HttpComponent {
                     Err(e) => {
                         let reason = reason(e);
                         outcome(&app, reason);
+                        log_table_full(e);
                         tracing::warn!(
                             reason,
                             error = %format!("{e:#}"),
@@ -1117,6 +1119,17 @@ fn outcome(app: &str, o: &str) {
 }
 
 /// Why an instance failed, as an outcome.
+/// A line of its own when the front trapped on its resource table's cap,
+/// so an operator tells it apart from a bug in the front.
+fn log_table_full(e: &wasmtime::Error) {
+    if crate::guest_tables::is_table_full(e) {
+        tracing::warn!(
+            cap = crate::MAX_GUEST_RESOURCES,
+            "front request trapped: it held as many host resources as a store allows"
+        );
+    }
+}
+
 fn reason(e: &wasmtime::Error) -> &'static str {
     if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
         "cpu_budget"

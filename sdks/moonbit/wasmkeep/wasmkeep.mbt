@@ -572,6 +572,11 @@ fn read_body(handle : @http.IncomingRequest) -> Bytes {
   while true {
     match stream.blocking_read(65536) {
       Ok(chunk) => buf.write_bytes(Bytes::from_array(chunk[:]))
+      // A broken body's error is released, or the host keeps it.
+      Err(LastOperationFailed(e)) => {
+        e.drop()
+        break
+      }
       Err(_) => break // closed: the body has ended
     }
   }
@@ -602,8 +607,13 @@ fn respond(out : @http.ResponseOutparam, r : Response) -> Unit {
     while at < data.length() {
       let end = if at + 4096 < data.length() { at + 4096 } else { data.length() }
       let chunk = data[at:end].to_owned().to_fixedarray()
-      if stream.blocking_write_and_flush(chunk) is Err(_) {
-        break
+      match stream.blocking_write_and_flush(chunk) {
+        Ok(_) => ()
+        Err(LastOperationFailed(e)) => {
+          e.drop()
+          break
+        }
+        Err(_) => break
       }
       at = end
     }
