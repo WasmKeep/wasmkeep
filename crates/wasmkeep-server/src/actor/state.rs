@@ -690,7 +690,7 @@ impl ActorState {
         let Some(companion) = companion.filter(|_| cluster.placement_on()) else {
             return Vec::new();
         };
-        if cluster.holds_here(&companion) {
+        if cluster.holds_for_events(&companion) {
             return vec![cluster.node_id.clone()];
         }
         use wasmkeep_cluster::node_lease::Route;
@@ -796,8 +796,8 @@ impl ActorState {
         // here (ADR 0024): its record names this node.
         if apart && listed.is_none() && cluster.placement_on() && !cluster.is_parked(&self.address)
         {
-            let here =
-                companion_of(&self.class, &self.address).is_some_and(|c| cluster.holds_here(&c));
+            let here = companion_of(&self.class, &self.address)
+                .is_some_and(|c| cluster.holds_for_events(&c));
             if here {
                 match cluster.apart_peer(&self.address, true) {
                     Some(peer) => {

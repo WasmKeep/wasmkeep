@@ -38,8 +38,10 @@ owner generation with exit code **3**, before publishing an export or emitting
 SQL results. Other runtime failures exit 1; argument errors exit 2. This checks
 the listed head even for historical selections; it does not prove durability.
 Every acquisition raises the owner generation, so an actor last woken without
-writing, or compacted by an idle pass (below), reads one or more generations
-past its head: such an actor is refused with `--require-owner-match` until it
+writing, or compacted by an idle pass (below), reads a generation past its
+head. In an app with the recorded-head format (ADR 0035), a released record one
+generation past the head whose recorded head is exactly the head still matches;
+in version 1 such an actor is refused with `--require-owner-match` until it
 next writes.
 
 `--at` takes an RFC3339 timestamp with timezone or a relative duration such

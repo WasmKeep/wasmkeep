@@ -557,6 +557,17 @@ impl Drop for InFlight {
 /// Nothing was written; the actor is not expired.
 pub(crate) const RECORD_CHANGED: &str = "the ownership record changed since the listing";
 
+/// Whether the record version `read` (an `ETag`, then a version id, as
+/// `object_store.rs` encodes them) is `remembered`: the same `ETag` and,
+/// where both carry a version id (a versioned bucket), the same id. An
+/// expiry's listing gives the `ETag` alone, which is then all compared.
+pub(crate) fn same_version(read: &str, remembered: &str) -> bool {
+    let (read_tag, read_id) = read.split_once('\n').unwrap_or((read, ""));
+    let (tag, id) = remembered.split_once('\n').unwrap_or((remembered, ""));
+    wasmkeep_cluster::expiry::etag(read_tag) == wasmkeep_cluster::expiry::etag(tag)
+        && (read_id.is_empty() || id.is_empty() || read_id == id)
+}
+
 /// This node's hold on one actor, released when dropped (hibernation).
 pub(crate) struct LeaseHold {
     cell: Cell,
@@ -644,11 +655,7 @@ impl LeaseHold {
                     .owners
                     .acquire_unchanged_prepared(
                         &key,
-                        |v| {
-                            let read = v.0.split('\n').next().unwrap_or_default();
-                            wasmkeep_cluster::expiry::etag(read)
-                                == wasmkeep_cluster::expiry::etag(listed)
-                        },
+                        |v| same_version(&v.0, listed),
                         Some(idle_origin_ms),
                         || cluster.validity.valid_in(epoch),
                         prepare,
@@ -674,6 +681,9 @@ impl LeaseHold {
                     tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), from = %previous, generation = hold.generation, "took over an actor whose node stopped");
                 }
                 let generation = hold.generation;
+                // Any acquisition here: the version an idle pass remembered
+                // is gone (ADR 0042).
+                cluster.idle_passes.remove(&key);
                 let cell = Arc::new(Mutex::new(Some(hold)));
                 cluster.pending.register(&key, &cell);
                 // The new hold carries the local evidence now.

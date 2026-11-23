@@ -2697,7 +2697,10 @@ impl Collector {
         let listed = self.list().await?;
         let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
         let gone = collectable(&listing, self.generation, snapshot);
-        Ok(self.delete_older(&listed, gone, retention).await?.0)
+        Ok(self
+            .delete_older(&listed, gone, retention, &|| false)
+            .await?
+            .0)
     }
 
     /// The collector of an idle pass (ADR 0042, section 3): `generation`
@@ -2722,11 +2725,14 @@ impl Collector {
     /// listing; the snapshot and keys [`idle_collectable`] gives for this
     /// collector's generation (the released one); and the deletes of
     /// those older than `retention` by `last_modified`, in batches, the
-    /// lease checked before each. A lease already invalid is
-    /// [`ReplicaError::Late`], nothing listed.
+    /// lease checked before each, and `stop` too: the pass stops deleting
+    /// once it says so (its deadline, an event waiting behind it, a drain),
+    /// and what is left waits for the actor's next write. A lease already
+    /// invalid is [`ReplicaError::Late`], nothing listed.
     pub(crate) async fn collect_idle(
         &self,
         retention: std::time::Duration,
+        stop: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<IdleCollected, ReplicaError> {
         if !self.lease.is_valid() {
             return Err(ReplicaError::Late);
@@ -2736,11 +2742,12 @@ impl Collector {
         let Some((snapshot, gone)) = idle_collectable(&listing, self.generation) else {
             return Ok(IdleCollected::NoSnapshot);
         };
-        let (deleted, kept) = self.delete_older(&listed, gone, retention).await?;
+        let (deleted, kept, stopped) = self.delete_older(&listed, gone, retention, stop).await?;
         Ok(IdleCollected::Collected {
             snapshot,
             deleted,
             kept,
+            stopped,
         })
     }
 
@@ -2772,15 +2779,17 @@ impl Collector {
     }
 
     /// Deletes the listed objects `gone` names that are older than
-    /// `retention`, in batches, while the lease is valid. Returns how many
-    /// were deleted (already gone counts) and how many were kept for being
-    /// younger than the window.
+    /// `retention`, in batches, while the lease is valid and `stop` says
+    /// nothing. Returns how many were deleted (already gone counts), how
+    /// many were kept for being younger than the window, and whether
+    /// `stop` cut the deletes short.
     async fn delete_older(
         &self,
         listed: &[(String, object_store::ObjectMeta)],
         gone: Vec<String>,
         retention: std::time::Duration,
-    ) -> Result<(usize, usize), ReplicaError> {
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(usize, usize, bool), ReplicaError> {
         use futures_util::StreamExt;
         let gone: std::collections::HashSet<String> = gone.into_iter().collect();
         let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
@@ -2796,10 +2805,14 @@ impl Collector {
                 kept += 1;
             }
         }
-        let mut deleted = 0;
+        let (mut deleted, mut stopped) = (0, false);
         for batch in doomed.chunks(COLLECT_BATCH) {
             // ADR 0012, condition 3.
             if !self.lease.is_valid() {
+                break;
+            }
+            if stop() {
+                stopped = true;
                 break;
             }
             // The stream outlives the batch: it takes its own copies.
@@ -2819,7 +2832,7 @@ impl Collector {
                 }
             }
         }
-        Ok((deleted, kept))
+        Ok((deleted, kept, stopped))
     }
 }
 
@@ -2836,6 +2849,8 @@ pub(crate) enum IdleCollected {
         snapshot: SegmentId,
         deleted: usize,
         kept: usize,
+        /// The pass's stop condition cut the deletes short.
+        stopped: bool,
     },
 }
 
@@ -3640,14 +3655,31 @@ mod tests {
             ..collector.clone()
         };
         assert_eq!(
-            other.collect_idle(std::time::Duration::ZERO).await.unwrap(),
+            other
+                .collect_idle(std::time::Duration::ZERO, &|| false)
+                .await
+                .unwrap(),
             IdleCollected::NoSnapshot
         );
+        assert_eq!(count().await, 253);
+        // A stop that says so before the first batch: nothing deleted, and
+        // said.
+        assert!(matches!(
+            collector
+                .collect_idle(std::time::Duration::ZERO, &|| true)
+                .await
+                .unwrap(),
+            IdleCollected::Collected {
+                deleted: 0,
+                stopped: true,
+                ..
+            }
+        ));
         assert_eq!(count().await, 253);
         // 249 segments and one snapshot below 250: three batches, of
         // which the first runs and lapses the lease.
         let done = collector
-            .collect_idle(std::time::Duration::ZERO)
+            .collect_idle(std::time::Duration::ZERO, &|| false)
             .await
             .unwrap();
         assert_eq!(
@@ -3659,11 +3691,14 @@ mod tests {
                 },
                 deleted: COLLECT_BATCH,
                 kept: 0,
+                stopped: false,
             }
         );
         assert_eq!(count().await, 253 - COLLECT_BATCH);
         assert!(matches!(
-            collector.collect_idle(std::time::Duration::ZERO).await,
+            collector
+                .collect_idle(std::time::Duration::ZERO, &|| false)
+                .await,
             Err(ReplicaError::Late)
         ));
         // Under a valid hold, the rest goes; the snapshot at 250, its
@@ -3675,7 +3710,7 @@ mod tests {
         };
         assert_eq!(
             valid
-                .collect_idle(std::time::Duration::from_secs(3600))
+                .collect_idle(std::time::Duration::from_secs(3600), &|| false)
                 .await
                 .unwrap(),
             IdleCollected::Collected {
@@ -3685,9 +3720,13 @@ mod tests {
                 },
                 deleted: 0,
                 kept: 250 - COLLECT_BATCH,
+                stopped: false,
             }
         );
-        valid.collect_idle(std::time::Duration::ZERO).await.unwrap();
+        valid
+            .collect_idle(std::time::Duration::ZERO, &|| false)
+            .await
+            .unwrap();
         let mut left: Vec<String> = {
             use futures_util::TryStreamExt;
             store

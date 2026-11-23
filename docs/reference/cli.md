@@ -170,7 +170,7 @@ Usage: `wasmkeep serve [OPTIONS] [COMPONENT]`
 | `--cluster-advertise <URL>` |  | URL the other nodes reach the cluster listener at, e.g. https://10.0.0.11:7443 (needs --cluster-listen) |
 | `--cluster-plaintext <MODE>` | `refuse` | Plain HTTP between nodes. One of: accept, refuse. |
 | `--history-retention-secs <SECS>` | `3600` | Seconds an actor's old history stays in the bucket before garbage collection may delete it (ADR 0012); 0 deletes it as soon as the rule allows. |
-| `--no-idle-compaction` |  | Never compact an idle actor's history (ADR 0042): no snapshot at the head when an actor hibernates. |
+| `--no-idle-compaction` |  | Never compact an idle actor's history (ADR 0042): no snapshot at the head when an actor hibernates, and no idle pass a retention window later. |
 | `--failover-wait-secs <SECS>` |  | Seconds a request for an actor whose node died or is stopping is kept until another node can take the actor over, instead of a 503 at once: a GET or HEAD without a body, or a WebSocket upgrade, arriving from outside. |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX]. Credentials, region and endpoint come from the AWS_* environment variables (AWS_ENDPOINT for MinIO or R2, AWS_ALLOW_HTTP=true for plain http) |
 | `--cache-dir <CACHE_DIR>` | `.wasmkeep/cache` | Directory for pre-compiled components |
@@ -395,7 +395,7 @@ Usage: `wasmkeep actor export [OPTIONS] --bucket <BUCKET> --output <FILE> <TENAN
 | `--txid <TXID>` |  | Exact retained transaction boundary on the current ancestry |
 | `--max-bytes <MAX_BYTES>` | `2147483648` | Maximum replayed database bytes (twice the default server cap) |
 | `--tmpdir <DIR>` |  | Parent directory for the plaintext scratch copy |
-| `--require-owner-match` |  | Refuse an unavailable or mismatched owner hint (exit 3) |
+| `--require-owner-match` |  | Refuse an unavailable or mismatched owner hint (exit 3). |
 | `-o, --output <FILE>` |  | New output SQLite file; existing files are never overwritten |
 
 #### `wasmkeep actor sql`
@@ -414,7 +414,7 @@ Usage: `wasmkeep actor sql [OPTIONS] --bucket <BUCKET> <TENANT/APP> <ACTOR> <QUE
 | `--txid <TXID>` |  | Exact retained transaction boundary on the current ancestry |
 | `--max-bytes <MAX_BYTES>` | `2147483648` | Maximum replayed database bytes (twice the default server cap) |
 | `--tmpdir <DIR>` |  | Parent directory for the plaintext scratch copy |
-| `--require-owner-match` |  | Refuse an unavailable or mismatched owner hint (exit 3) |
+| `--require-owner-match` |  | Refuse an unavailable or mismatched owner hint (exit 3). |
 | `--format <FORMAT>` |  | Output format (default: table on a terminal, csv otherwise) One of: table, csv, tsv, json, jsonl. |
 
 #### `wasmkeep actor move`

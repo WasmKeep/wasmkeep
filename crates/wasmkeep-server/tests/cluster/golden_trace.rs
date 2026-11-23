@@ -1050,13 +1050,14 @@ async fn idle_pass_life() -> String {
         "a",
         dir.path(),
         &seen_by_a,
-        Duration::from_secs(600),
+        // The actor hibernates when idle: the node keeps room, so the pass
+        // is admitted (it never evicts an actor for its job).
+        Duration::from_secs(1),
         &["t"],
         test_actor_wasm(),
         Duration::from_secs(30),
         "",
         |config: &mut ActorConfig| {
-            config.mailbox.max_resident = 1;
             let cluster = config.cluster.as_mut().unwrap();
             cluster.lease = LeaseConfig::new(6_000, 500, 1_000, 100).unwrap();
             cluster.placement = false;
@@ -1082,8 +1083,6 @@ async fn idle_pass_life() -> String {
          the release",
     );
     let released = std::time::Instant::now();
-    let r = run(&a, "GET", "/actor/t/y/plain").await;
-    assert_eq!(r.status, 200, "{}: {}", r.head, r.body);
     eventually("x hibernated", async || {
         owner_record(&shared, "x")
             .await

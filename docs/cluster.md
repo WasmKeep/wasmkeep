@@ -1758,25 +1758,30 @@ lease; deleted objects are counted by `wasmkeep_history_collected_total`
   actor that writes a little at each wake therefore keeps its last
   snapshot, the write under it and what the window keeps.
 - **One window later, the idle pass.** The node remembers each actor it
-  released after writing, in memory (at most 100,000, the oldest dropped
-  first). Once the window and the clocks' skew bound have passed, it takes
-  the actor's record again, only if it is still the one its release wrote,
+  released after writing, in memory (at most 100,000; a full queue
+  refuses new actors, counted by `wasmkeep_idle_passes_dropped_total`).
+  Once the window and the clocks' skew bound have passed, it takes the
+  actor's record again, only if it is still the one its release wrote,
   without running the actor's code or restoring it, lists its history
   once, deletes what the window kept below the snapshot at the head, and
   releases it. The actor then holds two objects: that snapshot and the
-  write at the head. At most 4 passes run at once per node and app. A
-  wake, a move or an expiry in between changed the record, and the pass
-  is dropped; so is one on a draining node, of an app deleted, restoring
-  or recreated since the node started, or of a class with
-  `expire-after-idle` (the pass's rewrites would restart its idle clock).
-  Counted by `wasmkeep_idle_compactions_total{outcome}`, its deletes by
-  `wasmkeep_history_collected_total`.
+  write at the head. Up to 4 passes run at once per node and app, a new
+  one starting as soon as one ends; a pass deletes for at most 5 s, and
+  stops as soon as a request for the actor waits behind it or the node
+  begins draining. A wake, a move or an expiry in between changed the
+  record, and the pass is dropped; so is one on a draining node, of an
+  app deleted, restoring or recreated since the node started, or of a
+  class with `expire-after-idle` (the pass's rewrites would restart its
+  idle clock). A node at its resident limit, behind the deployed version
+  or not hearing from the bucket tries again a few seconds later, a few
+  times. Counted by `wasmkeep_idle_compactions_total{outcome}`, its
+  deletes by `wasmkeep_history_collected_total`.
 
 What stays uncompacted: actors released by a node that then restarted
 within the window (the memory is lost), actors woken within the window
-without writing, actors whose node crashed, and actors whose release's
-answer was lost; each is compacted after it next writes and rests for a
-window. `--no-idle-compaction` turns both steps off. Late uploads of
+without writing, actors whose node crashed, actors whose release's answer
+was lost, and what a stopped pass did not reach; each is compacted after
+it next writes and rests for a window. `--no-idle-compaction` turns both steps off. Late uploads of
 earlier owners that land after a pass stay until the next pass. Old
 deploy versions are removed by `wasmkeep deploy` (see
 [Deploying](#deploying)).

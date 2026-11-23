@@ -222,6 +222,14 @@ async fn an_idle_pass_leaves_the_snapshot_and_its_segment_and_the_same_database(
         "{}",
         r.body
     );
+    // b's restore read the compacted history; what it left is that
+    // database, byte for byte.
+    hibernated(&b).await;
+    let (after_b, _) = export(&store, "x", Point::Head).await;
+    assert_eq!(
+        (after_b.position, after_b.raw_checksum),
+        (head.position, head.raw_checksum)
+    );
 }
 
 /// ADR 0042, Tests, "Readers": an export that listed before the pass and
@@ -258,20 +266,40 @@ async fn an_export_racing_a_pass_publishes_the_same_database() {
     );
 }
 
-/// A wake before the pass, even one that only reads, rewrites the record:
-/// the pass finds it changed and leaves every object.
+/// A wake before the pass, even one that only reads, rewrites the record.
+/// On the node that remembers the pass, the wake's acquisition forgets it.
+/// On another node, the pass finds the record changed (one read, before
+/// its job is submitted) and leaves every object.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wake_before_the_pass_leaves_every_object() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let da = tempfile::tempdir().unwrap();
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = compacting("a", da.path(), &store, Duration::from_millis(500)).await;
+    let b = compacting("b", db.path(), &store, Duration::from_millis(500)).await;
     settle().await;
+    // Here: forgotten at the wake.
     writes(&a, "w", 0, 4).await;
     hibernated(&a).await;
     assert_eq!(a.service.idle_passes_queued().len(), 1);
     let r = send(a.addr, "GET", "/actor/t/w/durable", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "4"), "{}", r.body);
     hibernated(&a).await;
+    assert!(
+        a.service.idle_passes_queued().is_empty(),
+        "the wake here forgot it"
+    );
+    // Elsewhere: found changed.
+    writes(&a, "w", 4, 1).await;
+    hibernated(&a).await;
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    let r = send(b.addr, "GET", "/actor/t/w/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "5", Some("b")),
+        "{}",
+        r.body
+    );
+    hibernated(&b).await;
     let before = actor_keys(&store, "w").await;
     tokio::time::sleep(Duration::from_millis(700)).await;
     let outcome = run_passes(&a).await;
@@ -429,4 +457,385 @@ async fn no_pass_is_queued_with_idle_compaction_off() {
     writes(&a, "o", 0, 3).await;
     hibernated(&a).await;
     assert!(a.service.idle_passes_queued().is_empty());
+}
+
+/// A bucket with two hooks for the idle pass's races: history listings
+/// held back `delay_list_ms` (counted in `lists` once they start), and an
+/// app marker written as an ownership record naming a holder is written,
+/// once armed (the pass's acquisition: between its two marker reads).
+#[derive(Debug)]
+struct Hooked {
+    inner: Arc<dyn ObjectStore>,
+    delay_list_ms: std::sync::atomic::AtomicU64,
+    lists: Arc<std::sync::atomic::AtomicU32>,
+    marker_at_acquisition: std::sync::Mutex<Option<&'static str>>,
+    /// Reads of an ownership record's metadata (a HEAD) held back this
+    /// long, counted in `heads` once they start.
+    delay_owner_head_ms: std::sync::atomic::AtomicU64,
+    heads: std::sync::atomic::AtomicU32,
+}
+
+impl Hooked {
+    fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            delay_list_ms: Default::default(),
+            lists: Default::default(),
+            marker_at_acquisition: Default::default(),
+            delay_owner_head_ms: Default::default(),
+            heads: Default::default(),
+        })
+    }
+}
+
+impl std::fmt::Display for Hooked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hooked")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Hooked {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use object_store::ObjectStoreExt as _;
+        if location.as_ref().contains("/owners/") {
+            let body: Vec<u8> = (&payload).into_iter().flat_map(|b| b.to_vec()).collect();
+            let held = wasmkeep_cluster::node_lease::OwnerRecord::decode(&body)
+                .is_some_and(|r| r.holder.is_some());
+            let marker = if held {
+                self.marker_at_acquisition.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                self.inner
+                    .put(
+                        &object_store::path::Path::from(format!("apps/default/default/{marker}")),
+                        b"written during the pass".to_vec().into(),
+                    )
+                    .await?;
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let delay = self.delay_owner_head_ms.load(Ordering::SeqCst);
+        if options.head && delay > 0 && location.as_ref().contains("/owners/") {
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        use futures_util::StreamExt as _;
+        let delay = self.delay_list_ms.load(Ordering::SeqCst);
+        let history = prefix.is_some_and(|p| p.as_ref().contains("/actors/"));
+        let listing = self.inner.list(prefix);
+        if delay == 0 || !history {
+            return listing;
+        }
+        let lists = Arc::clone(&self.lists);
+        futures_util::stream::once(async move {
+            lists.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            listing
+        })
+        .flatten()
+        .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A node `a` on `hooked`, an actor written over two generations and
+/// hibernated, its pass remembered, the window passed: what the M2 and
+/// mid-pass tests start from. Returns the node and the keys before.
+async fn rested(
+    dir: &Path,
+    hooked: &Arc<Hooked>,
+    name: &str,
+    retention: Duration,
+) -> (Node, Vec<String>) {
+    let store: Arc<dyn ObjectStore> = Arc::clone(hooked) as Arc<dyn ObjectStore>;
+    let a = compacting("a", dir, &store, retention).await;
+    settle().await;
+    writes(&a, name, 0, 3).await;
+    hibernated(&a).await;
+    writes(&a, name, 3, 3).await;
+    hibernated(&a).await;
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    let before = actor_keys(&hooked.inner, name).await;
+    assert!(before.len() > 2, "{before:?}");
+    tokio::time::sleep(retention + Duration::from_millis(200)).await;
+    (a, before)
+}
+
+/// M2: a marker written after the pass's first read of the markers and
+/// before its second (here at its acquisition's write) makes the pass
+/// compact nothing. The check made under the hold is what refuses.
+async fn marker_during_the_pass(marker: &'static str) {
+    let hooked = Hooked::new(Arc::new(InMemory::new()));
+    let da = tempfile::tempdir().unwrap();
+    let (a, before) = rested(da.path(), &hooked, "m", Duration::from_millis(500)).await;
+    *hooked.marker_at_acquisition.lock().unwrap() = Some(marker);
+    let outcome = run_passes(&a).await;
+    assert!(
+        hooked.marker_at_acquisition.lock().unwrap().is_none(),
+        "the pass did not acquire"
+    );
+    assert_eq!(
+        actor_keys(&hooked.inner, "m").await,
+        before,
+        "the pass deleted objects after the app's {marker} marker appeared"
+    );
+    assert_eq!(outcome, "refused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recreated_marker_written_during_the_pass_stops_it() {
+    marker_during_the_pass("recreated").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_marker_written_during_the_pass_stops_it() {
+    marker_during_the_pass("restored").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_or_restoring_marker_written_during_the_pass_stops_it() {
+    marker_during_the_pass("deleted").await;
+    marker_during_the_pass("restoring").await;
+}
+
+/// M1: passes are taken as slots free up, not a few per tick. 50 actors
+/// rest, their passes come due together; with a window long enough that
+/// the loop's tick is its longest (5 s), all 50 run within a few seconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn fifty_due_passes_all_run_promptly() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let da = tempfile::tempdir().unwrap();
+    let a = compacting("a", da.path(), &store, Duration::from_secs(60)).await;
+    settle().await;
+    for i in 0..50 {
+        writes(&a, &format!("f{i}"), 0, 1).await;
+    }
+    eventually("all hibernate", async || a.service.resident() == 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.service.idle_passes_queued().len(), 50);
+    let before: u64 = all_compactions().await.iter().sum();
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    let started = std::time::Instant::now();
+    loop {
+        let ran = all_compactions().await.iter().sum::<u64>() - before;
+        if ran == 50 && a.service.idle_passes_queued().is_empty() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{ran} of 50 passes ran in {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// S9: a drain that begins after the pass's first checks and before its
+/// job starts (here during its read of the record) is seen by the job,
+/// which refuses before acquiring anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_begun_before_the_pass_job_starts_refuses_it() {
+    let hooked = Hooked::new(Arc::new(InMemory::new()));
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store: Arc<dyn ObjectStore> = Arc::clone(&hooked) as Arc<dyn ObjectStore>;
+    let _b = compacting("b", db.path(), &store, Duration::from_millis(500)).await;
+    let (a, before) = rested(da.path(), &hooked, "dj", Duration::from_millis(500)).await;
+    let (_, generation) = owner_record(&hooked.inner, "dj").await.unwrap();
+    hooked.delay_owner_head_ms.store(4_000, Ordering::SeqCst);
+    let refused = compactions("refused").await;
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    eventually("the pass reads the record", async || {
+        hooked.heads.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    drain(&hooked.inner, "a").await;
+    eventually("the pass ended", async || {
+        compactions("refused").await > refused
+    })
+    .await;
+    assert_eq!(actor_keys(&hooked.inner, "dj").await, before);
+    let (_, now) = owner_record(&hooked.inner, "dj").await.unwrap();
+    assert_eq!(now, generation, "the record was acquired");
+}
+
+/// S9: a drain that begins while the pass lists stops it before any
+/// delete (the pass's stop, checked before each batch, covers a drain).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_begun_during_a_pass_stops_its_deletes() {
+    let hooked = Hooked::new(Arc::new(InMemory::new()));
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store: Arc<dyn ObjectStore> = Arc::clone(&hooked) as Arc<dyn ObjectStore>;
+    let _b = compacting("b", db.path(), &store, Duration::from_millis(500)).await;
+    let (a, before) = rested(da.path(), &hooked, "dm", Duration::from_millis(500)).await;
+    hooked.delay_list_ms.store(4_000, Ordering::SeqCst);
+    let lists = hooked.lists.load(Ordering::SeqCst);
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    eventually("the pass lists", async || {
+        hooked.lists.load(Ordering::SeqCst) > lists
+    })
+    .await;
+    drain(&hooked.inner, "a").await;
+    eventually("the pass ended", async || {
+        a.service.idle_passes_queued().is_empty() && a.service.resident() == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(actor_keys(&hooked.inner, "dm").await, before);
+}
+
+/// S9: an event that arrives while the pass lists waits behind it in the
+/// mailbox; the pass stops before deleting, releases, and the event is
+/// served after it, from the same history, under a hold of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_during_a_slow_pass_is_served_after_it() {
+    let hooked = Hooked::new(Arc::new(InMemory::new()));
+    let da = tempfile::tempdir().unwrap();
+    let (a, before) = rested(da.path(), &hooked, "w2", Duration::from_millis(500)).await;
+    let (_, generation) = owner_record(&hooked.inner, "w2").await.unwrap();
+    hooked.delay_list_ms.store(2_000, Ordering::SeqCst);
+    let lists = hooked.lists.load(Ordering::SeqCst);
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    eventually("the pass lists", async || {
+        hooked.lists.load(Ordering::SeqCst) > lists
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let r = send(a.addr, "GET", "/actor/t/w2/durable", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "6"), "{}", r.body);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_000),
+        "served before the pass ended ({:?})",
+        started.elapsed()
+    );
+    hooked.delay_list_ms.store(0, Ordering::SeqCst);
+    assert_eq!(actor_keys(&hooked.inner, "w2").await, before, "deleted");
+    // The pass's hold at generation + 1, released; the event's at + 2.
+    let (holder, now) = owner_record(&hooked.inner, "w2").await.unwrap();
+    assert_eq!((holder.as_deref(), now), (Some("a"), generation + 2));
+}
+
+/// S7, and a pass on a version 2 app: the pass releases with the head it
+/// inherited, so the record still names the head (one generation past
+/// it), and `--require-owner-match` accepts the compacted actor.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_version_2_app_a_pass_keeps_the_recorded_head_and_the_owner_match() {
+    use object_store::ObjectStoreExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    store
+        .put(
+            &object_store::path::Path::from(wasmkeep_cluster::app_format::key(
+                "", "default", "default",
+            )),
+            wasmkeep_cluster::app_format::ENABLED_BODY.to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let da = tempfile::tempdir().unwrap();
+    let a = compacting("a", da.path(), &store, Duration::from_millis(500)).await;
+    settle().await;
+    writes(&a, "v2", 0, 3).await;
+    hibernated(&a).await;
+    writes(&a, "v2", 3, 3).await;
+    hibernated(&a).await;
+    let (head, _) = export(&store, "v2", Point::Head).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(run_passes(&a).await, "done");
+    assert_eq!(actor_keys(&store, "v2").await.len(), 2);
+    let record = store
+        .get(&object_store::path::Path::from(test_key(
+            Family::Owners,
+            "t/v2",
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let record = wasmkeep_cluster::node_lease::OwnerRecord::decode(&record).unwrap();
+    assert_eq!(record.generation, head.position.generation + 1);
+    let recorded = record.recorded.expect("a version 2 record");
+    assert!(
+        matches!(
+            recorded.head,
+            wasmkeep_cluster::recorded_head::Position::Known { generation, txid, .. }
+                if generation == head.position.generation && txid == head.position.txid
+        ),
+        "{recorded:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let strict = history::export_with_options(
+        &store,
+        &StateRoot::new("", "default", "default"),
+        &ActorAddress::new("default", "t", "v2").unwrap(),
+        Point::Head,
+        &dir.path().join("strict.db"),
+        history::Options {
+            require_owner_match: true,
+            ..history::Options::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(strict.raw_checksum, head.raw_checksum);
 }

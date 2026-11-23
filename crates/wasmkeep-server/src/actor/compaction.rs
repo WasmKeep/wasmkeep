@@ -4,18 +4,25 @@
 //! still the one that release wrote, and deletes the history the idle
 //! snapshot made unnecessary.
 //!
-//! The release remembers the actor here ([`Queue::note`]): its record key,
-//! the generation released, the version the release wrote, and when it is
-//! due (release + retention window + clock skew bound). The queue is in
-//! memory, bounded ([`QUEUE_MAX`], the entry due first dropped first) and
-//! keyed by actor, a later release replacing an earlier one. A loop takes
-//! what is due, [`PASSES_AT_ONCE`] at a time, each a job in the actor's
+//! A release that lands remembers the actor here
+//! ([`Cluster::note_idle_release`]): its record key, the generation
+//! released, the version the release wrote, and when it is due (release +
+//! retention window + clock skew bound). The queue is in memory, keyed by
+//! actor, a later release replacing an earlier one; a release that did not
+//! write, or any acquisition here, forgets the actor. It is bounded
+//! ([`QUEUE_MAX`]): a full queue refuses a new actor, counted in
+//! `wasmkeep_idle_passes_dropped_total`. A loop takes what is due as soon as
+//! one of its [`PASSES_AT_ONCE`] slots is free, each a job in the actor's
 //! mailbox that runs no guest code ([`ActorState::idle_pass`]):
 //!
 //! 1. skipped if the actor is resident, held, parked or has a socket here,
-//!    if the node drains or moves it or is behind the deployed version, if
-//!    its class has an idle limit or is not deployed, or if the app is
-//!    deleted, restoring or of another incarnation (its markers read);
+//!    if the node drains or moves it, if its class has an idle limit or is
+//!    not deployed, if the record is not the remembered version (one read),
+//!    or if the app is deleted, restoring or of another incarnation (its
+//!    markers read). A node behind the deployed version, an app gate not yet
+//!    checked, a bucket that did not answer and a node at its resident
+//!    limit put the entry back a few seconds later, a few times
+//!    ([`RETRY_AFTER`], [`RETRIES`]);
 //! 2. the record acquired with `Owners::acquire_unchanged` on the
 //!    remembered version (a wake since, an expiry, a move, an app delete
 //!    or a whole-app restore changed it: dropped);
@@ -26,9 +33,13 @@
 //! 4. one listing, and the deletes of
 //!    [`idle_collectable`](wasmkeep_cluster::replication::idle_collectable)`(listing, g)`
 //!    older than the window, in batches, the new hold's lease checked
-//!    before each ([`Collector::collect_idle`](crate::replica::Collector::collect_idle));
+//!    before each ([`Collector::collect_idle`](crate::replica::Collector::collect_idle)),
+//!    and the pass's stop too: past [`PASS_DEADLINE`], an event waiting in
+//!    the mailbox behind the job, or a drain begun, it deletes no more (what
+//!    is left waits for the actor's next write);
 //! 5. the release, which keeps the requirement the hold inherited (it is
-//!    never verified) and the idle origin.
+//!    never verified) and the idle origin. Then the job's empty state is
+//!    let go, unless an event that came after it holds the actor.
 //!
 //! Nothing is restored, activated or uploaded. The entry is only a hint of
 //! when to try: what the pass deletes rests on the record and the listing
@@ -39,8 +50,9 @@
 //! the same generation has the same bytes, so the same `ETag`: the version
 //! check alone cannot tell the recreated app's record from the remembered
 //! one. The pass therefore compares the app's epoch (the `recreated` and
-//! `restored` markers, as the blob sweep does, ADR 0030) read after its
-//! acquisition with the one this runtime started with, and compacts
+//! `restored` markers, as the blob sweep does, ADR 0030) with the one this
+//! runtime started with, before its acquisition (so nothing is written)
+//! and again under its hold (what the deletes rest on), and compacts
 //! nothing on a difference. A node that sees the app's tombstone also
 //! drops its whole queue.
 
@@ -56,20 +68,31 @@ use wasmkeep_cluster::node_lease::Hold;
 use wasmkeep_cluster::recorded_head::Position;
 use wasmkeep_cluster::state_root::Family;
 
-/// Entries the queue keeps at most; then the one due first is dropped.
+/// Entries the queue keeps at most; then a new actor is refused.
 pub(crate) const QUEUE_MAX: usize = 100_000;
 
 /// Passes a node runs at once (as idle expiry's
 /// [`PARALLEL`](wasmkeep_cluster::expiry::PARALLEL)).
 pub(crate) const PASSES_AT_ONCE: usize = 4;
 
-/// How long the loop waits for one pass (the events queued before it, an
-/// acquisition, a listing, the deletes and a release).
+/// How long the loop waits for one pass's job (the events queued before
+/// it, an acquisition, a listing, the deletes and a release). Its slot is
+/// kept until the job ends, whatever this wait.
 const PASS_WAIT: Duration = Duration::from_secs(60);
 
+/// How long a pass deletes, from its acquisition: then it stops, and what
+/// is left waits for the actor's next write.
+const PASS_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Attempts at a pass's listing and deletes inside its hold, with doubling
-/// waits from one second, while the hold is valid.
+/// waits from one second, while the hold is valid and the pass not stopped.
 const PASS_ATTEMPTS: u32 = 3;
+
+/// When a pass that met a passing obstacle is tried again.
+pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// How many times an entry is put back for a passing obstacle.
+pub(crate) const RETRIES: u32 = 3;
 
 /// The longest the loop sleeps between looks at the queue.
 const TICK_MAX: Duration = Duration::from_secs(5);
@@ -88,6 +111,8 @@ pub(crate) struct Entry {
     pub(crate) released_ms: u64,
     /// When the pass is due (Unix ms).
     pub(crate) due_ms: u64,
+    /// Times it was put back for a passing obstacle.
+    pub(crate) attempts: u32,
 }
 
 /// The idle passes due on this node, by record key.
@@ -96,6 +121,8 @@ pub(crate) struct Queue {
     inner: std::sync::Mutex<QueueInner>,
     /// Tests: while set, the loop takes nothing.
     paused: std::sync::atomic::AtomicBool,
+    /// Wakes the loop: an entry added, a pass's slot given back.
+    changed: tokio::sync::Notify,
 }
 
 #[derive(Debug, Default)]
@@ -104,26 +131,43 @@ struct QueueInner {
     by_due: BTreeSet<(u64, String)>,
 }
 
+impl QueueInner {
+    fn remove(&mut self, key: &str) -> Option<Entry> {
+        let old = self.by_key.remove(key)?;
+        self.by_due.remove(&(old.due_ms, old.key.clone()));
+        Some(old)
+    }
+}
+
 impl Queue {
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueInner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Adds `entry`, replacing one of the same key. A full queue drops the
-    /// entry due first (the oldest release).
-    pub(crate) fn push(&self, entry: Entry) {
-        let mut q = self.lock();
-        if let Some(old) = q.by_key.remove(&entry.key) {
-            q.by_due.remove(&(old.due_ms, old.key));
+    /// Adds `entry`, replacing one of the same key. A full queue refuses
+    /// a new actor (`false`, counted): the entries already there are
+    /// older and closer to running.
+    pub(crate) fn push(&self, entry: Entry) -> bool {
+        {
+            let mut q = self.lock();
+            let replaced = q.remove(&entry.key).is_some();
+            if !replaced && q.by_key.len() >= QUEUE_MAX {
+                drop(q);
+                crate::metrics::inc(&crate::metrics::METRICS.idle_passes_dropped);
+                return false;
+            }
+            q.by_due.insert((entry.due_ms, entry.key.clone()));
+            q.by_key.insert(entry.key.clone(), entry);
         }
-        while q.by_key.len() >= QUEUE_MAX {
-            let Some(first) = q.by_due.pop_first() else {
-                break;
-            };
-            q.by_key.remove(&first.1);
-        }
-        q.by_due.insert((entry.due_ms, entry.key.clone()));
-        q.by_key.insert(entry.key.clone(), entry);
+        self.changed.notify_one();
+        true
+    }
+
+    /// Forgets `key`'s entry, if any: the actor was acquired here, or
+    /// released by a hold that wrote nothing, so the version remembered is
+    /// gone.
+    pub(crate) fn remove(&self, key: &str) {
+        self.lock().remove(key);
     }
 
     /// Takes up to `most` entries due at `now_ms`, due first.
@@ -145,6 +189,11 @@ impl Queue {
             }
         }
         taken
+    }
+
+    /// When the next entry is due (Unix ms), if any.
+    fn next_due(&self) -> Option<u64> {
+        self.lock().by_due.first().map(|(due, _)| *due)
     }
 
     /// Forgets every entry (the app's tombstone was seen, or compaction is
@@ -174,6 +223,7 @@ impl Queue {
     pub(crate) fn pause(&self, paused: bool) {
         self.paused
             .store(paused, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_one();
     }
 
     fn is_paused(&self) -> bool {
@@ -192,16 +242,30 @@ pub(crate) fn wrote(hold: &Hold) -> bool {
     )
 }
 
+/// Why the app's markers stop a pass ([`Cluster::fresh_app_epoch`]).
+enum Markers {
+    /// Deleted or restoring: the entry is dropped.
+    Gone(String),
+    /// Not read (the bucket did not answer): tried again later.
+    Unread(String),
+}
+
 impl Cluster {
-    /// A release of `hold` landed with `written` its answer's version:
-    /// with idle compaction on, a hold that wrote is remembered for its
-    /// idle pass. A release whose answer was lost (it comes back
-    /// `Superseded`) never reaches here: that actor is not queued.
+    /// A release of `hold` landed with `written` its answer's version.
+    /// With idle compaction on, a hold that wrote is remembered for its
+    /// idle pass; one that did not write makes this node forget any entry
+    /// of the actor (the version it remembered is gone). A release whose
+    /// answer was lost (it comes back `Superseded`) never reaches here:
+    /// that actor is not queued.
     pub(crate) fn note_idle_release(&self, hold: &Hold, written: Option<Version>) {
         let Some(version) = written else {
             return;
         };
-        if !self.idle_compaction || !wrote(hold) || self.app_refusal().is_some() {
+        if !wrote(hold) {
+            self.idle_passes.remove(&hold.key);
+            return;
+        }
+        if !self.idle_compaction || self.app_refusal().is_some() {
             return;
         }
         let now = now_ms();
@@ -214,6 +278,7 @@ impl Cluster {
             version,
             released_ms: now,
             due_ms: now.saturating_add(wait),
+            attempts: 0,
         });
     }
 
@@ -221,7 +286,7 @@ impl Cluster {
     /// bucket (ADR 0030, section 2: `recreated` and `restored`), or why the
     /// pass compacts nothing: the app has a tombstone or is restoring, or
     /// the bucket did not answer.
-    async fn fresh_app_epoch(&self) -> Result<String, String> {
+    async fn fresh_app_epoch(&self) -> Result<String, Markers> {
         let root = self.state_root();
         let mut bodies = Vec::new();
         for marker in ["deleted", "restoring", "recreated", "restored"] {
@@ -241,18 +306,26 @@ impl Cluster {
             .await;
             let body: Option<Vec<u8>> = match read {
                 Ok(Ok(body)) => body,
-                Ok(Err(e)) => return Err(format!("reading the app's {marker} marker: {e}")),
-                Err(_) => return Err(format!("reading the app's {marker} marker: no answer")),
+                Ok(Err(e)) => {
+                    return Err(Markers::Unread(format!(
+                        "reading the app's {marker} marker: {e}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(Markers::Unread(format!(
+                        "reading the app's {marker} marker: no answer"
+                    )));
+                }
             };
             if body.is_some() && matches!(marker, "deleted" | "restoring") {
-                return Err(format!(
+                return Err(Markers::Gone(format!(
                     "the app is {}",
                     if marker == "deleted" {
                         "deleted"
                     } else {
                         "restoring"
                     }
-                ));
+                )));
             }
             bodies.push(body);
         }
@@ -261,13 +334,56 @@ impl Cluster {
             bodies[3].as_deref(),
         ))
     }
+
+    /// Whether this node holds `address` for an idle pass now (such a hold
+    /// is not the actor in use: placement does not count it).
+    pub(crate) fn idle_pass_holds(&self, address: &ActorAddress) -> bool {
+        let key = self.owner_key(address);
+        self.idle_pass_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&key)
+    }
+
+    /// Whether this node holds `address` for its events: [`Self::holds_here`]
+    /// less an idle pass's hold. What placement asks of a companion.
+    pub(crate) fn holds_for_events(&self, address: &ActorAddress) -> bool {
+        self.holds_here(address) && !self.idle_pass_holds(address)
+    }
+}
+
+/// The key of a hold an idle pass has, registered while it lasts.
+struct PassHold<'a> {
+    cluster: &'a Cluster,
+    key: String,
+}
+
+impl<'a> PassHold<'a> {
+    fn new(cluster: &'a Cluster, key: String) -> Self {
+        cluster
+            .idle_pass_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone());
+        Self { cluster, key }
+    }
+}
+
+impl Drop for PassHold<'_> {
+    fn drop(&mut self) {
+        self.cluster
+            .idle_pass_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key);
+    }
 }
 
 /// What an idle pass did, a label of `wasmkeep_idle_compactions_total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Compacted {
     /// Compacted: `deleted` objects gone (0 if the history was already
-    /// as compact as the window allows).
+    /// as compact as the window allows, or the pass was stopped first).
     Done { deleted: usize },
     /// The record is not the one the release wrote: dropped.
     Changed,
@@ -275,6 +391,9 @@ pub(crate) enum Compacted {
     Nothing,
     /// Not compacted, and why.
     Refused(String),
+    /// A passing obstacle, and why: the entry is put back a few seconds
+    /// later, a few times, then counted refused.
+    Retry(String),
     /// The actor was in use on this node.
     Busy,
 }
@@ -285,11 +404,14 @@ impl Compacted {
             Self::Done { .. } => "done",
             Self::Changed => "changed",
             Self::Nothing => "nothing",
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::Retry(_) => "refused",
             Self::Busy => "busy",
         }
     }
 }
+
+/// Whether an event waits behind the pass's job, asked from inside it.
+type Waiting = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl ActorState {
     /// The idle pass's job (ADR 0042, section 3): acquire the actor only
@@ -298,8 +420,14 @@ impl ActorState {
     /// guest code, restores nothing, uploads nothing; the hold it takes is
     /// never this state's (`self.held` stays empty), so no event runs
     /// under it, and an event queued behind the job finds the actor
-    /// released and acquires as usual.
-    pub(super) async fn idle_pass(&mut self, entry: Entry, app_epoch: String) -> Compacted {
+    /// released and acquires as usual. `waiting` says whether one is
+    /// queued: the deletes then stop.
+    pub(super) async fn idle_pass(
+        &mut self,
+        entry: Entry,
+        app_epoch: String,
+        waiting: Waiting,
+    ) -> Compacted {
         let Some(cluster) = self.cluster.clone() else {
             return Compacted::Refused("not in a cluster".into());
         };
@@ -314,13 +442,6 @@ impl ActorState {
             return Compacted::Refused("this node is draining or moving the actor".into());
         }
         self.owner_hint = None;
-        let etag = entry
-            .version
-            .0
-            .split('\n')
-            .next()
-            .unwrap_or_default()
-            .to_owned();
         // An app deleted, restoring or of another incarnation: skipped
         // before anything is written (section 3, step 1). Checked again
         // under the hold, which is what the deletes rest on.
@@ -330,7 +451,7 @@ impl ActorState {
         let hold = match LeaseHold::acquire_with(
             &cluster,
             &self.address,
-            Some((&etag, entry.released_ms)),
+            Some((&entry.version.0, entry.released_ms)),
         )
         .await
         {
@@ -339,16 +460,18 @@ impl ActorState {
                 return Compacted::Changed;
             }
             Err(OwnershipError::NotOwner { .. }) => return Compacted::Changed,
-            Err(
-                OwnershipError::Unavailable(e)
-                | OwnershipError::Refused(e)
-                | OwnershipError::Broken(e),
-            ) => return Compacted::Refused(e),
+            Err(OwnershipError::Unavailable(e)) => return Compacted::Retry(e),
+            Err(OwnershipError::Refused(e) | OwnershipError::Broken(e)) => {
+                return Compacted::Refused(e);
+            }
             Err(OwnershipError::Elsewhere { .. }) => {
                 return Compacted::Refused("this node is draining or moving the actor".into());
             }
         };
-        let outcome = compact_under(&cluster, &self.address, &hold, &entry, &app_epoch).await;
+        let registered = PassHold::new(&cluster, cluster.owner_key(&self.address));
+        let outcome =
+            compact_under(&cluster, &self.address, &hold, &entry, &app_epoch, waiting).await;
+        drop(registered);
         // Unverified: it releases with the requirement it inherited, and
         // with the idle origin its acquisition carried.
         hold.release().await;
@@ -359,14 +482,15 @@ impl ActorState {
 /// Why the pass compacts nothing of the app now, if it does not: its
 /// markers, read again, give another epoch than `app_epoch` (this
 /// runtime's: the app was recreated or restored since), or it is deleted
-/// or restoring, or the bucket did not answer.
+/// or restoring (refused), or the bucket did not answer (tried again).
 async fn other_incarnation(cluster: &Cluster, app_epoch: &str) -> Option<Compacted> {
     match cluster.fresh_app_epoch().await {
         Ok(fresh) if fresh == app_epoch => None,
         Ok(_) => Some(Compacted::Refused(
             "the app was recreated or restored since this node started".into(),
         )),
-        Err(why) => Some(Compacted::Refused(why)),
+        Err(Markers::Gone(why)) => Some(Compacted::Refused(why)),
+        Err(Markers::Unread(why)) => Some(Compacted::Retry(why)),
     }
 }
 
@@ -377,6 +501,7 @@ async fn compact_under(
     hold: &LeaseHold,
     entry: &Entry,
     app_epoch: &str,
+    waiting: Waiting,
 ) -> Compacted {
     // The released generation, from the record this hold replaced
     // (every acquisition writes generation + 1). The entry's own must
@@ -394,17 +519,23 @@ async fn compact_under(
     if let Some(refused) = other_incarnation(cluster, app_epoch).await {
         return refused;
     }
+    let deadline = std::time::Instant::now() + PASS_DEADLINE;
+    let stopping = Arc::clone(cluster);
+    let stop = move || std::time::Instant::now() >= deadline || waiting() || stopping.draining();
     let collector = Collector::idle(cluster, address, generation, hold.view());
     let mut wait = Duration::from_secs(1);
     for attempt in 1..=PASS_ATTEMPTS {
-        match collector.collect_idle(cluster.history_retention).await {
+        match collector
+            .collect_idle(cluster.history_retention, &stop)
+            .await
+        {
             Ok(IdleCollected::NoSnapshot) => return Compacted::Nothing,
             Ok(IdleCollected::Collected { deleted, .. }) => {
                 return Compacted::Done { deleted };
             }
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
-                if attempt == PASS_ATTEMPTS || !collector.lease_valid() {
+                if attempt == PASS_ATTEMPTS || !collector.lease_valid() || stop() {
                     return Compacted::Refused(e.to_string());
                 }
                 tokio::time::sleep(wait).await;
@@ -424,58 +555,95 @@ fn address_of(inner: &ServiceInner, cluster: &Cluster, key: &str) -> Option<Acto
     ActorAddress::new(&inner.tenant, class, &name).ok()
 }
 
-/// Takes due entries, [`PASSES_AT_ONCE`] at a time, and runs each one's
-/// pass. `app_epoch` is the epoch this runtime started with. Runs until
-/// the service is dropped or stops.
+/// One of the loop's [`PASSES_AT_ONCE`] slots, held until the pass's job
+/// ends (not only the loop's wait for it); giving it back wakes the loop.
+struct Slot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    cluster: Arc<Cluster>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.cluster.idle_passes.changed.notify_one();
+    }
+}
+
+/// Takes due entries whenever a slot is free and runs each one's pass.
+/// `app_epoch` is the epoch this runtime started with. Wakes when an entry
+/// is added, a slot is given back, or the next entry comes due (at most
+/// every [`TICK_MAX`]). Runs until the service is dropped or stops.
 pub(super) async fn compaction_loop(
     service: std::sync::Weak<ServiceInner>,
     cluster: Arc<Cluster>,
     app_epoch: String,
 ) {
-    let tick = (cluster.history_retention / 10).clamp(Duration::from_millis(50), TICK_MAX);
     let slots = Arc::new(tokio::sync::Semaphore::new(PASSES_AT_ONCE));
     loop {
-        tokio::time::sleep(tick).await;
-        let Some(inner) = service.upgrade() else {
-            return;
-        };
-        if inner.mailboxes.is_closed() {
-            return;
-        }
-        if !cluster.idle_compaction {
-            cluster.idle_passes.clear();
-            continue;
-        }
-        if cluster.idle_passes.is_paused() {
-            continue;
-        }
-        let free = slots.available_permits();
-        if free == 0 {
-            continue;
-        }
-        for entry in cluster.idle_passes.take_due(now_ms(), free) {
-            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
-                // Not reached: no more were taken than were free.
-                cluster.idle_passes.push(entry);
-                break;
+        {
+            let Some(inner) = service.upgrade() else {
+                return;
             };
-            let (inner, cluster, epoch) =
-                (Arc::clone(&inner), Arc::clone(&cluster), app_epoch.clone());
-            tokio::spawn(async move {
-                let _permit = permit;
-                let outcome = pass_one(&inner, &cluster, entry, epoch).await;
-                crate::metrics::idle_compaction(outcome.label());
-            });
+            if inner.mailboxes.is_closed() {
+                return;
+            }
+            if !cluster.idle_compaction {
+                cluster.idle_passes.clear();
+            } else if !cluster.idle_passes.is_paused() {
+                while let Ok(permit) = Arc::clone(&slots).try_acquire_owned() {
+                    let Some(entry) = cluster.idle_passes.take_due(now_ms(), 1).pop() else {
+                        break;
+                    };
+                    let slot = Slot {
+                        _permit: permit,
+                        cluster: Arc::clone(&cluster),
+                    };
+                    let (inner, cluster, epoch) =
+                        (Arc::clone(&inner), Arc::clone(&cluster), app_epoch.clone());
+                    tokio::spawn(async move {
+                        let outcome = pass_one(&inner, &cluster, entry.clone(), epoch, slot).await;
+                        settle(&cluster, entry, outcome);
+                    });
+                }
+            }
+        }
+        // Until something changes, or the next entry comes due.
+        let wait = cluster
+            .idle_passes
+            .next_due()
+            .map_or(TICK_MAX, |due| {
+                Duration::from_millis(due.saturating_sub(now_ms()).max(10))
+            })
+            .min(TICK_MAX);
+        tokio::select! {
+            () = cluster.idle_passes.changed.notified() => {}
+            () = tokio::time::sleep(wait) => {}
         }
     }
 }
 
+/// Counts a pass's outcome, or puts its entry back for a passing obstacle
+/// while it has tries left.
+fn settle(cluster: &Cluster, mut entry: Entry, outcome: Compacted) {
+    if let Compacted::Retry(why) = &outcome
+        && entry.attempts < RETRIES
+    {
+        tracing::debug!(key = %crate::logging::text(&entry.key), %why, "idle pass: tried again later");
+        entry.attempts += 1;
+        entry.due_ms = now_ms().saturating_add(u64::try_from(RETRY_AFTER.as_millis()).unwrap_or(0));
+        cluster.idle_passes.push(entry);
+        return;
+    }
+    crate::metrics::idle_compaction(outcome.label());
+}
+
 /// One entry: its job in the actor's mailbox, unless it is skipped first.
-pub(super) async fn pass_one(
+/// `slot` is given back when the job ends, or when it is not submitted.
+async fn pass_one(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
     entry: Entry,
     app_epoch: String,
+    slot: Slot,
 ) -> Compacted {
     let Some(address) = address_of(inner, cluster, &entry.key) else {
         return Compacted::Refused("not an actor address that can be told back".into());
@@ -494,19 +662,23 @@ pub(super) async fn pass_one(
     {
         return Compacted::Refused("the class has an idle limit".into());
     }
-    // As idle expiry: no pass under rules the node could not apply (a
-    // deploy it is behind on), nor of a class no longer deployed.
-    if inner
-        .deploy_behind
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return Compacted::Refused("this node is behind the deployed version".into());
-    }
     if !read(&inner.classes).contains_key(address.class()) {
         return Compacted::Refused("the class is not deployed".into());
     }
     if cluster.draining() {
         return Compacted::Refused("this node is draining".into());
+    }
+    // As idle expiry: no pass under rules the node could not apply (a
+    // deploy it is behind on), nor before the app's gate was checked;
+    // both pass.
+    if inner
+        .deploy_behind
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Compacted::Retry("this node is behind the deployed version".into());
+    }
+    if cluster.app_unchecked() {
+        return Compacted::Retry("the app's tombstone is not checked yet".into());
     }
     if let Some(why) = cluster.app_refusal() {
         return Compacted::Refused(why.into());
@@ -518,11 +690,33 @@ pub(super) async fn pass_one(
     {
         return Compacted::Busy;
     }
+    // A stale entry costs one read, not a resident slot.
+    match current_version(cluster, &entry.key).await {
+        Ok(Some(now)) if crate::cluster::same_version(&now, &entry.version.0) => {}
+        Ok(_) => return Compacted::Changed,
+        Err(why) => return Compacted::Retry(why),
+    }
+    // Admitted without evicting anyone: a node at its resident limit
+    // tries again later.
+    let share = inner.mailboxes.resident_share();
+    if share.residents >= share.cap || share.process >= share.limit {
+        return Compacted::Retry("this node is at its resident limit".into());
+    }
+    let waiting: Waiting = {
+        let (weak, address) = (Arc::downgrade(inner), address.clone());
+        Arc::new(move || {
+            weak.upgrade()
+                .is_some_and(|i| i.mailboxes.waiting(&address) > 0)
+        })
+    };
     let job =
         inner
             .mailboxes
             .submit_wait(&address, ADMISSION_WAIT, move |state: &mut ActorState| {
-                Box::pin(state.idle_pass(entry, app_epoch))
+                Box::pin(async move {
+                    let _slot = slot;
+                    state.idle_pass(entry, app_epoch, waiting).await
+                })
             });
     let outcome = match tokio::time::timeout(PASS_WAIT, job).await {
         Ok(Ok(outcome)) => outcome,
@@ -533,17 +727,46 @@ pub(super) async fn pass_one(
         Compacted::Done { deleted } => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, "idle history compacted");
         }
-        Compacted::Refused(why) => {
+        Compacted::Refused(why) | Compacted::Retry(why) => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %why, "idle pass: not compacted");
         }
         Compacted::Changed | Compacted::Nothing | Compacted::Busy => {}
     }
-    // Released (or never acquired): the next event, wherever it lands,
-    // restores the actor. One found in use is left as it is.
+    // The job's state let go, unless an event that came after it holds the
+    // actor now: asked in a job of its own, behind any such event.
     if outcome != Compacted::Busy {
-        inner.mailboxes.hibernate(&address);
+        let weak = Arc::downgrade(inner);
+        let _ = inner
+            .mailboxes
+            .submit_if_resident(&address, move |state: &mut ActorState| {
+                Box::pin(async move {
+                    if state.held.is_none()
+                        && state.live.is_none()
+                        && let Some(inner) = weak.upgrade()
+                    {
+                        inner.mailboxes.hibernate(&state.address);
+                    }
+                })
+            })
+            .await;
     }
     outcome
+}
+
+/// The record's version now (one read of its metadata), `None` without a
+/// record.
+async fn current_version(cluster: &Cluster, key: &str) -> Result<Option<String>, String> {
+    let path = object_store::path::Path::from(format!("{}{key}", cluster.state_root().prefix()));
+    match tokio::time::timeout(cluster.lease_attempt, cluster.store.head(&path)).await {
+        Ok(Ok(meta)) => Ok(Some(format!(
+            "{}\n{}",
+            meta.e_tag.unwrap_or_default(),
+            meta.version.unwrap_or_default()
+        ))),
+        Ok(Err(object_store::Error::NotFound { .. })) => Ok(None),
+        Ok(Err(e)) => Err(format!("reading the ownership record: {e}")),
+        Err(_) => Err("reading the ownership record: no answer".into()),
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +780,7 @@ mod tests {
             version: Version(format!("v-{key}")),
             released_ms: due_ms,
             due_ms,
+            attempts: 0,
         }
     }
 
@@ -569,24 +793,36 @@ mod tests {
         // A later release of `a` replaces its entry.
         q.push(entry("a", 25));
         assert_eq!(q.len(), 3);
+        assert_eq!(q.next_due(), Some(20));
         assert!(q.take_due(19, 10).is_empty());
         let keys = |v: Vec<Entry>| v.into_iter().map(|e| e.key).collect::<Vec<_>>();
         assert_eq!(keys(q.take_due(30, 2)), ["b", "a"]);
-        assert_eq!(keys(q.take_due(30, 2)), ["c"]);
+        q.remove("c");
+        assert!(q.take_due(30, 2).is_empty());
         assert_eq!(q.len(), 0);
     }
 
     #[test]
-    fn a_full_queue_drops_the_entry_due_first() {
+    fn a_full_queue_refuses_a_new_actor_and_keeps_the_older_entries() {
         let q = Queue::default();
         for i in 0..QUEUE_MAX as u64 {
-            q.push(entry(&format!("k{i}"), 1_000 + i));
+            assert!(q.push(entry(&format!("k{i}"), 1_000 + i)));
         }
+        let dropped = crate::metrics::METRICS
+            .idle_passes_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(!q.push(entry("new", 5_000_000)), "refused");
+        assert_eq!(
+            crate::metrics::METRICS
+                .idle_passes_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dropped + 1
+        );
         assert_eq!(q.len(), QUEUE_MAX);
-        q.push(entry("new", 5_000_000));
-        assert_eq!(q.len(), QUEUE_MAX);
+        // An actor already there is still replaced.
+        assert!(q.push(entry("k0", 2_000_000)));
         let first = q.take_due(u64::MAX, 1);
-        assert_eq!(first[0].key, "k1", "k0, due first, was dropped");
+        assert_eq!(first[0].key, "k1", "k0 moved behind the others");
         q.clear();
         assert_eq!(q.len(), 0);
     }

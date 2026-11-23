@@ -131,6 +131,22 @@ impl Default for Options<'_> {
     }
 }
 
+/// Whether a record one generation past the listed head still names that
+/// head as its owner's (`--require-owner-match`): released, in version 2
+/// (ADR 0035), with its recorded head at exactly the listed head's
+/// generation and txid. What an idle pass (ADR 0042) or a wake that only
+/// read leaves: a hold that wrote nothing above the head. A version 1
+/// record carries no head, so it cannot.
+fn vouches_for(record: &wasmkeep_cluster::node_lease::OwnerRecord, head: SegmentId) -> bool {
+    use wasmkeep_cluster::recorded_head::Position;
+    record.holder.is_none()
+        && head.generation.checked_add(1) == Some(record.generation)
+        && record.recorded.is_some_and(|r| {
+            matches!(r.head, Position::Known { generation, txid, .. }
+                if generation == head.generation && txid == head.txid)
+        })
+}
+
 /// Export with scratch placement and optional ownership-hint enforcement.
 pub async fn export_with_options(
     store: &Arc<dyn ObjectStore>,
@@ -213,9 +229,13 @@ async fn export_mode(
                     .ok()
                     .and_then(|bytes| wasmkeep_cluster::node_lease::OwnerRecord::decode(&bytes));
                 result.owner_generation = record.as_ref().map(|owner| owner.generation);
+                let vouched = record
+                    .as_ref()
+                    .is_some_and(|r| vouches_for(r, result.listed_head));
                 result.owner_recorded = record.and_then(|owner| owner.recorded);
                 if options.require_owner_match
                     && result.owner_generation != Some(result.listed_head.generation)
+                    && !vouched
                 {
                     return Err(Error::OwnerMismatch);
                 }

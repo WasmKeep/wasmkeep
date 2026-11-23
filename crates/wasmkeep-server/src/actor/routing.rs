@@ -133,7 +133,7 @@ impl ServiceInner {
         cluster.placement_on()
             && self
                 .companion(address)
-                .is_some_and(|c| cluster.holds_here(&c))
+                .is_some_and(|c| cluster.holds_for_events(&c))
     }
 
     /// The actor `address` is kept apart from, by the class it takes now

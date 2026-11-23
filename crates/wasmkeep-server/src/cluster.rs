@@ -452,6 +452,8 @@ pub(crate) struct Cluster {
     /// Idle passes due (ADR 0042, section 3): actors whose hold wrote and
     /// whose release landed, remembered until a retention window later.
     pub(crate) idle_passes: crate::actor::compaction::Queue,
+    /// Record keys this node holds for an idle pass now.
+    pub(crate) idle_pass_keys: std::sync::Mutex<std::collections::HashSet<String>>,
     /// [`ClusterConfig::snapshot_retry_min`].
     pub(crate) snapshot_retry_min: Duration,
     /// [`ClusterConfig::restore_budget`].
@@ -877,6 +879,7 @@ impl Cluster {
                 crate::replica::IDLE_SNAPSHOTS_AT_ONCE,
             )),
             idle_passes: crate::actor::compaction::Queue::default(),
+            idle_pass_keys: std::sync::Mutex::default(),
             snapshot_retry_min: config.snapshot_retry_min,
             restore_budget: config.restore_budget,
             snapshot_waits: Arc::default(),

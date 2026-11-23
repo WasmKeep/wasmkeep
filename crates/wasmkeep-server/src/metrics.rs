@@ -576,6 +576,8 @@ pub(crate) struct Metrics {
     /// Idle passes a retention window after a release (ADR 0042, section
     /// 3), by `outcome` ([`IDLE_COMPACTION_OUTCOMES`]).
     pub(crate) idle_compactions: Family<AtomicU64>,
+    /// Idle passes not queued because the queue was full (ADR 0042).
+    pub(crate) idle_passes_dropped: AtomicU64,
     /// Node calls refused because the record of used signatures was full,
     /// by record (`calls`; `control`, takes and alarm hand-offs; `ingress`, charged proofs).
     pub(crate) signatures_refused_full: Family<AtomicU64>,
@@ -1711,6 +1713,12 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_idle_compactions_total",
         "Idle passes a retention window after an actor's release, by outcome.",
         &m.idle_compactions,
+    );
+    counter(
+        &mut out,
+        "wasmkeep_idle_passes_dropped_total",
+        "Idle passes not remembered because the node's queue was full.",
+        m.idle_passes_dropped.load(Ordering::Relaxed),
     );
     family(
         &mut out,
