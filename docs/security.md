@@ -68,11 +68,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   pollables), and a `wasi:http` `fields` it builds, or copies to change,
   at most 64 KiB (counting a few dozen bytes per entry on top of its names
   and values). Past either, the call traps: the event fails, and an
-  actor's instance is replaced by a fresh one at its next event. What
-  guest-built headers can hold is thus about 256 MiB per instance
-  (4,096 × 64 KiB) in the worst case; headers that arrive from the network
-  are bounded by the HTTP parser instead (100 headers in about 400 KiB a
-  message), bodies and streams by their own limits.
+  actor's instance is replaced by a fresh one at its next event. A
+  response to an outbound request fails past 64 KiB of head (status line
+  and headers) or of trailers. What headers a guest holds is thus about
+  256 MiB per instance (4,096 × 64 KiB) in the worst case, whether it
+  built them or fetched them; a request's own headers are bounded by the
+  HTTP parser instead (100 headers in about 400 KiB). Bodies and streams
+  have their own limits.
 - Outbound HTTP: public addresses only (the host resolves, checks and
   connects to the checked address; TLS verified against the name);
   `--allow-outbound` and `--outbound-ca` open specific internal services.

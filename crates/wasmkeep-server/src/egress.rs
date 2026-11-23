@@ -45,6 +45,12 @@ pub const PER_NODE_REQUESTS: usize = 256;
 const PER_NODE_LOOKUPS: usize = 32;
 /// Addresses tried per request.
 const MAX_ADDRESSES: usize = 4;
+/// Bytes of a response's head (status line and headers), and of its
+/// trailers, on the wire; past it the request fails. A guest may hold a
+/// response's headers as long as it keeps the response, so this bounds
+/// each like a `fields` it builds (`MAX_GUEST_FIELDS_BYTES`), instead of
+/// the HTTP parser's default of about 400 KiB.
+pub const MAX_RESPONSE_HEAD_BYTES: usize = crate::guest_tables::MAX_GUEST_FIELDS_BYTES;
 
 /// Ports no outbound request may use unless the operator allows them: the
 /// Fetch standard's "bad ports" (fetch.spec.whatwg.org, "port blocking"),
@@ -520,7 +526,9 @@ async fn send(
     };
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(stream)),
+        hyper::client::conn::http1::Builder::new()
+            .max_header_size(MAX_RESPONSE_HEAD_BYTES)
+            .handshake(TokioIo::new(stream)),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
@@ -731,6 +739,53 @@ mod tests {
         Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) })))
             .await
             .err()
+    }
+
+    /// A response from a local server whose one header is `bytes` long:
+    /// its status, or the request's error.
+    async fn fetch_with_header(bytes: usize) -> Result<u16, Error> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nx-big: {}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                "v".repeat(bytes)
+            );
+            // The client may hang up partway through a head it refuses.
+            let _ = stream.write_all(reply.as_bytes()).await;
+        });
+        let mut hooks = EgressHooks::new(Arc::new(EgressPolicy::allowing(vec![
+            "127.0.0.1".parse().unwrap(),
+        ])));
+        let req = ::http::Request::builder()
+            .uri(format!("http://127.0.0.1:{port}/"))
+            .body(
+                http_body_util::Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let sent = Pin::from(hooks.send_request(req, None, Box::new(async { Ok(()) }))).await;
+        let _ = server.await;
+        sent.map(|(res, _)| res.status().as_u16())
+    }
+
+    #[tokio::test]
+    async fn a_response_head_past_the_limit_fails_the_request() {
+        assert_eq!(fetch_with_header(16 * 1024).await.unwrap(), 200);
+        let refused = fetch_with_header(MAX_RESPONSE_HEAD_BYTES).await;
+        assert!(refused.is_err(), "{:?}", refused.map(|_| ()));
     }
 
     #[tokio::test]
