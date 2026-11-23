@@ -1013,3 +1013,122 @@ async fn the_bucket_operations_of_one_actors_life_are_those_of_0_4_2() {
         diff(&want, &got)
     );
 }
+
+/// Where the idle pass's trace lives (ADR 0042, Tests: a second trace,
+/// kept apart so the main one stays a comparison with 0.4.2).
+const IDLE_PASS_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/cluster/golden_trace_idle_pass.txt"
+);
+
+/// The idle pass's retention window here: long next to the writes and
+/// the hibernation before it (whose own collection then deletes nothing),
+/// short enough to wait out.
+const IDLE_PASS_WINDOW: Duration = Duration::from_secs(5);
+
+/// One actor's writes, its hibernation, and the idle pass a window later
+/// (ADR 0042, section 3): the pass's acquisition, its one listing, its
+/// deletes and its release, in that order, and nothing else.
+async fn idle_pass_life() -> String {
+    let keys = Keys::new();
+    let log = Arc::new(Log::default());
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::new(Recording {
+        inner: Arc::clone(&shared),
+        node: "a",
+        log: Arc::clone(&log),
+        keys: keys.clone(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let a = node_configured(
+        "a",
+        dir.path(),
+        &seen_by_a,
+        Duration::from_secs(600),
+        &["t"],
+        test_actor_wasm(),
+        Duration::from_secs(30),
+        "",
+        |config: &mut ActorConfig| {
+            config.mailbox.max_resident = 1;
+            let cluster = config.cluster.as_mut().unwrap();
+            cluster.lease = LeaseConfig::new(6_000, 500, 1_000, 100).unwrap();
+            cluster.placement = false;
+            cluster.history_retention = IDLE_PASS_WINDOW;
+        },
+    )
+    .await;
+    a.service.pause_idle_passes(true);
+    settle().await;
+    log.quiet().await;
+    log.ops.lock().unwrap().clear();
+    let expect = |r: Reply, body: &str| {
+        assert_eq!((r.status, r.body.trim()), (200, body), "{}", r.head);
+    };
+
+    log.step("plain writes: the first event takes the actor, then a segment each");
+    for n in ["1", "2", "3"] {
+        expect(run(&a, "POST", "/actor/t/x/plain").await, n);
+    }
+    settled(&log, &a).await;
+    log.step(
+        "hibernation: the idle snapshot, the collection under its hold (nothing old enough), \
+         the release",
+    );
+    let released = std::time::Instant::now();
+    let r = run(&a, "GET", "/actor/t/y/plain").await;
+    assert_eq!(r.status, 200, "{}: {}", r.head, r.body);
+    eventually("x hibernated", async || {
+        owner_record(&shared, "x")
+            .await
+            .is_some_and(|(n, _)| n.is_none())
+    })
+    .await;
+    log.quiet().await;
+    assert!(
+        released.elapsed() < IDLE_PASS_WINDOW,
+        "the hibernation took longer than the window"
+    );
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    // A window after the release, and its skew bound.
+    tokio::time::sleep(
+        IDLE_PASS_WINDOW.saturating_sub(released.elapsed()) + Duration::from_millis(300),
+    )
+    .await;
+    log.step("the idle pass: acquisition, one listing, the deletes, the release");
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    eventually("the pass ran", async || {
+        a.service.idle_passes_queued().is_empty()
+            && log.since(0).iter().any(|op| op.is("DELETE", ""))
+            && owner_record(&shared, "x")
+                .await
+                .is_some_and(|(n, _)| n.is_none())
+    })
+    .await;
+    log.quiet().await;
+    let ops = log.ops.lock().unwrap().clone();
+    drop(a);
+    render(&ops, &keys, &sha256_hex(test_actor_wasm()))
+}
+
+/// See [`idle_pass_life`].
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bucket_operations_of_an_idle_pass() {
+    if over_tls() {
+        return;
+    }
+    let got = idle_pass_life().await;
+    if std::env::var_os("WASMKEEP_RECORD_TRACE").is_some_and(|v| v == "1") {
+        std::fs::write(IDLE_PASS_FIXTURE, &got).unwrap();
+        eprintln!("recorded {IDLE_PASS_FIXTURE}");
+        return;
+    }
+    let want = std::fs::read_to_string(IDLE_PASS_FIXTURE).unwrap_or_default();
+    assert!(
+        want == got,
+        "the idle pass's bucket operations changed (- expected, + now); \
+         if that is meant, record the trace again (see golden_trace.rs):\n{}",
+        diff(&want, &got)
+    );
+}

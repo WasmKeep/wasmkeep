@@ -1,0 +1,19 @@
+## plain writes: the first event takes the actor, then a segment each
+a LIST history/ -> -
+a PUT owner [create] -> ok holder=a generation=1
+a LIST history/ -> -
+a PUT history/snapshot/0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=4 txid=1..1 pre=- post=C1 wal=0/0/0/0 node=0 pages=[1:d722d9ee73335103 2:efcdff0134f58f5f 3:a9cef6bcf16738ac 4:cefabea8fa1219de])
+a PUT history/wal/0000000000000002-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=2..2 pre=C1 post=C2 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:aba4090d3815a457 3:d17caeda31c87567 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:a8fb39d7dbf14ac6 8:dde6497f15c8df6d 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
+a PUT history/wal/0000000000000003-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=3..3 pre=C2 post=C3 wal=0/0/0/0 node=0 pages=[7:cc3e8e32ea2c66ab])
+a PUT history/wal/0000000000000004-0000000000000001-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=4..4 pre=C3 post=C4 wal=0/0/0/0 node=0 pages=[7:cd8e8e32ea2c66ab])
+## hibernation: the idle snapshot, the collection under its hold (nothing old enough), the release
+a PUT history/snapshot/0000000000000004-0000000000000001.ltx [create] -> ok ltx(flags=0 page_size=4096 commit=10 txid=1..4 pre=- post=C4 wal=0/0/0/0 node=0 pages=[1:f0cd81077fde4783 2:aba4090d3815a457 3:d17caeda31c87567 4:cefabea8fa1219de 5:bb64ce5d0ea3a9df 6:95c65f43137179dd 7:cd8e8e32ea2c66ab 8:dde6497f15c8df6d 9:e3451618c0354b3c 10:ff4c1b3b643a39d6])
+a LIST history/ -> -
+a PUT owner [update] -> ok holder=- generation=1
+## the idle pass: acquisition, one listing, the deletes, the release
+a PUT owner [update] -> ok holder=a generation=2
+a LIST history/ -> -
+a DELETE history/snapshot/0000000000000001-0000000000000001.ltx -> -
+a DELETE history/wal/0000000000000002-0000000000000001-0000000000000001.ltx -> -
+a DELETE history/wal/0000000000000003-0000000000000001-0000000000000001.ltx -> -
+a PUT owner [update] -> ok holder=- generation=2
