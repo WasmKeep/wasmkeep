@@ -37,6 +37,10 @@ matching generation still does not prove acknowledgement. Add
 owner generation with exit code **3**, before publishing an export or emitting
 SQL results. Other runtime failures exit 1; argument errors exit 2. This checks
 the listed head even for historical selections; it does not prove durability.
+Every acquisition raises the owner generation, so an actor last woken without
+writing, or compacted by an idle pass (below), reads one or more generations
+past its head: such an actor is refused with `--require-owner-match` until it
+next writes.
 
 `--at` takes an RFC3339 timestamp with timezone or a relative duration such
 as `-15m`, `-2h`, `-1d` (also seconds). Relative durations use the operator's

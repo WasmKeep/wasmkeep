@@ -672,6 +672,84 @@ async fn history_all_reports_listed_get_miss() {
     assert!(!array(&actor, "gaps").unwrap().is_empty());
 }
 
+/// ADR 0042, Tests, "Readers": `backup create` racing an idle pass. The
+/// actor rests with an idle snapshot at its head; the pass deletes
+/// `idle_collectable` of the released generation (here the first
+/// snapshot) after the backup listed and before its first read, as any
+/// collection may:
+/// - `--history head` completes and verifies at the head;
+/// - `--history all` with `--require-continuous false` completes with the
+///   deleted position recorded as a gap;
+/// - `--history all` by default (continuous) is refused as partial, as
+///   after an ordinary collection between its listing and its reads, and
+///   the next run, which lists after the pass, completes.
+#[tokio::test]
+async fn backup_create_during_an_idle_pass() {
+    for (history, continuous) in [
+        (History::Head, None),
+        (History::All, Some(false)),
+        (History::All, None),
+    ] {
+        let mut f = Fixture::new().await;
+        f.increment().await;
+        let prefix = "state/acme/shop/actors/counter/alice/";
+        let at_head = SegmentId {
+            generation: 1,
+            txid: 2,
+        };
+        let idle = Key::from(format!("{prefix}{}", snapshot_key(at_head)));
+        let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 500).unwrap();
+        put(&f.source, idle.as_ref(), bytes.clone(), false)
+            .await
+            .unwrap();
+        let listed = history::list_objects(&f.source, prefix).await.unwrap();
+        let listing = wasmkeep_cluster::replication::Listing::from_keys(
+            listed.keys().map(|k| k.strip_prefix(prefix).unwrap_or(k)),
+        );
+        let (snapshot, gone) =
+            wasmkeep_cluster::replication::idle_collectable(&listing, 1).unwrap();
+        assert_eq!(snapshot, at_head);
+        assert_eq!(
+            gone,
+            [snapshot_key(SegmentId {
+                generation: 1,
+                txid: 1
+            })]
+        );
+        // At the first read: the pass's delete. The hook also writes an
+        // object; one outside the app, so no listed object changes.
+        let source: Store = Arc::new(ReadOnly {
+            inner: f.source.clone(),
+            gets: Default::default(),
+            collect: std::sync::Mutex::new(Some((
+                Key::from(format!("{prefix}{}", gone[0])),
+                Key::from("elsewhere/unrelated"),
+                bytes,
+            ))),
+            collect_after: 0,
+            fail_collect: false,
+        });
+        let mut args = f.args();
+        args.history = history;
+        args.require_continuous = continuous;
+        let raced = create(&args, &source, "", &f.dest, "").await;
+        let refused = history == History::All && continuous.is_none();
+        assert_eq!(raced.is_err(), refused, "{history:?} {continuous:?}");
+        if refused {
+            // The next run lists after the pass.
+            create(&args, &source, "", &f.dest, "").await.unwrap();
+        }
+        let run_id = latest(&f.dest, "").await.unwrap().unwrap();
+        verify(&f.dest, "", &run_id, None).await.unwrap();
+        let run = load(&f.dest, "", &run_id).await.unwrap();
+        let actor = disk_actor(&run.actors[0]).unwrap();
+        assert_eq!(actor["txid"], 2, "{history:?} {continuous:?}");
+        if continuous == Some(false) {
+            assert_eq!(array(&actor, "gaps").unwrap().len(), 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn chunks_stay_below_loader_cap() {
     let dest: Store = Arc::new(object_store::memory::InMemory::new());

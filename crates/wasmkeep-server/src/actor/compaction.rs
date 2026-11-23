@@ -13,8 +13,9 @@
 //! mailbox that runs no guest code ([`ActorState::idle_pass`]):
 //!
 //! 1. skipped if the actor is resident, held, parked or has a socket here,
-//!    if the node drains or moves it, if its class has an idle limit, or
-//!    if the app is deleted;
+//!    if the node drains or moves it or is behind the deployed version, if
+//!    its class has an idle limit or is not deployed, or if the app is
+//!    deleted, restoring or of another incarnation (its markers read);
 //! 2. the record acquired with `Owners::acquire_unchanged` on the
 //!    remembered version (a wake since, an expiry, a move, an app delete
 //!    or a whole-app restore changed it: dropped);
@@ -320,6 +321,12 @@ impl ActorState {
             .next()
             .unwrap_or_default()
             .to_owned();
+        // An app deleted, restoring or of another incarnation: skipped
+        // before anything is written (section 3, step 1). Checked again
+        // under the hold, which is what the deletes rest on.
+        if let Some(refused) = other_incarnation(&cluster, &app_epoch).await {
+            return refused;
+        }
         let hold = match LeaseHold::acquire_with(
             &cluster,
             &self.address,
@@ -349,6 +356,20 @@ impl ActorState {
     }
 }
 
+/// Why the pass compacts nothing of the app now, if it does not: its
+/// markers, read again, give another epoch than `app_epoch` (this
+/// runtime's: the app was recreated or restored since), or it is deleted
+/// or restoring, or the bucket did not answer.
+async fn other_incarnation(cluster: &Cluster, app_epoch: &str) -> Option<Compacted> {
+    match cluster.fresh_app_epoch().await {
+        Ok(fresh) if fresh == app_epoch => None,
+        Ok(_) => Some(Compacted::Refused(
+            "the app was recreated or restored since this node started".into(),
+        )),
+        Err(why) => Some(Compacted::Refused(why)),
+    }
+}
+
 /// The pass's work under its own hold `hold` of `address`.
 async fn compact_under(
     cluster: &Arc<Cluster>,
@@ -370,14 +391,8 @@ async fn compact_under(
     // The incarnation: this runtime's epoch, read again now that the
     // pass holds the actor. A recreated or restored app compacts
     // nothing of what this node remembered.
-    match cluster.fresh_app_epoch().await {
-        Ok(fresh) if fresh == app_epoch => {}
-        Ok(_) => {
-            return Compacted::Refused(
-                "the app was recreated or restored since this node started".into(),
-            );
-        }
-        Err(why) => return Compacted::Refused(why),
+    if let Some(refused) = other_incarnation(cluster, app_epoch).await {
+        return refused;
     }
     let collector = Collector::idle(cluster, address, generation, hold.view());
     let mut wait = Duration::from_secs(1);
@@ -478,6 +493,17 @@ pub(super) async fn pass_one(
         .contains_key(address.class())
     {
         return Compacted::Refused("the class has an idle limit".into());
+    }
+    // As idle expiry: no pass under rules the node could not apply (a
+    // deploy it is behind on), nor of a class no longer deployed.
+    if inner
+        .deploy_behind
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Compacted::Refused("this node is behind the deployed version".into());
+    }
+    if !read(&inner.classes).contains_key(address.class()) {
+        return Compacted::Refused("the class is not deployed".into());
     }
     if cluster.draining() {
         return Compacted::Refused("this node is draining".into());

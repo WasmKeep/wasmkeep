@@ -189,6 +189,31 @@ async fn an_idle_pass_leaves_the_snapshot_and_its_segment_and_the_same_database(
     );
     // The snapshot, and the segment at P for its capture stamp.
     assert!(again.objects <= 2, "read {} objects", again.objects);
+    // The record is one generation past the head now (the pass's hold),
+    // as after a wake that only read: `--require-owner-match` refuses
+    // until the actor next writes.
+    assert_eq!(
+        again.owner_generation,
+        Some(head.position.generation + 1),
+        "the pass's release"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let strict = history::export_with_options(
+        &store,
+        &StateRoot::new("", "default", "default"),
+        &ActorAddress::new("default", "t", "x").unwrap(),
+        Point::Head,
+        &dir.path().join("strict.db"),
+        history::Options {
+            require_owner_match: true,
+            ..history::Options::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(strict, Err(history::Error::OwnerMismatch)),
+        "{strict:?}"
+    );
     // A restore on the other node.
     let r = send(b.addr, "GET", "/actor/t/x/durable", "").await;
     assert_eq!(
