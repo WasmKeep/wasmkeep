@@ -59,7 +59,12 @@ sudo install -d -m 0700 -o wasmkeep -g wasmkeep /var/lib/wasmkeep/data /var/lib/
 The data directory holds every actor's database: keep it readable by the
 service alone. `serve` creates a missing `--data-dir` with mode 0700 and
 warns at start when an existing one is open to other accounts; it never
-changes the mode of a directory that exists.
+changes the mode of a directory that exists. On an existing install,
+tighten them once:
+
+```bash
+sudo chmod 700 /var/lib/wasmkeep/data /var/lib/wasmkeep/cache
+```
 
 Copy your components (built as in each SDK's README) into
 `/var/lib/wasmkeep/classes/`. The unit below serves two: the counter, which

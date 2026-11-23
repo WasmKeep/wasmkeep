@@ -135,6 +135,7 @@ pub(crate) fn run(options: DevOptions) -> anyhow::Result<()> {
         let component = runtime.compile(&wasm)?;
         classes.push((p.class.clone(), component, wasm));
     }
+    wasmkeep_cli::prepare_data_root(&options.data_dir)?;
     let mut config = ActorConfig::new(&options.data_dir);
     config.egress = options.egress.clone();
     config.guest_log = options.guest_log.clone();

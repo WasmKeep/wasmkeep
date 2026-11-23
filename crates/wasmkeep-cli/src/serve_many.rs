@@ -52,6 +52,14 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
         );
         entries.push((args, file.apps[i].hostnames.clone()));
     }
+    // Once per process (not per app start): each distinct data directory.
+    let data_dirs: std::collections::BTreeSet<&std::path::Path> = entries
+        .iter()
+        .map(|(args, _)| args.data_dir.as_path())
+        .collect();
+    for dir in data_dirs {
+        wasmkeep_cli::prepare_data_root(dir)?;
+    }
     let bucket = base.bucket.clone().context("--node-file needs --bucket")?;
     let (store, prefix) = open_bucket(&bucket)?;
     let several = entries.len() > 1;
@@ -227,7 +235,6 @@ async fn start_runtime(
     let app_ref = AppRef::new(Arc::clone(&shared.store), &shared.prefix, &tenant, &name);
     // A deleted app is never served, and this node's files of it go
     // (ADR 0028).
-    wasmkeep_cli::prepare_data_root(&args.data_dir)?;
     let local = wasmkeep_server::local_app_dir(&args.data_dir, &tenant, &name);
     let blob_epoch = app_ref
         .prepare_local(&local)

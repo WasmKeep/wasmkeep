@@ -118,6 +118,7 @@ pub(crate) fn run(mut project: Project, options: Options) -> anyhow::Result<()> 
     let local = local_values(&project)?;
     let rules = rules(&project)?;
 
+    wasmkeep_cli::prepare_data_root(&options.data_dir)?;
     let mut config = ActorConfig::new(&options.data_dir);
     config.tenant = project.tenant.clone();
     config.app = project.name.clone();
