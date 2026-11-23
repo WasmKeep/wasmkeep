@@ -492,7 +492,10 @@ async fn heavy(suffix: &str) {
 async fn typescript_big_room_full_window_at_default_budget() {
     heavy("").await;
 }
+// Failed once in CI on a CPU-budget trap (a slow shared runner's CPU past the
+// real 50 ms budget) and passed on a re-run: kept out of the pull-request jobs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "speed-sensitive: a slow CI runner's CPU can trap on the real 50 ms budget; scripts/check.sh --full and the scheduled languages job run it"]
 async fn typescript_big_room_full_window_at_default_budget_starlingmonkey() {
     heavy("-starlingmonkey").await;
 }

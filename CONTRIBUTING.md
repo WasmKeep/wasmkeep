@@ -31,7 +31,9 @@ Run `./scripts/check.sh` before committing:
 The base is the merge base with `origin/main`; fetch first. Set `CHECK_BASE` to
 an explicit PR base when needed. Checks include staged, unstaged and untracked
 changes, and scan the commits introduced since that base for personal
-filesystem paths.
+filesystem paths. Set `WASMKEEP_TEST_THREADS=N` to cap the threads of every
+nextest run the script starts (`--test-threads N`) on a loaded or small
+machine.
 
 Before merging any code change, run `./scripts/check.sh --full`. It adds all
 workspace tests, scanner/runner tests, every guest SDK's unit tests,

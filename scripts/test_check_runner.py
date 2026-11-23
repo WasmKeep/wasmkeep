@@ -44,7 +44,8 @@ esac
 '''
         for name in ('cargo', 'rustup', 'rustc', 'mdbook', 'python3', 'go', 'npm'):
             self.write('bin/' + name, stub, executable=True)
-        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'], CALLS=str(self.root / 'calls'))
+        self.env = {k: v for k, v in os.environ.items() if k != 'WASMKEEP_TEST_THREADS'}
+        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ['PATH'], CALLS=str(self.root / 'calls'))
         self.write('target-libs/libcore-test.rlib', '')
         self.env['TARGET_LIBDIR'] = str(self.root / 'target-libs')
         self.env.pop('CHECK_BASE', None)
@@ -217,6 +218,16 @@ esac
         result, calls = self.run_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('nextest run --workspace --locked -E all() - binary(cluster_over_tls) flags=', calls)
+
+    def test_test_threads_cap_reaches_nextest(self):
+        self.write('wit/new.wit', '')
+        self.env['WASMKEEP_TEST_THREADS'] = '3'
+        result, calls = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('binary(cluster_over_tls) --test-threads 3 flags=', calls)
+        self.env['WASMKEEP_TEST_THREADS'] = 'x'
+        result, _ = self.run_check()
+        self.assertEqual(result.returncode, 2)
 
     def test_full_has_all_local_gates(self):
         result, calls = self.run_check('--full')

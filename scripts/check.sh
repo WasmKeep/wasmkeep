@@ -5,6 +5,8 @@
 # for CHECK_DEEP_SEEDS seeds (20,000 by default), one at a time, in release
 # mode at low priority (about half an hour at 20,000 on an 8-core desktop:
 # about 11 s of tests at 200 seeds), logging to target/deep/.
+# WASMKEEP_TEST_THREADS=N caps the threads of every nextest run here
+# (--test-threads N), for a loaded or small machine; unset, nextest picks.
 # Whatever a run does not cover is listed at the end under "not run", so a
 # green run says what it skipped.
 # The guest SDKs' own unit tests (TypeScript, Python, Go, C) run when their files change (or with --full),
@@ -19,9 +21,16 @@ for arg in "$@"; do
     --full) full=true ;;
     --s3) s3=true ;;
     --deep) deep=true ;;
-    *) echo "usage: $0 [--full] [--s3] [--deep]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--full] [--s3] [--deep] (WASMKEEP_TEST_THREADS=N caps nextest's threads)" >&2; exit 2 ;;
   esac
 done
+threads=()
+if [ -n "${WASMKEEP_TEST_THREADS:-}" ]; then
+  case "$WASMKEEP_TEST_THREADS" in
+    *[!0-9]*|0*) echo 'WASMKEEP_TEST_THREADS must be a positive integer' >&2; exit 2 ;;
+  esac
+  threads=(--test-threads "$WASMKEEP_TEST_THREADS")
+fi
 not_run=()
 skip() { echo "skipped: $*"; not_run+=("$*"); }
 base=$(git merge-base HEAD "${CHECK_BASE:-origin/main}") || {
@@ -160,7 +169,7 @@ fi
 if $full || $rust; then
   step tests
   if $full; then
-    cargo nextest run --workspace --locked
+    cargo nextest run --workspace --locked "${threads[@]}"
     # The TypeScript room and edge tests at the default CPU budget
     # assert fuel ceilings too, but keep their real 50 ms CPU budget.
     # Only variants still sensitive to CPU speed remain ignored:
@@ -170,7 +179,7 @@ if $full || $rust; then
     # The two TypeScript fanout tests also remain ignored because their
     # in-test node build is load-sensitive.
     cargo nextest run -p wasmkeep-server --test big_room --test room_edge --locked --run-ignored only \
-      -E '(binary(big_room) & test(/^typescript_big_room_distinct_positions_at_default_budget(_starlingmonkey)?$/)) | (binary(room_edge) & test(/^fanout_500_(quickjs|starlingmonkey)_default_budget$/))'
+      -E '(binary(big_room) & (test(/^typescript_big_room_distinct_positions_at_default_budget(_starlingmonkey)?$/) | test(=typescript_big_room_full_window_at_default_budget_starlingmonkey))) | (binary(room_edge) & test(/^fanout_500_(quickjs|starlingmonkey)_default_budget$/))' "${threads[@]}"
   else
     # The cluster suite over TLS repeats the cluster suite on another
     # transport: --full only.
@@ -181,11 +190,11 @@ if $full || $rust; then
       filter=$(printf 'rdeps(%s) | ' "${packages[@]}")
       filter="(${filter% | })"
     fi
-    cargo nextest run --workspace --locked -E "$filter - binary(cluster_over_tls)"
+    cargo nextest run --workspace --locked -E "$filter - binary(cluster_over_tls)" "${threads[@]}"
     skip 'the cluster suite over TLS (cluster_over_tls): --full'
   fi
 elif $preflight; then
-  cargo nextest run -p wasmkeep-compare --test preflight --locked
+  cargo nextest run -p wasmkeep-compare --test preflight --locked "${threads[@]}"
 fi
 # Every simulation but madsim_lease, the retired per-actor lease's: the
 # server no longer runs that protocol, so it runs under --deep only.
