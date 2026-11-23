@@ -6,8 +6,25 @@
 use std::path::Path;
 
 use wasmkeep_storage::ltx::{self, DbChecksum};
-use wasmkeep_storage::wal::{CaptureError, Changes, restore};
+use wasmkeep_storage::wal::{CaptureError, Changes, RestoreError, Restorer};
 use wasmkeep_storage::{ActorDb, SqlValue, StateDir, Storage, StorageConfig};
+
+/// Rebuilds a database at `path` (which must not exist) from a snapshot
+/// file and the segments after it, verifying every checksum on the way.
+fn restore(
+    path: &Path,
+    snapshot: Option<&ltx::File>,
+    segments: &[ltx::File],
+) -> Result<DbChecksum, RestoreError> {
+    let mut restorer = Restorer::create(path, u64::MAX)?;
+    if let Some(s) = snapshot {
+        restorer.apply_file(s)?;
+    }
+    for seg in segments {
+        restorer.apply_file(seg)?;
+    }
+    restorer.finish()
+}
 
 /// The LTX files an owner would upload: a snapshot, then one segment per
 /// capture.

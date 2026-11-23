@@ -40,12 +40,6 @@
 //! `CompletionOtherHold`).
 //!
 //! Strict classes never come here: their writes keep [`Replica::ship`].
-//! Nothing outside the tests calls this module before S9 wires it.
-
-#![allow(
-    dead_code,
-    reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
-)]
 
 use std::future::Future;
 use std::sync::Arc;
@@ -242,6 +236,7 @@ impl BudgetPermit {
     }
 
     /// The bytes it holds.
+    #[cfg(test)]
     pub(crate) fn charged(&self) -> u64 {
         self.charged
     }
@@ -381,6 +376,7 @@ struct Flight {
     /// The last boundary it carries (`WalBoundary::sequence`).
     sequence: WalBoundary,
     /// Whole events (boundaries) it carries.
+    #[cfg(test)]
     events: usize,
     /// One event alone over the byte cap: uploaded strict-style, its
     /// actor to wait for it at the event's end.
@@ -520,6 +516,7 @@ impl Replica {
 
     /// The acknowledged head and its checksum: what the sidecar names, and
     /// what every rule asking "the head" asks (ADR 0034, section 5).
+    #[cfg(test)]
     pub(crate) fn acknowledged_position(&self) -> (SegmentId, DbChecksum) {
         (self.head, self.checksum)
     }
@@ -546,7 +543,8 @@ impl Replica {
 
     /// The last boundary the captured position covers: the segment in
     /// flight's, or the acknowledged head's. A flush with nothing left
-    /// uncaptured waits for this one ([`Self::wait_acknowledged`]).
+    /// uncaptured waits for this one (`Self::wait_acknowledged`).
+    #[cfg(test)]
     pub(crate) fn captured_sequence(&self) -> Option<WalBoundary> {
         match *self.batched.shared.slot.borrow() {
             Slot::Uploading { .. } | Slot::Landed { .. } => self.batched.flight.map(|f| f.sequence),
@@ -555,6 +553,7 @@ impl Replica {
     }
 
     /// Optional barrier notification; storage owns capture identities.
+    #[cfg(test)]
     pub(crate) async fn capture_restarted(&mut self) -> Result<(), ReplicaError> {
         self.finish_sidecar().await?;
         self.settle_abandoned();
@@ -588,6 +587,7 @@ impl Replica {
     }
 
     /// The events (boundaries) the segment in flight carries.
+    #[cfg(test)]
     pub(crate) fn in_flight_events(&self) -> usize {
         self.batched.flight.map_or(0, |f| f.events)
     }
@@ -653,6 +653,7 @@ impl Replica {
     }
 
     /// The bytes bound of [`Self::batched_snapshot_due`] (tests shorten it).
+    #[cfg(test)]
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: u64) {
         self.batched.snapshot_bytes = bytes.max(1);
     }
@@ -692,6 +693,7 @@ impl Replica {
     /// The last boundary marked under this hold: the one a flush waits to
     /// see acknowledged. `None`: nothing was ever committed in this
     /// capture session.
+    #[cfg(test)]
     pub(crate) fn last_marked(&self) -> Option<WalBoundary> {
         self.batched
             .marked
@@ -719,7 +721,7 @@ impl Replica {
     /// task runs (ADR 0034, section 2), 21 s at the defaults. The deadline
     /// of a hibernation's flush and of a mode switch's (sections 1 and 6).
     pub(crate) fn upload_budget(&self) -> std::time::Duration {
-        let megabytes = u32::try_from(DEFAULT_SEGMENT_BYTES.div_ceil(1 << 20)).unwrap_or(1);
+        let megabytes = super::started_mib(DEFAULT_SEGMENT_BYTES);
         self.upload_idle
             .saturating_mul(super::UPLOAD_BUDGET_IDLES)
             .saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
@@ -857,6 +859,7 @@ impl Replica {
         self.batched.flight = Some(Flight {
             id: segment.id,
             sequence: plan.boundary,
+            #[cfg(test)]
             events: plan.boundaries,
             oversize: plan.oversize,
         });
@@ -1050,6 +1053,7 @@ impl Replica {
         self.batched.acked.borrow().covers(boundary)
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_acknowledged(
         &self,
         boundary: WalBoundary,
@@ -1113,11 +1117,6 @@ pub(crate) struct Ticket {
 }
 
 impl Ticket {
-    /// The segment this ticket uploads.
-    pub(crate) fn segment(&self) -> SegmentId {
-        self.segment.id
-    }
-
     /// Captures the reserved plan from `db`, checks it, encodes it and
     /// hands it to its upload task, in one step with no await: run it on
     /// the database's worker, which completes it whatever happens to the

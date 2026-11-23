@@ -726,8 +726,7 @@ GET of each gives the same body.
 
 ### The rule
 
-`heartbeat_loop` (`cluster/view.rs`), with
-`membership::full_listing_due`:
+`heartbeat_loop` (`cluster/view.rs`):
 
 - A listing of `nodes/` at the node's first period, every
   `FULL_LISTING_EVERY` (10) periods (30 s), and when one was asked for:
@@ -746,7 +745,7 @@ GET of each gives the same body.
   comes from the latest read of its object, by a listing or not: never
   from when this node last listed.
 - In the other periods, one GET of each node the last refresh found,
-  live or not, this node's own included (`Membership::heartbeats_of`). An
+  live or not, this node's own included (`membership::heartbeats_of`). An
   object that is gone (`cluster forget`) drops out; a read that fails
   fails the refresh, which keeps the last view, as a failed listing did.
 - Everything after the read is the same code for both: the twin check,

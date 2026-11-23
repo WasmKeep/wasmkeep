@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::ltx::DbChecksum;
-use crate::wal::WalCapture;
+use crate::wal::{WalCapture, db_page_size};
 
 /// Reuse only a sidecar at the authoritative head, an empty/absent WAL,
 /// and a main file whose checksum matches that sidecar. The sidecar format
@@ -27,10 +27,7 @@ pub fn local_is_at(path: &Path, generation: u64, txid: u64) -> Option<DbChecksum
     let mut h = [0u8; 18];
     let page_size = std::fs::File::open(path)
         .and_then(|mut f| f.read_exact(&mut h))
-        .map(|()| match u16::from_be_bytes([h[16], h[17]]) {
-            1 => 65_536,
-            raw => u32::from(raw),
-        })
+        .map(|()| db_page_size(&h))
         .unwrap_or(4096);
     let found = WalCapture::start(path, page_size).ok()?.checksum();
     (found.value() == sum).then_some(found)

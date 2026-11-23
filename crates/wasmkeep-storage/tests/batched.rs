@@ -4,9 +4,25 @@
 use rusqlite::Connection;
 use std::path::Path;
 use wasmkeep_storage::wal::{
-    CaptureError, Changes, DEFAULT_SEGMENT_BYTES, Restorer, WalCapture, estimated_segment_bytes,
+    BoundaryChanges, CaptureError, Changes, DEFAULT_SEGMENT_BYTES, Restorer, WalCapture,
+    estimated_segment_bytes,
 };
 use wasmkeep_storage::{ActorDb, CaptureHold, SqlValue, StateDir, Storage, StorageConfig};
+
+/// The longest prefix of whole events fitting `byte_cap` (the first event
+/// alone if it exceeds it), planned and captured in one step.
+trait CaptureBounded {
+    fn capture_bounded(&mut self, byte_cap: u64) -> Result<Option<BoundaryChanges>, CaptureError>;
+}
+
+impl CaptureBounded for WalCapture {
+    fn capture_bounded(&mut self, byte_cap: u64) -> Result<Option<BoundaryChanges>, CaptureError> {
+        let Some(plan) = self.next_capture(byte_cap) else {
+            return Ok(None);
+        };
+        self.capture_plan(plan).map(Some)
+    }
+}
 
 fn raw(path: &Path) -> (Connection, WalCapture) {
     let conn = Connection::open(path).unwrap();
