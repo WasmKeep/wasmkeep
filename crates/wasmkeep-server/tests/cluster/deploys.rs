@@ -1309,3 +1309,226 @@ async fn a_slow_compile_holds_back_no_event_and_no_lease() {
     let r = send(node.addr, "POST", "/actor/u/y/plain", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.body);
 }
+
+/// What happens right after the next successful write of the app's
+/// `current` once armed: `delete` writes the tombstone (`app delete`
+/// landing while a rollback switches `current`); `fail_tombstone` makes
+/// every later read of the tombstone fail (`tombstone_gets` counts them).
+#[derive(Debug, Default)]
+struct AtSwap {
+    inner: InMemory,
+    delete: AtomicBool,
+    fail_tombstone: AtomicBool,
+    failing: AtomicBool,
+    tombstone_gets: AtomicUsize,
+}
+impl std::fmt::Display for AtSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deleted-at-swap")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for AtSwap {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use object_store::ObjectStoreExt as _;
+        let put = self.inner.put_opts(p, b, o).await?;
+        if p.as_ref() == "apps/default/shop/current"
+            && self.fail_tombstone.swap(false, Ordering::SeqCst)
+        {
+            self.failing.store(true, Ordering::SeqCst);
+        }
+        if p.as_ref() == "apps/default/shop/current" && self.delete.swap(false, Ordering::SeqCst) {
+            self.inner
+                .put(
+                    &"apps/default/shop/deleted".into(),
+                    b"deleted by a test".to_vec().into(),
+                )
+                .await?;
+        }
+        Ok(put)
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if p.as_ref() == "apps/default/shop/deleted" && self.failing.load(Ordering::SeqCst) {
+            self.tombstone_gets.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "tombstone read refused".into(),
+            });
+        }
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        a: &object_store::path::Path,
+        b: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(a, b, o).await
+    }
+}
+
+/// A rollback racing `app delete` (ADR 0028) is refused as a deploy is:
+/// its `current` may land after the tombstone, and it never reports a
+/// deleted app rolled back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_racing_app_delete_is_refused() {
+    use wasmkeep_server::apps::{Changes, DeployError};
+    let racing = Arc::new(AtSwap::default());
+    let store: Arc<dyn ObjectStore> = racing.clone();
+    let app = AppRef::new(store, "", "default", "shop");
+    let rt = deploy_runtime();
+    app.deploy(&rt, vec![("c".into(), counter_wasm().to_vec())])
+        .await
+        .unwrap();
+    app.deploy_changes(
+        &rt,
+        Changes {
+            access: vec![("c".into(), "internal".into())],
+            ..Changes::default()
+        },
+    )
+    .await
+    .unwrap();
+    racing.delete.store(true, Ordering::SeqCst);
+    let rolled = app.rollback(true).await;
+    assert!(
+        !racing.delete.load(Ordering::SeqCst),
+        "the swap was reached"
+    );
+    assert!(
+        matches!(&rolled, Err(DeployError::Refused(why)) if why.contains("deleted while")),
+        "{rolled:?}"
+    );
+}
+
+/// A rollback whose `current` was switched, but whose check for a delete
+/// made meanwhile cannot read the tombstone: it retries, then says the
+/// switch happened and not to roll back again (a second rollback would go
+/// one more version back).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_that_cannot_check_for_a_delete_says_it_switched() {
+    use wasmkeep_server::apps::Changes;
+    let bucket = Arc::new(AtSwap::default());
+    let store: Arc<dyn ObjectStore> = bucket.clone();
+    let app = AppRef::new(store, "", "default", "shop");
+    let rt = deploy_runtime();
+    let first = app
+        .deploy(&rt, vec![("c".into(), counter_wasm().to_vec())])
+        .await
+        .unwrap();
+    app.deploy_changes(
+        &rt,
+        Changes {
+            access: vec![("c".into(), "internal".into())],
+            ..Changes::default()
+        },
+    )
+    .await
+    .unwrap();
+    bucket.fail_tombstone.store(true, Ordering::SeqCst);
+    let e = app.rollback(true).await.unwrap_err().to_string();
+    assert!(
+        bucket.tombstone_gets.load(Ordering::SeqCst) >= 3,
+        "retried: {}",
+        bucket.tombstone_gets.load(Ordering::SeqCst)
+    );
+    assert!(
+        e.contains(&format!("switched to {} (seq 3)", first.version)),
+        "{e}"
+    );
+    assert!(e.contains("do not run the rollback again"), "{e}");
+    bucket.failing.store(false, Ordering::SeqCst);
+    let now = app.current().await.unwrap().unwrap();
+    assert_eq!((now.version, now.seq), (first.version, 3));
+}
+
+/// A local marker this node cannot read while it follows deploys: the app
+/// is not stopped and its files stay; after a few failed checks in a row
+/// the node is not ready, and ready again once the marker reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_local_marker_keeps_the_app_and_makes_the_node_not_ready() {
+    use object_store::ObjectStoreExt as _;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let rt = deploy_runtime();
+    app.deploy(&rt, vec![("c".into(), counter_wasm().to_vec())])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (_a, service) = node_app(
+        "a",
+        dir.path(),
+        &store,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+    .await;
+    let wait_for = |want: Option<&'static str>| {
+        let service = service.clone();
+        async move {
+            let started = std::time::Instant::now();
+            while service.not_ready() != want {
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "readiness stayed {:?}",
+                    service.not_ready()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    wait_for(None).await;
+    // As after a `--recreate`: the local copy first, then the bucket's.
+    let local = service.local_app_dir().to_path_buf();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join(".recreated"), b"r1").unwrap();
+    store
+        .put(&"apps/default/shop/recreated".into(), b"r1".to_vec().into())
+        .await
+        .unwrap();
+    std::fs::write(local.join("kept"), b"state").unwrap();
+    std::fs::remove_file(local.join(".recreated")).unwrap();
+    std::fs::create_dir(local.join(".recreated")).unwrap();
+    wait_for(Some("cannot apply the deployed version")).await;
+    assert_eq!(std::fs::read(local.join("kept")).unwrap(), b"state");
+    std::fs::remove_dir(local.join(".recreated")).unwrap();
+    std::fs::write(local.join(".recreated"), b"r1").unwrap();
+    wait_for(None).await;
+    assert_eq!(std::fs::read(local.join("kept")).unwrap(), b"state");
+}

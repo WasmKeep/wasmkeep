@@ -44,6 +44,26 @@ pub use collect::KEEP_PREVIOUS;
 pub use delete::fence_app_nodes;
 pub use delete::{DeleteApp, LATE_WRITES, delete_app};
 
+/// A local copy of an app marker (`.recreated`, `.restored`): `None` only
+/// when the file is missing. Any other error (EMFILE under socket load,
+/// EIO, EACCES) says nothing about the app: an error, so the caller retries
+/// or fails, never stops the app or removes its local files as if the
+/// marker did not match.
+fn read_local_marker(path: &std::path::Path) -> Result<Option<Vec<u8>>, DeployError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DeployError::Local(format!(
+            "reading {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Deploy checks in a row that cannot read this node's local marker files
+/// before the node reports itself not ready.
+const LOCAL_FAILURES_BEHIND: u32 = 3;
+
 /// Why a deploy, rollback or update failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -58,6 +78,11 @@ pub enum DeployError {
     /// The bucket did not answer, or refused a write.
     #[error("bucket: {0}")]
     Bucket(String),
+    /// This node could not read its own local copy of an app marker
+    /// (`.recreated`, `.restored`): not the bucket's, and not a sign the
+    /// app was deleted.
+    #[error("local files: {0}")]
+    Local(String),
     /// Someone else changed `current` at the same moment; nothing changed.
     #[error("another deploy changed the app at the same time; retry")]
     Conflict,
@@ -787,14 +812,16 @@ impl AppRef {
             markers[0].1.as_ref().map(|(body, _)| body.as_slice()),
             markers[1].1.as_ref().map(|(body, _)| body.as_slice()),
         );
-        if markers.iter().any(|(file, value)| {
-            value.as_ref().is_some_and(|(body, _)| {
-                !marker_matches(
-                    Some(body.as_slice()),
-                    std::fs::read(local.join(file)).ok().as_deref(),
-                )
-            })
-        }) {
+        // A local marker this node cannot read is an error, never a reason
+        // to remove the app's files.
+        let mut stale = false;
+        for (file, value) in &markers {
+            if let Some((body, _)) = value {
+                let ours = read_local_marker(&local.join(file))?;
+                stale |= !marker_matches(Some(body.as_slice()), ours.as_deref());
+            }
+        }
+        if stale {
             remove("the app was recreated or restored since this node last ran it")?;
             std::fs::create_dir_all(local).map_err(bucket)?;
             for (file, value) in markers {
@@ -858,7 +885,6 @@ impl AppRef {
         read: Option<UpdateVersion>,
         version: &str,
         seq: u64,
-        marked: bool,
     ) -> Result<(), DeployError> {
         let mode = match read {
             None => PutMode::Create,
@@ -868,9 +894,7 @@ impl AppRef {
             mode,
             ..PutOptions::default()
         };
-        // Every `current` this version writes is rooted (ADR 0022), which
-        // implies marked.
-        debug_assert!(marked, "a rooted current is marked");
+        // Rooted (ADR 0022), which implies marked.
         let body = Current {
             version: version.to_owned(),
             seq,
@@ -1606,8 +1630,9 @@ impl AppRef {
             let previous = read.as_ref().map(|(c, _)| c.version.clone());
             if let Some(marker) = &marker {
                 marker.check()?;
+                marker.switching(&version, seq);
             }
-            self.swap_current(read.map(|(_, v)| v), &version, seq, marked)
+            self.swap_current(read.map(|(_, v)| v), &version, seq)
                 .await?;
             // Deleted while this deployed (ADR 0028): what it wrote is left to
             // `app delete`, which removes everything but the tombstone.
@@ -1682,8 +1707,37 @@ impl AppRef {
         // Rooted, so marked (ADR 0022).
         let marked = true;
         let seq = current.seq + 1;
-        self.swap_current(Some(read), &previous, seq, marked)
-            .await?;
+        self.swap_current(Some(read), &previous, seq).await?;
+        // Deleted while this rolled back (ADR 0028), as a deploy checks. A
+        // rollback is not idempotent: run again after a failed check, it
+        // would go one more version back, so the check is retried, and a
+        // failure says the switch happened.
+        let mut deleted = self.tombstone().await;
+        for wait in [250, 500] {
+            if deleted.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            deleted = self.tombstone().await;
+        }
+        match deleted {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(DeployError::Refused(format!(
+                    "{} was deleted while this rolled back: the `current` it wrote stays in the \
+                     bucket until `wasmkeep app delete` is run again",
+                    self.name()
+                )));
+            }
+            Err(e) => {
+                return Err(DeployError::Bucket(format!(
+                    "{}: `current` was switched to {previous} (seq {seq}); only the check for a \
+                     delete made meanwhile failed ({e}): do not run the rollback again (it would \
+                     go one more version back): check whether the app was deleted",
+                    self.name()
+                )));
+            }
+        }
         Ok(Deployed {
             repaired: 0,
             current: Current {
@@ -1722,6 +1776,8 @@ impl AppRef {
         // small reads): a deleted app stops being served within a period
         // or two, not at the end of a backoff that reaches minutes.
         let mut backoff: Option<Duration> = None;
+        // Checks in a row that could not read this node's own marker files.
+        let mut local_failures = 0_u32;
         loop {
             match backoff {
                 Some(wait) => {
@@ -1740,6 +1796,7 @@ impl AppRef {
             match self.update(&service).await {
                 Ok(_) => {
                     backoff = None;
+                    local_failures = 0;
                     service.set_deploy_behind(false);
                 }
                 Err(DeployError::Deleted(_)) => {
@@ -1755,6 +1812,17 @@ impl AppRef {
                         DeployError::Invalid(..) | DeployError::Front(_) | DeployError::Corrupt(_)
                     ) {
                         service.set_deploy_behind(true);
+                    }
+                    // This node's own files, unlike a bucket outage: once it
+                    // lasts, the node no longer follows deploys, so it is not
+                    // ready (and ready again at the next good check).
+                    if matches!(e, DeployError::Local(_)) {
+                        local_failures += 1;
+                        if local_failures >= LOCAL_FAILURES_BEHIND {
+                            service.set_deploy_behind(true);
+                        }
+                    } else {
+                        local_failures = 0;
                     }
                     let wait = backoff.map_or(every, |w| (w * 2).min(FOLLOW_BACKOFF_MAX));
                     tracing::warn!(error = %e, retry_in_s = wait.as_secs(), "checking for a new deploy failed");
@@ -1829,12 +1897,11 @@ impl AppRef {
             return Ok(false);
         }
         for (remote, file) in [(RECREATED, RECREATED_LOCAL), ("restored", ".restored")] {
-            if let Some((marker, _)) = self.get(remote).await?
-                && !marker_matches(
-                    Some(marker.as_slice()),
-                    std::fs::read(local.join(file)).ok().as_deref(),
-                )
-            {
+            let Some((marker, _)) = self.get(remote).await? else {
+                continue;
+            };
+            let ours = read_local_marker(&local.join(file))?;
+            if !marker_matches(Some(marker.as_slice()), ours.as_deref()) {
                 return Ok(false);
             }
         }
@@ -3673,5 +3740,66 @@ mod tests {
         let big = vec![b'#'; usize::try_from(crate::env::MAX_FILE).unwrap() + 1];
         assert!(parse_config(&big).is_err());
         assert!(parse_config(&[0xff, 0xfe]).is_err());
+    }
+
+    /// A local marker this node cannot read (here a directory where the
+    /// file should be; in production EMFILE, EIO, EACCES) is not a
+    /// mismatch: `still_ours` fails, and the follow loop retries, rather
+    /// than stopping the app and removing its local files. Only a missing
+    /// marker, or one with other bytes, says the app is no longer ours.
+    #[tokio::test]
+    async fn an_unreadable_local_marker_is_an_error_not_a_mismatch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let local = tempfile::tempdir().unwrap();
+        let marker = local.path().join(RECREATED_LOCAL);
+        // No remote marker: the legacy app's files are kept.
+        assert!(app.still_ours(local.path()).await.unwrap());
+        app.put_once(RECREATED, b"one".to_vec()).await.unwrap();
+        // Missing locally: recreated since this node prepared its files.
+        assert!(!app.still_ours(local.path()).await.unwrap());
+        std::fs::write(&marker, b"two").unwrap();
+        assert!(!app.still_ours(local.path()).await.unwrap());
+        std::fs::write(&marker, b"one").unwrap();
+        assert!(app.still_ours(local.path()).await.unwrap());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let read = app.still_ours(local.path()).await;
+        assert!(
+            matches!(&read, Err(DeployError::Local(why)) if why.contains(RECREATED_LOCAL)),
+            "{read:?}"
+        );
+    }
+
+    /// At start, too, a local marker this node cannot read is an error,
+    /// never a reason to remove the app's local files: only a missing
+    /// marker, or one with other bytes, is.
+    #[tokio::test]
+    async fn an_unreadable_local_marker_never_removes_local_files_at_start() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let app = AppRef::new(Arc::clone(&store), "", "default", "shop");
+        let data = tempfile::tempdir().unwrap();
+        let local = data.path().join("app");
+        app.put_once(RECREATED, b"one".to_vec()).await.unwrap();
+        // Missing locally: the directory is replaced, the marker written.
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("state"), b"old").unwrap();
+        app.prepare_local(&local).await.unwrap();
+        assert!(!local.join("state").exists());
+        assert_eq!(std::fs::read(local.join(RECREATED_LOCAL)).unwrap(), b"one");
+        // Same bytes: kept.
+        std::fs::write(local.join("state"), b"kept").unwrap();
+        app.prepare_local(&local).await.unwrap();
+        assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
+        // Unreadable: an error, and nothing is removed.
+        std::fs::remove_file(local.join(RECREATED_LOCAL)).unwrap();
+        std::fs::create_dir(local.join(RECREATED_LOCAL)).unwrap();
+        let prepared = app.prepare_local(&local).await;
+        assert!(
+            matches!(&prepared, Err(DeployError::Local(why)) if why.contains(RECREATED_LOCAL)),
+            "{prepared:?}"
+        );
+        assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
+        assert!(local.join(RECREATED_LOCAL).is_dir());
     }
 }
