@@ -27,6 +27,9 @@ interface Cursor {
     n: number;
     lagging: boolean;
     stalled?: boolean;
+    /** Opened before the edge knew a head: told `n: null`, the client checks
+     * its position over HTTP. The first push places it. */
+    unplaced?: boolean;
 }
 import { byteLength as bytes } from "./room-utf8";
 export class Edge {
@@ -39,6 +42,9 @@ export class Edge {
     }[] = [];
     head?: Position;
     floor = 0;
+    /** A push came since this instance started. A head before it is a
+     * stored one (`init`, `range`, `drain`), with nothing buffered. */
+    private pushed = false;
     private cursors = new Map<bigint, Cursor>();
     private index = new Map<number, (typeof this.buffer)[number]>();
     private size = 0;
@@ -60,15 +66,27 @@ export class Edge {
             return false;
         const resume = this.head && position?.e === this.head.e && position.n >= this.floor && position.n <= this.head.n;
         const n = resume ? position!.n : this.head?.n ?? 0;
-        this.cursors.set(id, { n, lagging: false });
+        this.cursors.set(id, this.head ? { n, lagging: false } : { n, lagging: false, unplaced: true });
         this.send(id, { t: "ready", e: this.head?.e ?? 0, n: !this.head || (position && !resume) ? null : n });
         this.deliver(id);
         return true;
     }
     forget(id: bigint) { this.cursors.delete(id); this.points.delete(id); }
-    /** Existing host sockets after a cold wake start at the next known head. */
+    /** The head of a stored configuration (`init`, `range`, `drain`), on an
+     * edge that knows none: clients that open now resume from it. Sockets
+     * kept through a hibernation, and those that opened before it (told
+     * `n: null`), are left to the first push, which places them where the
+     * stream it carries starts. */
+    stored(h: Position) {
+        if (!this.head) {
+            this.head = { ...h };
+            this.floor = h.n;
+        }
+    }
+    /** Sockets with no cursor start at the head once a push has come;
+     * before it, the first push places them (`receive`). */
     adopt(ids: bigint[]) {
-        if (this.head)
+        if (this.head && this.pushed)
             for (const id of ids)
                 if (!this.cursors.has(id))
                     this.cursors.set(id, { n: this.head.n, lagging: false });
@@ -81,44 +99,28 @@ export class Edge {
     private send(id: bigint, frame: unknown) { return this.io.send(id, JSON.stringify(frame)); }
     /** A push from the room or a relay; `ids` the host's sockets.
      *
-     * The first push after a wake from hibernation (no head, sockets with no
-     * cursor) places those sockets at `first - 1`, so the messages it carries
-     * go out, their frames saying where they stand. A header-only one has
-     * nothing to send, so it tells each socket that position with a `ready`
-     * carrying `b`: a client whose own position is lower fetches the rest
-     * over HTTP, one that missed nothing makes no request (ADR 0040, section 5). */
+     * The first push since this instance started (after a wake from
+     * hibernation, sockets with no cursor) places those sockets at
+     * `first - 1`, so the messages it carries go out, their frames saying
+     * where they stand. A header-only one has nothing to send, so it tells
+     * each of them the edge's head with a `ready` carrying `b`: a client
+     * whose own position is lower fetches the rest over HTTP, one that
+     * missed nothing makes no request (ADR 0040, section 5). A head stored
+     * by `init`, `range` or `drain` before it does not change this. */
     receive(p: Push, ids: bigint[]) {
-        if (this.head)
+        if (this.pushed) {
             this.adopt(ids);
-        // Its frames carry each message's own position (and epoch): rules 2
-        // and 3 apply, one frame per socket.
-        else if (p.messages.length) {
-            for (const id of ids)
-                if (!this.cursors.has(id))
-                    this.cursors.set(id, { n: Math.max(0, p.first - 1), lagging: false });
+            return this.push(p);
         }
-        else {
-            const n = Math.max(0, p.first - 1);
-            const ready = JSON.stringify({ t: "ready", e: p.e, b: p.b, n });
-            for (const id of ids) {
-                if (this.cursors.has(id))
-                    continue;
-                const result = this.io.send(id, ready);
-                if (result === "ok")
-                    this.cursors.set(id, { n, lagging: false });
-                // Like a `behind` that cannot be queued: the client would
-                // never learn where it stands.
-                else if (result === "backpressure") {
-                    this.io.close(id, 4802);
-                    this.slow++;
-                }
-            }
-        }
-        return this.push(p);
+        return this.take(p, ids.filter(id => !this.cursors.has(id)));
     }
-    push(p: Push) {
+    push(p: Push) { return this.take(p, []); }
+    /** A push; on the first one, `kept` are the sockets to place. */
+    private take(p: Push, kept: bigint[]) {
         if (this.head && p.e < this.head.e)
             return this.answer();
+        const first = !this.pushed;
+        this.pushed = true;
         if (!this.head) {
             this.head = { e: p.e, n: p.messages.length ? p.first - 1 : p.head };
             this.floor = this.head.n;
@@ -139,6 +141,12 @@ export class Edge {
             this.floor = p.head;
             this.head.n = p.head;
         }
+        // A stored head has nothing buffered: the first push may start below
+        // it, so its messages reach the sockets it places.
+        if (first && !this.buffer.length && p.messages.length && p.first <= this.head.n) {
+            this.head.n = p.first - 1;
+            this.floor = this.head.n;
+        }
         if (p.messages.length && p.first > this.head.n + 1) {
             this.buffer = [];
             this.index.clear();
@@ -146,6 +154,8 @@ export class Edge {
             this.floor = p.first - 1;
             this.head.n = this.floor;
         }
+        if (first)
+            this.place(p, kept);
         for (let i = 0; i < p.messages.length; i++) {
             const n = p.first + i;
             if (n <= this.head.n)
@@ -168,13 +178,45 @@ export class Edge {
         this.deliverMany([...this.cursors.keys()]);
         return this.answer();
     }
+    /** The first push's placement, at the head it starts from (before its
+     * messages, or the head of a header-only one). Sockets opened before any
+     * head are fetching their position over HTTP: live frames follow from
+     * there. Sockets kept through a hibernation start there too; with no
+     * messages to show it, each is told with one `ready` carrying `b`. */
+    private place(p: Push, kept: bigint[]) {
+        const n = this.head!.n;
+        for (const c of this.cursors.values())
+            if (c.unplaced) {
+                c.n = n;
+                c.unplaced = false;
+            }
+        // Its frames carry each message's own position (and epoch): rules 2
+        // and 3 apply, one frame per socket.
+        if (p.messages.length) {
+            for (const id of kept)
+                this.cursors.set(id, { n, lagging: false });
+            return;
+        }
+        const ready = JSON.stringify({ t: "ready", e: this.head!.e, b: p.b, n });
+        for (const id of kept) {
+            const result = this.io.send(id, ready);
+            if (result === "ok")
+                this.cursors.set(id, { n, lagging: false });
+            // Like a `behind` that cannot be queued: the client would never
+            // learn where it stands.
+            else if (result === "backpressure") {
+                this.io.close(id, 4802);
+                this.slow++;
+            }
+        }
+    }
     private deliver(id: bigint) { this.deliverMany([id]); }
     private deliverMany(ids: bigint[]) {
         if (!this.head) return;
         const groups = new Map<number, bigint[]>();
         for (const id of ids) {
             const c = this.cursors.get(id);
-            if (!c || c.n >= this.head.n) continue;
+            if (!c || c.n >= this.head.n || c.unplaced) continue;
             const group = groups.get(c.n) ?? [];
             group.push(id); groups.set(c.n, group);
         }

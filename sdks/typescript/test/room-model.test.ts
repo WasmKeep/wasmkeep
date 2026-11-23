@@ -105,7 +105,8 @@ function model(seed: number) {
             sockets.set(`${name}#${++id}`, { seen: 0, errors: [] });
             edge.open(id);
         }
-    let published = 0;
+    let published = 0, wakes = 0;
+    let kept: { e: bigint; n: bigint } | undefined;
     for (let step = 0; step < 150; step++) {
         const x = rand();
         if (x < 0.4) {
@@ -115,10 +116,30 @@ function model(seed: number) {
         }
         else if (x < 0.45)
             core = new Core(db); // A clean restart: the next operation opens an epoch.
-        else if (x < 0.5)
-            round = new Round(names); // A pusher restart: positions unknown.
-        else
-            round.run(source, now);
+        else if (x < 0.5) {
+            // A pusher restart: positions unknown, but for the one it kept
+            // when it last went idle with every child there (section 13).
+            round = new Round(names);
+            if (kept) {
+                round.wakeAt(kept);
+                wakes++;
+            }
+        }
+        else {
+            const r = round.run(source, now);
+            // As the pusher's idle step does: kept only while idle with
+            // every child acknowledged at the head, cleared otherwise.
+            const busy = r.next !== undefined && r.next <= now + 20;
+            let h: { e: bigint; head: bigint } | undefined;
+            try {
+                h = busy ? undefined : core.pull(r.delivered, 0, true, now).pull;
+            }
+            catch {
+                h = undefined;
+            }
+            const s = r.settled;
+            kept = s && h && r.delivered && s.e === h.e && s.n === h.head && r.delivered.e === s.e && r.delivered.n === s.n ? s : undefined;
+        }
         now += 20 + Math.floor(rand() * 600);
     }
     // No more faults: the rounds converge.
@@ -134,12 +155,14 @@ function model(seed: number) {
         assert.equal(s.seen, Number(head.head), `seed ${seed}, socket ${key} saw each number once`);
     }
     db.close();
-    return { published, repeats };
+    return { published, repeats, wakes };
 }
 test("room, pusher and edges: every socket sees every (e, n) once, in order, eventually", () => {
-    let total = 0, repeats = 0;
+    let total = 0, repeats = 0, wakes = 0;
     for (let seed = 1; seed <= 40; seed++)
-        { const r = model(seed); total += r.published; repeats += r.repeats; }
+        { const r = model(seed); total += r.published; repeats += r.repeats; wakes += r.wakes; }
     assert(total > 1000);
-    console.log(`model: ${total} messages, ${repeats} edge repeats dropped by the client rule`);
+    // Some pusher restarts start from the position kept when it went idle.
+    assert(wakes > 0);
+    console.log(`model: ${total} messages, ${repeats} edge repeats dropped by the client rule, ${wakes} pusher restarts from a kept position`);
 });

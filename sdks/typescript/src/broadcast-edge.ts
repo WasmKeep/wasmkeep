@@ -79,10 +79,8 @@ export function defineEdge(): ActorDefinition {
                     storage.execDurable("INSERT INTO wasmkeep_edge(id,config) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET config=excluded.config", [{ tag: "text", val: JSON.stringify(next) }]);
                     config = next;
                 }
-                if (!edge.head && config!.e !== undefined) {
-                    edge.head = { e: config!.e, n: config!.n! };
-                    edge.floor = config!.n!;
-                }
+                if (config!.e !== undefined)
+                    edge.stored({ e: config!.e, n: config!.n! });
                 if (!init)
                     edge.range(BigInt('0x' + config!.lo), config!.hi === undefined ? undefined : BigInt('0x' + config!.hi), config!.state === 'draining', Array.from(host.connections()));
                 return { status: 200, body: JSON.stringify({ sockets: host.connections().length }) };

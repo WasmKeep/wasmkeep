@@ -460,3 +460,39 @@ test("a woken edge's first push across epochs reaches the client with no fetch",
     assert.deepEqual(seen, ["1.371", "1.372", "1.373", "2.374"]);
     assert.deepEqual(r.last, { e: 2, n: 374 });
 });
+test("a client that joins a woken edge before its first push fetches history once", async () => {
+    const clock = new FakeClock(), ws = new FakeSocket(), urls: string[] = [], seen: number[] = [];
+    const c = new RoomClient({ join: "wss://x/join", history: "https://x/history", last: { e: 1, n: 3 }, clock, random: () => .5, socket: () => ws, onMessage: p => { seen.push(p.n); },
+        fetch: (async (url: string) => { urls.push(url); return new Response(JSON.stringify({ head: { e: 1, n: 4 }, messages: [{ position: { e: 1, n: 4 }, at: 0, body: "4" }], more: false })); }) as typeof fetch });
+    c.connect();
+    ws.onopen?.();
+    // The edge knew no head: n null, the client checks its position.
+    ws.frame({ t: "ready", e: 0, n: null });
+    // wake-vectors.txt: the first push then reaches it live, no behind.
+    ws.frame({ t: "m", e: 1, b: 0, n: 5, m: [{ a: 0, d: "5" }] });
+    await settle();
+    assert.equal(urls.length, 1);
+    assert.deepEqual(seen, [4, 5]);
+    c.close();
+});
+test("an announced position more than one epoch ahead, or behind the client's epoch, is a gap", async () => {
+    const queries: unknown[] = [], lost: number[][] = [];
+    const ahead = new Receiver({ onLost: (a, b) => { lost.push([a, b]); }, history: async (p) => {
+            queries.push(p);
+            // Rule 2 over a gap of epochs: history answers the lowest base in between.
+            return { head: { e: 3, n: 5 }, lost: { e: 2, base: 4 }, messages: [{ position: { e: 3, n: 5 }, at: 0, body: "5" }], more: false };
+        } }, { e: 1, n: 6 });
+    await ahead.receive({ t: "ready", e: 3, b: 4, n: 4 });
+    assert.deepEqual(queries, [{ e: 1, n: 6 }]);
+    assert.deepEqual(lost, [[5, 6]]);
+    assert.deepEqual(ahead.last, { e: 3, n: 5 });
+    queries.length = 0;
+    const behind = new Receiver({ history: async (p) => {
+            queries.push(p);
+            return { head: { e: 2, n: 7 }, messages: [], more: false };
+        } }, { e: 2, n: 7 });
+    // An older epoch than the client's own: checked over HTTP, not applied.
+    await behind.receive({ t: "ready", e: 1, b: 0, n: 7 });
+    assert.deepEqual(queries, [{ e: 2, n: 7 }]);
+    assert.deepEqual(behind.last, { e: 2, n: 7 });
+});

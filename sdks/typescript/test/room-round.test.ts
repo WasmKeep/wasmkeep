@@ -97,4 +97,68 @@ test("stalled-only lag backs off alarm writes, new messages reset the delay", ()
     assert.equal(alarms.pending,BigInt(now+20));
     lagging=0; round.run(of(core), now+20); db.close();
 });
+// ADR 0040, section 13: a pusher keeps where every child stood when it went
+// idle; after everything hibernated, its first push carries the publish
+// that woke the room instead of a header every client then fetches after.
+test("a pusher woken at the position it kept pushes the waking publish, not a header", () => {
+    db.install(":memory:");
+    let core = new Core(db);
+    core.init();
+    core.publish([{ body: "a" }], 0n);
+    const pushes: any[] = [];
+    install((_a, r) => {
+        if (r.path.endsWith("init"))
+            return { status: 200, headers: [], body: new TextEncoder().encode("{}") };
+        const p = JSON.parse(new TextDecoder().decode(r.body));
+        pushes.push(p);
+        return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify({ e: p.e, n: p.head, sockets: 1, lagging: 0 })) };
+    });
+    const names = ["edge/a", "edge/b"];
+    let round = new Round(names);
+    round.run(of(core), 0);
+    const idle = round.run(of(core), 20);
+    assert.equal(idle.next, undefined);
+    assert.deepEqual(idle.settled, { e: 1n, n: 1n });
+    const wake = (kept?: { e: bigint; n: bigint }) => {
+        // Everything hibernates: the room opens an epoch at its base, the
+        // pusher has no positions but the one it kept.
+        core = new Core(db);
+        core.publish([{ body: "b" }], 100n);
+        round = new Round(names);
+        if (kept)
+            round.wakeAt(kept);
+        round.run(of(core), 100);
+        pushes.length = 0;
+        round.run(of(core), 120);
+        return pushes.map(p => [p.e, p.b, p.first, p.head, p.messages.map((m: any) => m.d)]);
+    };
+    assert.deepEqual(wake(idle.settled), [[2, 1, 2, 2, ["b"]], [2, 1, 2, 2, ["b"]]]);
+    // Without it (an older pusher, or none kept): the header alone.
+    assert.deepEqual(wake(), [[3, 2, 4, 3, []], [3, 2, 4, 3, []]]);
+    db.close();
+});
+test("a kept position the room refuses is dropped: the children start with none", () => {
+    db.install(":memory:");
+    const core = new Core(db);
+    core.init();
+    core.publish([{ body: "a" }], 0n);
+    const pushes: any[] = [];
+    install((_a, r) => {
+        if (r.path.endsWith("init"))
+            return { status: 200, headers: [], body: new TextEncoder().encode("{}") };
+        const p = JSON.parse(new TextDecoder().decode(r.body));
+        pushes.push(p);
+        return { status: 200, headers: [], body: new TextEncoder().encode(JSON.stringify({ e: p.e, n: p.head, sockets: 1, lagging: 0 })) };
+    });
+    const round = new Round(["edge/a"]);
+    // A position past the room's head: the pull answers invalid position.
+    round.wakeAt({ e: 1n, n: 7n });
+    round.run(of(core), 0);
+    const r = round.run(of(core), 20);
+    assert.deepEqual(pushes, []);
+    assert.equal(r.next, 40);
+    round.run(of(core), 40);
+    assert.deepEqual(pushes.map(p => [p.e, p.first, p.head, p.messages.length]), [[1, 2, 1, 0]]);
+    db.close();
+});
 }

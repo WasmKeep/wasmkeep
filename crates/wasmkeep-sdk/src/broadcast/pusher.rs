@@ -127,9 +127,62 @@ pub const IDLE_ROUND: u64 = 60_000;
 thread_local! {
     static SAFE: std::cell::Cell<Option<Position>> = const { std::cell::Cell::new(None) };
     static IDLE_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(IDLE_ROUND) };
+    /// The idle position as stored; `None` until this instance read it.
+    static KEPT: std::cell::Cell<Option<Option<Position>>> = const { std::cell::Cell::new(None) };
+}
+/// Where every child stood when this pusher last went idle: kept in its
+/// own SQLite (a plain write, at most one per burst), so a cold start can
+/// give it to its children (ADR 0040, section 13). The first call of an
+/// instance reads it; later calls answer `None`. Best effort: a missing
+/// table or a failed read is no position, a header-only first push.
+pub fn wake_position() -> Option<Position> {
+    if KEPT.get().is_some() {
+        return None;
+    }
+    let p = crate::storage::query("SELECT e,n FROM wasmkeep_pusher_idle WHERE id=1", &[])
+        .ok()
+        .and_then(|r| {
+            let row = r.values.first()?;
+            Some(Position {
+                e: u64::try_from(row.first()?.as_i64()?).ok()?,
+                n: u64::try_from(row.get(1)?.as_i64()?).ok()?,
+            })
+        });
+    KEPT.set(Some(p));
+    p
+}
+/// Stores or clears the idle position when it changes. A failed write is
+/// ignored: it only leaves the next cold start without a position.
+fn keep_idle(p: Option<Position>) {
+    if KEPT.get() == Some(p) {
+        return;
+    }
+    let sql = |s: &str, v: &[crate::Value]| crate::storage::exec(s, v).map(|_| ());
+    let written = match p {
+        Some(p) => sql(
+            "CREATE TABLE IF NOT EXISTS wasmkeep_pusher_idle(id INTEGER PRIMARY KEY CHECK(id=1),e INTEGER NOT NULL,n INTEGER NOT NULL)",
+            &[],
+        )
+        .and_then(|()| {
+            sql(
+                "INSERT INTO wasmkeep_pusher_idle(id,e,n) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET e=excluded.e,n=excluded.n",
+                &[
+                    i64::try_from(p.e).unwrap_or(i64::MAX).into(),
+                    i64::try_from(p.n).unwrap_or(i64::MAX).into(),
+                ],
+            )
+        }),
+        // No table yet: nothing to clear.
+        None => sql("DELETE FROM wasmkeep_pusher_idle", &[]).or(Ok(())),
+    };
+    if written.is_ok() {
+        KEPT.set(Some(p));
+    }
 }
 pub(super) fn idle(source: &mut impl Source, result: RoundResult, now: u64) {
     if result.next.is_some_and(|at| at <= now.saturating_add(20)) {
+        // Busy: a cold start must not believe the children still there.
+        keep_idle(None);
         return;
     }
     let keep = |delay: u64| {
@@ -139,7 +192,15 @@ pub(super) fn idle(source: &mut impl Source, result: RoundResult, now: u64) {
         }
     };
     let idle_ms = IDLE_MS.get();
-    match source.pull(result.delivered, 0, true, now) {
+    let pulled = source.pull(result.delivered, 0, true, now);
+    // Idle with every child acknowledged at the head: where a cold start
+    // puts them. Anything else clears it.
+    keep_idle(pulled.as_ref().ok().and_then(|h| {
+        result
+            .settled
+            .filter(|p| p.e == h.e && p.n == h.head && result.delivered == Some(*p))
+    }));
+    match pulled {
         Ok(h) => {
             if result
                 .delivered
@@ -191,6 +252,9 @@ pub mod handler {
         let now = crate::now_ms();
         LAST_ROUND.set(Some(now));
         let mut source = room();
+        if let Some(p) = wake_position() {
+            round.wake_at(p);
+        }
         let result = round.run(&mut source, now)?;
         idle(&mut source, result, now);
         Ok(())
@@ -203,6 +267,9 @@ pub mod handler {
         let mut source = room();
         if !scale.migrate(&source, now)? {
             return Ok(());
+        }
+        if let Some(p) = wake_position() {
+            round.wake_at(p);
         }
         let result = scale.run(round, &mut source, now)?;
         idle(&mut source, result, now);

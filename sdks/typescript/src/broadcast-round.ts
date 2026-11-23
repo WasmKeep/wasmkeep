@@ -29,6 +29,9 @@ export interface RoundResult {
     delivered?: Position;
     /** Some child holds sockets, or did not say: an idle pusher keeps an alarm. */
     occupied?: boolean;
+    /** Every child is initialized and acknowledged this one position: an
+     * idle pusher keeps it, for its next cold start (`Round.wakeAt`). */
+    settled?: Position;
 }
 /** Distinct positions one round pulls at most: the rest are deferred to
  * the next round, so laggards at many positions never make one round a
@@ -83,6 +86,12 @@ export class Round {
     /** The child the last round deferred first: the next round starts there. */
     private resume?: string;
     private suspects = new Map<string, Suspect>();
+    /** Where every child stood when this pusher last went idle, read back
+     * after a cold start: the first run gives it to the children that have
+     * no position (`wakeAt`). */
+    private wake?: Position;
+    /** The position the first run gave, until a pull refuses it. */
+    private seeded?: Position;
     constructor(addresses: string[]) {
         if (addresses.length > 16)
             throw Error("at most 16 fixed edges");
@@ -110,12 +119,26 @@ export class Round {
     private relayOf = new Map<string, Relay>();
     private byAddress = new Map<string, Child>();
     count(name: string) { return this.byAddress.get(name)?.sockets; }
+    /** After a cold start: where every child stood when this pusher last
+     * went idle (ADR 0040, section 13). The next run gives it to each child
+     * that has no position, so a quiet room's first publish after a full
+     * hibernation is pushed to the edges, not announced as a header every
+     * client would then fetch over HTTP. A child that was elsewhere answers
+     * its own position, as after any push. */
+    wakeAt(p: Position) { this.wake = p; }
     /** One round over `source` (the room's `pull`, or a local `Core`).
      * Sets the next alarm when one is due and answers it, with the
      * position every pushed child was brought to (the lowest header
      * used), for the pusher's idle pull. */
     run(input: Source | Core, now: number): RoundResult {
         const source = asSource(input);
+        if (this.wake) {
+            for (const c of this.children)
+                c.position ??= this.wake;
+            this.seeded = this.wake;
+            this.wake = undefined;
+        }
+        let refused = false;
         const ready = this.children.filter(c => {
             const r = this.relayOf.get(c.address);
             const due = c.suspect.due <= now && !(r && (this.suspects.get(r.name)?.due ?? 0) > now);
@@ -167,6 +190,10 @@ export class Round {
                 // Not durable yet (confirm): the upload's retry is 50 ms.
                 if (errorMessage(e).includes("not durable"))
                     retry = 50;
+                // A position read back that the room no longer accepts:
+                // those children start with none.
+                if (errorMessage(e).includes("invalid position") && position && this.seeded && position.e === this.seeded.e && position.n === this.seeded.n)
+                    refused = true;
                 slices.set(key, undefined);
                 return;
             }
@@ -362,7 +389,18 @@ export class Round {
                 next = Math.min(next, c.suspect.due);
         if (next !== Infinity)
             alarms.setAlarm(BigInt(next));
+        if (refused) {
+            const s = this.seeded!;
+            for (const c of this.children)
+                if (c.position && c.position.e === s.e && c.position.n === s.n)
+                    c.position = undefined;
+            this.seeded = undefined;
+        }
         const occupied = this.children.some(c => c.sockets === undefined || c.sockets > 0);
-        return { next: next === Infinity ? undefined : next, delivered, occupied };
+        // Every child initialized and acknowledged at one position: where an
+        // idle pusher may say they all stand.
+        const p = this.children[0]?.position;
+        const settled = p && this.children.every(c => c.initialized && c.position?.e === p.e && c.position.n === p.n) ? { ...p } : undefined;
+        return { next: next === Infinity ? undefined : next, delivered, occupied, settled };
     }
 }

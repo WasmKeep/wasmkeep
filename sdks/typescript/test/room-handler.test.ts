@@ -71,3 +71,45 @@ test("an edge woken with sockets announces their start, delivers its first push 
         db.close();
     }
 });
+test("an edge woken with sockets and a stored head still announces where its first push starts", () => {
+    db.install(":memory:");
+    const fetch = (e: ReturnType<typeof defineEdge>, path: string, body: string) => {
+        const r = e.fetch!({ method: "POST", path, headers: { "x-wasmkeep-caller": "tenant/pusher/r" }, text: () => body, bytes: () => new TextEncoder().encode(body), json: <T>() => JSON.parse(body) as T });
+        assert(typeof r === "object" && !(r instanceof Uint8Array));
+        return r.status;
+    };
+    const config = { room: "tenant/pusher/r", lo: "0000000000000000", state: "active", e: 1, n: 3 };
+    const frames = () => sockets.sent.splice(0).map(([id, s]) => [id, JSON.parse(s)]);
+    sockets.open.push(7n);
+    try {
+        // A replayed init on an edge that kept its row (and a socket) through
+        // a hibernation: the stored head (1, 3) is the edge's, but the socket
+        // is told where the first push starts, not silently placed there.
+        const e = defineEdge();
+        e.init!();
+        assert.equal(fetch(e, "/wasmkeep-edge/v1/init", JSON.stringify(config)), 200);
+        const woken = defineEdge();
+        assert.equal(fetch(woken, "/wasmkeep-edge/v1/init", JSON.stringify({ ...config, n: 9 })), 200);
+        assert.deepEqual(frames(), []);
+        assert.equal(fetch(woken, "/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 6, head: 5, messages: [] })), 200);
+        assert.deepEqual(frames(), [[7n, { t: "ready", e: 1, b: 0, n: 3 }]]);
+        assert.equal(fetch(woken, "/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 4, head: 5, messages: [{ a: 0, d: "4" }, { a: 0, d: "5" }] })), 200);
+        assert.deepEqual(frames(), [[7n, { t: "m", e: 1, b: 0, n: 4, m: [{ a: 0, d: "4" }, { a: 0, d: "5" }] }]]);
+        // A range on a woken edge stores a head too; a client that joined
+        // before it (told n: null) gets the first push live, no behind.
+        const ranged = defineEdge();
+        ranged.websocket!.open!(8n, "/?c=c&p=0000000000000001&e=1&n=2");
+        sockets.open.push(8n);
+        assert.deepEqual(frames(), [[8n, { t: "ready", e: 0, n: null }]]);
+        assert.equal(fetch(ranged, "/wasmkeep-edge/v1/range", JSON.stringify({ ...config, n: 4 })), 200);
+        // The range closed the kept socket, whose point it does not know.
+        sockets.open.splice(0, 1);
+        assert.equal(fetch(ranged, "/wasmkeep-edge/v1/push", JSON.stringify({ e: 1, b: 0, first: 5, head: 5, messages: [{ a: 0, d: "5" }] })), 200);
+        assert.deepEqual(frames(), [[8n, { t: "m", e: 1, b: 0, n: 5, m: [{ a: 0, d: "5" }] }]]);
+    }
+    finally {
+        sockets.open.splice(0);
+        sockets.sent.splice(0);
+        db.close();
+    }
+});

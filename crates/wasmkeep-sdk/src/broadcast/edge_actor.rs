@@ -232,11 +232,8 @@ impl http::Guest for EdgeActor {
                     old.ok_or("invalid config")?
                 };
                 EDGE.with_borrow_mut(|e| {
-                    if e.head.is_none() {
-                        e.head = active.head;
-                        if let Some(h) = active.head {
-                            e.floor = h.n;
-                        }
+                    if let Some(h) = active.head {
+                        e.stored(h);
                     }
                     if !init {
                         e.range(

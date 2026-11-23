@@ -278,9 +278,13 @@ struct Wire {
     sent: Vec<(u64, String)>,
     blocked: bool,
     closed: Vec<(u64, u16)>,
+    gone: Vec<u64>,
 }
 impl SocketIo for Wire {
     fn send(&mut self, id: u64, text: &str) -> SendResult {
+        if self.gone.contains(&id) {
+            return SendResult::Gone;
+        }
         self.sent.push((id, text.into()));
         if self.blocked {
             SendResult::Backpressure
@@ -330,6 +334,7 @@ fn shared_wake_vectors() {
         let mut edge = Edge::default();
         let mut wire = Wire::default();
         let mut expected: Vec<String> = vec![];
+        let mut sockets: Option<usize> = None;
         let check = |wire: &mut Wire, expected: &mut Vec<String>, event: &str| {
             let got: Vec<String> = wire
                 .sent
@@ -365,34 +370,55 @@ fn shared_wake_vectors() {
                     assert!(edge.open(id, p, &mut wire));
                 }
                 "ping" => edge.ping(num(1), &mut wire),
-                "push" => {
-                    let p = Push {
-                        recover: false,
-                        e: num(1),
-                        base: num(2),
-                        first: num(3),
-                        head: num(4),
-                        messages: (0..num(5))
-                            .map(|i| Item {
-                                epoch: (words.len() == 9 && i < num(8)).then(|| super::Epoch {
-                                    e: num(6),
-                                    base: num(7),
-                                }),
-                                at: 0,
-                                id: None,
-                                body: "x".into(),
-                            })
-                            .collect(),
+                "stored" => edge.stored(Position {
+                    e: num(1),
+                    n: num(2),
+                }),
+                "gone" => wire.gone.push(num(1)),
+                "count" => assert_eq!(sockets, Some(num(1) as usize), "{line}"),
+                "push" | "recover" => {
+                    let recover = words[0] == "recover";
+                    let p = if recover {
+                        Push {
+                            recover,
+                            e: num(1),
+                            base: num(2),
+                            first: num(3) + 1,
+                            head: num(3),
+                            messages: vec![],
+                        }
+                    } else {
+                        Push {
+                            recover,
+                            e: num(1),
+                            base: num(2),
+                            first: num(3),
+                            head: num(4),
+                            messages: (0..num(5))
+                                .map(|i| Item {
+                                    epoch: (words.len() == 9 && i < num(8)).then(|| super::Epoch {
+                                        e: num(6),
+                                        base: num(7),
+                                    }),
+                                    at: 0,
+                                    id: None,
+                                    body: "x".into(),
+                                })
+                                .collect(),
+                        }
                     };
                     let ids = wire.sockets.clone();
-                    edge.receive(&p, &ids, &mut wire);
+                    sockets = Some(edge.receive(&p, &ids, &mut wire).sockets);
+                    // A socket found gone leaves the host's list.
+                    let gone = wire.gone.clone();
+                    wire.sockets.retain(|s| !gone.contains(s));
                 }
                 other => panic!("unknown event {other}"),
             }
         }
         check(&mut wire, &mut expected, &event);
     }
-    assert_eq!(count, 8);
+    assert_eq!(count, 14);
 }
 #[test]
 fn wake_announcement_backpressure_closes_slow() {

@@ -117,7 +117,17 @@ test("shared wake vectors: a woken edge's first push reaches its sockets", () =>
         count++;
         const sent: string[] = [];
         let sockets: bigint[] = [];
-        const edge = new Edge({ send(id, s) { sent.push(notation(id, s)); return "ok"; }, close() { } });
+        const gone = new Set<bigint>();
+        let counted: number | undefined;
+        const edge = new Edge({
+            send(id, s) {
+                if (gone.has(id))
+                    return "gone";
+                sent.push(notation(id, s));
+                return "ok";
+            },
+            close() { },
+        });
         let expected: string[] = [], event = "";
         const check = () => {
             assert.deepEqual(sent.splice(0), expected, `after ${event} in:\n${scenario.join("\n")}`);
@@ -141,14 +151,26 @@ test("shared wake vectors: a woken edge's first push reaches its sockets", () =>
             }
             else if (w[0] === "ping")
                 edge.ping(BigInt(w[1]));
-            else if (w[0] === "push")
-                edge.receive({ e: n(1), b: n(2), first: n(3), head: n(4), messages: Array.from({ length: n(5) }, (_, i) => w.length === 9 && i < n(8) ? { a: 0, d: "x", e: n(6), b: n(7) } : { a: 0, d: "x" }) }, [...sockets]);
+            else if (w[0] === "stored")
+                edge.stored({ e: n(1), n: n(2) });
+            else if (w[0] === "gone")
+                gone.add(BigInt(w[1]));
+            else if (w[0] === "count")
+                assert.equal(counted, n(1), line);
+            else if (w[0] === "push" || w[0] === "recover") {
+                const p = w[0] === "recover"
+                    ? { recover: true, e: n(1), b: n(2), first: n(3) + 1, head: n(3), messages: [] }
+                    : { e: n(1), b: n(2), first: n(3), head: n(4), messages: Array.from({ length: n(5) }, (_, i) => w.length === 9 && i < n(8) ? { a: 0, d: "x", e: n(6), b: n(7) } : { a: 0, d: "x" }) };
+                counted = edge.receive(p, [...sockets]).sockets;
+                // A socket found gone leaves the host's list.
+                sockets = sockets.filter(id => !gone.has(id));
+            }
             else
                 throw Error(`unknown event ${line}`);
         }
         check();
     }
-    assert.equal(count, 8);
+    assert.equal(count, 14);
 });
 test("a wake announcement that meets backpressure closes the socket as slow", () => {
     const closed: [bigint, number][] = [];
