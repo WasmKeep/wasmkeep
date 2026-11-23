@@ -2,7 +2,7 @@
 //! and 6): boundaries, the capture step, the completion job, the wait at
 //! an event's end, `flush` and the barriers.
 //!
-//! The replica's uploader ([`crate::replica::Ticket`]) does the upload;
+//! The replica's uploader (`replica::batched::Ticket`) does the upload;
 //! this module decides when. At each mailbox gap the actor marks a
 //! boundary, applies an outcome that landed, and, when nothing is in
 //! flight, captures up to the last boundary within the cap and hands the

@@ -527,22 +527,6 @@ pub fn visit<E>(
     Ok((header, trailer))
 }
 
-/// `<min>-<max>.ltx` with 16-digit lowercase hex transaction ids.
-pub fn file_name(min_txid: u64, max_txid: u64) -> String {
-    format!("{min_txid:016x}-{max_txid:016x}.ltx")
-}
-
-/// Parses [`file_name`]'s format.
-pub fn parse_file_name(name: &str) -> Option<(u64, u64)> {
-    let (min, rest) = name.strip_suffix(".ltx")?.split_once('-')?;
-    let hex16 = |s: &str| {
-        (s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-            .then(|| u64::from_str_radix(s, 16).ok())
-            .flatten()
-    };
-    Some((hex16(min)?, hex16(rest)?))
-}
-
 fn uvarint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
@@ -812,19 +796,5 @@ mod tests {
         assert!(check_order(true, lock, lock - 1, lock + 1).is_ok());
         assert!(check_order(true, lock, lock - 1, lock).is_err());
         assert_eq!(last_pgno(lock, 65_536), lock - 1);
-    }
-
-    #[test]
-    fn file_names() {
-        assert_eq!(file_name(1, 0x2a), "0000000000000001-000000000000002a.ltx");
-        assert_eq!(
-            parse_file_name("0000000000000001-000000000000002a.ltx"),
-            Some((1, 0x2a))
-        );
-        assert_eq!(
-            parse_file_name("0000000000000001-000000000000002A.ltx"),
-            None
-        );
-        assert_eq!(parse_file_name("1-2.ltx"), None);
     }
 }

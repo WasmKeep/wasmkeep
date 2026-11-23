@@ -289,21 +289,6 @@ impl WalCapture {
         })
     }
 
-    /// Capture the longest prefix of whole events fitting `byte_cap`. If the
-    /// first event alone exceeds it, capture that event alone. Stop before an
-    /// oversize event even if a later shrink could make the union smaller.
-    /// Use `DEFAULT_SEGMENT_BYTES` for the ADR's default.
-    /// Unmarked commits are never included. No checkpoint is performed here.
-    pub fn capture_bounded(
-        &mut self,
-        byte_cap: u64,
-    ) -> Result<Option<BoundaryChanges>, CaptureError> {
-        let Some(plan) = self.next_capture(byte_cap) else {
-            return Ok(None);
-        };
-        self.capture_plan(plan).map(Some)
-    }
-
     /// Consume exactly the reserved prefix, even if more events were marked.
     /// A consumed or changed prefix is refused before capture state advances.
     pub fn capture_plan(&mut self, plan: BoundaryPlan) -> Result<BoundaryChanges, CaptureError> {

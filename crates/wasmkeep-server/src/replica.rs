@@ -28,14 +28,11 @@ use wasmkeep_storage::wal::Changes;
 use crate::cluster::{Cluster, LeaseView};
 
 mod batched;
-#[allow(
-    unused_imports,
-    reason = "wired to actors with batched writes in S9 (ADR 0034, plan)"
-)]
 pub(crate) use batched::{
-    AlarmIndex, Applied, BudgetPermit, NODE_UPLOAD_BYTES, Stop, Ticket, UploadBudget,
-    UploadFailure, stopped,
+    AlarmIndex, BudgetPermit, NODE_UPLOAD_BYTES, Stop, UploadBudget, stopped,
 };
+#[cfg(test)]
+pub(crate) use batched::{Applied, UploadFailure};
 
 /// What `failed` says while an inline upload is under way, so a cut that
 /// interrupts it stops replication.
@@ -134,11 +131,17 @@ impl Drop for InFlightBytes {
     }
 }
 
+/// The started megabytes of `bytes`, saturating at `u32::MAX`: what the
+/// per-megabyte time and permit allowances count.
+pub(crate) fn started_mib(bytes: impl TryInto<u64>) -> u32 {
+    u32::try_from(bytes.try_into().unwrap_or(u64::MAX).div_ceil(1 << 20)).unwrap_or(u32::MAX)
+}
+
 /// The limit of one try of a read: [`READ_IDLE`] plus a second per
 /// started megabyte of `bytes`, the bytes read over the same link
 /// alongside it, its own included.
 fn read_limit(bytes: u64) -> std::time::Duration {
-    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    let megabytes = started_mib(bytes);
     READ_IDLE.saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
 }
 
@@ -246,9 +249,7 @@ impl Turn {
         // past any bound.
         Self {
             app,
-            megabytes: u32::try_from(size.div_ceil(1 << 20))
-                .unwrap_or(u32::MAX)
-                .clamp(1, RESTORE_READ_ONE_MIB),
+            megabytes: started_mib(size).clamp(1, RESTORE_READ_ONE_MIB),
             counted: size.min(u64::from(RESTORE_READ_ONE_MIB) << 20),
             restore,
             has,
@@ -400,7 +401,7 @@ const RESTORE_PER_AHEAD: std::time::Duration = std::time::Duration::from_secs(1)
 /// The time a restore's reads are allowed, counted from `budget`: see
 /// [`RESTORE_BUDGET`].
 fn restore_time(budget: std::time::Duration, objects: usize, bytes: u64) -> std::time::Duration {
-    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    let megabytes = started_mib(bytes);
     let rounds = u32::try_from(objects.div_ceil(READ_AHEAD)).unwrap_or(u32::MAX);
     budget
         .saturating_add(RESTORE_PER_MIB.saturating_mul(megabytes))
@@ -565,7 +566,7 @@ impl SnapshotWaits {
 /// How long a periodic snapshot's one attempt may take, for an idle bound
 /// of `idle` and a snapshot of `bytes`: see [`PERIODIC_SNAPSHOT_IDLES`].
 fn periodic_snapshot_bound(idle: std::time::Duration, bytes: usize) -> std::time::Duration {
-    let megabytes = u32::try_from(bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+    let megabytes = started_mib(bytes);
     idle.saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
         .min(idle.saturating_mul(PERIODIC_SNAPSHOT_IDLES))
 }
@@ -1945,6 +1946,12 @@ impl Replica {
             }
             return;
         }
+        self.take_up_snapshot_wait(&wait);
+    }
+
+    /// Makes `wait` this replica's own: its failures, the segment count and
+    /// the time before the next try.
+    fn take_up_snapshot_wait(&mut self, wait: &SnapshotWait) {
         self.snapshot_failures = wait.failures;
         self.snapshot_retry_at = self
             .since_snapshot
@@ -1961,11 +1968,7 @@ impl Replica {
         let Some(wait) = self.batched.set_aside_wait.take() else {
             return;
         };
-        self.snapshot_failures = wait.failures;
-        self.snapshot_retry_at = self
-            .since_snapshot
-            .saturating_add(wait.txid.saturating_sub(self.head.txid));
-        self.snapshot_retry_after = wait.after;
+        self.take_up_snapshot_wait(&wait);
         self.snapshot_waits.set(&self.address, wait);
     }
 
@@ -2167,7 +2170,7 @@ impl UploadTarget {
     /// The upload's budget for `len` bytes: its base idle bounds plus a
     /// second per started megabyte (what [`Self::put_bounded`] allows).
     fn budget_for(&self, len: usize) -> std::time::Duration {
-        let megabytes = u32::try_from(len.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+        let megabytes = started_mib(len);
         self.upload_idle
             .saturating_mul(UPLOAD_BUDGET_IDLES)
             .saturating_add(std::time::Duration::from_secs(1).saturating_mul(megabytes))
@@ -2210,7 +2213,7 @@ impl UploadTarget {
         let location = StorePath::from(format!("{}{key}", self.prefix));
         // Shared, not copied, by each attempt.
         let bytes = bytes::Bytes::from(bytes);
-        let megabytes = u32::try_from(bytes.len().div_ceil(1 << 20)).unwrap_or(u32::MAX);
+        let megabytes = started_mib(bytes.len());
         let per_size = std::time::Duration::from_secs(1).saturating_mul(megabytes);
         let first = self.upload_idle.saturating_add(per_size);
         let deadline = Instant::now()

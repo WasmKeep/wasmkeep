@@ -46,14 +46,6 @@ pub const NODES_PREFIX: &str = "nodes/";
 /// same day).
 pub const FULL_LISTING_EVERY: u32 = 10;
 
-/// Whether this period's refresh lists [`NODES_PREFIX`] rather than reading
-/// the known nodes: before the first listing (`since_full` `None`), every
-/// [`FULL_LISTING_EVERY`] periods, and when a listing was asked for (a
-/// hello, an unknown pin) and not made yet.
-pub fn full_listing_due(since_full: Option<u32>, wanted: bool) -> bool {
-    wanted || since_full.is_none_or(|n| n >= FULL_LISTING_EVERY)
-}
-
 /// What a node publishes about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -835,25 +827,6 @@ impl<D: Directory, C: Clock> Membership<D, C> {
         }
     }
 
-    /// This node id's heartbeat object as the bucket holds it (whoever
-    /// wrote it): its bytes, and what they say if this version can read
-    /// them. `None` if there is no such object.
-    pub async fn own_heartbeat(&self) -> Result<Option<(Vec<u8>, Option<NodeInfo>)>, BucketError> {
-        let key = format!("{NODES_PREFIX}{}", self.id);
-        // Listed under `nodes/`: a bucket lists by path segment, so the key
-        // is not a prefix of itself.
-        Ok(self
-            .directory
-            .list(NODES_PREFIX)
-            .await?
-            .into_iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, body)| {
-                let info = NodeInfo::decode(&body).filter(|n| n.id == self.id);
-                (body, info)
-            }))
-    }
-
     /// Nodes with a fresh heartbeat (this one included), sorted by id.
     /// Unreadable heartbeat objects are skipped.
     pub async fn live_nodes(&self) -> Result<Vec<NodeInfo>, BucketError> {
@@ -864,13 +837,6 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     /// also need the stale ones; [`Membership::live`] filters them.
     pub async fn heartbeats(&self) -> Result<Vec<NodeInfo>, BucketError> {
         all_heartbeats(&self.directory).await
-    }
-
-    /// The heartbeats of the nodes `ids` names, read one by one (no
-    /// listing), sorted by id: those whose object is gone are left out.
-    /// What [`Membership::heartbeats`] would give for them.
-    pub async fn heartbeats_of(&self, ids: &[String]) -> Result<Vec<NodeInfo>, BucketError> {
-        heartbeats_of(&self.directory, ids).await
     }
 
     /// The live ones of `nodes` (see [`Membership::live_nodes`]).
@@ -1128,21 +1094,12 @@ mod tests {
         let listed = run(a.heartbeats()).unwrap();
         let ids = ["node-b".to_owned(), "node-a".to_owned(), "gone".to_owned()];
         // Sorted, the gone one left out, the bodies the same.
-        assert_eq!(run(a.heartbeats_of(&ids)).unwrap(), listed);
+        assert_eq!(run(heartbeats_of(&a.directory, &ids)).unwrap(), listed);
         // A node it does not know is not read.
         assert_eq!(
-            run(a.heartbeats_of(&ids[1..2])).unwrap(),
+            run(heartbeats_of(&a.directory, &ids[1..2])).unwrap(),
             listed[..1].to_vec()
         );
-    }
-
-    #[test]
-    fn nodes_are_listed_first_then_every_ten_periods_or_when_asked() {
-        assert!(full_listing_due(None, false));
-        assert!(!full_listing_due(Some(0), false));
-        assert!(!full_listing_due(Some(FULL_LISTING_EVERY - 1), false));
-        assert!(full_listing_due(Some(FULL_LISTING_EVERY), false));
-        assert!(full_listing_due(Some(1), true));
     }
 
     #[test]

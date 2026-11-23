@@ -421,11 +421,6 @@ impl WalCapture {
             post_apply: self.db,
         })
     }
-
-    /// The database file this capture follows.
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
-    }
 }
 
 /// Frames up to the last commit seen so far: the pages, the database size,
@@ -475,26 +470,13 @@ fn checksum(big_endian: bool, (mut s0, mut s1): (u32, u32), data: &[u8]) -> (u32
     (s0, s1)
 }
 
-/// Rebuilds a database at `path` (which must not exist) from a snapshot
-/// file and the segments after it, verifying every checksum on the way.
-/// Returns the database checksum at the end. See [`Restorer`] for the
-/// streaming form, one file and one page in memory at a time.
-///
-/// On error `path` is left partly written: remove it before retrying. Files
-/// without checksums are refused, and so is an empty chain.
-pub fn restore(
-    path: &Path,
-    snapshot: Option<&crate::ltx::File>,
-    segments: &[crate::ltx::File],
-) -> Result<DbChecksum, RestoreError> {
-    let mut restorer = Restorer::create(path, u64::MAX)?;
-    if let Some(s) = snapshot {
-        restorer.apply_file(s)?;
+/// The page size a SQLite database file's header (its first 18 bytes)
+/// states: 65536 is stored as 1.
+pub(crate) fn db_page_size(header: &[u8; 18]) -> u32 {
+    match u16::from_be_bytes([header[16], header[17]]) {
+        1 => 65_536,
+        n => u32::from(n),
     }
-    for seg in segments {
-        restorer.apply_file(seg)?;
-    }
-    restorer.finish()
 }
 
 /// Builds a database file from a chain of LTX files, applying one file at a
@@ -576,10 +558,7 @@ impl Restorer {
         }
         let mut header = [0u8; 18];
         file.read_exact(&mut header).map_err(io)?;
-        let page_size = match u16::from_be_bytes([header[16], header[17]]) {
-            1 => 65536,
-            n => u32::from(n),
-        };
+        let page_size = db_page_size(&header);
         if !(512..=65536).contains(&page_size)
             || !page_size.is_power_of_two()
             || !size.is_multiple_of(u64::from(page_size))
