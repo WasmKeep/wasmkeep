@@ -566,6 +566,16 @@ impl Cluster {
                 }
             }
             last = now;
+            // Over a created fence, on the clock that dates the first write
+            // (the wait above runs on the monotonic one).
+            if let Some((body, _)) = &last
+                && let Some(o) = NodeLeaseObject::decode(body)
+                    .filter(wasmkeep_cluster::node_lease::created_fence)
+                && now_ms() < o.written_at_ms.saturating_add(ttl_grace)
+            {
+                deadline = deadline.max(lapsed_at(o.written_at_ms));
+                continue;
+            }
             if tokio::time::Instant::now() >= deadline {
                 // Format 3 only: a process of an older version writes
                 // without conditions, so a copy of its body proves nothing.

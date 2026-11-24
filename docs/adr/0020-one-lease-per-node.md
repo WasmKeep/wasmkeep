@@ -1292,9 +1292,11 @@ would leave the actors of a restarted node unfreeable.
 ### A fence created over a deleted object
 
 `cluster fence` over an absent `nodes/<id>` creates a fence dated by the
-operator's clock (raised to the bucket's time), naming no instance. It is
-written after every body of the processes before it, yet it may be dated
-before the last of them: that process's clock may run ahead and the
+operator's clock, naming no instance, then moves its date to the bucket's
+time plus a second and the skew if that is later (`raise_created_fence`).
+It is written after every body of the processes before it, yet until it is
+raised (or if the raise fails, or with `operator_fence` alone) it may be
+dated before the last of them: that process's clock may run ahead and the
 operator's behind, each within the skew allowed, so by less than twice the
 skew. Ordered by date alone, a process that read the predecessor's last
 `live` body and then the fence takes the current fence for a stale read
@@ -1314,11 +1316,15 @@ the record's, and frees it at once: two owners. The simulation found it
   earlier than the created fence's `written_at` plus ttl plus grace on its
   own clock, whether the fence was there at its first read or appeared
   over no object during the check (before, that check could end at its
-  own wait, ttl plus grace from its first read). The same clock dates
-  that body, so it is at least ttl plus grace after the fence, whatever
-  the skew. This adds at most the fence's lead over this clock (twice the
-  skew allowed) to such a start, only after an operator's fence over a
-  deleted object.
+  own wait, ttl plus grace from its first read). The check compares the
+  fence's date with the clock that dates the first write, right before
+  that write, so the body is at least ttl plus grace after the fence
+  whatever the skew. Over a fence read first, this adds at most the
+  fence's lead over this clock to the start (`cluster fence` dates a
+  created fence a second plus the skew past the bucket's time); over one
+  created during the check, the wait runs on to ttl plus grace past the
+  fence, up to ttl plus grace more. Both happen only after an operator's
+  fence over a deleted object.
 - Nodes of the previous patch may start over a created fence earlier: a
   body of theirs dated less than ttl plus grace after the fence is then
   read as older than it, refused until the unpin window passes, and under
