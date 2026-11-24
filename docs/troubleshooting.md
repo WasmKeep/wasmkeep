@@ -167,6 +167,7 @@ same words.
 | `this node's lease object holds something this version cannot read` | An unreadable object under this id | Check that the bucket prefix is the cluster's own; see the version notes under [Upgrade](cluster.md#upgrading-wasmkeep). |
 | `this node holds no lease` | The node has not written a lease yet | Wait; if it lasts, the bucket refuses writes. |
 | `the bucket does not enforce conditional writes` (for good) | The start check failed | Use a bucket that enforces them ([Buckets](deploy/buckets.md)). |
+| `the app's upgrade floor is above this node's version, or unreadable` (for good) | The app's upgrade was finalized at a newer minor version than this binary, or its floor record is corrupt | Install that version or later; for a corrupt record, the log names the key ([ADR 0020](adr/0020-one-lease-per-node.md#the-upgrade-floor-record)). |
 | `bucket unreachable (node lease not renewed)` | The bucket refused or did not answer the node's lease writes for the lease's ttl less its margin (8 s by default) | Check the bucket and the network. `wasmkeep_node_lease_failures_total`, `wasmkeep_bucket_requests_total{status="error"}`. |
 | `cluster secret not loaded` | The node has not read the cluster secret from the bucket | Check bucket access; the node retries. |
 | `cluster identity not published for a heartbeat period yet` | A start-up step, one heartbeat period | Wait. |

@@ -32,6 +32,14 @@
 //! within the wait. This models acquisitions, not requests: what a kept
 //! request's caller sees is the cluster tests' to show.
 //!
+//! With stale reads (`stale_lease_reads_never_free_a_held_record`), the
+//! record clients' reads of node leases now and then return the body the
+//! process was served before the newest one: the same checks hold, and
+//! judging those bodies as read instead of reading them again is caught
+//! (ADR 0020, amendment on lease reads). A first read that is stale, of a
+//! body the process never saw past, is not modelled: the rule does not
+//! close it.
+//!
 //! Ignoring the node's epoch rule is never caught here, and a test says
 //! why (`ignoring_the_epoch_is_never_caught_here`).
 //!
@@ -48,9 +56,10 @@ use madsim::net::NetSim;
 use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::failover::{OwnerWatch, Seen, Step, Verdict, Waiter};
-use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig};
+use wasmkeep_cluster::lease::{Bucket, BucketError, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
-    AcquireError, Hold, NodeLeaseObject, NodeState, OwnerRecord, frees, operator_fence, tail,
+    AcquireError, Hold, NodeLeaseObject, NodeState, OwnerRecord, ReadFault, frees, operator_fence,
+    tail,
 };
 use wasmkeep_sim::check::{double_ownership, stop_process};
 use wasmkeep_sim::driver::{Claim, Env, SkewedClock};
@@ -128,11 +137,138 @@ enum Variant {
     HintAsGrant,
     /// Waiters that never wait: a refusal is final, as without the wait.
     GiveUp,
+    /// The correct rules, with a bucket whose node lease reads by the
+    /// record clients now and then go back: they return the body this
+    /// process was served before the newest one (a stale replica or cache).
+    StaleReads,
+    /// The same stale reads, judged as read: a record is freed on a body
+    /// older than one of that lease the process already read (the rule
+    /// before ADR 0020's amendment on lease reads).
+    StaleReadsTrusted,
+    /// The same stale reads, with the read back after a failed acquisition
+    /// write judging its body as read.
+    StaleReadBackUnchecked,
+    /// The same stale reads, with a judgement whose every read was behind
+    /// judging the last one anyway.
+    StaleExhaustedJudged,
+    /// Stale reads that may return a body this process was never served
+    /// (the newest it was not given): a first stale read, which the rule
+    /// does not close.
+    StaleUnseen,
+    /// The correct rules under stale reads, with every node's clock
+    /// stepping back [`CLOCK_STEP_MS`] at [`CLOCK_STEP_AT_MS`] (the crash
+    /// scenario only).
+    StaleClockStep,
 }
+
+/// When the clocks step back in [`Variant::StaleClockStep`] (global ms).
+const CLOCK_STEP_AT_MS: u64 = EPOCH_MS + 5_000;
+/// By how much.
+const CLOCK_STEP_MS: u64 = 2_000;
 
 impl Variant {
     fn waiters(self) -> bool {
         matches!(self, Self::Waiters | Self::HintAsGrant | Self::GiveUp)
+    }
+
+    fn stale(self) -> bool {
+        matches!(
+            self,
+            Self::StaleReads
+                | Self::StaleReadsTrusted
+                | Self::StaleReadBackUnchecked
+                | Self::StaleExhaustedJudged
+                | Self::StaleUnseen
+                | Self::StaleClockStep
+        )
+    }
+
+    fn read_fault(self) -> ReadFault {
+        match self {
+            Self::StaleReadsTrusted => ReadFault::Off,
+            Self::StaleReadBackUnchecked => ReadFault::ReadBackUnchecked,
+            Self::StaleExhaustedJudged => ReadFault::ExhaustedJudged,
+            _ => ReadFault::None,
+        }
+    }
+
+    /// How far back the nodes' clocks are at global `now`.
+    fn stepped_back(self, now: u64) -> u64 {
+        if self == Self::StaleClockStep && now >= CLOCK_STEP_AT_MS {
+            CLOCK_STEP_MS
+        } else {
+            0
+        }
+    }
+}
+
+/// The bodies of each `nodes/` object a process's record clients were
+/// served, by the store's version (the last few).
+type Served = Arc<Mutex<HashMap<String, std::collections::BTreeMap<u64, Vec<u8>>>>>;
+
+/// A process's bucket client. With `served`, a read of a node lease now
+/// and then returns the body this process was served before the newest
+/// one it was served, with that body's version: a read that goes back
+/// behind what the process has already seen, never one it was not served.
+/// With `unseen`, the current body counts as served even when the stale
+/// one is returned instead, so a stale answer may be older than anything
+/// this process was given since (a first stale read).
+struct StaleNodes {
+    inner: EpBucket,
+    served: Option<Served>,
+    unseen: bool,
+}
+
+impl StaleNodes {
+    async fn connect(served: Option<Served>, unseen: bool) -> Self {
+        Self {
+            inner: EpBucket::connect().await,
+            served,
+            unseen,
+        }
+    }
+}
+
+impl Bucket for StaleNodes {
+    async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+        let got = self.inner.get(key).await?;
+        let Some(served) = self.served.as_ref().filter(|_| key.starts_with(NODES)) else {
+            return Ok(got);
+        };
+        let mut served = served.lock().unwrap();
+        let bodies = served.entry(key.to_owned()).or_default();
+        if self.unseen
+            && let Some((body, v)) = &got
+        {
+            bodies.insert(v.0.parse().unwrap(), body.clone());
+        }
+        // Now and then the body served before the newest one served (only
+        // what this process was served is recorded, never a stale answer).
+        if madsim::rand::random::<u64>().is_multiple_of(3)
+            && let Some((v, body)) = bodies.iter().rev().nth(1)
+        {
+            return Ok(Some((body.clone(), Version(v.to_string()))));
+        }
+        if let Some((body, v)) = &got {
+            bodies.insert(v.0.parse().unwrap(), body.clone());
+            while bodies.len() > 3 {
+                bodies.pop_first();
+            }
+        }
+        Ok(got)
+    }
+
+    async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+        self.inner.create(key, body).await
+    }
+
+    async fn replace(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        expected: &Version,
+    ) -> Result<Version, BucketError> {
+        self.inner.replace(key, body, expected).await
     }
 }
 
@@ -208,6 +344,9 @@ struct Shared {
     /// then on each surviving process asks once, and waits or not.
     killed_at: Option<u64>,
     killed_node: u32,
+    /// Lease reads found behind the process's newest and read again, by
+    /// process (slot, instance).
+    behind: HashMap<(usize, u64), u64>,
 }
 
 /// What node `i` writes after its lease lines: the heartbeat's fields,
@@ -353,12 +492,16 @@ async fn run_node(
         resolver_never_ends: false,
         release_before_stop: false,
         act_on_cell_only: false,
+        read_fault: variant.read_fault(),
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());
         let process = u64::from_str_radix(&instance, 16).unwrap();
         let clock = SkewedClock {
-            global: move || env.now(),
+            global: move || {
+                let now = env.now();
+                now - variant.stepped_back(now)
+            },
             skew_ms,
         };
         let setup = NodeSetup {
@@ -372,11 +515,16 @@ async fn run_node(
             attempt_ms: ATTEMPT_MS,
             breaks,
         };
+        // Stale reads, if any, only on the record clients: their reads
+        // of node leases are the ones that judge a record free (the start
+        // check's and the fence watch's are left as they are).
+        let served = variant.stale().then(Served::default);
+        let unseen = variant == Variant::StaleUnseen;
         let buckets = NodeBuckets {
-            lease: EpBucket::connect().await,
-            task_records: EpBucket::connect().await,
-            peers: EpBucket::connect().await,
-            records: EpBucket::connect().await,
+            lease: StaleNodes::connect(None, false).await,
+            task_records: StaleNodes::connect(served.clone(), unseen).await,
+            peers: StaleNodes::connect(None, false).await,
+            records: StaleNodes::connect(served, unseen).await,
         };
         let (node, task) = LeaseNode::start(
             setup,
@@ -464,7 +612,8 @@ async fn run_node(
                     let until = node
                         .valid_until_ms()
                         .unwrap_or(0)
-                        .saturating_add_signed(-skew_ms);
+                        .saturating_add_signed(-skew_ms)
+                        .saturating_add(variant.stepped_back(env.now()));
                     shared.lock().unwrap().claims.push(Claim {
                         node: i,
                         instance: process,
@@ -545,6 +694,11 @@ async fn run_node(
                         } else {
                             node.acquire(ACTOR, 1).await
                         };
+                        shared
+                            .lock()
+                            .unwrap()
+                            .behind
+                            .insert((slot, process), node.behind_reads());
                         if variant.waiters() {
                             let now = clock.now_ms();
                             let mut s = shared.lock().unwrap();
@@ -609,7 +763,8 @@ async fn run_node(
                             let until = node
                                 .valid_until_ms()
                                 .unwrap_or(0)
-                                .saturating_add_signed(-skew_ms);
+                                .saturating_add_signed(-skew_ms)
+                                .saturating_add(variant.stepped_back(env.now()));
                             serial += 1;
                             let mut s = shared.lock().unwrap();
                             s.acquired += 1;
@@ -656,6 +811,8 @@ struct Outcome {
     /// The crash scenario: when the holder was killed, and which node it
     /// was.
     killed: Option<(u64, u32)>,
+    /// Lease reads found behind and read again, over every process.
+    behind: u64,
 }
 
 fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
@@ -860,6 +1017,7 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
         reasons: s.reasons.clone(),
         waits: s.waits.clone(),
         killed: s.killed_at.map(|at| (at, s.killed_node)),
+        behind: s.behind.values().sum(),
     }
 }
 
@@ -944,6 +1102,8 @@ fn each_broken_variant_is_caught() {
         Variant::FreeOnFenceAtOnce,
         Variant::ResolveWhileHeld,
         Variant::HintAsGrant,
+        Variant::StaleReadsTrusted,
+        Variant::StaleExhaustedJudged,
     ] {
         // At least 200 seeds: the rarest variant shows within that, so a
         // quick run with fewer seeds still finds it.
@@ -963,6 +1123,44 @@ fn each_broken_variant_is_caught() {
             "{variant:?} was never caught in {} seeds",
             seeds()
         );
+    }
+}
+
+/// A bucket whose node lease reads go back behind what a process has
+/// already read (ADR 0020, amendment on lease reads): with the correct
+/// rules a body older than one of that lease the process read before is
+/// read again, never trusted, so the checks hold; the runs do meet such
+/// reads, and still hand the actor over. `each_broken_variant_is_caught`
+/// shows the same reads judged as read give two owners.
+#[test]
+fn stale_lease_reads_never_free_a_held_record() {
+    let (mut acquired, mut behind) = (0, 0);
+    let mut reasons: HashMap<&'static str, u64> = HashMap::new();
+    for seed in 0..seeds() {
+        let o = simulate(seed, Variant::StaleReads, Duration::from_secs(30));
+        if let Some(d) = double_ownership(&o.claims) {
+            panic!("seed {seed}: two owners under stale reads: {d:?}");
+        }
+        if let Some(pair) = shared_generation(&o.holds) {
+            panic!("seed {seed}: one generation, two holds under stale reads: {pair:?}");
+        }
+        acquired += o.acquired;
+        behind += o.behind;
+        for (r, n) in o.reasons {
+            *reasons.entry(r).or_default() += n;
+        }
+    }
+    eprintln!(
+        "{} seeds with stale lease reads: {acquired} acquisitions {reasons:?}, \
+         {behind} reads behind the newest read again",
+        seeds()
+    );
+    let floor = (seeds() / 20).max(1);
+    assert!(acquired > seeds() * 5, "{acquired} acquisitions");
+    assert!(behind >= floor, "{behind} reads behind, want {floor}");
+    for r in ["fenced", "another instance"] {
+        let n = reasons.get(r).copied().unwrap_or(0);
+        assert!(n >= floor, "{n} acquisitions after {r:?}, want {floor}");
     }
 }
 
@@ -1083,5 +1281,81 @@ fn a_waiter_takes_over_after_a_crash() {
         taken_over(&o),
         None,
         "taken over though no survivor waited: the scenario shows nothing"
+    );
+}
+
+/// What the rule does not close, shown: when a stale read may return a
+/// body older than one the bucket held when this process last read (but
+/// never gave it), a first stale read frees a held record on some seed.
+/// Closing it needs the ownership record to carry its holder's lease date
+/// (ADR 0020, amendment on lease reads).
+#[test]
+fn a_first_stale_read_is_not_closed() {
+    let caught = (0..seeds().max(200)).find(|&seed| {
+        let o = simulate(seed, Variant::StaleUnseen, Duration::from_secs(30));
+        double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
+    });
+    eprintln!("first stale reads: caught by seed {caught:?}");
+    assert!(
+        caught.is_some(),
+        "a first stale read was never caught: the model shows nothing"
+    );
+}
+
+/// The read back after a failed acquisition write judging its rival's
+/// lease as read, under stale reads, is caught: rarely (its case needs a
+/// failed write, a rival's record and a stale read of that rival's lease
+/// together), so the search runs to 1,000 seeds whatever
+/// `WASMKEEP_SIM_SEEDS` says.
+#[test]
+fn a_read_back_judging_as_read_is_caught() {
+    let caught = (0..seeds().max(1_000)).find(|&seed| {
+        let o = simulate(
+            seed,
+            Variant::StaleReadBackUnchecked,
+            Duration::from_secs(30),
+        );
+        double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
+    });
+    eprintln!("read back judging as read: caught by seed {caught:?}");
+    assert!(
+        caught.is_some(),
+        "the read back judging as read was never caught"
+    );
+}
+
+/// A killed holder is taken over within a bound under stale reads, after
+/// every node's clock stepped back 2 s (its live bodies after the step are
+/// dated before ones read before it; its fence keeps such a date): on each
+/// seed, never two owners, and a survivor holds the actor within the same
+/// bound as with waiters.
+#[test]
+fn a_killed_holder_is_taken_over_under_stale_reads_and_a_clock_step() {
+    let mut behind = 0;
+    for seed in 0..seeds() {
+        let o = simulate_with(seed, Variant::StaleClockStep, Duration::from_secs(16), true);
+        assert!(double_ownership(&o.claims).is_none(), "seed {seed}");
+        assert!(shared_generation(&o.holds).is_none(), "seed {seed}");
+        let (killed_at, dead) = o.killed.expect("the holder was never killed");
+        assert!(
+            killed_at >= CLOCK_STEP_AT_MS,
+            "seed {seed}: killed before the step"
+        );
+        let after = o
+            .claims
+            .iter()
+            .filter(|c| c.node != dead && c.until_ms > c.from_ms && c.from_ms >= killed_at)
+            .map(|c| c.from_ms - killed_at)
+            .min()
+            .unwrap_or_else(|| panic!("seed {seed}: nobody took over"));
+        assert!(
+            after <= 1_500 + WAIT_MS,
+            "seed {seed}: taken over {after} ms after the kill"
+        );
+        behind += o.behind;
+    }
+    eprintln!(
+        "{} seeds, clocks stepped back: {behind} reads behind",
+        seeds()
     );
 }

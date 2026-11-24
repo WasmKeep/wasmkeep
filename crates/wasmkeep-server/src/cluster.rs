@@ -850,7 +850,8 @@ impl Cluster {
                 instance.clone(),
                 NODES_PREFIX,
                 config.lease,
-            ),
+            )
+            .with_reads(Arc::clone(&transport.lease_reads)),
             pending: Pending::default(),
             judged: std::sync::Mutex::default(),
             membership,
@@ -1834,6 +1835,9 @@ impl Cluster {
             }
             Identity::Taken(stopped, _) => return Some(stopped.words()),
             Identity::Refused(_) => return Some("the bucket does not enforce conditional writes"),
+            Identity::BelowFloor(_) => {
+                return Some("the app's upgrade floor is above this node's version, or unreadable");
+            }
             Identity::Unique => {}
         }
         if !self.multi_app_missing().is_empty() {

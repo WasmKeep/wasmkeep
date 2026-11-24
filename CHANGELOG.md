@@ -9,6 +9,18 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Leases: a node lease read to judge an actor's ownership record free is
+  never older than a body of that lease the process has already read; an
+  older one (a stale replica or cache) is read again and never frees the
+  record (counted by `wasmkeep_lease_reads_behind_total`,
+  `wasmkeep_lease_reads_stale_total` and
+  `wasmkeep_lease_reads_unpinned_total`). At start, a node reads the app's upgrade floor
+  (`formats/<tenant>/<app>/floor`, written from 0.9.0 by `cluster upgrade
+  finalize`) before its first lease write and again after it: a floor
+  above its minor version, or an unreadable one, stops the start; a read
+  with no answer is retried. No format changes
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)).
+
 ## 0.8.0
 
 **A big room that needs no hand placement, idle histories compacted, and

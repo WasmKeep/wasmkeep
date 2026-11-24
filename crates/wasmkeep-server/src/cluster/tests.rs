@@ -3939,6 +3939,151 @@ async fn a_re_acquire_inherits_the_head_its_predecessor_froze() {
     assert_eq!(a.pending.local_head(&key), None);
 }
 
+/// The app's upgrade floor, read before the first lease write: above this
+/// binary's minor version, the start stops with both versions named and
+/// no lease written; unreadable, it refuses to start; at or below this
+/// version, or absent, the node starts as before.
+#[tokio::test]
+async fn a_floor_above_this_version_stops_the_start() {
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    let this = Minor::of_version(env!("CARGO_PKG_VERSION")).unwrap();
+    let key = StorePath::from(floor::key("", "t", "default"));
+    let above = Minor {
+        minor: this.minor + 1,
+        ..this
+    };
+    let refused = async |body: Vec<u8>| {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store.put(&key, body.into()).await.unwrap();
+        let a = fast_node("a", &store);
+        let why = a.identity().await.unwrap_err();
+        assert!(
+            matches!(
+                store.head(&StorePath::from("nodes/a")).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "no lease written"
+        );
+        why
+    };
+    let why = refused(floor::encode(above)).await;
+    assert!(
+        why.contains(&above.to_string()) && why.contains(&this.to_string()),
+        "{why}"
+    );
+    let why = refused(b"wasmkeep-floor 1\nnine\n".to_vec()).await;
+    assert!(
+        why.contains("unreadable") && why.contains("formats/t/default/floor"),
+        "{why}"
+    );
+    // Written while the node is in its start check (ttl plus grace, 1.2 s,
+    // before its first write): the read after the first write stops it,
+    // and its lease is left `released`.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    store.put(&key, floor::encode(above).into()).await.unwrap();
+    let why = a.identity().await.unwrap_err();
+    assert!(why.contains(&above.to_string()), "{why}");
+    let lease = store
+        .get(&StorePath::from("nodes/a"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        wasmkeep_cluster::node_lease::NodeLeaseObject::decode(&lease).map(|o| o.state),
+        Some(wasmkeep_cluster::node_lease::NodeState::Released)
+    );
+    for body in [Some(floor::encode(this)), None] {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        if let Some(body) = body {
+            store.put(&key, body.into()).await.unwrap();
+        }
+        let a = fast_node("a", &store);
+        a.identity().await.unwrap();
+        wait_lease_valid(&a).await;
+    }
+}
+
+/// The floor read after the first lease write refuses only on an answer.
+/// With no answer (the floor's reads hang for 7 s, seven lease ttls), the
+/// node stays checking, keeps its lease renewed, and reads again: it
+/// starts once the bucket answers. After a first write whose answer was
+/// lost and adopted, the read is still made, and a floor written during
+/// the start check stops the node. A stop while the read waits releases
+/// the lease.
+#[tokio::test]
+async fn the_floor_read_after_the_first_write_waits_for_an_answer() {
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState};
+    let this = Minor::of_version(env!("CARGO_PKG_VERSION")).unwrap();
+    let key = StorePath::from(floor::key("", "t", "default"));
+    let above = Minor {
+        minor: this.minor + 1,
+        ..this
+    };
+    let lease_of = async |store: &SlowNodeReads| {
+        let got = store.inner.get(&StorePath::from("nodes/a")).await.ok()?;
+        NodeLeaseObject::decode(&got.bytes().await.unwrap())
+    };
+    // A 7 s blip of the floor's reads, from within the start check.
+    let slow = Arc::new(SlowNodeReads::default());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let first = lease_of(&slow).await.expect("the first write landed");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(*a.identity.borrow(), Identity::Checking, "not refused");
+    let later = lease_of(&slow).await.unwrap();
+    assert_eq!(later.state, NodeState::Live);
+    assert!(
+        later.written_at_ms > first.written_at_ms,
+        "renewed meanwhile"
+    );
+    *slow.hang.lock().unwrap() = None;
+    tokio::time::timeout(Duration::from_secs(5), a.identity())
+        .await
+        .unwrap()
+        .unwrap();
+    // The first write's answer is lost (it is adopted), and a floor above
+    // is written during the start check: still read, still refused.
+    let slow = Arc::new(SlowNodeReads::default());
+    *slow.lose_put_reply.lock().unwrap() = Some("nodes/a".to_owned());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    slow.inner
+        .put(&key, floor::encode(above).into())
+        .await
+        .unwrap();
+    let why = a.identity().await.unwrap_err();
+    assert!(why.contains(&above.to_string()), "{why}");
+    assert!(
+        slow.lose_put_reply.lock().unwrap().is_none(),
+        "the reply was lost"
+    );
+    assert_eq!(
+        lease_of(&slow).await.map(|o| o.state),
+        Some(NodeState::Released)
+    );
+    // A stop while the read waits: the lease is released.
+    let slow = Arc::new(SlowNodeReads::default());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
+    while lease_of(&slow).await.is_none() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(a.stop_node_lease(a.node_lease_stop_limit()).await);
+    assert_eq!(
+        lease_of(&slow).await.map(|o| o.state),
+        Some(NodeState::Released)
+    );
+    assert_eq!(*a.identity.borrow(), Identity::Checking);
+}
+
 /// ADR 0035, section 5: the app's format setting. Unreadable, it fails
 /// closed without writing a record; absent, records are version 1;
 /// enabled, version 2 (an acquisition over nothing carries no evidence).
@@ -4992,6 +5137,8 @@ struct SlowNodeReads {
     others_delay_ms: std::sync::atomic::AtomicU64,
     /// Reads of `nodes/` objects, counted.
     node_gets: std::sync::atomic::AtomicU64,
+    /// The next write of this key lands, and its answer is lost (once).
+    lose_put_reply: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Display for SlowNodeReads {
@@ -5008,7 +5155,16 @@ impl ObjectStore for SlowNodeReads {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
+        let put = self.inner.put_opts(location, payload, opts).await;
+        let mut lose = self.lose_put_reply.lock().unwrap();
+        if put.is_ok() && lose.as_deref() == Some(location.as_ref()) {
+            *lose = None;
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "reply lost".into(),
+            });
+        }
+        put
     }
 
     async fn put_multipart_opts(
@@ -5032,17 +5188,6 @@ impl ObjectStore for SlowNodeReads {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            let hang = self.hang.lock().unwrap().as_deref() == Some(key);
-            if hang {
-                std::future::pending::<()>().await;
-            }
-            let fail = self.fail.lock().unwrap().as_deref() == Some(key);
-            if fail {
-                return Err(object_store::Error::Generic {
-                    store: "test",
-                    source: "read refused".into(),
-                });
-            }
         } else {
             let delay = self
                 .others_delay_ms
@@ -5050,6 +5195,17 @@ impl ObjectStore for SlowNodeReads {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
+        }
+        let hang = self.hang.lock().unwrap().as_deref() == Some(key);
+        if hang {
+            std::future::pending::<()>().await;
+        }
+        let fail = self.fail.lock().unwrap().as_deref() == Some(key);
+        if fail {
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "read refused".into(),
+            });
         }
         self.inner.get_opts(location, options).await
     }
@@ -5304,6 +5460,56 @@ async fn an_older_read_landing_late_never_undoes_a_newer_one() {
         |a, _, _| a.to_vec(),
     );
     assert_eq!(all.len(), 1, "a failed read keeps the node as last read");
+}
+
+/// The heartbeats a process reads raise the newest lease bodies its
+/// ownership records are judged against (ADR 0020, amendment on lease
+/// reads), by date and never back, whatever order the reads were issued
+/// in: the table is the one the node's `Owners` holds.
+#[tokio::test]
+async fn heartbeat_reads_raise_the_newest_lease_bodies() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    use wasmkeep_cluster::node_lease::NodeState;
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    assert!(Arc::ptr_eq(&a.transport.lease_reads, a.owners.reads()));
+    let body = |state: &str, instance: &str, at: u64| {
+        let text = format!(
+            "wasmkeep-node 3\n{state} {instance}\n{at}\nb\nhttp://b\n0.0.0\nt/\nhttps://b.test:7443\n{}\nserving\n\ntake\n",
+            "ab".repeat(32)
+        );
+        NodeInfo::decode(text.as_bytes()).unwrap()
+    };
+    let found =
+        |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
+    let t0 = std::time::Instant::now();
+    a.transport
+        .note_heartbeats(found(body("live", "cafe", 2_000)), t0, |_, _, _| ());
+    // Issued later, dated earlier (a stale read): the newest stays.
+    a.transport.note_heartbeats(
+        found(body("released", "beef", 1_000)),
+        t0 + Duration::from_millis(1),
+        |_, _, _| (),
+    );
+    let newest = a.transport.lease_reads.newest("b").unwrap();
+    assert_eq!(
+        (
+            newest.state,
+            newest.instance.as_deref(),
+            newest.written_at_ms
+        ),
+        (NodeState::Live, Some("cafe"), 2_000)
+    );
+    // A listing's bodies count too.
+    a.transport.note_heartbeats(
+        Heartbeats::Listed(vec![body("fenced", "cafe", 2_000)]),
+        t0 + Duration::from_millis(2),
+        |_, _, _| (),
+    );
+    assert_eq!(
+        a.transport.lease_reads.newest("b").map(|o| o.state),
+        Some(NodeState::Fenced)
+    );
 }
 
 /// A runtime restarted in place (same process, same node id, a new

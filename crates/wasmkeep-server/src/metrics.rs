@@ -526,6 +526,15 @@ pub(crate) struct Metrics {
     /// Node lease writes that failed or timed out: with the defaults, two
     /// in a row (a write every 3 s, valid for 8 s) and the lease runs out.
     pub(crate) node_lease_failures: AtomicU64,
+    /// Node lease reads made to judge an ownership record that returned a
+    /// body older than one this process read before (ADR 0020, lease
+    /// reads): read again.
+    pub(crate) lease_reads_behind: AtomicU64,
+    /// Judgements where every read was such a body: refused for now.
+    pub(crate) lease_reads_stale: AtomicU64,
+    /// Newest lease bodies replaced by an older one after no read
+    /// confirmed them for ttl plus grace.
+    pub(crate) lease_reads_unpinned: AtomicU64,
     /// One node lease write, from its send to its answer (ms): the
     /// writer's side of how late peers see this node's heartbeat.
     pub(crate) node_lease_write_ms: HeartbeatMs,
@@ -1123,7 +1132,7 @@ pub(crate) const FRONT_CALL_OUTCOMES: [&str; 4] = ["ok", "busy", "timeout", "fai
 /// [`crate::ActorService::not_ready`], of the cluster's readiness and the
 /// words of a stopped node. A reason not listed here is still rendered
 /// while it holds; a test keeps the list complete.
-pub(crate) const NOT_READY_REASONS: [&str; 22] = [
+pub(crate) const NOT_READY_REASONS: [&str; 23] = [
     "shutting down",
     "checking that no other process runs with this node id",
     "another process runs with this node id",
@@ -1135,6 +1144,7 @@ pub(crate) const NOT_READY_REASONS: [&str; 22] = [
     "this node's lease object holds something this version cannot read",
     "this node holds no lease",
     "the bucket does not enforce conditional writes",
+    "the app's upgrade floor is above this node's version, or unreadable",
     "cluster secret not loaded",
     "a live node of an older version (no multi-app) runs in this cluster",
     "bucket unreachable (node lease not renewed)",
@@ -1627,6 +1637,24 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
         "wasmkeep_node_lease_failures_total",
         "Node lease (heartbeat) writes that failed or timed out.",
         m.node_lease_failures.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_lease_reads_behind_total",
+        "Node lease reads, made to judge an ownership record, older than a body this process read before: read again.",
+        m.lease_reads_behind.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_lease_reads_stale_total",
+        "Ownership judgements refused because every node lease read was older than a body read before.",
+        m.lease_reads_stale.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "wasmkeep_lease_reads_unpinned_total",
+        "Newest node lease bodies replaced by an older one after older bodies were read for ttl plus grace with none confirming them.",
+        m.lease_reads_unpinned.load(Ordering::Relaxed),
     );
     counter(
         &mut out,

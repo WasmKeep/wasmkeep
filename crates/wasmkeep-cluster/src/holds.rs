@@ -261,6 +261,7 @@ impl<T> Parked<T> {
             Err(
                 AcquireError::Unresolved { .. }
                 | AcquireError::Unavailable
+                | AcquireError::StaleRead { .. }
                 | AcquireError::LeaseInvalid
                 | AcquireError::Corrupt
                 | AcquireError::FormatMismatch

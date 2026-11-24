@@ -20,6 +20,20 @@ pub(crate) enum Identity {
     /// The bucket breaks a guarantee leases rely on; why, for the operator
     /// ([`Cluster::check_bucket`]).
     Refused(String),
+    /// The app's upgrade floor is above this binary's minor version, or
+    /// unreadable; why, for the operator ([`Cluster::read_floor`]).
+    BelowFloor(String),
+}
+
+/// What one read of the app's upgrade floor found ([`Cluster::read_floor`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FloorRead {
+    /// Absent, or at most this binary's minor version.
+    Allowed,
+    /// Above this binary's minor version, or unreadable: why.
+    Refused(String),
+    /// No answer, or an error: proves nothing.
+    NoAnswer(String),
 }
 
 /// Why this process stops serving (ADR 0020): what it found writing its
@@ -219,7 +233,9 @@ impl Cluster {
             .await
             .map(|s| s.clone());
         match state {
-            Ok(Identity::Taken(_, why) | Identity::Refused(why)) => Err(why),
+            Ok(Identity::Taken(_, why) | Identity::Refused(why) | Identity::BelowFloor(why)) => {
+                Err(why)
+            }
             Ok(_) => Ok(()),
             // The sender lives in `self`: not reached.
             Err(_) => Err("the node id check stopped".into()),
@@ -258,6 +274,64 @@ impl Cluster {
             }
         }
         None
+    }
+
+    /// One read of the app's upgrade floor
+    /// ([`wasmkeep_cluster::app_format::floor`]), within one lease attempt.
+    /// Refused only on an answer: the floor above this binary's minor
+    /// version (the message names both), or a body this version cannot
+    /// read (fail closed, as an unreadable format setting; the message
+    /// names the key). Absent or at most this version: allowed.
+    pub(super) async fn read_floor(&self) -> FloorRead {
+        use wasmkeep_cluster::app_format::floor;
+        let name = floor::key_of(&self.root);
+        let key = object_store::path::Path::from(name.as_str());
+        let Some(this) = floor::Minor::of_version(env!("CARGO_PKG_VERSION")) else {
+            return FloorRead::Refused(format!(
+                "this binary's version {} has no minor version to check the app's upgrade \
+                 floor against",
+                env!("CARGO_PKG_VERSION")
+            ));
+        };
+        let read = tokio::time::timeout(self.lease_attempt, async {
+            match self.store.get(&key).await {
+                Ok(got) => got.bytes().await.map(Some),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        match read {
+            Ok(Ok(body)) => match floor::decode(body.as_deref()) {
+                Ok(found) => match floor::allows(found, this) {
+                    Ok(()) => FloorRead::Allowed,
+                    Err(why) => FloorRead::Refused(why),
+                },
+                Err(e) => FloorRead::Refused(format!(
+                    "the app's upgrade floor `{name}` is unreadable ({} bytes); refusing to start",
+                    e.len
+                )),
+            },
+            Ok(Err(e)) => FloorRead::NoAnswer(e.to_string()),
+            Err(_) => FloorRead::NoAnswer("no answer".to_owned()),
+        }
+    }
+
+    /// The app's upgrade floor, read before this node writes its first
+    /// lease ([`Self::read_floor`]): `Some(why)` if the node must not
+    /// start, `None` to go on. A read with no answer proves nothing and is
+    /// tried again every half period, as the bucket check is.
+    pub(super) async fn check_floor(&self) -> Option<String> {
+        loop {
+            match self.read_floor().await {
+                FloorRead::Allowed => return None,
+                FloorRead::Refused(why) => return Some(why),
+                FloorRead::NoAnswer(e) => {
+                    tracing::warn!(error = %e, "reading the app's upgrade floor failed; retrying before starting");
+                    tokio::time::sleep(self.heartbeat_every / 2).await;
+                }
+            }
+        }
     }
 
     /// Waits while any heartbeat in a format from before node leases

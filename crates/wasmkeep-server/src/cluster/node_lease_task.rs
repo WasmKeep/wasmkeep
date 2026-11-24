@@ -78,13 +78,61 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
     if !started {
         return;
     }
-    c.identity.send_replace(Identity::Unique);
-    tracing::info!("{}", super::identity::checked_message(&c.node_id));
     let every = c.lease_every;
     drop(c);
-    // The first renewal a period after the first write.
+    // The first renewal a period after the first write. One the floor's
+    // read pushed past its time is sent at once.
     let mut next = tokio::time::Instant::now() + every;
+    // The upgrade floor, read again now that this node is live: a floor
+    // written during the start check (when no listing could see this node)
+    // stops it before it serves. Refused only on an answer; without one
+    // the node stays checking (no acquisition waits less), its lease
+    // renewed each period, and the floor is read again after each renewal.
+    let mut floor_read = false;
     loop {
+        if !floor_read {
+            let Some(c) = cluster.upgrade() else {
+                return;
+            };
+            let read = tokio::select! {
+                read = c.read_floor() => Some(read),
+                _ = stop.wait_for(|s| *s) => None,
+            };
+            match read {
+                // A clean stop meanwhile: release what was written.
+                None => {
+                    c.release_node_lease(&mut lease).await;
+                    return;
+                }
+                Some(super::identity::FloorRead::Allowed) => {
+                    floor_read = true;
+                    // A verdict reached meanwhile (a twin found by the
+                    // listing) stands: Unique only over Checking.
+                    let unique = c.identity.send_if_modified(|s| {
+                        let checking = *s == Identity::Checking;
+                        if checking {
+                            *s = Identity::Unique;
+                        }
+                        checking
+                    });
+                    if !unique || c.identity_taken() {
+                        c.invalidate_node_lease(false);
+                        return;
+                    }
+                    tracing::info!("{}", super::identity::checked_message(&c.node_id));
+                }
+                Some(super::identity::FloorRead::Refused(why)) => {
+                    tracing::error!("{why}");
+                    // It held nothing: acquisitions wait for the verdict.
+                    c.release_node_lease(&mut lease).await;
+                    c.identity.send_replace(Identity::BelowFloor(why));
+                    return;
+                }
+                Some(super::identity::FloorRead::NoAnswer(e)) => {
+                    tracing::warn!(error = %e, "reading the app's upgrade floor after the first lease write failed; renewing the lease and reading it again");
+                }
+            }
+        }
         let asked = tokio::select! {
             () = tokio::time::sleep_until(next) => false,
             _ = stop.wait_for(|s| *s) => true,
@@ -158,7 +206,9 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
 }
 
 impl Cluster {
-    /// The bucket check, the start check, then the first write. A first
+    /// The bucket check, the upgrade floor, the start check, then the
+    /// first write (the floor is read again once it landed, in
+    /// [`node_lease_loop`]). A first
     /// write that fails its condition goes back to the start check (ADR
     /// 0020, section 1): a peer may have fenced a stopped predecessor
     /// meanwhile, or a twin started. It keeps this process's instance.
@@ -170,6 +220,13 @@ impl Cluster {
         if let Some(why) = self.check_bucket().await {
             tracing::error!("{why}");
             self.identity.send_replace(Identity::Refused(why));
+            return false;
+        }
+        // Before any write: a binary below the app's upgrade floor never
+        // writes a lease, so it never holds or serves anything.
+        if let Some(why) = self.check_floor().await {
+            tracing::error!("{why}");
+            self.identity.send_replace(Identity::BelowFloor(why));
             return false;
         }
         loop {

@@ -83,6 +83,9 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_failovers_total` | counter | none | Actor leases taken from another node whose lease expired without being released. |
 | `wasmkeep_node_lease_writes_total` | counter | none | Node lease (heartbeat) writes that reached the bucket. |
 | `wasmkeep_node_lease_failures_total` | counter | none | Node lease writes that failed or timed out. |
+| `wasmkeep_lease_reads_behind_total` | counter | none | Node lease reads, made to judge an ownership record, older than a body this process read before: read again. |
+| `wasmkeep_lease_reads_stale_total` | counter | none | Ownership judgements refused because every node lease read was older than a body read before. |
+| `wasmkeep_lease_reads_unpinned_total` | counter | none | Newest node lease bodies replaced by an older one after older bodies were read for ttl plus grace with none confirming them. |
 | `wasmkeep_node_lease_write_milliseconds` | histogram | none | One node lease write, from its send to its answer. |
 | `wasmkeep_node_fences_total` | counter | none | Fences this node wrote over a node that stopped renewing its lease. |
 | `wasmkeep_node_hellos_total` | counter | none | Signed hellos from peers that just started, each asking for a listing of the nodes. |

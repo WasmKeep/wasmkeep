@@ -22,6 +22,10 @@
 //! on the reader's clock. The fenced process's validity ended at
 //! `written_at + ttl - safety` on its own clock, and `grace + safety >=
 //! 2 * max_skew` puts the reader's moment after it, whoever wrote the fence.
+//! That read is never judged when it is older than a body of the same
+//! lease the process has already read ([`NewestReads`]): it is read again,
+//! and counts as unanswered if it stays older (ADR 0020, amendment on
+//! lease reads).
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
@@ -155,6 +159,293 @@ pub fn frees(
             }
         },
     }
+}
+
+/// Whether `body` is provably older than `seen`, two bodies of one node's
+/// lease ([ADR 0020], amendment on lease reads).
+///
+/// - The same instance: a `fenced` or `released` body is newer than any
+///   `live` one, whatever their dates (that instance never writes `live`
+///   after its fence or release, and its own clock may have stepped back
+///   before them); otherwise the earlier date is older.
+/// - Different instances: the earlier date is older (a successor's start
+///   check dates its bodies after its predecessor's); dated the same, they
+///   are not ordered.
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+pub fn older_than(body: &NodeLeaseObject, seen: &NodeLeaseObject) -> bool {
+    if body.instance == seen.instance {
+        let ended = |o: &NodeLeaseObject| o.state != NodeState::Live;
+        if ended(body) != ended(seen) {
+            return ended(seen);
+        }
+    }
+    body.written_at_ms < seen.written_at_ms
+}
+
+/// How many times a node lease read after a record is made before its
+/// caller gives up, when each read returns a body older than one this
+/// process has already read ([`NewestReads`]).
+pub const BEHIND_READS: usize = 3;
+
+/// What [`NewestReads`] reports, for the server's counters and logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadEvent {
+    /// A read made to judge a record returned a body older than the newest
+    /// held: it is read again.
+    Behind {
+        /// The node.
+        node: String,
+        /// The newest body's date.
+        held_ms: u64,
+        /// The date of the body read.
+        read_ms: u64,
+    },
+    /// Every read of one judgement was behind: nothing judged.
+    Exhausted {
+        /// The node.
+        node: String,
+    },
+    /// The newest held was not confirmed by any read for the unpin window
+    /// while reads kept returning an older body: that body replaced it.
+    Unpinned {
+        /// The node.
+        node: String,
+        /// The date of the body replaced.
+        held_ms: u64,
+        /// The date of the body that replaced it.
+        read_ms: u64,
+    },
+}
+
+/// Deliberate faults in [`NewestReads`], for a simulation's broken
+/// variants only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadFault {
+    /// None: the rule.
+    #[default]
+    None,
+    /// Remembers nothing: every body is judged as read (the rule before
+    /// the amendment).
+    Off,
+    /// The read back after a failed acquisition write judges its body as
+    /// read, bypassing the table.
+    ReadBackUnchecked,
+    /// When every read is behind, the last one is judged anyway.
+    ExhaustedJudged,
+}
+
+/// What [`NewestReads::with_report`] calls.
+type ReportFn = Box<dyn Fn(&ReadEvent) + Send + Sync>;
+
+#[derive(Debug, Clone)]
+struct Newest {
+    body: NodeLeaseObject,
+    /// Since when (the reader's clock, ms) every read made to judge a
+    /// record returned an older body, with no read returning this one (or
+    /// one not older) since: `None` while it is confirmed.
+    behind_since_ms: Option<u64>,
+}
+
+/// The newest body of each node's lease that a process has read, from any
+/// of its reads (heartbeat rounds and listings, the reads that judge a
+/// record free), shared by every [`Owners`] of the process ([ADR 0020],
+/// amendment on lease reads). It moves forward by [`older_than`]. A read
+/// made to judge a record free that returns a body older than the one held
+/// here is a stale read (the bucket or a cache in front of it serving an
+/// earlier version): it is read again, never trusted.
+///
+/// The newest held is never kept for ever on its date alone: once older
+/// bodies have been read for the unpin window (ttl plus grace, given by the
+/// caller) with no read returning it (or a body not older) meanwhile, the
+/// next older body read replaces it. The window counts from the first such
+/// read, so an outage with no reads does not shorten it. A clock that ran
+/// ahead or stepped back cannot hold a node's records unfreeable much
+/// longer than that; at worst, after the window, a body is judged as read,
+/// the rule before.
+///
+/// This closes a read that goes back behind what the process has seen
+/// recently, not a first read that is stale: that needs the ownership
+/// record to carry its holder's lease date, which is a format change.
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+#[derive(Default)]
+pub struct NewestReads {
+    newest: std::sync::Mutex<std::collections::HashMap<String, Newest>>,
+    /// Reads found older than the newest held, since the start.
+    behind: std::sync::atomic::AtomicU64,
+    fault: ReadFault,
+    report: Option<ReportFn>,
+}
+
+impl std::fmt::Debug for NewestReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewestReads")
+            .field("newest", &self.newest)
+            .field("behind", &self.behind)
+            .field("fault", &self.fault)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewestReads {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A table with a deliberate fault: for a simulation's broken variant
+    /// only.
+    pub fn with_fault(fault: ReadFault) -> Self {
+        Self {
+            fault,
+            ..Self::default()
+        }
+    }
+
+    /// A table that remembers nothing, so every read is trusted (the rule
+    /// before the amendment): for a simulation's broken variant only.
+    pub fn off() -> Self {
+        Self::with_fault(ReadFault::Off)
+    }
+
+    /// Calls `report` on every [`ReadEvent`] (counters, logs).
+    #[must_use]
+    pub fn with_report(mut self, report: impl Fn(&ReadEvent) + Send + Sync + 'static) -> Self {
+        self.report = Some(Box::new(report));
+        self
+    }
+
+    /// Its fault.
+    pub fn fault(&self) -> ReadFault {
+        self.fault
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Newest>> {
+        self.newest.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn report(&self, event: ReadEvent) {
+        if let Some(report) = &self.report {
+            report(&event);
+        }
+    }
+
+    /// Notes `body`, just read for node `node`: it becomes the newest held
+    /// if the one held is older than it, and confirms the one held unless it
+    /// is older.
+    pub fn observe(&self, node: &str, body: &NodeLeaseObject) {
+        if self.fault == ReadFault::Off {
+            return;
+        }
+        let mut newest = self.lock();
+        match newest.get_mut(node) {
+            Some(held) => {
+                if older_than(&held.body, body) {
+                    held.body = body.clone();
+                }
+                if !older_than(body, &held.body) {
+                    held.behind_since_ms = None;
+                }
+            }
+            None => {
+                newest.insert(
+                    node.to_owned(),
+                    Newest {
+                        body: body.clone(),
+                        behind_since_ms: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Whether `body`, just read for node `node` at `now_ms`, is older
+    /// than the newest held, and so must not be judged (counted and
+    /// reported when it is). If not, it is noted ([`Self::observe`]). An
+    /// older body replaces the newest held (and is not behind) once older
+    /// bodies have been read for `unpin_ms` with no read confirming it.
+    pub fn behind(&self, node: &str, body: &NodeLeaseObject, now_ms: u64, unpin_ms: u64) -> bool {
+        if self.fault == ReadFault::Off {
+            return false;
+        }
+        let mut newest = self.lock();
+        let Some(held) = newest.get_mut(node) else {
+            newest.insert(
+                node.to_owned(),
+                Newest {
+                    body: body.clone(),
+                    behind_since_ms: None,
+                },
+            );
+            return false;
+        };
+        if !older_than(body, &held.body) {
+            if older_than(&held.body, body) {
+                held.body = body.clone();
+            }
+            held.behind_since_ms = None;
+            return false;
+        }
+        // The first behind read starts the window; a reader's clock that
+        // stepped back before it starts it again now.
+        let since = match held.behind_since_ms {
+            Some(since) if since <= now_ms => since,
+            _ => now_ms,
+        };
+        held.behind_since_ms = Some(since);
+        let (held_ms, read_ms) = (held.body.written_at_ms, body.written_at_ms);
+        if now_ms - since >= unpin_ms {
+            held.body = body.clone();
+            held.behind_since_ms = None;
+            drop(newest);
+            self.report(ReadEvent::Unpinned {
+                node: node.to_owned(),
+                held_ms,
+                read_ms,
+            });
+            return false;
+        }
+        drop(newest);
+        self.behind
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.report(ReadEvent::Behind {
+            node: node.to_owned(),
+            held_ms,
+            read_ms,
+        });
+        true
+    }
+
+    /// Reports that every read of one judgement of node `node` was behind.
+    fn exhausted(&self, node: &str) {
+        self.report(ReadEvent::Exhausted {
+            node: node.to_owned(),
+        });
+    }
+
+    /// The newest body held for node `node`.
+    pub fn newest(&self, node: &str) -> Option<NodeLeaseObject> {
+        self.lock().get(node).map(|n| n.body.clone())
+    }
+
+    /// How many reads were found older than the newest held, since the
+    /// start.
+    pub fn behind_count(&self) -> u64 {
+        self.behind.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A read of a node's lease made to judge a record, as
+/// [`Owners`] makes it.
+enum LeaseRead {
+    /// The lease as read (`None`: absent, or in a format that frees
+    /// nothing), never older than the newest this process read.
+    Read(Option<NodeLeaseObject>),
+    /// No answer.
+    Unknown,
+    /// Every read older than one the process read before.
+    Stale,
 }
 
 /// Why a node lease write did not succeed.
@@ -926,6 +1217,13 @@ pub enum AcquireError {
     FormatMismatch,
     /// No answer before writing: nothing written.
     Unavailable,
+    /// Every read of the holder's node lease returned a body older than
+    /// one this process had read before (a stale replica or cache, ADR
+    /// 0020's amendment on lease reads): nothing judged, nothing written.
+    StaleRead {
+        /// The holder's node.
+        node: String,
+    },
     /// An idle expiry's acquisition ([`Owners::acquire_unchanged`]): the
     /// record is not the one the listing showed, or names a holder. Nothing
     /// written.
@@ -969,6 +1267,8 @@ pub struct Owners<B, C> {
     /// The app has enabled the recorded-head format (ADR 0035, section 5):
     /// acquisitions and releases write version 2.
     recorded_head: std::sync::atomic::AtomicBool,
+    /// The newest node lease bodies the process has read.
+    reads: std::sync::Arc<NewestReads>,
 }
 
 impl<B: Bucket, C: Clock> Owners<B, C> {
@@ -991,6 +1291,66 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             config,
             unresolved_wait_ms: UNRESOLVED_WAIT_MS,
             recorded_head: std::sync::atomic::AtomicBool::new(false),
+            reads: std::sync::Arc::default(),
+        }
+    }
+
+    /// Judges node leases against `reads`, the process's newest bodies
+    /// read ([`NewestReads`]; by default a table of this value's own).
+    /// Every `Owners` of a process, and its heartbeat reads, should share
+    /// one.
+    #[must_use]
+    pub fn with_reads(mut self, reads: std::sync::Arc<NewestReads>) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// The table this value judges node leases against.
+    pub fn reads(&self) -> &std::sync::Arc<NewestReads> {
+        &self.reads
+    }
+
+    /// Node `node`'s lease, read after a record to judge it: a body older
+    /// than the newest this process has read of that lease is read again,
+    /// up to [`BEHIND_READS`] reads in all, and never trusted
+    /// ([`LeaseRead::Stale`] if every one is). A failed read is
+    /// [`LeaseRead::Unknown`] at once, as every reader before.
+    async fn read_lease(&self, node: &str) -> LeaseRead {
+        let key = format!("{}{node}", self.nodes_prefix);
+        let unpin_ms = self.config.ttl_ms().saturating_add(self.config.grace_ms());
+        let mut last = None;
+        for _ in 0..BEHIND_READS {
+            let Ok(read) = self.bucket.get(&key).await else {
+                return LeaseRead::Unknown;
+            };
+            let obj = read.and_then(|(b, _)| NodeLeaseObject::decode(&b));
+            match &obj {
+                Some(o) if self.reads.behind(node, o, self.clock.now_ms(), unpin_ms) => {
+                    last = obj;
+                }
+                _ => return LeaseRead::Read(obj),
+            }
+        }
+        self.reads.exhausted(node);
+        if self.reads.fault() == ReadFault::ExhaustedJudged {
+            return LeaseRead::Read(last);
+        }
+        LeaseRead::Stale
+    }
+
+    /// [`Self::read_lease`], or for the read back with the
+    /// [`ReadFault::ReadBackUnchecked`] fault, one read judged as read.
+    async fn read_lease_back(&self, node: &str) -> LeaseRead {
+        if self.reads.fault() != ReadFault::ReadBackUnchecked {
+            return self.read_lease(node).await;
+        }
+        match self
+            .bucket
+            .get(&format!("{}{node}", self.nodes_prefix))
+            .await
+        {
+            Ok(read) => LeaseRead::Read(read.and_then(|(b, _)| NodeLeaseObject::decode(&b))),
+            Err(_) => LeaseRead::Unknown,
         }
     }
 
@@ -1155,13 +1515,15 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if let Some((node, instance)) = &record.holder
                     && !(node == &self.node && instance == &self.instance)
                 {
-                    // Read after the record, never from a view.
-                    let obj = self
-                        .bucket
-                        .get(&format!("{}{node}", self.nodes_prefix))
-                        .await
-                        .map_err(|_| AcquireError::Unavailable)?
-                        .and_then(|(b, _)| NodeLeaseObject::decode(&b));
+                    // Read after the record, never from a view, and never
+                    // behind a body of it this process read before.
+                    let obj = match self.read_lease(node).await {
+                        LeaseRead::Read(obj) => obj,
+                        LeaseRead::Unknown => return Err(AcquireError::Unavailable),
+                        LeaseRead::Stale => {
+                            return Err(AcquireError::StaleRead { node: node.clone() });
+                        }
+                    };
                     if !frees(instance, obj.as_ref(), self.clock.now_ms(), &self.config) {
                         return Err(AcquireError::Held {
                             node: node.clone(),
@@ -1336,12 +1698,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 }
             }
             Some(((node, instance), _)) => {
-                let lease = self
-                    .bucket
-                    .get(&format!("{}{node}", self.nodes_prefix))
-                    .await;
-                let Ok(obj) = lease.map(|o| o.and_then(|(b, _)| NodeLeaseObject::decode(&b)))
-                else {
+                let LeaseRead::Read(obj) = self.read_lease_back(&node).await else {
                     return Err(unresolved);
                 };
                 if frees(&instance, obj.as_ref(), self.clock.now_ms(), &self.config) {
@@ -2416,6 +2773,298 @@ mod tests {
         // Fenced or released: only after written_at + ttl + grace.
         assert!(!frees("i1", Some(&fenced), 1_000 + 15_000, &c));
         assert!(frees("i1", Some(&fenced), 1_000 + 15_001, &c));
+    }
+
+    #[test]
+    fn which_body_of_a_lease_is_older() {
+        let body = |state, i: Option<&str>, at| NodeLeaseObject {
+            state,
+            instance: i.map(str::to_owned),
+            written_at_ms: at,
+        };
+        let live = |i, at| body(NodeState::Live, Some(i), at);
+        // Dated earlier, across instances or between two live bodies.
+        assert!(older_than(&live("i1", 1_000), &live("i1", 1_001)));
+        assert!(older_than(
+            &body(NodeState::Released, Some("i1"), 1_000),
+            &live("i2", 1_001)
+        ));
+        assert!(!older_than(&live("i1", 1_001), &live("i1", 1_000)));
+        for end in [NodeState::Fenced, NodeState::Released] {
+            // The same instance: its fence or release is newer than any of
+            // its live bodies, whatever the dates (its clock stepped back).
+            for at in [999, 1_000, 1_001] {
+                assert!(older_than(&live("i1", at), &body(end, Some("i1"), 1_000)));
+                assert!(!older_than(&body(end, Some("i1"), 1_000), &live("i1", at)));
+            }
+            // Another instance's, dated the same: not ordered either way.
+            assert!(!older_than(
+                &live("i2", 1_000),
+                &body(end, Some("i1"), 1_000)
+            ));
+            assert!(!older_than(
+                &body(end, Some("i1"), 1_000),
+                &live("i2", 1_000)
+            ));
+        }
+        // Two ends of one instance: by date.
+        assert!(older_than(
+            &body(NodeState::Released, Some("i1"), 1_000),
+            &body(NodeState::Fenced, Some("i1"), 1_001)
+        ));
+        // The same body is not older than itself.
+        assert!(!older_than(&live("i1", 1_000), &live("i1", 1_000)));
+    }
+
+    #[test]
+    fn the_newest_reads_only_move_forward() {
+        let live = |i: &str, at| NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some(i.into()),
+            written_at_ms: at,
+        };
+        let w = 15_000;
+        let reads = NewestReads::new();
+        assert!(!reads.behind("b", &live("i1", 1_000), 0, w));
+        assert!(!reads.behind("b", &live("i2", 2_000), 0, w));
+        // An earlier body is behind, and leaves the newest as it was.
+        assert!(reads.behind("b", &live("i1", 1_000), 10, w));
+        reads.observe("b", &live("i1", 1_500));
+        assert_eq!(reads.newest("b"), Some(live("i2", 2_000)));
+        assert_eq!(reads.behind_count(), 1);
+        // Per node.
+        assert!(!reads.behind("c", &live("i1", 1_000), 10, w));
+        // Off: nothing held, nothing behind.
+        let off = NewestReads::off();
+        off.observe("b", &live("i2", 2_000));
+        assert!(!off.behind("b", &live("i1", 1_000), 0, w));
+        assert_eq!(off.newest("b"), None);
+    }
+
+    /// The newest held never pins a node for ever: a body dated far ahead
+    /// (a clock that ran ahead) holds back older bodies only while they
+    /// have not persisted for the window with no read confirming it; then
+    /// the older body replaces it, reported. The window counts from the
+    /// first behind read, so a gap with no reads at all (an outage) does
+    /// not shorten it; a confirming read ends it; a clock that steps back
+    /// counts it from the step.
+    #[test]
+    fn a_body_dated_ahead_holds_the_newest_for_a_window_only() {
+        let live = |i: &str, at| NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some(i.into()),
+            written_at_ms: at,
+        };
+        let w = 15_000;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&events);
+        let reads = NewestReads::new().with_report(move |e| seen.lock().unwrap().push(e.clone()));
+        // k, on a clock an hour ahead, then dead; m, its successor.
+        reads.observe("b", &live("k", 3_600_000));
+        // A minute with no read, then a behind read: the window starts now.
+        assert!(reads.behind("b", &live("m", 61_000), 61_000, w));
+        // A read confirming k ends it.
+        reads.observe("b", &live("k", 3_600_000));
+        assert!(reads.behind("b", &live("m", 80_000), 80_000, w));
+        assert!(reads.behind("b", &live("m", 94_000), 94_999, w));
+        // Behind for 15 s with no confirming read: m's body replaces it.
+        assert!(!reads.behind("b", &live("m", 95_000), 95_000, w));
+        assert_eq!(reads.newest("b"), Some(live("m", 95_000)));
+        assert!(events.lock().unwrap().contains(&ReadEvent::Unpinned {
+            node: "b".into(),
+            held_ms: 3_600_000,
+            read_ms: 95_000
+        }));
+        // The reader's clock steps back: the window counts from the step.
+        reads.observe("b", &live("x", 9_000_000));
+        assert!(reads.behind("b", &live("m", 99_000), 99_000, w));
+        assert!(reads.behind("b", &live("m", 50_000), 50_000, w));
+        assert!(reads.behind("b", &live("m", 64_000), 64_999, w));
+        assert!(!reads.behind("b", &live("m", 65_000), 65_000, w));
+    }
+
+    /// A stale read of a predecessor's body never frees a record its
+    /// current instance holds, once this process has read that instance's
+    /// lease: b's i1 stopped cleanly long ago, b runs as i2 and holds the
+    /// actor, and the bucket serves i1's `released` body to a's next reads.
+    /// Read again, then refused as a stale read while it stays stale; held
+    /// by i2 once a read is current.
+    #[test]
+    fn a_stale_read_of_a_predecessor_frees_nothing() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_000);
+        let old = NodeLeaseObject {
+            state: NodeState::Released,
+            instance: Some("i1".into()),
+            written_at_ms: 1_000,
+        }
+        .encode();
+        mem.overwrite("nodes/b", Some(&old));
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        let v = run((&mem).get("nodes/b")).unwrap().unwrap().1;
+        run(lb.start(Some(&v))).unwrap();
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(hold.generation, 1);
+        let reads = std::sync::Arc::new(NewestReads::new());
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+        // a's heartbeat reads saw b live as i2.
+        let current =
+            NodeLeaseObject::decode(&run((&mem).get("nodes/b")).unwrap().unwrap().0).unwrap();
+        reads.observe("b", &current);
+        // Stale on every read: refused, nothing written.
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), BEHIND_READS as u32));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::StaleRead { node: "b".into() })
+        );
+        assert_eq!(reads.behind_count(), BEHIND_READS as u64);
+        // Stale once: read again, and the current body says b holds it.
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), 1));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held {
+                node: "b".into(),
+                instance: "i2".into()
+            })
+        );
+        // Every read stale, with the exhausted read judged anyway: freed.
+        let judging = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(
+            std::sync::Arc::new(NewestReads::with_fault(ReadFault::ExhaustedJudged)),
+        );
+        judging.reads().observe("b", &current);
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), BEHIND_READS as u32));
+        assert_eq!(
+            run(judging.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(2),
+            "judging an exhausted read takes the record b holds"
+        );
+        // Without the table (the rule before), one stale read frees it.
+        let trusting = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg())
+            .with_reads(std::sync::Arc::new(NewestReads::off()));
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), 1));
+        assert_eq!(
+            run(trusting.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(3),
+            "the unfixed rule takes the record a holds"
+        );
+    }
+
+    /// b's clock steps back while it runs as i2, then b is fenced: the
+    /// fence keeps i2's last date, earlier than a live body a read before
+    /// the step. The fence is still newer (the same instance's end), so the
+    /// record b held frees once that date is ttl plus grace old, as without
+    /// the table.
+    #[test]
+    fn a_fence_after_a_clock_step_back_frees_after_ttl_and_grace() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(50_000);
+        let body = |state, at| NodeLeaseObject {
+            state,
+            instance: Some("i2".into()),
+            written_at_ms: at,
+        };
+        mem.overwrite(
+            "owners/x",
+            Some(
+                &OwnerRecord {
+                    holder: Some(("b".into(), "i2".into())),
+                    generation: 3,
+                    recorded: None,
+                }
+                .encode(),
+            ),
+        );
+        let reads = std::sync::Arc::new(NewestReads::new());
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+        // a read b live as i2 at 50 s; b's clock then went back 20 s.
+        reads.observe("b", &body(NodeState::Live, 50_000));
+        mem.overwrite("nodes/b", Some(&body(NodeState::Live, 30_000).encode()));
+        t.set(52_000);
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::StaleRead { node: "b".into() }),
+            "a live body of i2 dated before one read is not judged"
+        );
+        // Fenced over that body: it keeps 30 s.
+        mem.overwrite("nodes/b", Some(&body(NodeState::Fenced, 30_000).encode()));
+        t.set(30_000 + 15_000);
+        assert!(matches!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held { .. })
+        ));
+        t.set(30_000 + 15_001);
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(4)
+        );
+    }
+
+    /// The read back after a failed acquisition write judges the rival's
+    /// lease as the acquisition does: a rival b as i3 took the record, a
+    /// read b live as i3, and the bucket serves b's earlier `live` body as
+    /// i2 once. Read again: the race is lost to i3 (`Held`). Judged as read
+    /// (the fault), the stale body frees i3's record and the acquire stays
+    /// unresolved instead.
+    #[test]
+    fn the_read_back_never_judges_a_stale_body() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_000);
+        let live = |i: &str, at| {
+            NodeLeaseObject {
+                state: NodeState::Live,
+                instance: Some(i.into()),
+                written_at_ms: at,
+            }
+            .encode()
+        };
+        let record = |holder: Option<(&str, &str)>, generation| {
+            OwnerRecord {
+                holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+                generation,
+                recorded: None,
+            }
+            .encode()
+        };
+        mem.overwrite("nodes/b", Some(&live("i3", 99_000)));
+        for (fault, want) in [
+            (
+                ReadFault::None,
+                Err(AcquireError::Held {
+                    node: "b".into(),
+                    instance: "i3".into(),
+                }),
+            ),
+            (
+                ReadFault::ReadBackUnchecked,
+                Err(AcquireError::Unresolved {
+                    generation: 5,
+                    before: Some(Box::new(OwnerRecord {
+                        holder: None,
+                        generation: 4,
+                        recorded: None,
+                    })),
+                }),
+            ),
+        ] {
+            let reads = std::sync::Arc::new(NewestReads::with_fault(fault));
+            let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+            reads.observe("b", &NodeLeaseObject::decode(&live("i3", 99_000)).unwrap());
+            mem.overwrite("owners/r", Some(&record(None, 4)));
+            *mem.steal_next.borrow_mut() = Some(("owners/r".into(), record(Some(("b", "i3")), 5)));
+            *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), live("i2", 90_000), 1));
+            assert_eq!(
+                run(a.acquire("owners/r", || true, async || Ok(1))),
+                want,
+                "{fault:?}"
+            );
+        }
     }
 
     /// A version 2 record (ADR 0035) is read everywhere a version 1 record
