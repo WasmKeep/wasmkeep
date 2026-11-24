@@ -97,3 +97,85 @@ node refuses an env file, a secrets key or a cache it should not trust.
 - **Placement.** A room and its pusher wake on different nodes by default,
   and a big room's edges spread over the nodes; see the 0.8.0 notes in
   the [changelog](../../CHANGELOG.md). Nothing to deploy.
+
+## From 0.8.0 to 0.8.1
+
+0.8.1 is a patch: a security fix, fixes and follow-ups, with no new
+feature (the [changelog](../../CHANGELOG.md) lists them). **Upgrade every
+node of 0.7.0 or 0.8.0**: on those versions a `LIKE` or `GLOB` pattern
+full of wildcards, in a statement an actor runs, can stop the node.
+
+What stays as it was:
+
+- **The bucket.** No format changes: layout, manifests, ownership
+  records, node leases and heartbeats (no new heartbeat word), history,
+  the alarm index and intents are read and written as by 0.8.0. A backup
+  archive's actor entries can gain a `collected` list, which 0.8.0
+  ignores: it verifies and restores an archive made by 0.8.1.
+- **The WIT.** The package stays `wasmkeep:actor@0.2.0`, and only its
+  comments changed. Actors built with the 0.8.0 SDKs run as they are,
+  with one exception: rebuild with the 0.8.1 SDK, and deploy, a Rust, Go
+  or TypeScript actor that passes more than 16 requests to the batch
+  helper (`fetch_all`, `FetchAll`, `fetchAll`), which could trap on an
+  empty poll.
+- **Calls between nodes.** What a node signs and sends is unchanged byte
+  for byte, so 0.8.0 and 0.8.1 nodes verify each other's calls.
+- **Ports, routes, exit codes and existing flags.**
+
+What is new on the command line:
+
+- `serve --sqlite-heap-bytes BYTES` (`[limits] sqlite-heap-bytes` in a
+  [node file](../reference/node-file.md)): SQLite's heap cap for the
+  process. The default is 4 GiB, as 0.8.0 had it fixed, and the least is
+  64 MiB. Nothing to set unless you want another cap.
+- `backup create --history-retention-secs SECS` (default 3600): give it
+  the value the cluster's nodes run with as `serve
+  --history-retention-secs`, if that is not the default
+  ([backup and restore](backup-and-restore.md)).
+
+What to check after the upgrade:
+
+- **Queries with `LIKE` or `GLOB` on an indexed column.** `GLOB` on a
+  column with the default (`BINARY`) collation and `LIKE` on a `COLLATE
+  NOCASE` column no longer use the index for a prefix: write a range
+  instead (`path >= 'a/' AND path < 'a0'` for `path GLOB 'a/*'`,
+  `name >= 'a' AND name < 'b'` for `name LIKE 'a%'`).
+- **Dashboards on `wasmkeep_signatures_bad_total`.** It now counts a bad
+  signature once per request, and on the cluster port too.
+- **Alerts on `wasmkeep_plain_events_dropped_total`.** A write dropped
+  after the node's lease was replaced counts as `lost_lease`, where it
+  counted as `lapse` or `stop`.
+- **A systemd unit copied from the single-node guide.** Optional: add the
+  new hardening lines ([single node](single-node.md)).
+
+### The binary
+
+Upgrade the binary as [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)
+says: **stop every node, upgrade them all, start them all**. 0.8.1
+documents no exception for one node at a time, so plan a short window in
+which the cluster serves nothing.
+
+1. **Stop every node** cleanly (`systemctl stop wasmkeep`, or `SIGTERM`).
+2. **Install** the 0.8.1 binary on each.
+3. **Start every node.**
+4. **Wait until each is `serving`**: `/_wasmkeep/ready` answers 200 on
+   every node, and `cluster status` lists every node live, `serving`, with
+   version 0.8.1.
+
+   ```bash
+   wasmkeep cluster status --bucket s3://wasmkeep-demo
+   ```
+
+### The upgrade floor
+
+At start, a 0.8.1 node reads the app's upgrade floor,
+`formats/<tenant>/<app>/floor`. Nothing writes that record yet: 0.9.0's
+`cluster upgrade finalize` will, and without it a node starts as before.
+If a 0.8.1 binary is started into an app finalized at a later minor
+version, it does not serve: it stops, its
+log names the floor and its own version, and until then it is not ready
+with the reason `the app's upgrade floor is above this node's version, or
+unreadable`. Install that version or later
+([troubleshooting](../troubleshooting.md),
+[ADR 0020](../adr/0020-one-lease-per-node.md#the-upgrade-floor-record)).
+A 0.8.0 binary does not read the floor.

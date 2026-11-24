@@ -9,87 +9,153 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-- Calls between nodes: a node call's signature (`x-wasmkeep-internal`)
-  is checked once on arrival, by the runtime that serves the request, and
-  every later check of that request reads the result (a hop refused there
-  stays refused); one code path signs every hop, and one function sends a
-  client's request forwarded to its actor's owner. What is signed and
-  sent is unchanged byte for byte (pinned by tests), so 0.8.0 and later
-  nodes verify each other. `wasmkeep_signatures_bad_total` counts a bad
-  signature once per request: on the cluster port now too, and, when
-  plain HTTP between nodes is accepted, junk in that header on the public
-  port. A request to a front path carrying the header is now judged on
-  arrival like any other: in refuse mode a valid signature there is
-  spent on the public port (never honoured on the cluster port), and in
-  accept mode a bad one is counted and logged.
-- Cluster availability: a request kept for a dead node's actors is no
-  longer kept for a peer that only could not be read, or for a body
-  older than one already read; a round has at most 32 heartbeat reads in
-  flight; a node whose object is gone leaves the live senders at once and
-  is forgotten a minute later; an app joining a process reads the known
-  nodes by key instead of waiting for a slow listing; over TLS, a joining
-  node is read by the name on its certificate, so it no longer waits for
-  a listing; the start hellos are not spent before a live peer of the app
-  is found. The full test job's time limit on ubuntu-latest is 60
-  minutes. No lease rule or format changes
-  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-availability)).
-- Backups: `backup create --history all` lists an actor again after a
-  read misses. A key gone from below a retained snapshot and its
-  segment, as history collection and idle compaction leave it, and older
-  than the retention window (new `--history-retention-secs`, default
-  3600, as on `serve`), is recorded under the actor's `collected` and is
-  no longer a gap, so a
-  continuous run that races a collection or an idle pass completes
-  instead of failing as partial; a key still listed whose read missed is
-  read again, up to 8 attempts; any other key gone is a gap as before.
-  New simulations: a backup reader racing idle passes within ADR 0033's
-  two-attempt bound, and an acquirer proving the recorded head exactly
-  after a pass. The run's actor entries gain the `collected` list;
-  nothing else in the archive changes
-  ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md#as-built-the-backup-retry-and-the-last-simulations-081)).
-- Leases: a node lease read to judge an actor's ownership record free is
-  never older than a body of that lease the process has already read; an
-  older one (a stale replica or cache) is read again and never frees the
-  record (counted by `wasmkeep_lease_reads_behind_total`,
-  `wasmkeep_lease_reads_stale_total` and
-  `wasmkeep_lease_reads_unpinned_total`). At start, a node reads the app's upgrade floor
-  (`formats/<tenant>/<app>/floor`, written from 0.9.0 by `cluster upgrade
-  finalize`) before its first lease write and again after it: a floor
-  above its minor version, or an unreadable one, stops the start; a read
-  with no answer is retried. No format changes
+**0.8 settled: a security fix, the follow-ups 0.8.0 left open, and no
+format change.** A `LIKE` or `GLOB` pattern full of wildcards could stop a
+node of 0.7.0 or 0.8.0; that is fixed, and every cluster on those versions
+should upgrade. Lease reads no longer trust an older copy of a node's
+lease, a slow or failing bucket read keeps fewer requests waiting, a backup
+with `--history all` completes when it races a collection, and SQLite's
+memory cap is a setting. Nothing in the bucket, the `wasmkeep:actor@0.2.0`
+package or the signatures between nodes changes, and actors built with
+the 0.8.0 SDKs keep running (one SDK fix needs a rebuild, below). A node
+also reads, at start, the upgrade floor that 0.9.0 will write. Upgrade as
+for any release, every node stopped: the steps are in
+[upgrading from 0.8.0 to 0.8.1](docs/deploy/upgrading-to-0.8.md#from-080-to-081).
+Still a **pre-alpha pre-release**.
+
+### Security
+
+- **A `LIKE` or `GLOB` pattern could stop a node (0.7.0 and 0.8.0).**
+  SQLite matches these patterns by recursion, one level per wildcard. A
+  wildcard pattern of tens of kilobytes (`%a%a...`; the test uses 50,000
+  bytes), in a statement an actor runs, overflowed the thread's stack, and
+  the node's process aborted, with every app it serves. Any actor's code
+  could do it, and so could a client of an app that passes client input as
+  a `LIKE` or `GLOB` pattern. The other nodes take the actors over as
+  after any crash. 0.8.1
+  matches both without recursion, in the host, as it already did `instr`,
+  `replace` and `trim`: SQLite's answers, stopped at the statement's time
+  and CPU budgets. The offline connections that verify backups, exports and
+  restores do the same, where a guest's index on such a pattern aborted the
+  run. As a second barrier, `serve` and `dev` run on 8 MiB thread stacks.
+  Upgrade to 0.8.1 ([security](docs/security.md#layers)).
+
+### Changes
+
+- **`LIKE` and `GLOB` no longer narrow an indexed search to a prefix.**
+  This is the cost of the fix above, as for any replaced `like()`. It
+  changes two cases, which now scan the table: `GLOB` on a `BINARY` column
+  (write `path >= 'a/' AND path < 'a0'` for `path GLOB 'a/*'`) and `LIKE`
+  on a `COLLATE NOCASE` column (write `name >= 'a' AND name < 'b'` for
+  `name LIKE 'a%'`). `LIKE` on any other column never used an index.
+  Check the queries of actors with large tables.
+- **SQLite's memory cap is a setting.** `serve --sqlite-heap-bytes BYTES`,
+  or `sqlite-heap-bytes` in a node file's `[limits]`, sets SQLite's
+  process-wide heap cap: 4 GiB by default, as in 0.8.0, and at least
+  64 MiB. Like the other flags a node file describes, the flag is refused
+  beside `--node-file`
+  ([node file](docs/reference/node-file.md)).
+- **Guest objects named `_wasmkeep_` from before 0.8 are kept.** 0.8.0
+  refuses a guest schema change that names the reserved prefix, but a
+  database could already hold such objects. At open they are now logged
+  once and left as they are, closed to the guest's schema changes; the
+  actor opens and nothing is dropped or renamed. Offline verification no
+  longer refuses them, only an object holding a host table's own name, so
+  backups and exports of such actors verify.
+- **Streamed file reads are capped and closed.** An instance holds at most
+  16 streamed file reads with bytes left at once (past it, `not-allowed`;
+  a stream dropped or read to its end no longer counts), and each closes
+  its file or response when its event ends, where a resident actor kept
+  the descriptor open. A wait for a read that the guest gives up no longer
+  loses bytes. The WIT documents these caps, and `actors.call`'s header,
+  size and chain limits; only its comments changed
+  ([files](docs/files.md#limits)).
+- **SDKs: a batch of more than 16 fetches no longer traps.** `fetch_all`
+  (Rust), `FetchAll` (Go) and `fetchAll` (TypeScript) start what fits in
+  the host's 16 open requests and queue the rest. When every open request
+  finished while others were still queued, the helper polled an empty
+  list and the actor trapped (`empty poll list`; the caller got a 500).
+  It now starts the queued requests instead. The fix is in the SDKs:
+  rebuild with the 0.8.1 SDK, and deploy, any actor that passes more than
+  16 requests to the batch helper.
+- **Lease reads never trust an older copy.** A node lease read to judge an
+  actor's ownership record free is never older than a body of that lease
+  the process has already read. An older one (a stale replica or a cache)
+  is read again, up to three reads in all, and never frees the record;
+  if all three are older, the request is answered as unavailable, to be
+  retried. Counted by
+  `wasmkeep_lease_reads_behind_total`, `wasmkeep_lease_reads_stale_total`
+  and `wasmkeep_lease_reads_unpinned_total`. No format changes
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)).
-- Guest limits: SQLite's process-wide heap cap is configurable
-  (`serve --sqlite-heap-bytes`, or `sqlite-heap-bytes` in a node file's
-  `[limits]`; default 4 GiB as before, at least 64 MiB). `LIKE` and `GLOB`
-  are the host's, as `instr`, `replace` and `trim` are: SQLite's answers,
-  stopped at the statement's time and CPU budgets, and no deep recursion on
-  a pattern full of wildcards, also on the offline connections that verify
-  backups, exports and restores. Like any replaced `like()`, they no longer
-  narrow an indexed search to a prefix, which changes two cases: `GLOB` on
-  a `BINARY` column (write `path >= 'a/' AND path < 'a0'` for
-  `path GLOB 'a/*'`) and `LIKE` on a `COLLATE NOCASE` column (write
-  `name >= 'a' AND name < 'b'` for `name LIKE 'a%'`); `LIKE` on any other
-  column never used an index. Offline verification no longer refuses a
-  guest object with the `_wasmkeep_` prefix, only one holding a host
-  table's name.
-  At open, a database's guest objects that use the reserved `_wasmkeep_`
-  prefix (made before 0.8) are logged once and kept as they are, closed to
-  the guest's schema changes. An instance holds at most 16 streamed file
-  reads at once, and each closes (its file or response) when its event
-  ends; a wait for a read the guest gives up no longer loses bytes. The WIT
-  documents these caps and `actors.call`'s header, size and chain limits.
-- Hardening and small fixes: the single-node guide's systemd unit drops
-  every capability, filters system calls to `@system-service`, limits
-  address families and writes only the data and cache directories (add
-  the new lines to an existing unit; see the guide). The compose demo's
-  bucket key and Grafana password come from `WASMKEEP_DEMO_*` variables
-  (a `.env` file), and their public defaults are marked insecure. A release
-  tag must be a signed tag GitHub verifies. A batched write dropped because
-  another writer replaced the node's lease (a fence, a twin), or by the
-  stop that follows, now counts as `lost_lease` in
+- **A node reads the app's upgrade floor at start.** The record,
+  `formats/<tenant>/<app>/floor`, will be written from 0.9.0 by `cluster
+  upgrade finalize`; nothing writes it yet, and a node starts as before
+  without it. A node reads it before its first lease write and again after
+  it: a floor above its minor version, or an unreadable one, stops the
+  start with a message that says so, and a read with no answer is retried.
+  So a 0.8.1 binary started into an app finalized at 0.9 stops instead of
+  serving
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#the-upgrade-floor-record),
+  [troubleshooting](docs/troubleshooting.md)).
+- **Cluster availability after a slow bucket.** A request kept for a dead
+  node's actors is no longer kept for a peer that only could not be read,
+  or for a body older than one already read. A round has at most 32
+  heartbeat reads in flight, so a hung read delays no other node's. A
+  node whose object is gone leaves the live senders at once and is
+  forgotten a minute later. An app joining a process reads the known nodes
+  by key instead of waiting for a slow listing; over TLS, a joining node
+  is read by the name on its certificate, so it no longer waits for a
+  listing either; and the start hellos are not spent before a live peer of
+  the app is found. No lease rule or format changes
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-availability)).
+- **Calls between nodes: one signature check per request.** A node call's
+  signature (`x-wasmkeep-internal`) is checked once on arrival, by the
+  runtime that serves the request, and every later check of that request
+  reads the result (a hop refused there stays refused). One code path
+  signs every hop. What is signed and sent is unchanged byte for byte
+  (pinned by tests), so 0.8.0 and 0.8.1 nodes verify each other.
+  `wasmkeep_signatures_bad_total` counts a bad signature once per request:
+  on the cluster port now too, and, when plain HTTP between nodes is
+  accepted, junk in that header on the public port; expect it to count
+  differently on a dashboard. A request to a front path carrying the
+  header is now judged on arrival like any other: in refuse mode a valid
+  signature there is spent on the public port (never honoured on the
+  cluster port), and in accept mode a bad one is counted and logged
+  ([monitoring](docs/monitoring.md)).
+- **Backups: `backup create --history all` completes when it races a
+  collection.** A continuous run that raced a history collection or an
+  idle pass failed as partial, and the next run completed. Now an actor is
+  listed again after a read misses. A key gone from below a retained
+  snapshot and its segment, and older than the retention window, is
+  recorded under the actor's new `collected` list and is no longer a gap;
+  a key still listed whose read missed is read again, up to 8 attempts;
+  any other key gone is a gap, as before. Give the window the cluster
+  runs with as `--history-retention-secs` (default 3600, as on `serve`).
+  Nothing else in the archive changes, and 0.8.0 reads an archive with the
+  new list. New simulations cover a backup reader racing idle passes and
+  an acquirer proving the recorded head after a pass
+  ([backup and restore](docs/deploy/backup-and-restore.md),
+  [ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md#as-built-the-backup-retry-and-the-last-simulations-081)).
+- **`lost_lease` is counted.** A batched write dropped because another
+  writer replaced the node's lease (a fence, a twin), or by the stop that
+  follows, now counts as `lost_lease` in
   `wasmkeep_plain_events_dropped_total`, where it counted as `lapse` or
   `stop`; the label set is unchanged. An actor that traps on its full
-  resource table logs a line of its own, as the front does.
+  resource table logs a line of its own, as the front does
+  ([ADR 0034](docs/adr/0034-batched-plain-writes.md)).
+- **Hardening of the documented deployments.** The single-node guide's
+  systemd unit drops every capability, filters system calls to
+  `@system-service`, limits address families and writes only the data and
+  cache directories: add the new lines to an existing unit
+  ([single node](docs/deploy/single-node.md)). The compose demo's bucket
+  key and Grafana password come from `WASMKEEP_DEMO_*` variables (a `.env`
+  file), and their public defaults are marked insecure.
+- **Releases** (for whoever cuts them). A release tag must be a signed tag
+  GitHub verifies. The mixed-version check, three nodes moved one at a
+  time from the previous release to this one and back, is a gate before a
+  patch tag: it takes the old version as a parameter (0.8.0 by default),
+  and its checks and the move back count in its exit status
+  ([releasing](docs/releasing.md#the-mixed-version-check)).
 
 ## 0.8.0
 
