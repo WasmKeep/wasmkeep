@@ -9,8 +9,9 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
-- Calls between nodes: a hop's signature is checked once on arrival, and
-  every later check of that request reads the result; one code path signs
+- Calls between nodes: a node call's signature (`x-wasmkeep-internal`)
+  is checked once on arrival, and every later check of that request reads
+  the result; one code path signs
   every hop and one forwards every request. What is signed and sent is
   unchanged byte for byte (pinned by tests), so 0.8.0 and later nodes
   verify each other. A bad signature on the cluster port is now counted in
