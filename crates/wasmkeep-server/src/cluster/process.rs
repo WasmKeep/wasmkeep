@@ -185,7 +185,10 @@ impl NodeProcess {
                     nodes,
                     live: RwLock::default(),
                     heard: Mutex::default(),
-                    lease_reads: Arc::default(),
+                    lease_reads: Arc::new(
+                        wasmkeep_cluster::node_lease::NewestReads::new()
+                            .with_report(report_lease_read),
+                    ),
                     instances: Mutex::default(),
                 });
                 *slot = Some(Arc::clone(&t));
@@ -286,6 +289,60 @@ pub(crate) struct Transport {
     /// earlier one is a stopped predecessor's, never a twin's.
     instances: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
+
+/// Counts what the process's newest lease reads report, and warns, at most
+/// once per [`LEASE_READ_WARN_MS`] for each kind: a stale read is the
+/// bucket (or a cache in front of it) serving an earlier version.
+fn report_lease_read(event: &wasmkeep_cluster::node_lease::ReadEvent) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wasmkeep_cluster::node_lease::ReadEvent;
+    static WARNED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let m = &crate::metrics::METRICS;
+    let (counter, slot) = match event {
+        ReadEvent::Behind { .. } => (&m.lease_reads_behind, 0),
+        ReadEvent::Exhausted { .. } => (&m.lease_reads_stale, 1),
+        ReadEvent::Unpinned { .. } => (&m.lease_reads_unpinned, 2),
+    };
+    crate::metrics::inc(counter);
+    let now = crate::cluster_tls::now_ms();
+    let last = WARNED[slot].load(Ordering::Relaxed);
+    if now.saturating_sub(last) < LEASE_READ_WARN_MS
+        || WARNED[slot]
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    match event {
+        ReadEvent::Behind {
+            node,
+            held_ms,
+            read_ms,
+        } => tracing::warn!(
+            node = %node,
+            held_written_at_ms = held_ms,
+            read_written_at_ms = read_ms,
+            "a node lease read returned a body older than one this process read before (a stale read); reading it again"
+        ),
+        ReadEvent::Exhausted { node } => tracing::warn!(
+            node = %node,
+            "every read of a node lease was stale: the acquisition is refused for now (ADR 0020, lease reads)"
+        ),
+        ReadEvent::Unpinned {
+            node,
+            held_ms,
+            read_ms,
+        } => tracing::warn!(
+            node = %node,
+            held_written_at_ms = held_ms,
+            read_written_at_ms = read_ms,
+            "no read confirmed a node lease body for ttl plus grace: an older body now counts as its newest (a clock ahead or stepped back)"
+        ),
+    }
+}
+
+/// At most one warning of each kind per this long (ms).
+const LEASE_READ_WARN_MS: u64 = 10_000;
 
 /// [`Transport::note_heartbeats`]'s state.
 #[derive(Debug, Default)]

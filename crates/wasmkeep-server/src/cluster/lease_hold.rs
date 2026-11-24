@@ -735,6 +735,10 @@ impl LeaseHold {
             Err(AcquireError::Unavailable) => Err(OwnershipError::Unavailable(
                 "the bucket did not answer".into(),
             )),
+            Err(AcquireError::StaleRead { node }) => Err(OwnershipError::Unavailable(format!(
+                "every read of node {node}'s lease returned a body older than one this node \
+                 read before (a stale read): not judged, retrying later"
+            ))),
             // Only an expiry's acquisition gives it (ADR 0028).
             Err(AcquireError::Changed) => Err(OwnershipError::Refused(RECORD_CHANGED.into())),
         }

@@ -3996,27 +3996,6 @@ async fn a_floor_above_this_version_stops_the_start() {
         wasmkeep_cluster::node_lease::NodeLeaseObject::decode(&lease).map(|o| o.state),
         Some(wasmkeep_cluster::node_lease::NodeState::Released)
     );
-    // The read after the first write gets no answer: bounded by the lease's
-    // validity (it is not renewed meanwhile), then refused, the lease left
-    // `released`.
-    let slow = Arc::new(SlowNodeReads::default());
-    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
-    let why = a.identity().await.unwrap_err();
-    assert!(why.contains("no answer") && why.contains("floor"), "{why}");
-    let lease = slow
-        .inner
-        .get(&StorePath::from("nodes/a"))
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(
-        wasmkeep_cluster::node_lease::NodeLeaseObject::decode(&lease).map(|o| o.state),
-        Some(wasmkeep_cluster::node_lease::NodeState::Released)
-    );
     for body in [Some(floor::encode(this)), None] {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         if let Some(body) = body {
@@ -4026,6 +4005,83 @@ async fn a_floor_above_this_version_stops_the_start() {
         a.identity().await.unwrap();
         wait_lease_valid(&a).await;
     }
+}
+
+/// The floor read after the first lease write refuses only on an answer.
+/// With no answer (the floor's reads hang for 7 s, seven lease ttls), the
+/// node stays checking, keeps its lease renewed, and reads again: it
+/// starts once the bucket answers. After a first write whose answer was
+/// lost and adopted, the read is still made, and a floor written during
+/// the start check stops the node. A stop while the read waits releases
+/// the lease.
+#[tokio::test]
+async fn the_floor_read_after_the_first_write_waits_for_an_answer() {
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState};
+    let this = Minor::of_version(env!("CARGO_PKG_VERSION")).unwrap();
+    let key = StorePath::from(floor::key("", "t", "default"));
+    let above = Minor {
+        minor: this.minor + 1,
+        ..this
+    };
+    let lease_of = async |store: &SlowNodeReads| {
+        let got = store.inner.get(&StorePath::from("nodes/a")).await.ok()?;
+        NodeLeaseObject::decode(&got.bytes().await.unwrap())
+    };
+    // A 7 s blip of the floor's reads, from within the start check.
+    let slow = Arc::new(SlowNodeReads::default());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let first = lease_of(&slow).await.expect("the first write landed");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(*a.identity.borrow(), Identity::Checking, "not refused");
+    let later = lease_of(&slow).await.unwrap();
+    assert_eq!(later.state, NodeState::Live);
+    assert!(
+        later.written_at_ms > first.written_at_ms,
+        "renewed meanwhile"
+    );
+    *slow.hang.lock().unwrap() = None;
+    tokio::time::timeout(Duration::from_secs(5), a.identity())
+        .await
+        .unwrap()
+        .unwrap();
+    // The first write's answer is lost (it is adopted), and a floor above
+    // is written during the start check: still read, still refused.
+    let slow = Arc::new(SlowNodeReads::default());
+    *slow.lose_put_reply.lock().unwrap() = Some("nodes/a".to_owned());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    slow.inner
+        .put(&key, floor::encode(above).into())
+        .await
+        .unwrap();
+    let why = a.identity().await.unwrap_err();
+    assert!(why.contains(&above.to_string()), "{why}");
+    assert!(
+        slow.lose_put_reply.lock().unwrap().is_none(),
+        "the reply was lost"
+    );
+    assert_eq!(
+        lease_of(&slow).await.map(|o| o.state),
+        Some(NodeState::Released)
+    );
+    // A stop while the read waits: the lease is released.
+    let slow = Arc::new(SlowNodeReads::default());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
+    while lease_of(&slow).await.is_none() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(a.stop_node_lease(a.node_lease_stop_limit()).await);
+    assert_eq!(
+        lease_of(&slow).await.map(|o| o.state),
+        Some(NodeState::Released)
+    );
+    assert_eq!(*a.identity.borrow(), Identity::Checking);
 }
 
 /// ADR 0035, section 5: the app's format setting. Unreadable, it fails
@@ -5081,6 +5137,8 @@ struct SlowNodeReads {
     others_delay_ms: std::sync::atomic::AtomicU64,
     /// Reads of `nodes/` objects, counted.
     node_gets: std::sync::atomic::AtomicU64,
+    /// The next write of this key lands, and its answer is lost (once).
+    lose_put_reply: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Display for SlowNodeReads {
@@ -5097,7 +5155,16 @@ impl ObjectStore for SlowNodeReads {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
+        let put = self.inner.put_opts(location, payload, opts).await;
+        let mut lose = self.lose_put_reply.lock().unwrap();
+        if put.is_ok() && lose.as_deref() == Some(location.as_ref()) {
+            *lose = None;
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "reply lost".into(),
+            });
+        }
+        put
     }
 
     async fn put_multipart_opts(

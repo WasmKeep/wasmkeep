@@ -42,6 +42,7 @@ at the start of `serve`'s exit line, followed there by the details:
 | `a node of an older WasmKeep version runs in this cluster` | another node of a version from before node leases (stop every older node first) |
 | `this node's lease object holds something this version cannot read` | an unreadable object under this id |
 | `the bucket does not enforce conditional writes` | the bucket check at start failed |
+| `the app's upgrade floor is above this node's version, or unreadable` | the app's upgrade floor (`formats/<tenant>/<app>/floor`, written by a finalized upgrade) names a newer minor version than this binary, or cannot be read; the node does not start |
 
 Point load balancers at `/_wasmkeep/ready`, and use `/_wasmkeep/health` for
 "restart it if it stops answering".
@@ -273,6 +274,7 @@ its first request.
 | `wasmkeep_front_slots_in_use` | gauge | Front requests running now, out of `--max-front-requests`. |
 | `wasmkeep_front_calls_total{tenant,app,outcome}` | counter | `actors.call` from the front, by `outcome`: `ok` (the callee answered, whatever its status), `busy` (a quarter of the front's slots already waited on that actor: `failed("front busy: ...")`), `timeout` (5 s of the front's wall were left, or the actors' call limit passed) and `failed` (every other error: an invalid address, a callee that failed or was overloaded, a body too large). A call to another node is also counted in `wasmkeep_forwards_total{kind="call"}`. |
 | `wasmkeep_alarm_admission_retries_total` | counter | Alarm deliveries rescheduled because resident capacity or an actor queue was full; no actor labels. |
+| `wasmkeep_lease_reads_behind_total`, `wasmkeep_lease_reads_stale_total`, `wasmkeep_lease_reads_unpinned_total` | counters | Reads of a node's lease, made to judge an actor's ownership record, that returned a body older than one this process read before (a stale replica or cache), and were read again; judgements where all three reads were such a body, refused for now (the request is answered as unavailable); and bodies a process held as newest that no read confirmed for ttl plus grace, replaced by the older one read (a clock that ran ahead or stepped back) ([ADR 0020](adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)). Each is logged at most every 10 s. A steady rise of the first two means the bucket serves stale reads. |
 | `wasmkeep_node_lease_writes_total`, `wasmkeep_node_lease_failures_total` | counters | Writes of this node's lease (its heartbeat, [ADR 0020](adr/0020-one-lease-per-node.md)) that reached the bucket, and that failed or timed out. With the defaults (a write every 3 s, valid for 8 s), two failing in a row and the lease runs out: the node reports not ready. A write that hangs is counted when it times out (2.7 s), so alert on the first increment. |
 | `wasmkeep_node_fences_total` | counter | Fences this node wrote over a node that stopped renewing its lease (crashed, or cut off from the bucket). |
 | `wasmkeep_node_hellos_total` | counter | Signed hellos from peers that just started; each makes this node list `nodes/` at once (at most one early listing per heartbeat period). |

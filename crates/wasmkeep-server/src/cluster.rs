@@ -1835,6 +1835,9 @@ impl Cluster {
             }
             Identity::Taken(stopped, _) => return Some(stopped.words()),
             Identity::Refused(_) => return Some("the bucket does not enforce conditional writes"),
+            Identity::BelowFloor(_) => {
+                return Some("the app's upgrade floor is above this node's version, or unreadable");
+            }
             Identity::Unique => {}
         }
         if !self.multi_app_missing().is_empty() {

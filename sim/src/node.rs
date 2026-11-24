@@ -24,7 +24,7 @@ use wasmkeep_cluster::holds::{self, Parked, PendingEntry, Validity};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
     AcquireError, Fence, FenceWatch, Hold, NewestReads, NodeLease, NodeLeaseError, NodeLeaseObject,
-    NodeState, Owners, Released, fence,
+    NodeState, Owners, ReadFault, Released, fence,
 };
 
 use crate::driver::Env;
@@ -95,10 +95,10 @@ pub struct Breaks {
     /// validity: with [`Self::release_before_stop`], a hold an event gives
     /// up after a lapse acts until its release is answered.
     pub act_on_cell_only: bool,
-    /// The ownership records are judged on every node lease body as read,
-    /// even one older than a body of that lease this process read before
-    /// (ADR 0020 before its amendment on lease reads).
-    pub trust_stale_reads: bool,
+    /// A fault in the process's newest lease reads (ADR 0020, amendment
+    /// on lease reads): off (every body judged as read, the rule before),
+    /// the read back judging as read, or an exhausted read judged anyway.
+    pub read_fault: ReadFault,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -250,11 +250,7 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         };
         // One table of newest lease reads for the process, as the server's
         // transport holds one for all its apps.
-        let reads = Arc::new(if setup.breaks.trust_stale_reads {
-            NewestReads::off()
-        } else {
-            NewestReads::new()
-        });
+        let reads = Arc::new(NewestReads::with_fault(setup.breaks.read_fault));
         let owners = |b| {
             Owners::new(b, clock, &setup.id, instance, &setup.nodes_prefix, cfg)
                 .with_unresolved_wait_ms(wait)
