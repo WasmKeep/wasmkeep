@@ -70,7 +70,10 @@ impl ActorState {
         self.finish_event(trapped).await;
         match run {
             Ok(Ok(accepted)) => Ok(accepted),
-            Ok(Err(trap)) => Err(format!("on-websocket-open trapped: {trap:#}")),
+            Ok(Err(trap)) => {
+                super::state::log_table_full(&self.app_name, &self.address, "websocket", &trap);
+                Err(format!("on-websocket-open trapped: {trap:#}"))
+            }
             Err(cut) => Err(format!("on-websocket-open {cut}")),
         }
     }
@@ -95,6 +98,9 @@ impl ActorState {
                 .call_on_websocket_message(&mut live.store, conn, &msg),
         )
         .await;
+        if let Ok(Err(trap)) = &run {
+            super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
+        }
         self.ws_done(matches!(run, Ok(Ok(())))).await;
     }
 
@@ -117,6 +123,9 @@ impl ActorState {
                 .call_on_websocket_close(&mut live.store, conn, code, &reason),
         )
         .await;
+        if let Ok(Err(trap)) = &run {
+            super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
+        }
         self.ws_done(matches!(run, Ok(Ok(())))).await;
     }
 

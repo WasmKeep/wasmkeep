@@ -174,3 +174,62 @@ async fn guest_held_resources_and_header_size_are_capped() {
     // Other actors on the node were never affected.
     assert_eq!(sql(addr, "g", "", "SELECT 1").await, "ok:1");
 }
+
+/// What this test process logged.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An actor that traps on its full resource table gets a log line of its
+/// own, as the front does; any other trap does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_resource_table_is_logged_apart_from_other_traps() {
+    // Each test runs in its own process (nextest): the subscriber is this
+    // test's alone.
+    let captured = Captured::default();
+    let writer = captured.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter("wasmkeep_server=warn")
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .init();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let text = || String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    let full = "as many host resources as a store allows";
+
+    let path = format!(
+        "/fields?n=1&bytes={}",
+        wasmkeep_server::MAX_GUEST_FIELDS_BYTES
+    );
+    assert_eq!(post(addr, "f", &path).await.0, 500);
+    assert!(text().contains("guest trapped"), "{}", text());
+    assert!(!text().contains(full), "{}", text());
+
+    let over = wasmkeep_server::MAX_GUEST_RESOURCES + 1;
+    assert_eq!(
+        post(addr, "f", &format!("/fields?n={over}&bytes=16"))
+            .await
+            .0,
+        500
+    );
+    let line = text()
+        .lines()
+        .find(|l| l.contains(full))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no table-full line in {}", text()));
+    assert!(
+        line.contains("event=\"fetch\"") || line.contains("event=fetch"),
+        "{line}"
+    );
+    assert!(line.contains("actor="), "{line}");
+}

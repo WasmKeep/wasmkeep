@@ -102,8 +102,8 @@ impl ActorState {
             return HandOver::Busy;
         }
         if !self.held.as_ref().is_some_and(Held::is_valid) {
-            // A lapsed hold: dropped (released), nothing to hand.
-            self.drop_hold(Dropped::Lapse);
+            // A lapsed or lost hold: dropped (released), nothing to hand.
+            self.drop_hold(self.invalid_hold_reason());
             return HandOver::NotHeld;
         }
         // A batched hold flushes first, within 20 s from the job's start

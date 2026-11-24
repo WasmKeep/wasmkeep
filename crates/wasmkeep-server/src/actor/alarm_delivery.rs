@@ -301,7 +301,10 @@ impl ActorState {
             other => {
                 let reason = match other {
                     Ok(Ok(Err(msg))) => format!("on-alarm returned an error: {msg}"),
-                    Ok(Err(trap)) => format!("on-alarm trapped: {trap:#}"),
+                    Ok(Err(trap)) => {
+                        super::state::log_table_full(&self.app_name, &self.address, "alarm", &trap);
+                        format!("on-alarm trapped: {trap:#}")
+                    }
                     Err(cut) => format!("on-alarm {cut}"),
                     Ok(Ok(Ok(()))) => unreachable!("handled above"),
                 };
