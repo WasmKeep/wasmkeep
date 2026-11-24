@@ -1,47 +1,84 @@
 #!/usr/bin/env bash
-# The mixed-version test (a release-candidate step, docs/releasing.md):
+# The mixed-version check (a gate before tagging a release, docs/releasing.md):
 # three nodes on this machine, against moto as the tutorials and the S3
-# suites run it, start on the published 0.7.0 binary, then move one node at
-# a time to the binary built from this checkout (drain, stop, swap, start,
-# wait for ready and `cluster status`), and finally move one node back to
-# 0.7.0. After each step it checks, through every node: the durable counter
-# keeps every acknowledged write, `actors.call` works between every pair of
-# nodes (and so between versions, both ways), alarms armed before the step
-# fire once, secrets and env files are readable, and WebSocket room clients
-# receive every acknowledged publish, live or after catching up. It also
-# probes what 0.8 changed: the signature start floor (#266), request head
-# and call limits on hops (#268), the placement of a room and its pusher
-# and its refusal header (#261, #265), the pusher's stored idle position
-# read by a room built with the 0.7.0 SDK (#274), databases written by 0.7
-# opened by 0.8 (#263) and the env file mode rule (#270).
+# suites run it, start on a published release (OLD_VERSION, v0.8.0 by
+# default), then move one node at a time to the binary built from this
+# checkout (drain, stop, swap, start, wait for ready and `cluster status`),
+# and finally move one node back to the old release. After each step it
+# checks, through every node: the durable counter keeps every acknowledged
+# write, `actors.call` works between every pair of nodes (and so between
+# versions, both ways), alarms armed before the step fire once, secrets and
+# env files are readable, WebSocket room clients receive every acknowledged
+# publish, live or after catching up, and both versions' `cluster status`
+# agree. While the cluster is mixed, both CLIs deploy and seal secrets.
 #
-# This is a test, not a supported procedure: WasmKeep supports nodes of one
-# version per cluster (docs/cluster.md, "Upgrading WasmKeep").
+# Four paths are checked as PASS or FAIL lines, each failing when its
+# precondition was not reached:
+# - the signature start floor: no client sees a failure from a node's
+#   start; the refusals for their date are counted (observational when
+#   none happen, see end_probe);
+# - the pusher's stored idle position: after the room and its pusher have
+#   both left memory, the first publish makes no client fetch the history,
+#   with this checkout's pusher, on a room built with each version's SDK;
+# - kept apart: a pusher woken on its room's node is sent on, and a placed
+#   wake-up's apart refusal is read by a node of the other version, both
+#   ways;
+# - a node of this checkout holding the room is drained while clients are
+#   connected, and every client keeps every acknowledged number.
+# It also probes request head and call limits on hops, databases written by
+# the old version and opened by the new one, and the env file mode rule.
+#
+# This is a test, not a supported procedure: whether a release can be
+# installed one node at a time is said on its upgrading page
+# (docs/cluster.md, "Upgrading WasmKeep").
 #
 # Needs gh (signed in), cargo with wasm32-wasip2, node (with a global
 # WebSocket, 22 or later), curl, jq, and uv (for uvx) or moto_server. It
-# downloads the 0.7.0 release once into target/mixed-version/cache/ and
-# checks its SHA-256 against the release's SHA256SUMS and the value pinned
-# below. Everything it writes stays under target/mixed-version/ (or
+# downloads the old release once into target/mixed-version/cache/ and checks
+# its SHA-256 against the release's SHA256SUMS and the value pinned below
+# (or given). Everything it writes stays under target/mixed-version/ (or
 # MIXED_VERSION_DIR); the run's data is removed at the end unless
 # MIXED_VERSION_KEEP=1. Nodes and moto are stopped by the PIDs this script
 # started, never by name.
 #
-# Exit status: 0 when every upgrade check passed; 1 otherwise. What the
-# downgrade step finds is reported (INFO lines) and never changes it.
+# Exit status: 0 when every check passed, the move back included; 1 when
+# one failed; 2 when the old version cannot be used (no pinned SHA-256).
 #
-# Usage: scripts/mixed-version.sh
+# Usage: scripts/mixed-version.sh [OLD_VERSION]
+#   OLD_VERSION (argument or variable, default v0.8.0): the release the
+#   nodes start on. A version without a SHA-256 pinned below is refused
+#   unless OLD_SHA256 gives the hash of its Linux x86_64 archive (from the
+#   release's SHA256SUMS).
 #   MIXED_VERSION_PORT_BASE (default 18100): client ports BASE+1..3,
 #   cluster ports BASE+11..13, metrics BASE+21..23, moto BASE+50, and
 #   BASE+60 for the env file probe.
+#   MIXED_VERSION_IDLE_SECS (default 15): the nodes' --idle-timeout-secs,
+#   short so that a room and its pusher leave memory within a minute.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 
-OLD_VERSION=v0.7.0
-OLD_ASSET=wasmkeep-0.7.0-x86_64-unknown-linux-gnu.tar.gz
-OLD_SHA256=3dda0dfebc23428fff34779515b83bae38327923ffb7755b7a3c97872e5b469b
+# The SHA-256 of each known release's wasmkeep-<v>-x86_64-unknown-linux-gnu.tar.gz,
+# as its SHA256SUMS asset lists it. Add the next release here.
+declare -A PINNED_SHA256=(
+  [v0.7.0]=3dda0dfebc23428fff34779515b83bae38327923ffb7755b7a3c97872e5b469b
+  [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
+)
+OLD_VERSION=${1:-${OLD_VERSION:-v0.8.0}}
+[[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }
+old_short=${OLD_VERSION#v}
+OLD_ASSET=wasmkeep-$old_short-x86_64-unknown-linux-gnu.tar.gz
+OLD_SHA256=${OLD_SHA256:-${PINNED_SHA256[$OLD_VERSION]:-}}
+if [ -z "$OLD_SHA256" ]; then
+  echo "no SHA-256 pinned for $OLD_VERSION: add it to PINNED_SHA256, or give" \
+    "OLD_SHA256=<the hash of $OLD_ASSET from the release's SHA256SUMS>" >&2
+  exit 2
+fi
+# Whether VERSION is older than 0.8.0, which first refused an env file
+# its group can read.
+before_080() { [ "$(printf '%s\n0.8.0\n' "$1" | sort -V | head -1)" != 0.8.0 ]; }
 MOTO_VERSION=5.2.5
+idle_secs=${MIXED_VERSION_IDLE_SECS:-15}
 APP=mv/test
 BUCKET=s3://mixed-version
 NODES=(a b c)
@@ -51,7 +88,7 @@ cache=$mv_dir/cache
 run=$mv_dir/run
 started_at=$SECONDS
 
-[ "$(uname -sm)" = "Linux x86_64" ] || { echo "the 0.7.0 binary used here is for Linux x86_64" >&2; exit 1; }
+[ "$(uname -sm)" = "Linux x86_64" ] || { echo "the $old_short binary used here is for Linux x86_64" >&2; exit 1; }
 for tool in gh cargo node curl jq; do
   command -v "$tool" >/dev/null || { echo "needs $tool" >&2; exit 1; }
 done
@@ -72,12 +109,20 @@ done
 report=$mv_dir/report.txt
 fails=0
 phase=upgrade
+# Per step, in order: its phase, checks passed and failed, and its time.
+steps=()
+declare -A step_phase step_pass step_fail step_t0 step_secs
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$report"; }
-pass() { log "PASS [$step] $*"; }
+pass() { log "PASS [$step] $*"; step_pass[$step]=$(( ${step_pass[$step]:-0} + 1 )); }
 note() { log "NOTE [$step] $*"; }
+# Every phase counts, the move back included.
 fail() {
-  if [ "$phase" = downgrade ]; then log "INFO [$step] (downgrade) $*"
-  else log "FAIL [$step] $*"; fails=$((fails + 1)); fi
+  log "FAIL [$step] $*"; fails=$((fails + 1))
+  step_fail[$step]=$(( ${step_fail[$step]:-0} + 1 ))
+}
+begin() { # begin STEP: the steps that follow are counted under it
+  [ -z "${step:-}" ] || step_secs[$step]=$(( SECONDS - ${step_t0[$step]:-$SECONDS} ))
+  step=$1; steps+=("$1"); step_phase[$1]=$phase; step_t0[$1]=$SECONDS
 }
 step=setup
 
@@ -92,18 +137,22 @@ if [ ! -x "$old_bin" ]; then
   echo "$OLD_SHA256  $old_dir/$OLD_ASSET" | sha256sum --strict -c -
   tar -xzf "$old_dir/$OLD_ASSET" -C "$old_dir"
 fi
+# Checked on every run, a cached archive included: the pin is the gate's.
+echo "$OLD_SHA256  $old_dir/$OLD_ASSET" | sha256sum --strict --quiet -c - \
+  || { echo "$old_dir/$OLD_ASSET does not match the pinned SHA-256" >&2; exit 2; }
 cargo build --release --locked -p wasmkeep-cli
 new_bin=$root/target/release/wasmkeep
 old_label=$("$old_bin" --version | cut -d' ' -f2)
 new_label=$("$new_bin" --version | cut -d' ' -f2)
 [ "$old_label" != "$new_label" ] || { echo "both binaries report $old_label" >&2; exit 1; }
-label() { if [ "$1" = "$old_bin" ]; then echo "0.7.0"; else echo "main"; fi; }
+label() { if [ "$1" = "$old_bin" ]; then echo "$old_short"; else echo "new"; fi; }
 
 # ---------------------------------------------------------------- guests
-# The app as built for 0.7.0: the room classes and the front from the
-# v0.7.0 tree (the 0.7.0 SDK); test-actor from this checkout (the WIT is
-# unchanged since 0.7.0, and its probes are newer). The pusher is later
-# redeployed from this checkout's SDK alone, against the 0.7.0 room (#274).
+# The app as built for the old release: the room classes and the front
+# from its tree (its SDK); test-actor from this checkout (its WIT must not
+# have changed since, and its probes are newer). The pusher is later
+# redeployed from this checkout's SDK alone, against the old room, and then
+# every room class from this checkout's SDK.
 # Outside this checkout: inside it, the old crates would inherit this
 # workspace's version (version.workspace) instead of their own.
 old_src=${MIXED_VERSION_OLD_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/wasmkeep-mixed-version/src-$OLD_VERSION}
@@ -137,10 +186,10 @@ test_actor=$root/crates/wasmkeep-server/tests/guests/test-actor/$rel/test_actor.
 # ---------------------------------------------------------------- the run
 rm -rf "$run"; mkdir -p "$run"; chmod 700 "$run"
 : > "$report"
-moto_pid=; clients_pid=; probe_pid=; bg_pid=
+moto_pid=; clients_pid=; small_pid=; probe_pid=; bg_pid=
 cleanup() {
   local n
-  for p in $probe_pid $bg_pid $clients_pid; do kill "$p" 2>/dev/null || true; done
+  for p in $probe_pid $bg_pid $clients_pid $small_pid; do kill "$p" 2>/dev/null || true; done
   for n in "${NODES[@]}"; do
     [ -z "${pid[$n]:-}" ] || kill -9 "${pid[$n]}" 2>/dev/null || true
   done
@@ -180,18 +229,29 @@ mkdir -m 700 "$run/etc"
 old() { "$old_bin" "$@"; }
 new() { "$new_bin" "$@"; }
 
+# Node b has a smaller instance pool (180 resident actors, the rest the
+# front's), so that a few dozen wake-ups put it past placement's floor (a
+# fifth of its capacity): the apart refusal needs a sender that places.
+declare -A extra=([a]="" [b]="--max-instances 200" [c]="")
 start_node() { # start_node ID BINARY
   local n=$1 b=$2
   mkdir -p "$run/$n/data" "$run/$n/cache"; chmod 700 "$run/$n" "$run/$n/data" "$run/$n/cache"
   echo "=== $(date -u +%T) start $(label "$b") ($("$b" --version))" >> "$run/$n.log"
+  # shellcheck disable=SC2086 # extra holds whole flags
   "$b" serve --app "$APP" --bucket "$BUCKET" --node-id "$n" \
     --data-dir "$run/$n/data" --cache-dir "$run/$n/cache" \
     --listen "127.0.0.1:${port[$n]}" --advertise "http://127.0.0.1:${port[$n]}" \
     --cluster-listen "127.0.0.1:${cport[$n]}" --cluster-advertise "https://127.0.0.1:${cport[$n]}" \
-    --metrics-listen "127.0.0.1:${mport[$n]}" \
+    --metrics-listen "127.0.0.1:${mport[$n]}" --idle-timeout-secs "$idle_secs" ${extra[$n]} \
     --env "t=$run/etc/t.env" --secrets-key "$run/etc/secrets.key" \
     >> "$run/$n.log" 2>&1 &
   pid[$n]=$!; bin[$n]=$b
+}
+# The sum of a node's metric NAME over the series whose labels contain
+# MATCH (all of them without it).
+metric() { # metric ID NAME [MATCH]
+  curl -s -m 5 "http://127.0.0.1:${mport[$1]}/metrics" 2>/dev/null | awk -v n="$2" -v m="${3:-}" '
+    { split($1, f, "{") } f[1] == n && index($1, m) { s += $NF } END { printf "%d\n", s + 0 }'
 }
 wait_ready() { # wait_ready ID SECS
   local n=$1 deadline=$((SECONDS + ${2:-90}))
@@ -257,9 +317,9 @@ retries() { # the answers retried in this step, counted by status
   [ -s "$run/retries-$step.txt" ] || return 0
   note "retried: $(awk '{ print $7 }' "$run/retries-$step.txt" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')(first: $(head -1 "$run/retries-$step.txt" | cut -c1-160))"
 }
-holder() { # holder CLASS/NAME: the node owning it, or -
+holder() { # holder CLASS/NAME: the node owning it, - for none, ? when unknown
   new actor where --app "$APP" --bucket "$BUCKET" --json "$1" 2>/dev/null \
-    | jq -r '.[0].owner // "-"' 2>/dev/null || echo -
+    | jq -r '.[0].owner // "-"' 2>/dev/null || echo "?"
 }
 # Have node N hold test-actor NAME: an actor move, checked through the
 # answer header of a read.
@@ -280,35 +340,35 @@ pin() { pin_actor "at-$1" "$1"; }
 ctr=0             # the shared durable counter's acknowledged value
 declare -A fired  # alarms armed: actor -> fired count expected
 published=0       # the room's highest acknowledged number
-secret2=0         # 1 once main's CLI has sealed MV_SECRET2
+declare -A sealed # secrets sealed during the run: name -> "value|which CLI"
 
+# `cluster status` from both CLIs: three live, each node serving on the
+# version it runs.
 check_status() {
-  local out
-  out=$(new cluster status --bucket "$BUCKET" 2>&1 || true)
-  printf '%s\n' "$out" > "$run/status-$step.txt"
-  old cluster status --bucket "$BUCKET" > "$run/status-old-cli-$step.txt" 2>&1 || true
-  local live
-  live=$(printf '%s\n' "$out" | grep -Eo '^[0-9]+ of [0-9]+ nodes live' || true)
-  if [ "$live" = "3 of 3 nodes live" ]; then pass "cluster status: $live"
-  else fail "cluster status: '${live:-no summary}'"; fi
-  for n in "${NODES[@]}"; do
-    local line v
-    line=$(printf '%s\n' "$out" | awk -v n="$n" '$1 == n')
-    # The VERSION column, by the header (live rows only: LIVE is one word).
-    v=$(printf '%s\n' "$out" | awk -v n="$n" '
-      $1 == "NODE" { for (i = 1; i <= NF; i++) if ($i == "VERSION") col = i }
-      col && $1 == n && $2 == "yes" { print $col }')
-    local want; if [ "${bin[$n]}" = "$old_bin" ]; then want=$old_label; else want=$new_label; fi
-    if [ "$v" = "$want" ] && printf '%s\n' "$line" | grep -q ' serving '; then
-      pass "status: $n serving $(label "${bin[$n]}") ($v)"
-    else fail "status: $n: '$line' (want serving $want)"; fi
+  local cli out
+  for cli in new old; do
+    out=$("$cli" cluster status --bucket "$BUCKET" 2>&1 || true)
+    printf '%s\n' "$out" > "$run/status-$cli-cli-$step.txt"
+    local live who
+    who="$( [ $cli = new ] && echo "new CLI" || echo "$old_short CLI")"
+    live=$(printf '%s\n' "$out" | grep -Eo '^[0-9]+ of [0-9]+ nodes live' || true)
+    if [ "$live" = "3 of 3 nodes live" ]; then pass "cluster status ($who): $live"
+    else fail "cluster status ($who): '${live:-no summary}'"; fi
+    for n in "${NODES[@]}"; do
+      local line v
+      line=$(printf '%s\n' "$out" | awk -v n="$n" '$1 == n')
+      # The VERSION column, by the header (live rows only: LIVE is one word).
+      v=$(printf '%s\n' "$out" | awk -v n="$n" '
+        $1 == "NODE" { for (i = 1; i <= NF; i++) if ($i == "VERSION") col = i }
+        col && $1 == n && $2 == "yes" { print $col }')
+      local want; if [ "${bin[$n]}" = "$old_bin" ]; then want=$old_label; else want=$new_label; fi
+      if [ "$v" = "$want" ] && printf '%s\n' "$line" | grep -q ' serving '; then
+        pass "status ($who): $n serving $(label "${bin[$n]}") ($v)"
+      else fail "status ($who): $n: '$line' (want serving $want)"; fi
+    done
+    local warn; warn=$(printf '%s\n' "$out" | grep -i 'warn\|different' | tr '\n' ' ' || true)
+    [ -z "$warn" ] || note "status warnings ($who): $warn"
   done
-  local warn; warn=$(printf '%s\n' "$out" | grep -i 'warn\|different' | tr '\n' ' ' || true)
-  [ -z "$warn" ] || note "status warnings: $warn"
-  if ! diff -q <(sed 's/[0-9.]*m\?s / /g' "$run/status-$step.txt" | awk '{print $1, $2}') \
-       <(sed 's/[0-9.]*m\?s / /g' "$run/status-old-cli-$step.txt" | awk '{print $1, $2}') >/dev/null; then
-    note "the 0.7.0 CLI's status differs: $(head -c 400 "$run/status-old-cli-$step.txt" | tr '\n' ' ')"
-  fi
 }
 
 check_counter() {
@@ -349,8 +409,8 @@ check_calls() {
   local olds=0 news=0
   for n in "${NODES[@]}"; do if [ "${bin[$n]}" = "$old_bin" ]; then olds=1; else news=1; fi; done
   if [ $olds = 1 ] && [ $news = 1 ]; then
-    if [ $seen_old_new = 1 ]; then pass "actors.call 0.7.0 -> main exercised"; else fail "no successful 0.7.0 -> main call"; fi
-    if [ $seen_new_old = 1 ]; then pass "actors.call main -> 0.7.0 exercised"; else fail "no successful main -> 0.7.0 call"; fi
+    if [ $seen_old_new = 1 ]; then pass "actors.call $old_short -> new exercised"; else fail "no successful $old_short -> new call"; fi
+    if [ $seen_new_old = 1 ]; then pass "actors.call new -> $old_short exercised"; else fail "no successful new -> $old_short call"; fi
   fi
 }
 
@@ -366,15 +426,29 @@ check_secrets() {
   done
 }
 
-check_secret2() { # the secret main's CLI sealed, on every node
-  local n
-  for n in "${NODES[@]}"; do
-    req_retry 20 GET "$n" "/actor/t/at-$n/env?name=MV_SECRET2"
-    if [ "$RS" = 200 ] && [ "$RB" = "main-sealed wasi=unset" ]; then
-      pass "secret sealed by main's CLI via $n ($(label "${bin[$n]}")) on ${RNODE}"
-    else fail "secret sealed by main's CLI via $n ($(label "${bin[$n]}")) on '${RNODE}': $RS '$RB'"; fi
+check_sealed() { # every secret sealed during the run, on every node
+  local n name
+  for name in "${!sealed[@]}"; do
+    local want=${sealed[$name]%%|*} who=${sealed[$name]#*|}
+    for n in "${NODES[@]}"; do
+      req_retry 20 GET "$n" "/actor/t/at-$n/env?name=$name"
+      if [ "$RS" = 200 ] && [ "$RB" = "$want wasi=unset" ]; then
+        pass "$name sealed by the $who CLI, via $n ($(label "${bin[$n]}")) on ${RNODE}"
+      else fail "$name sealed by the $who CLI, via $n ($(label "${bin[$n]}")) on '${RNODE}': $RS '$RB'"; fi
+    done
   done
 }
+# A secret for class t sealed by CLI (old or new); read on every node by
+# every later check_all.
+seal() { # seal CLI NAME VALUE
+  local who; if [ "$1" = old ]; then who=$old_short; else who=new; fi
+  if printf '%s\n' "$3" | "$1" secrets set --app "$APP" --bucket "$BUCKET" \
+    --key "$run/etc/secrets.key" --class t "$2" > "$run/secrets-$2.txt" 2>&1; then
+    pass "$who CLI secrets set $2 on a cluster of $(versions)"; sealed[$2]="$3|$who"
+  else fail "$who CLI secrets set $2: $(tr '\n' ' ' < "$run/secrets-$2.txt")"; fi
+}
+# The versions the live nodes run, as "0.8.0, new, new".
+versions() { local n vs=(); for n in "${NODES[@]}"; do vs+=("$(label "${bin[$n]}")"); done; local IFS=,; echo "${vs[*]}"; }
 
 # Alarms armed on actors held by each node (moved there, and armed through
 # that node, which must answer), one to fire during the next hand-over and
@@ -409,7 +483,7 @@ check_alarms() { # check_alarms [WAIT_SECS]
   done
 }
 
-client_state() { cat "$run/clients"/*.json 2>/dev/null | jq -s '.' 2>/dev/null; }
+client_state() { cat "${1:-$run/clients}"/*.json 2>/dev/null | jq -s '.' 2>/dev/null; }
 pubs=0            # publishes sent, for their ids (the room dedupes by id)
 publish() { # publish K messages, through each node in turn
   local k
@@ -422,7 +496,7 @@ publish() { # publish K messages, through each node in turn
     else fail "room publish mv-$pubs via $n: $RS '$RB' (last acknowledged $published)"; fi
   done
 }
-# What placement did on the main nodes (#261, #265): apart and spread
+# What placement did on the new nodes: apart and spread
 # wake-ups, and placed wake-ups received (refused ones included).
 check_placement() {
   local n
@@ -468,7 +542,7 @@ check_all() {
   check_counter
   check_calls
   check_secrets
-  [ "$secret2" = 0 ] || check_secret2
+  check_sealed
   publish 3
   check_room "live"
   check_apart
@@ -504,10 +578,21 @@ end_probe() {
   bad=$(grep -v ': 200 on' "$out" || true)
   local total; total=$(wc -l < "$out")
   local placed; placed=$(grep -c ": 200 on $1\$" "$out" || true)
-  if [ -z "$bad" ]; then pass "start probe: $total wake-ups through peers all 200 ($placed ran on $1)"
-  else fail "start probe: $(printf '%s\n' "$bad" | wc -l) of $total not 200: $(printf '%s\n' "$bad" | head -5 | tr '\n' '|')"; fi
-  local floor; floor=$(curl -s "http://127.0.0.1:${mport[$1]}/metrics" 2>/dev/null | grep '^wasmkeep_signatures_before_start_total' || true)
-  [ -z "$floor" ] || note "node $1: $floor"
+  if [ -z "$bad" ]; then pass "start floor: no client failure: $total wake-ups through peers all 200 ($placed ran on $1)"
+  else fail "start floor: $(printf '%s\n' "$bad" | wc -l) of $total wake-ups not 200: $(printf '%s\n' "$bad" | head -5 | tr '\n' '|')"; fi
+  # Calls refused on the started node as signed before its start. The
+  # floor is the start plus the clock skew nodes allow each other (1 s,
+  # not a setting), and peers send a node calls only once its heartbeat
+  # is live, many seconds after its start: on one machine's clock, no call
+  # normally lands in that window. Counted when it happens (with no client
+  # failure, above, it is the floor working); a note when it does not.
+  local floor; floor=$(metric "$1" wasmkeep_signatures_before_start_total)
+  if [ "$floor" -gt 0 ]; then
+    if [ -z "$bad" ]; then pass "start floor: $floor calls refused on $1 for their date, none seen by a client"
+    else fail "start floor: $floor calls refused on $1 for their date, and clients saw failures (above)"; fi
+  else
+    note "start floor (observational): 0 calls refused on $1 for their date; the window (its start plus 1 s of skew) closes before peers call it"
+  fi
 }
 
 # Publishes through the other nodes, one a second, while node N is
@@ -568,12 +653,174 @@ swap() { # swap ID BINARY
   retries
 }
 
-# ---------------------------------------------------------------- 0. all 0.7.0
+# ---------------------------------------------------------------- the four paths
+# A check that is a gate when GATE is 1 (PASS or FAIL) and a control
+# otherwise (a NOTE either way).
+verdict() { # verdict GATE OK MESSAGE
+  if [ "$1" = 1 ]; then if [ "$2" = 1 ]; then pass "$3"; else fail "$3"; fi
+  else note "control ($( [ "$2" = 1 ] && echo met || echo not met )): $3"; fi
+}
+# Waits until neither ACTOR... is held (out of memory, its hold released):
+# 0 when so within SECS, else 1, with the holders in HELD.
+released() { # released SECS ACTOR...
+  local deadline=$((SECONDS + $1)) a h; shift
+  while :; do
+    HELD=""
+    for a in "$@"; do h=$(holder "$a"); [ "$h" = - ] || HELD="$HELD $a@$h"; done
+    [ -z "$HELD" ] && return 0
+    [ $SECONDS -lt $deadline ] || return 1
+    sleep 2
+  done
+}
+
+# The stored idle position. The room `small` keeps the pusher's default
+# idle period: once a burst is delivered its pusher keeps one alarm 5 s
+# later, then one a minute out while its group holds sockets. In between,
+# with nothing published, the room and the pusher leave memory after the
+# nodes' --idle-timeout-secs and release their holds. The first publish
+# then wakes both cold, and the pusher hands its edges the position it
+# stored: no client fetches the history. Three clients, one through each
+# node, in $run/clients-small.
+small_published=0
+small_publish() { # small_publish ID
+  pubs=$((pubs + 1))
+  req_retry 30 GET "$1" "/r6/publish?room=small&id=sm-$pubs"
+  if [ "$RS" = 200 ] && [[ $RB =~ ^[0-9]+$ ]] && [ "$RB" -gt "$small_published" ]; then small_published=$RB
+  else fail "room small: publish via $1: $RS '$RB' (last acknowledged $small_published)"; fi
+}
+small_missing() { # what the clients of `small` lack of 1..N, after at most 30 s
+  local deadline=$((SECONDS + 30)) missing
+  while :; do
+    missing=$(client_state "$run/clients-small" | jq -r --argjson h "$small_published" \
+      '[.[] | (([range(1; $h + 1)] - .have) as $m | select($m | length > 0) | "\(.id) lacks \($m | .[0:5] | map(tostring) | join(","))")] | join("; ")' \
+      || echo "no client state")
+    [ -z "$missing" ] && break
+    [ $SECONDS -lt $deadline ] || break
+    sleep 1
+  done
+  printf '%s' "$missing"
+}
+small_fetches() { client_state "$run/clients-small" | jq '[.[] | .fetches] | add // 0' 2>/dev/null || echo 0; }
+idle_check() { # idle_check GATE WHAT
+  local gate=$1 what=$2 t0 missing before after count
+  small_publish a; small_publish b; small_publish c
+  missing=$(small_missing)
+  if [ -n "$missing" ]; then verdict "$gate" 0 "idle position ($what): the burst before the quiet spell: $missing"; return; fi
+  t0=$SECONDS
+  if ! released 150 room/small pusher/small; then
+    verdict "$gate" 0 "idle position ($what): still held after $((SECONDS - t0)) s with nothing published:$HELD"
+    return
+  fi
+  note "idle position ($what): room/small and pusher/small out of memory $((SECONDS - t0)) s after the burst"
+  sleep 2 # one more save of every client's state
+  before=$(small_fetches)
+  small_publish b
+  missing=$(small_missing)
+  sleep 2
+  after=$(small_fetches)
+  count=$(client_state "$run/clients-small" | jq length 2>/dev/null || echo 0)
+  if [ -z "$missing" ] && [ "$count" -gt 0 ] && [ "$after" = "$before" ]; then
+    verdict "$gate" 1 "idle position ($what): the first publish after both left memory ($small_published) reached all $count clients with 0 history fetches"
+  else
+    verdict "$gate" 0 "idle position ($what): the first publish after both left memory ($small_published): $((after - before)) history fetches; ${missing:-every client holds 1..$small_published}"
+  fi
+}
+
+# Kept apart, sent on: room/big woken on R by a call from R's front, then
+# its pusher woken the same way on R. R holds the room, so it sends the
+# pusher's wake-up to a peer, which runs it.
+apart_sent() { # apart_sent R
+  local r=$1 before after h p rs rb
+  if ! released 90 room/big pusher/big; then fail "apart, sent on: room/big or pusher/big still held:$HELD"; return; fi
+  req_retry 20 GET "$r" "/r6/history?room=big&n=0"
+  h=$(holder room/big)
+  if [ "$h" != "$r" ]; then fail "apart, sent on: room/big woke on '$h', not $r ($RS '$RB')"; return; fi
+  before=$(metric "$r" wasmkeep_placement_apart_total 'outcome="sent"')
+  req_retry 20 GET "$r" "/r6/warm-pusher?room=big"; rs=$RS; rb=$RB
+  after=$(metric "$r" wasmkeep_placement_apart_total 'outcome="sent"')
+  p=$(holder pusher/big)
+  if [ "$rs" = 200 ] && [ "$after" -gt "$before" ] && [ "$p" != - ] && [ "$p" != "$r" ]; then
+    pass "apart, sent on: pusher/big woken on $r ($(label "${bin[$r]}")), which holds its room, ran on $p ($(label "${bin[$p]:-}")); sent $before -> $after"
+  else
+    fail "apart, sent on: warm-pusher via $r ($(label "${bin[$r]}")): $rs '$rb'; pusher/big on '$p'; $r's sent $before -> $after"
+  fi
+}
+
+# Kept apart, the refusal read: pusher/legacy's wake-up, a request from
+# outside through node b, past placement's floor, placed on R, which
+# holds room/legacy: R refuses it with the apart reason, and b, of the
+# other version, runs it here (the pusher's guest answers 403 to a caller
+# from outside). b's fill comes from calls of t/at-b, which are never
+# placed, so no peer is marked as having just taken one. Placement picks
+# the lighter of b's peers: when that is not R, the attempt is noted and
+# made again (the peer that took it is then left out for a few periods).
+apart_refused() { # apart_refused R
+  local r=$1 x=b attempt before after h p resident got=""
+  if [ "$(label "${bin[$r]}")" = "$(label "${bin[$x]}")" ]; then fail "apart, refusal: $x and $r run one version"; return; fi
+  pin b || return
+  for attempt in 1 2 3; do
+    if ! released 90 room/legacy pusher/legacy; then fail "apart, refusal: room/legacy or pusher/legacy still held:$HELD"; return; fi
+    req_retry 20 GET "$r" "/r6/history?room=legacy&n=0"
+    h=$(holder room/legacy)
+    if [ "$h" != "$r" ]; then note "apart, refusal (attempt $attempt): room/legacy woke on '$h', not $r"; continue; fi
+    seq 1 70 | xargs -P 8 -I{} curl -s -m 20 -o /dev/null -X POST \
+      "http://127.0.0.1:${port[$x]}/actor/t/at-b/call?to=t/fill-$step-$attempt-{}&path=%2Ffired"
+    resident=$(metric "$x" wasmkeep_actors_resident)
+    before=$(metric "$r" wasmkeep_placements_received_total 'outcome="apart"')
+    req GET "$x" /actor/pusher/legacy/outside
+    after=$(metric "$r" wasmkeep_placements_received_total 'outcome="apart"')
+    p=$(holder pusher/legacy)
+    got="$RS from '${RNODE}', pusher/legacy on '$p', $x resident $resident, $r's apart refusals $before -> $after"
+    if [ "$after" -gt "$before" ] && [ "$RNODE" = "$x" ] && [ "$RS" -lt 500 ] && [ "$p" = "$x" ]; then
+      pass "apart, refusal: placed on $r ($(label "${bin[$r]}")), refused as apart, read and run by $x ($(label "${bin[$x]}")): $got"
+      return
+    fi
+    note "apart, refusal (attempt $attempt): not refused by $r: $got"
+  done
+  fail "apart, refusal: no wake-up of pusher/legacy placed on $r in 3 attempts (last: $got)"
+}
+
+# A node of this checkout holding room/quiet drained, with every client
+# connected and publishes through the other nodes; then undrained.
+drain_room() { # drain_room ID
+  local n=$1 h p deadline
+  log "---- step $step: node $n ($(label "${bin[$n]}")) drained holding room/quiet"
+  # Its pusher elsewhere first, so the room may stay with n.
+  p=$(holder pusher/quiet)
+  if [ "$p" = "$n" ]; then
+    local other; for other in "${NODES[@]}"; do [ "$other" = "$n" ] || break; done
+    new actor move --app "$APP" --bucket "$BUCKET" pusher/quiet --to "$other" >/dev/null 2>&1 || true
+    sleep 3
+  fi
+  new actor move --app "$APP" --bucket "$BUCKET" room/quiet --to "$n" >/dev/null 2>&1 || true
+  deadline=$((SECONDS + 40))
+  while h=$(holder room/quiet); [ "$h" != "$n" ] && [ $SECONDS -lt $deadline ]; do
+    publish 1 # an event, so that the room wakes where the move asks
+    sleep 1
+  done
+  if [ "$h" != "$n" ]; then fail "drain with the room: room/quiet on '$h' after a move to $n"; return; fi
+  pass "drain with the room: room/quiet on $n (pusher/quiet on $(holder pusher/quiet))"
+  bg_pub_start "$n"
+  if ! new cluster drain "$n" --bucket "$BUCKET" >/dev/null; then fail "drain $n refused"; fi
+  wait_state "$n" drained 90 || true
+  h=$(holder room/quiet)
+  if [ "$h" != "$n" ] && [ "$h" != - ]; then pass "drain with the room: room/quiet handed to $h ($(label "${bin[$h]:-}"))"
+  else fail "drain with the room: room/quiet on '$h' once $n is drained"; fi
+  sleep 5 # publishes while drained
+  new cluster undrain "$n" --bucket "$BUCKET" >/dev/null 2>&1 || fail "undrain $n refused"
+  wait_state "$n" serving 60 || true
+  bg_pub_stop
+  publish 3
+  check_room "after $n drained holding the room"
+  retries
+}
+
+# ---------------------------------------------------------------- 0. all old
 # From here on a failed command is a check's to report, not a reason to stop.
 set +e
-step=deploy
-# The 0640 env file a 0.7.0 install may have (owned by the service user,
-# group-readable), the rule #270 added: main must refuse it, 0.7.0 starts.
+begin deploy
+# The 0640 env file an install may have (owned by the service user,
+# group-readable): 0.8.0 and later refuse it, older releases start.
 (umask 027; printf 'MV_ENV=x\n' > "$run/etc/t-0640.env"); chmod 640 "$run/etc/t-0640.env"
 mkdir -m 700 "$run/probe-env"
 envprobe() { # envprobe BINARY: the exit status within 5 s (124: still running)
@@ -587,64 +834,61 @@ envprobe() { # envprobe BINARY: the exit status within 5 s (124: still running)
   echo $rc
 }
 rc_old=$(envprobe "$old_bin"); rc_new=$(envprobe "$new_bin")
-if [ "$rc_old" = 124 ] && [ "$rc_new" != 124 ] && [ "$rc_new" != 0 ]; then
-  pass "env file 0640 owner-readable: 0.7.0 starts, main refuses (exit $rc_new: $(grep -i 'env' "$run/probe-env/main.log" | head -1 | cut -c1-200))"
+refuses() { [ "$1" != 124 ] && [ "$1" != 0 ]; }
+if before_080 "$old_short"; then old_ok() { [ "$rc_old" = 124 ]; }; old_want="starts"
+else old_ok() { refuses "$rc_old"; }; old_want="refuses"; fi
+if old_ok && refuses "$rc_new"; then
+  pass "env file 0640 owner-readable: $old_short $old_want (exit $rc_old), new refuses (exit $rc_new: $(grep -i 'env' "$run/probe-env/new.log" | head -1 | cut -c1-200))"
 else
-  fail "env file 0640: 0.7.0 exit '$rc_old', main exit '$rc_new' (want 124 then non-zero): $(tail -n 2 "$run/probe-env/main.log" | tr '\n' ' ')"
+  fail "env file 0640: $old_short exit '$rc_old' (want: $old_want), new exit '$rc_new' (want non-zero): $(tail -n 2 "$run/probe-env/new.log" | tr '\n' ' ')"
 fi
 
+# The pusher class is open to outside requests (its guest answers 403 to
+# them): the apart refusal needs a placed wake-up of it, and only a
+# request from outside is placed.
 old deploy --no-project --app "$APP" --bucket "$BUCKET" \
   --actor "t=$test_actor" \
   --actor "room=$old_room" --actor "pusher=$old_room" --actor "edge=$old_room" \
   --actor "directory=$old_room" --actor "relay=$old_room" --front "$old_front" \
-  --access room=internal --access pusher=internal --access edge=internal \
+  --access room=internal --access pusher=open --access edge=internal \
   --access directory=internal --access relay=internal --writes pusher=batched \
   > "$run/deploy-1.txt" 2>&1 || { cat "$run/deploy-1.txt"; exit 1; }
 printf 'sealed-value\n' | old secrets set --app "$APP" --bucket "$BUCKET" \
   --key "$run/etc/secrets.key" --class t MV_SECRET >/dev/null 2>&1 \
   || { echo "secrets set failed" >&2; exit 1; }
 
-step=start-0.7.0
+begin "start-$old_short"
 for n in "${NODES[@]}"; do start_node "$n" "$old_bin"; done
 for n in "${NODES[@]}"; do wait_ready "$n" 90 || { tail -n 20 "$run/$n.log"; exit 1; }; done
 wait_state a serving 30 || true
 
-mkdir -p "$run/clients"
+mkdir -p "$run/clients" "$run/clients-small"
 # Four clients through each node: twelve, past the test room's edge
-# capacity of five, so it splits into edges (#265 spreads them).
+# capacity of five, so it splits into edges, spread over the nodes.
 node scripts/mixed-version/room-clients.mjs "$run/clients" quiet 4 "${port[a]}" "${port[b]}" "${port[c]}" \
   > "$run/clients.log" 2>&1 &
 clients_pid=$!
+# One through each node in the room the idle position is checked on.
+node scripts/mixed-version/room-clients.mjs "$run/clients-small" small 1 "${port[a]}" "${port[b]}" "${port[c]}" \
+  > "$run/clients-small.log" 2>&1 &
+small_pid=$!
 sleep 8
 check_all
-# The call limits between two 0.7.0 nodes, to compare with the hop below.
+# The call limits between two old nodes, to compare with the hop below.
 for spec in "97 10" "120 10"; do
   read -r hn hv <<< "$spec"
   req_retry 10 POST b "/actor/t/at-b/call?to=t/at-c&path=%2Fdurable&hn=$hn&hv=$hv"
-  note "actors.call 0.7.0 -> 0.7.0 with $hn headers of $hv bytes: $RS '$RB'"
+  note "actors.call $old_short -> $old_short with $hn headers of $hv bytes: $RS '$RB'"
 done
 
-# The first publish after a quiet spell (#274), all of it 0.7.0: the
-# control for the same after main's pusher is deployed. Where the room and
-# pusher are just before the publish ("-": hibernated and released).
-quiet_publish() {
-  note "quiet: 40 s with no publish, so the room, pusher and edges can hibernate"
-  sleep 40
-  note "before the publish: room/quiet on $(holder room/quiet), pusher/quiet on $(holder pusher/quiet)"
-  local before after
-  before=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
-  publish 1
-  check_room "first publish after a quiet spell"
-  after=$(client_state | jq '[.[] | .fetches] | add' || echo 0)
-  note "history fetches for the first publish after a quiet spell, pusher $1: $((after - before))"
-}
-step=quiet-0.7.0
-quiet_publish "0.7.0 SDK"
+# The control: the old pusher and room on old nodes.
+begin "idle-$old_short"
+idle_check 0 "$old_short pusher, $old_short room, all $old_short"
 
-# A database written by 0.7.0 (#263), opened by main after the upgrade: a
-# table under the prefix 0.8 reserves (0.7.0 may refuse it already), a
+# A database written by the old version, opened by the new one after the
+# upgrade: a table under the reserved prefix (refused since 0.7.0), a
 # plain one, and one big enough that sorting it is a long statement.
-step=sqlite-0.7.0
+begin "sqlite-$old_short"
 big_sort="SELECT x FROM big ORDER BY x DESC LIMIT 1"
 for sql in "CREATE TABLE _wasmkeep_legacy (x INTEGER)" \
            "CREATE TABLE plain_t (x INTEGER)" "INSERT INTO plain_t VALUES (1)" \
@@ -652,91 +896,147 @@ for sql in "CREATE TABLE _wasmkeep_legacy (x INTEGER)" \
            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300000) INSERT INTO big SELECT randomblob(16) FROM c" \
            "$big_sort"; do
   req_retry 20 POST a /actor/t/sqlx/sql --data-binary "$sql"
-  note "0.7.0 sql '${sql:0:60}' on ${RNODE}: $RS $RB"
+  note "$old_short sql '${sql:0:60}' on ${RNODE}: $RS $RB"
 done
 
 # ---------------------------------------------------------------- 1..3 upgrade
 phase=upgrade
-step=upgrade-a; swap a "$new_bin" || exit 1
+begin upgrade-a; swap a "$new_bin" || exit 1
 
-# #274: the pusher from this checkout's SDK, every other room class from
-# 0.7.0's, deployed with main's CLI; then a quiet room left to hibernate.
-step=pusher-main-sdk
+# Both CLIs on the mixed cluster (a new; b, c old). The new CLI deploys the
+# pusher from this checkout's SDK, every other room class from the old
+# one's; the old CLI then deploys the same with a configuration for t.
+# Each seals a secret, read on every node by every later step.
+begin cli-skew
 if new deploy --no-project --app "$APP" --bucket "$BUCKET" \
   --actor "t=$test_actor" \
   --actor "room=$old_room" --actor "pusher=$new_room" --actor "edge=$old_room" \
   --actor "directory=$old_room" --actor "relay=$old_room" \
   > "$run/deploy-2.txt" 2>&1; then
-  pass "main CLI deploy on a mixed cluster: $(tail -n 1 "$run/deploy-2.txt")"
-else fail "main CLI deploy: $(tr '\n' ' ' < "$run/deploy-2.txt")"; fi
-# A secret sealed by main's CLI, read on every node, 0.7.0 ones included.
-if printf 'main-sealed\n' | new secrets set --app "$APP" --bucket "$BUCKET" \
-  --key "$run/etc/secrets.key" --class t MV_SECRET2 > "$run/secrets-2.txt" 2>&1; then secret2=1
-else fail "main CLI secrets set: $(tr '\n' ' ' < "$run/secrets-2.txt")"; fi
+  pass "new CLI deploy on a cluster of $(versions): $(tail -n 1 "$run/deploy-2.txt")"
+else fail "new CLI deploy: $(tr '\n' ' ' < "$run/deploy-2.txt")"; fi
+seal new MV_SECRET2 new-sealed
+printf 'MV_CONFIG=from-old-cli\n' > "$run/etc/t.config"
+if old deploy --no-project --app "$APP" --bucket "$BUCKET" \
+  --actor "t=$test_actor" \
+  --actor "room=$old_room" --actor "pusher=$new_room" --actor "edge=$old_room" \
+  --actor "directory=$old_room" --actor "relay=$old_room" --config "t=$run/etc/t.config" \
+  > "$run/deploy-3.txt" 2>&1; then
+  pass "$old_short CLI deploy on a cluster of $(versions): $(tail -n 1 "$run/deploy-3.txt")"
+else fail "$old_short CLI deploy: $(tr '\n' ' ' < "$run/deploy-3.txt")"; fi
+seal old MV_SECRET3 old-sealed
 sleep 8
-check_secret2
+for n in "${NODES[@]}"; do
+  req_retry 20 GET "$n" "/actor/t/at-$n/env?name=MV_CONFIG"
+  if [ "$RS" = 200 ] && [ "$RB" = "from-old-cli wasi=unset" ]; then
+    pass "configuration deployed by the $old_short CLI, via $n ($(label "${bin[$n]}")) on ${RNODE}"
+  else fail "configuration deployed by the $old_short CLI, via $n on '${RNODE}': $RS '$RB'"; fi
+done
+check_status
+check_sealed
 publish 2
-check_room "after the pusher redeploy"
-quiet_publish "main SDK"
+check_room "after both CLIs deployed"
 
-# #268: request heads and calls across a 0.7.0 -> main hop (t/at-a on a).
-step=limits
+begin idle-new-pusher-old-room
+idle_check 1 "new pusher, $old_short room, nodes $(versions)"
+
+# Request heads and calls across an old -> new hop (t/at-a on a).
+begin limits
 pin a || true; pin b || true
 hdrs() { local k; for k in $(seq 1 "$1"); do printf -- '-H\nx-mv-%03d: v\n' "$k"; done; }
 for count in 90 95 99; do
   mapfile -t h < <(hdrs "$count")
   req GET a /actor/t/at-a/durable "${h[@]}"; direct="$RS"
   req GET b /actor/t/at-a/durable "${h[@]}"; hop="$RS on ${RNODE}"
-  note "$count client headers to t/at-a (main): direct $direct, via b (0.7.0) $hop"
-  [ "${hop%% *}" = "$direct" ] || fail "$count headers: direct $direct but via 0.7.0 $hop"
+  note "$count client headers to t/at-a (new): direct $direct, via b ($old_short) $hop"
+  [ "${hop%% *}" = "$direct" ] || fail "$count headers: direct $direct but via $old_short $hop"
 done
 for spec in "97 10" "120 10" "60 1000"; do
   read -r hn hv <<< "$spec"
   req_retry 10 POST b "/actor/t/at-b/call?to=t/at-a&path=%2Fdurable&hn=$hn&hv=$hv"
-  note "actors.call 0.7.0 -> main with $hn headers of $hv bytes: $RS '$RB'"
+  note "actors.call $old_short -> new with $hn headers of $hv bytes: $RS '$RB'"
   req_retry 10 POST a "/actor/t/at-a/call?to=t/at-b&path=%2Fdurable&hn=$hn&hv=$hv"
-  note "actors.call main -> 0.7.0 with $hn headers of $hv bytes: $RS '$RB'"
+  note "actors.call new -> $old_short with $hn headers of $hv bytes: $RS '$RB'"
 done
 
-step=upgrade-b; swap b "$new_bin" || exit 1
-step=upgrade-c; swap c "$new_bin" || exit 1
+# Kept apart on the mixed cluster: sent on by the new node, and refused by
+# the new node to an old sender.
+begin apart-new-receives
+apart_sent a
+apart_refused a
+check_placement
 
-# #263: the 0.7.0 database, now on a main node.
-step=sqlite
+begin drain-new-with-room
+drain_room a
+
+begin upgrade-b; swap b "$new_bin" || exit 1
+
+# Every room class from this checkout's SDK (the front stays the old one).
+begin room-new-sdk
+if new deploy --no-project --app "$APP" --bucket "$BUCKET" \
+  --actor "t=$test_actor" \
+  --actor "room=$new_room" --actor "pusher=$new_room" --actor "edge=$new_room" \
+  --actor "directory=$new_room" --actor "relay=$new_room" \
+  > "$run/deploy-4.txt" 2>&1; then
+  pass "new CLI deploy of every room class on a cluster of $(versions): $(tail -n 1 "$run/deploy-4.txt")"
+else fail "new CLI deploy: $(tr '\n' ' ' < "$run/deploy-4.txt")"; fi
+sleep 8
+publish 2
+check_room "after the room classes' redeploy"
+begin idle-new-pusher-new-room
+idle_check 1 "new pusher, new room, nodes $(versions)"
+
+# Kept apart the other way: sent on by the old node, and refused by the
+# old node to a new sender (b).
+begin apart-old-receives
+apart_sent c
+apart_refused c
+check_placement
+
+begin upgrade-c; swap c "$new_bin" || exit 1
+
+# The old version's database, now on a new node.
+begin sqlite
 new actor move --app "$APP" --bucket "$BUCKET" t/sqlx --to b >/dev/null 2>&1 || true
 sleep 3
 for sql in "SELECT count(*) FROM plain_t" "INSERT INTO plain_t VALUES (2)" \
            "ALTER TABLE plain_t ADD COLUMN y INTEGER" "SELECT count(*) FROM big" "$big_sort"; do
   req_retry 20 POST b /actor/t/sqlx/sql --data-binary "$sql"
-  note "main sql '${sql:0:60}' on ${RNODE}: $RS $RB"
+  note "new sql '${sql:0:60}' on ${RNODE}: $RS $RB"
 done
 req_retry 20 POST b /actor/t/sqlx/sql --data-binary "SELECT count(*) FROM plain_t"
-if [ "$RS" = 200 ] && [[ $RB == ok:* ]]; then pass "0.7.0 database read and written on main"
-else fail "0.7.0 database on main: $RS $RB"; fi
+if [ "$RS" = 200 ] && [[ $RB == ok:* ]]; then pass "$old_short database read and written on new"
+else fail "$old_short database on new: $RS $RB"; fi
 
 upgrade_secs=$((SECONDS - started_at))
 
 # ---------------------------------------------------------------- downgrade
+# Gating like the rest: one node back to the old release.
 phase=downgrade
-step=downgrade-c; swap c "$old_bin"
+begin downgrade-c; swap c "$old_bin"
 
-step=end
+begin end
 # Every alarm armed in the run, read again: still exactly one run each.
 late=0
 for a in "${!every_alarm[@]}"; do
-  case $a in *downgrade*) phase=downgrade ;; *) phase=upgrade ;; esac
   req_retry 20 GET a "/actor/t/$a/attempts"
   if [ "$RS" != 200 ] || [ "$RB" != 1 ]; then
     fail "alarm $a (armed on ${every_alarm[$a]}) has run '$RB' times by the end"; late=$((late + 1))
   fi
 done
 [ "$late" -gt 0 ] || pass "every alarm armed (${#every_alarm[@]}) ran once by the end"
-kill "$clients_pid" 2>/dev/null || true; wait "$clients_pid" 2>/dev/null || true; clients_pid=
+for p in "$clients_pid" "$small_pid"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+clients_pid=; small_pid=
 # What the nodes warned about, by message, per node.
 for n in "${NODES[@]}"; do
   sed -nE 's/^[0-9T:.Z-]+ +(WARN|ERROR) +([^ ]+): ([^=]{1,90}).*/\1 \2: \3/p' "$run/$n.log" \
     | sort | uniq -c | sort -rn | head -8 | while read -r line; do note "node $n log: $line"; done
 done
-log "upgrade checks: $fails failed; upgrade part ${upgrade_secs}s, whole run $((SECONDS - started_at))s"
+step_secs[end]=$((SECONDS - step_t0[end]))
+log "---- by step (phase, step, passed, failed, seconds)"
+for s in "${steps[@]}"; do
+  log "$(printf '%-9s %-28s %4d %4d %5d' "${step_phase[$s]}" "$s" "${step_pass[$s]:-0}" "${step_fail[$s]:-0}" "${step_secs[$s]:-0}")"
+done
+log "$OLD_VERSION -> $new_label: $fails checks failed; upgrade part ${upgrade_secs}s, whole run $((SECONDS - started_at))s"
 log "report: $report; node logs: $run/<node>.log (kept with MIXED_VERSION_KEEP=1)"
 [ "$fails" -eq 0 ]

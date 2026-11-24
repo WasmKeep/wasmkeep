@@ -78,7 +78,8 @@ Actions) is split so that a pull request waits a minute or two, not ten:
   three nodes moved one at a time from the previous release to the
   candidate and one moved back
   ([the mixed-version check](docs/releasing.md#the-mixed-version-check)).
-  It is not part of CI or of `check.sh`.
+  It gates a patch release's tag. It runs on a workstation, alone, and is
+  not part of CI or of `check.sh`.
 - **A release** needs a passing run on its commit.
 
 ## Code rules

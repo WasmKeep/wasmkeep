@@ -40,7 +40,7 @@ slow-timeout = { period = "300s" }
 
 [[profile.default.overrides]]
 # The mixed-version check (scripts/mixed-version.sh, ignored and gated on
-# WASMKEEP_MIXED_VERSION): about seven minutes after the release build;
+# WASMKEEP_MIXED_VERSION): about eight minutes after the release build;
 # ended after half an hour, its trap then stopping the nodes it started.
 filter = 'binary(=mixed_version)'
 slow-timeout = { period = "300s", terminate-after = 6 }

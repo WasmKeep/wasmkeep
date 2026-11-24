@@ -32,7 +32,8 @@ registry.
    (`gh workflow run ci.yml --ref main`: tests on Linux x86_64, arm64 and
    macOS, the S3 suites, every language) and wait for it to pass. A push
    runs the fast jobs only. On a workstation, run the
-   [mixed-version check](#the-mixed-version-check) on that commit too.
+   [mixed-version check](#the-mixed-version-check) on that commit too: for
+   a patch release it is a gate, and the tag waits for it to exit 0.
 2. **Tag.** Two signed tags on that commit: `v<version>`, and
    `sdks/go/v<version>` for the Go module (`git tag -s`, with a signing key
    added to your GitHub account). `release.yml` first checks that
@@ -61,31 +62,56 @@ registry.
 
 ## The mixed-version check
 
-A release-candidate step, run by hand on a workstation, never in CI:
+A gate before tagging a patch release, and a step before any other. It runs
+on a workstation, alone (nothing heavy beside it: it times node starts and
+deliveries), and never in pull request CI or in `check.sh`:
 
 ```bash
-./scripts/mixed-version.sh
+./scripts/mixed-version.sh            # from the previous release, v0.8.0 by default
+./scripts/mixed-version.sh v0.7.0     # or OLD_VERSION=v0.7.0
 ```
 
-It starts three nodes of the previous release (downloaded with `gh` and
-checked against its `SHA256SUMS` and a SHA-256 pinned in the script) on a
-local moto bucket, deploys a test app with a room and its pusher, moves one
+It starts three nodes of the old release (downloaded with `gh` and checked
+against its `SHA256SUMS` and a SHA-256 pinned in the script) on a local
+moto bucket, deploys a test app with rooms and their pushers, moves one
 node at a time to the binary built from the checkout (drain, stop, swap,
-start, undrain), then moves one back. After each step it checks durable
-writes, `actors.call` between every pair of nodes, alarms, secrets, env
-files and WebSocket room delivery. It writes
-`target/mixed-version/report.txt` and exits with 1 if an upgrade check
-failed; what the move back finds is reported only. The same run as an
-ignored test: `WASMKEEP_MIXED_VERSION=1 cargo nextest run -p wasmkeep-cli
---test mixed_version --run-ignored only --no-capture`.
+start, undrain), then moves one back. A version without a pinned SHA-256
+is refused unless `OLD_SHA256` gives it.
 
-It tests what a cluster of mixed versions does; it does not make a rolling
-upgrade supported. The rule stays the one in
-[Upgrading WasmKeep](cluster.md#upgrading-wasmkeep): stop every node,
-upgrade them all, start them all, unless the release's upgrading page says
-otherwise. Read what the report notes before writing such a statement. For
-the next release, update the previous version and its SHA-256 at the top of
-the script.
+After each step it checks durable writes, `actors.call` between every pair
+of nodes, alarms, secrets, env files, WebSocket room delivery, and
+`cluster status` from both versions' CLIs. While the cluster is mixed, both
+CLIs run `deploy` and `secrets set`. Four paths have checks of their own,
+each failing when it could not be brought about:
+
+- **The start floor.** No client sees a failure from a node's start. The
+  calls the started node refuses as signed before its start are counted. On
+  one machine's clock, peers rarely call a node within its first second, so
+  the report notes when there were none.
+- **The stored idle position.** Once a room and its pusher have both left
+  memory, the first publish reaches every client with no history fetch.
+  This is checked with the checkout's pusher, on a room built with the old
+  SDK and then on one built with the new SDK.
+- **Kept apart.** A pusher woken on its room's node is sent on to a peer.
+  A placed wake-up refused as apart is read and run by a node of the other
+  version, in both directions.
+- **A drain with the room.** A node of the checkout holding the room is
+  drained with clients connected, and every client still holds every
+  acknowledged number.
+
+It writes `target/mixed-version/report.txt`, ending with a table of
+passes, failures and seconds for each step. It exits with 1 if any check
+failed, the move back included. The same run as an ignored test:
+`WASMKEEP_MIXED_VERSION=1 cargo nextest run -p wasmkeep-cli --test
+mixed_version --run-ignored only --no-capture`.
+
+A passing run does not by itself make a rolling upgrade supported. A
+release's upgrading page says whether it can be installed one node at a
+time, from this check's result. Without that statement the rule stays the
+one in [Upgrading WasmKeep](cluster.md#upgrading-wasmkeep): stop every
+node, upgrade them all, start them all. After a release, add its SHA-256
+to `PINNED_SHA256` at the top of the script and make it the default
+`OLD_VERSION`.
 
 ## If a run stops half-way
 
