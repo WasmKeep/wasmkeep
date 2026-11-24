@@ -109,9 +109,7 @@ pub(crate) fn run(mut project: Project, options: Options) -> anyhow::Result<()> 
     if let Some(assets) = &mut project.assets {
         assets.dir = assets.dir.canonicalize().context("assets directory")?;
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = wasmkeep_cli::serving_runtime()?;
     let _entered = rt.enter();
     let runtime = Runtime::new(&RuntimeConfig::default())?;
     let loaded = load(&runtime, &project)?;

@@ -43,7 +43,10 @@ fn verification_connection(path: &Path) -> Result<Connection, SqlError> {
     conn.authorizer(Some(|ctx: AuthContext<'_>| {
         verification_authorizer(ctx, &[])
     }))?;
-    let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE lower(substr(name,1,10)) = '_wasmkeep_' AND (type != 'table' OR upper(substr(sql,1,20)) = 'CREATE VIRTUAL TABLE'))", [], |r| r.get(0))?;
+    // A host table's name held by something else (a view squatting
+    // `_wasmkeep_meta`, say) is refused; a guest's own object with the
+    // prefix, possible before 0.8, is not the host's and is kept.
+    let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE lower(name) IN ('_wasmkeep_meta', '_wasmkeep_alarm') AND (type != 'table' OR upper(substr(sql,1,20)) = 'CREATE VIRTUAL TABLE'))", [], |r| r.get(0))?;
     if invalid {
         return Err(SqlError::new(
             SqlErrorKind::NotAllowed,
@@ -95,13 +98,30 @@ fn verification_authorizer(ctx: AuthContext<'_>, shadows: &[String]) -> Authoriz
     }
 }
 
+/// Seconds an offline connection runs before it is stopped.
+const DEADLINE_SECS: u64 = 5;
+
 fn limits(conn: &mut Connection) -> Result<(), SqlError> {
     use rusqlite::limits::Limit;
     conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1 << 20)?;
     conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20)?;
     conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 256)?;
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The host's `LIKE`, `GLOB`, `instr`, `replace` and `trim`, as on guest
+    // connections: the same answers (an index or a CHECK a guest built on
+    // them is recomputed by `integrity_check`), no recursion on a deep
+    // pattern, and stopped at this connection's deadline.
+    let budget = crate::guest_functions::Budget {
+        deadline: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::db::clock_ms().saturating_add(DEADLINE_SECS * 1000),
+        )),
+        cpu_deadline: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    let max_len = usize::try_from(conn.limit(Limit::SQLITE_LIMIT_LENGTH)?).unwrap_or(0);
+    let max_pattern =
+        usize::try_from(conn.limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH)?).unwrap_or(0);
+    crate::guest_functions::register(conn, &budget, max_len, max_pattern)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECS);
     let mut steps = 0u32;
     conn.progress_handler(
         1000,

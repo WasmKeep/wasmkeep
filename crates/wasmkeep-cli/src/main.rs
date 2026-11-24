@@ -1747,9 +1747,8 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
         Ok((component, wasm))
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    // 8 MiB thread stacks: SQLite runs on them (`serving_runtime`).
+    let rt = wasmkeep_cli::serving_runtime()?;
     // ActorService starts its alarm timer on this runtime.
     let _entered = rt.enter();
 

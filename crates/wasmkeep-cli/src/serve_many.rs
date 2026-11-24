@@ -98,9 +98,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
     let socket_budget =
         wasmkeep_server::SocketBudget::new(requested_sockets, effective.socket_sessions);
     let cache = ComponentCache::new(runtime.clone(), &base.cache_dir)?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = wasmkeep_cli::serving_runtime()?;
     let _entered = rt.enter();
     // Before a second app is enabled anywhere, every live node must run a
     // version that knows it (ADR 0038, section 10).

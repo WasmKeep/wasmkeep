@@ -187,9 +187,15 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   is stopped at the event's wall clock and SQL CPU budget, checked between
   steps of SQLite's virtual machine and inside `instr`, `replace`, `trim`,
   `LIKE` and `GLOB`. These are the host's, with SQLite's answers, and match
-  without recursion; unlike SQLite's own `LIKE` and `GLOB`, they do not
-  narrow a search on an index to a prefix (`path GLOB 'a/*'` scans the
-  table; `path >= 'a/' AND path < 'a0'` uses the index). A stop inside one
+  without recursion, also on the offline connections that verify, read and
+  inspect exports (their `integrity_check` recomputes a guest's indexes,
+  under the same 5 s deadline). SQLite's own `LIKE` and `GLOB` can narrow
+  an indexed search to a prefix; the host's cannot. That changes two
+  cases: `GLOB` on a column with the default (`BINARY`) collation
+  (`path GLOB 'a/*'` scans the table; `path >= 'a/' AND path < 'a0'` uses
+  the index), and `LIKE` on a column declared `COLLATE NOCASE`
+  (`name LIKE 'a%'` scans; `name >= 'a' AND name < 'b'` uses the index).
+  `LIKE` on any other column never used an index. A stop inside one
   of these functions fails the statement only; it does not roll back the
   guest's open transaction (a stop between steps of a statement that writes
   does). Another single step over a large value is not interrupted, so a

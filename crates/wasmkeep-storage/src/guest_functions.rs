@@ -1,6 +1,8 @@
 //! The host's `instr`, `replace`, two-argument `trim`, `ltrim` and
-//! `rtrim`, and `like` and `glob` (the `LIKE` and `GLOB` operators) on
-//! guest connections, in place of SQLite's own.
+//! `rtrim`, and `like` and `glob` (the `LIKE` and `GLOB` operators), in
+//! place of SQLite's own, on every connection that runs a guest's SQL or
+//! schema: guest connections, and the offline ones of [`crate::readonly`]
+//! (whose `integrity_check` recomputes a guest's indexes).
 //!
 //! SQLite's versions run inside one virtual machine step, where the progress
 //! handler that enforces the statement's budgets cannot stop them, and take
@@ -645,7 +647,9 @@ pub(crate) fn register(
         conn.create_scalar_function(name, 2, flags, move |ctx| trim(ctx, &b, Sides(sides)))?;
     }
     // The `LIKE` and `GLOB` operators call these. `PRAGMA
-    // case_sensitive_like`, which would put SQLite's own back, is refused.
+    // case_sensitive_like` would put SQLite's own back: the guest
+    // connection's authorizer refuses it, and the offline connections run
+    // no guest pragma.
     for (name, args, w) in [("like", 2, LIKE), ("like", 3, LIKE), ("glob", 2, GLOB)] {
         let b = budget.clone();
         conn.create_scalar_function(name, args, flags, move |ctx| like(ctx, &b, w, max_pattern))?;

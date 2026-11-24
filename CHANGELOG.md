@@ -25,9 +25,15 @@ The text under a version's heading is its GitHub release text
   `[limits]`; default 4 GiB as before, at least 64 MiB). `LIKE` and `GLOB`
   are the host's, as `instr`, `replace` and `trim` are: SQLite's answers,
   stopped at the statement's time and CPU budgets, and no deep recursion on
-  a pattern full of wildcards. Like any replaced `like()`, they no longer
-  narrow an indexed search to a prefix: a query such as `path GLOB 'a/*'`
-  scans its table; write `path >= 'a/' AND path < 'a0'` to keep the index.
+  a pattern full of wildcards, also on the offline connections that verify
+  backups, exports and restores. Like any replaced `like()`, they no longer
+  narrow an indexed search to a prefix, which changes two cases: `GLOB` on
+  a `BINARY` column (write `path >= 'a/' AND path < 'a0'` for
+  `path GLOB 'a/*'`) and `LIKE` on a `COLLATE NOCASE` column (write
+  `name >= 'a' AND name < 'b'` for `name LIKE 'a%'`); `LIKE` on any other
+  column never used an index. Offline verification no longer refuses a
+  guest object with the `_wasmkeep_` prefix, only one holding a host
+  table's name.
   At open, a database's guest objects that use the reserved `_wasmkeep_`
   prefix (made before 0.8) are logged once and kept as they are, closed to
   the guest's schema changes. An instance holds at most 16 streamed file
