@@ -237,6 +237,10 @@ async fn node_with(
     Some((addr, stop, server))
 }
 
+/// Front requests [`http`] has had answered in this process (nextest runs
+/// each test in its own).
+static ANSWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, body: &str) -> String {
     let raw = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -246,6 +250,7 @@ async fn http(addr: std::net::SocketAddr, method: &str, path: &str, body: &str) 
     s.write_all(raw.as_bytes()).await.unwrap();
     let mut out = vec![];
     s.read_to_end(&mut out).await.unwrap();
+    ANSWERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // A chunked body is joined first: a chunk may end inside a character.
     let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let head = String::from_utf8(out[..at].to_vec()).unwrap();
@@ -582,8 +587,9 @@ async fn typescript_big_room_one_position_256_edges_at_default_budget() {
     positions("", "l", 256).await;
 }
 
-/// The front's fuel so far: the sum and count of `wasmkeep_front_fuel`.
-fn front_fuel() -> (u64, u64) {
+/// The front's fuel so far: the sum and count of `wasmkeep_front_fuel`,
+/// and its requests counted, of every outcome.
+fn front_fuel() -> (u64, u64, u64) {
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
     let total = |name: &str| {
         page.lines()
@@ -594,24 +600,39 @@ fn front_fuel() -> (u64, u64) {
     (
         total("wasmkeep_front_fuel_sum{"),
         total("wasmkeep_front_fuel_count{"),
+        total("wasmkeep_front_requests_total{"),
     )
 }
 
-/// One front request and the fuel it took: the front records its fuel once
-/// its instance ends, which may come just after the answer's last byte.
-async fn measured(addr: std::net::SocketAddr, path: &str) -> (String, u64) {
-    let (sum, count) = front_fuel();
-    let out = http(addr, "GET", path, "").await;
+/// The front's fuel once it has counted `requests` requests: a request's
+/// instance records its fuel before its outcome is counted, and may end
+/// just after the answer's last byte.
+async fn fuel_after(requests: u64) -> (u64, u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let (after, n) = front_fuel();
-        if n > count {
-            assert_eq!(n, count + 1, "one front request at a time");
-            return (out, after - sum);
+        let (sum, count, counted) = front_fuel();
+        if counted >= requests {
+            return (sum, count);
         }
-        assert!(std::time::Instant::now() < deadline, "no front fuel sample");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{counted} of {requests} front requests counted"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// One front request and the fuel it took. Measured once every request
+/// answered before it is counted: the last of [`fill`]'s publishes can
+/// still be ending (its fuel sample landed inside the window once, the
+/// count one too many).
+async fn measured(addr: std::net::SocketAddr, path: &str) -> (String, u64) {
+    let before = ANSWERED.load(std::sync::atomic::Ordering::SeqCst);
+    let (sum, count) = fuel_after(before).await;
+    let out = http(addr, "GET", path, "").await;
+    let (after, n) = fuel_after(before + 1).await;
+    assert_eq!(n, count + 1, "one front fuel sample for one request");
+    (out, after - sum)
 }
 
 /// Every page of the window, from its start, while `more`: the pages'
