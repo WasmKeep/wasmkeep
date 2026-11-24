@@ -181,6 +181,17 @@ impl Storage {
             })?;
         }
         let mut db = open_retrying(&path, &self.config)?;
+        match db.find_reserved() {
+            Ok(found) => db.reserved = found,
+            // Not a reason to keep the actor closed: the sandbox refuses
+            // what it would refuse anyway.
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not look for guest objects with the reserved _wasmkeep_ prefix"
+            ),
+        }
+        warn_reserved(&path, &db.reserved);
         *self
             .open
             .lock()
@@ -299,6 +310,49 @@ impl Storage {
 /// Meta key holding `tenant/class/name`.
 const ADDRESS_KEY: &str = "address";
 
+/// Logs, once per database file and process, the guest objects with the
+/// reserved prefix it holds: at most a few, each name shortened and
+/// escaped (a guest chose them).
+fn warn_reserved(path: &Path, found: &[ReservedObject]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// Files warned about; past this many, no more warnings.
+    const MAX_WARNED: usize = 10_000;
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    if found.is_empty() {
+        return;
+    }
+    {
+        let mut warned = WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if warned.len() >= MAX_WARNED || !warned.insert(path.to_owned()) {
+            return;
+        }
+    }
+    let names: Vec<String> = found
+        .iter()
+        .take(8)
+        .map(|o| {
+            let name: String = o.name.chars().take(64).collect();
+            let how = match o.uses {
+                ReservedUse::Named => "named",
+                ReservedUse::References => "naming a host table",
+            };
+            format!("{} {name:?} ({how})", o.kind)
+        })
+        .collect();
+    tracing::warn!(
+        path = %path.display(),
+        count = found.len(),
+        objects = %names.join(", "),
+        "the database holds guest objects that use the reserved _wasmkeep_ prefix (made \
+         before 0.8): kept as they are; the guest can change none of them, nor read a table \
+         so named"
+    );
+}
+
 /// `*.db` files at `<root>/<class>/`.
 fn db_files(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
     let read = |dir: &Path| -> Result<Vec<PathBuf>, StorageError> {
@@ -392,6 +446,8 @@ pub struct ActorDb {
     failed_checkpoints: u64,
     batch_hold: Option<std::sync::Weak<()>>,
     segment_byte_cap: u64,
+    /// Guest objects found at open that use the reserved prefix.
+    reserved: Vec<ReservedObject>,
     /// Last, so it is released after the connection has closed.
     open_guard: Option<OpenGuard>,
 }
@@ -772,8 +828,65 @@ impl ActorDb {
             failed_checkpoints: 0,
             batch_hold: None,
             segment_byte_cap: crate::wal::DEFAULT_SEGMENT_BYTES,
+            reserved: Vec::new(),
             open_guard: None,
         })
+    }
+
+    /// Guest objects in the schema that use the reserved prefix: a guest
+    /// could give one a reserved name before 0.8 (a view, an index, a
+    /// trigger, or a table renamed onto one), or name a host table in its
+    /// definition (a foreign key to one). Found once, at open.
+    ///
+    /// They are left as they are: dropping one could lose the guest's rows
+    /// (a renamed table holds them) and renaming one changes the guest's
+    /// schema behind its back, both replicated as ordinary changes, while
+    /// refusing to open would take the actor down. The sandbox already
+    /// keeps them out of the guest's reach: no schema change may name one
+    /// (drop, alter, reindex, or a new object naming it), a reserved table
+    /// or view can be neither read nor written, and host statements run
+    /// none of its triggers or cascades. What still works for the guest is
+    /// an index or a trigger so named on a table of its own: the index is
+    /// used and the trigger fires. A table carrying such a trigger cannot
+    /// be dropped; one carrying only such an index can, and the index goes
+    /// with it.
+    #[must_use]
+    pub fn reserved_objects(&self) -> &[ReservedObject] {
+        &self.reserved
+    }
+
+    /// Reads [`Self::reserved_objects`] from the schema.
+    fn find_reserved(&mut self) -> Result<Vec<ReservedObject>, SqlError> {
+        let rows = self.internal(|conn| {
+            // Narrowed by SQLite, judged here as guest DDL is judged; no
+            // LIKE, where `_` is a wildcard.
+            let mut stmt = conn.prepare(
+                "SELECT type, name, sql FROM main.sqlite_schema \
+                 WHERE instr(lower(name), '_wasmkeep_') OR instr(lower(sql), '_wasmkeep_')",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter(|(kind, name, _)| !(kind == "table" && HOST_TABLES.contains(&name.as_str())))
+            .filter_map(|(kind, name, sql)| {
+                let uses = if is_reserved(&name) {
+                    ReservedUse::Named
+                } else if sql.as_deref().is_some_and(names_reserved) {
+                    ReservedUse::References
+                } else {
+                    return None;
+                };
+                Some(ReservedObject { kind, name, uses })
+            })
+            .collect())
     }
 
     /// Starts capturing committed changes for replication: turns automatic
@@ -1734,6 +1847,30 @@ fn bind(params: &[SqlValue]) -> rusqlite::ParamsFromIter<Vec<rusqlite::types::Va
 
 /// Tables reserved for the host. Guests can neither read nor write them.
 const RESERVED_PREFIX: &str = "_wasmkeep_";
+
+/// The host's own tables, made at the first open of every database.
+const HOST_TABLES: &[&str] = &["_wasmkeep_meta", "_wasmkeep_alarm"];
+
+/// A guest object in the schema that uses the reserved prefix
+/// ([`ActorDb::reserved_objects`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedObject {
+    /// `table`, `view`, `index` or `trigger`, as `sqlite_schema` says.
+    pub kind: String,
+    /// Its name, as the guest wrote it.
+    pub name: String,
+    pub uses: ReservedUse,
+}
+
+/// How a [`ReservedObject`] uses the reserved prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedUse {
+    /// Its name has it.
+    Named,
+    /// Its definition names something that has it (a foreign key to a
+    /// host table, say).
+    References,
+}
 
 /// SQLite virtual machine steps between deadline checks.
 const PROGRESS_STEPS: std::ffi::c_int = 10_000;

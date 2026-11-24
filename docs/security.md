@@ -171,6 +171,15 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   schema (not their rows) show in `sqlite_master`. Host statements run with
   triggers and foreign key enforcement off, so they run nothing a guest
   wrote.
+- Before 0.8 a guest could give a view, index or trigger a reserved name,
+  rename a table onto one, or declare a foreign key to a host table. Such
+  objects found in a database are logged once per process at open (a
+  warning naming a few of them) and left as they are: nothing is dropped
+  or renamed, and the actor opens. The guest can neither change them (drop,
+  alter, reindex, or a new object naming one) nor read a table or view so
+  named, so a renamed table's rows are kept but out of its reach; an index
+  or trigger so named on one of its own tables keeps working, and a table
+  carrying such a trigger cannot be dropped.
 - 1 GB per database; 16 MiB per value and per query result. The result
   budget counts text/blob payloads after UTF-8 replacement, column names
   once, and conservative result/row/cell, allocation and vector-capacity
