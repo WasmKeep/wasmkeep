@@ -20,6 +20,20 @@ The text under a version's heading is its GitHub release text
   is found. The full test job's time limit on ubuntu-latest is 60
   minutes. No lease rule or format changes
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-availability)).
+- Backups: `backup create --history all` lists an actor again after a
+  read misses. A key gone from below a retained snapshot and its
+  segment, as history collection and idle compaction leave it, and older
+  than the retention window (new `--history-retention-secs`, default
+  3600, as on `serve`), is recorded under the actor's `collected` and is
+  no longer a gap, so a
+  continuous run that races a collection or an idle pass completes
+  instead of failing as partial; a key still listed whose read missed is
+  read again, up to 8 attempts; any other key gone is a gap as before.
+  New simulations: a backup reader racing idle passes within ADR 0033's
+  two-attempt bound, and an acquirer proving the recorded head exactly
+  after a pass. The run's actor entries gain the `collected` list;
+  nothing else in the archive changes
+  ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md#as-built-the-backup-retry-and-the-last-simulations-081)).
 - Leases: a node lease read to judge an actor's ownership record free is
   never older than a body of that lease the process has already read; an
   older one (a stale replica or cache) is read again and never frees the

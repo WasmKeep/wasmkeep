@@ -53,6 +53,9 @@ pub struct Create {
     /// Fail if listed retained history could not be archived (default for all).
     #[arg(long, action = clap::ArgAction::Set)]
     require_continuous: Option<bool>,
+    /// The cluster's history retention window: with --history all, a key gone during the run from below a kept snapshot and its segment, and last modified at least this long before, was collected and is not a gap.
+    #[arg(long, value_name = "SECS", default_value_t = 3600)]
+    history_retention_secs: u64,
     /// Local verified content cache; contains plaintext actor data.
     #[arg(long)]
     cache: Option<PathBuf>,
@@ -1127,6 +1130,48 @@ async fn save_blob(
     put(dest, &key(dp, &format!("data/{hash}")), bytes, false).await?;
     Ok(entry)
 }
+/// How many times one actor is listed, planned and read before the run
+/// gives it up (ADR 0033, section 1).
+const ATTEMPTS: usize = 8;
+/// Of `gone`, keys listed earlier and absent from `listing` now, those
+/// collection could have deleted: below a listed snapshot whose segment is
+/// listed too, by the shared rule (`collectable`, which the idle pass's
+/// `idle_collectable` applies as well), and last modified (as first
+/// listed) at least `retention` before `now`, as collection deletes
+/// nothing younger than the window. The tool does not see the ownership
+/// record: a collection by any generation is judged the same way.
+fn collected_by_rule<'k>(
+    listing: &Listing,
+    gone: impl IntoIterator<Item = (&'k String, &'k chrono::DateTime<chrono::Utc>)>,
+    retention: std::time::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BTreeSet<String> {
+    use wasmkeep_cluster::replication::collectable;
+    let old: Vec<&String> = gone
+        .into_iter()
+        .filter(|(_, modified)| {
+            chrono::Duration::from_std(retention)
+                .ok()
+                .and_then(|w| modified.checked_add_signed(w))
+                .is_some_and(|due| due <= now)
+        })
+        .map(|(k, _)| k)
+        .collect();
+    let mut with = listing.clone();
+    let parsed = Listing::from_keys(old.iter().map(|k| k.as_str()));
+    with.segments.extend(parsed.segments);
+    with.snapshots.extend(parsed.snapshots);
+    let rule: BTreeSet<String> = listing
+        .snapshots
+        .iter()
+        .filter(|s| listing.segments.iter().any(|seg| seg.id == **s))
+        .flat_map(|s| collectable(&with, s.generation, *s))
+        .collect();
+    old.into_iter()
+        .filter(|k| rule.contains(*k))
+        .cloned()
+        .collect()
+}
 fn same(meta: &ObjectMeta, old: &Value) -> bool {
     meta.e_tag.is_some()
         && old["size"].as_u64() == Some(meta.size)
@@ -1139,6 +1184,8 @@ struct Copier<'a> {
     dp: &'a str,
     cache: Option<&'a std::path::Path>,
     all: bool,
+    /// The cluster's history retention window (`--history-retention-secs`).
+    retention: std::time::Duration,
 }
 impl Copier<'_> {
     async fn actor(
@@ -1149,16 +1196,24 @@ impl Copier<'_> {
     ) -> anyhow::Result<Value> {
         let mut objects = initial;
         let mut reason = String::new();
-        let mut expected: BTreeSet<_> = objects.keys().cloned().collect();
+        // Every key any attempt listed, with its last-modified time as
+        // first listed.
+        let mut expected: BTreeMap<String, chrono::DateTime<chrono::Utc>> = BTreeMap::new();
         let mut validated = serde_json::Map::new();
-        for attempt in 0..8 {
+        let mut relisted = None;
+        for attempt in 0..ATTEMPTS {
             if attempt > 0 {
-                objects = list_bounded(self.source, prefix).await?;
+                objects = match relisted.take() {
+                    Some(objects) => objects,
+                    None => list_bounded(self.source, prefix).await?,
+                };
             }
             validated.retain(|k, entry| objects.get(k).is_none_or(|meta| same(meta, entry)));
-            expected.extend(objects.keys().cloned());
+            for (name, meta) in &objects {
+                expected.entry(name.clone()).or_insert(meta.last_modified);
+            }
             let mut observed_bytes = 0;
-            for name in &expected {
+            for name in expected.keys() {
                 charge(
                     &mut observed_bytes,
                     name.len() as u64 + 256,
@@ -1184,16 +1239,51 @@ impl Copier<'_> {
             {
                 Ok(mut actor) => {
                     let copied = actor["objects"].as_object().context("missing objects")?;
-                    let gaps: Vec<_> = if self.all {
+                    let mut gaps: Vec<_> = if self.all {
                         expected
-                            .iter()
+                            .keys()
                             .filter(|k| !copied.contains_key(*k))
                             .cloned()
                             .collect()
                     } else {
                         Vec::new()
                     };
+                    let mut collected = Vec::new();
+                    if !gaps.is_empty() {
+                        // Listed, then gone before its read: list again. A
+                        // key gone from below a listed snapshot and its
+                        // segment, by the collection rule (ADR 0012; ADR
+                        // 0042's idle pass applies the same), and older
+                        // than the retention window, is what a collection
+                        // leaves, as if it had run before the listing: not
+                        // a gap. Anything else is one.
+                        let now = list_bounded(self.source, prefix).await?;
+                        let listing = Listing::from_keys(now.keys().map(String::as_str));
+                        let by_rule = collected_by_rule(
+                            &listing,
+                            gaps.iter()
+                                .filter(|k| !now.contains_key(*k))
+                                .filter_map(|k| expected.get_key_value(k)),
+                            self.retention,
+                            chrono::Utc::now(),
+                        );
+                        (collected, gaps) = gaps.into_iter().partition(|k| by_rule.contains(k));
+                        // A gap left while the actor changed, or a read
+                        // that missed a key still listed: list, plan and
+                        // read again, within the attempts. Then the gaps
+                        // stand.
+                        if !gaps.is_empty()
+                            && attempt + 1 < ATTEMPTS
+                            && (gaps.iter().any(|k| now.contains_key(k))
+                                || !now.keys().eq(objects.keys()))
+                        {
+                            reason = format!("retained history gone while read: {gaps:?}");
+                            relisted = Some(now);
+                            continue;
+                        }
+                    }
                     actor["gaps"] = json!(gaps);
+                    actor["collected"] = json!(collected);
                     return Ok(actor);
                 }
                 Err(e)
@@ -1213,7 +1303,9 @@ impl Copier<'_> {
                 Err(e) => return Err(e),
             }
         }
-        bail!("{reason}; collected faster than read: raise --history-retention-secs (8 attempts)")
+        bail!(
+            "{reason}; collected faster than read: raise --history-retention-secs ({ATTEMPTS} attempts)"
+        )
     }
     async fn cached_replay(
         &self,
@@ -1805,6 +1897,7 @@ async fn create_undo(
         dp,
         cache: args.cache.as_deref(),
         all: args.history == History::All,
+        retention: std::time::Duration::from_secs(args.history_retention_secs),
     };
     let mut actors = Vec::new();
     let mut actor_count = 0usize;

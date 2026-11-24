@@ -66,7 +66,16 @@ the default for `--history all`. Use `--require-continuous false` to explicitly
 accept a partial historical range; full verify replays every position within
 each recorded range and reports those ranges. Runs closer than the retention
 window alone do not guarantee continuous history: a read can cross expiry.
-Every retry adds its observed keys to gap accounting. A retained snapshot
+Every retry adds its observed keys to gap accounting. After a miss, create
+lists the actor again: a key gone from below a retained snapshot and its
+boundary segment, the shape history collection or an idle actor's
+compaction leaves, and older than the retention window, is recorded under
+`collected` and is not a gap, so a run racing a collection completes (as
+a run listed after it would). Give `--history-retention-secs` the value
+the cluster runs with (default 3600, as on `serve`); a larger one only
+counts more gaps. A key still listed whose read missed is read again, up
+to 8 attempts; any other key gone, a delete's erase among them, is a gap.
+A retained snapshot
 restores its own position even if its boundary segment has disappeared.
 Objects already erased before listing cannot be promised by this archive.
 
