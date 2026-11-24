@@ -2,7 +2,11 @@
 //! state and kind of signature: whether it is a node's call, whether it is
 //! refused with 503, what it counts and what it spends on the public port.
 //! The table was captured from 0.8.0's code, before the hop's signature
-//! was checked once instead of in each of its readers.
+//! was checked once instead of in each of its readers. One change since,
+//! on purpose: a bad signature on the cluster port, refused there before
+//! any handler read it, is now counted in `wasmkeep_signatures_bad_total`
+//! too (it was counted only where a handler read it, off the cluster
+//! port), as the metric's documentation says.
 
 use super::*;
 
@@ -142,9 +146,11 @@ async fn table() -> String {
                     let headers = hop(kind);
                     let m = hyper::Method::POST;
                     let before = bad_signatures();
-                    let refused = c.hop_refused(&m, PATH, &headers, cluster_port);
-                    let internal = refused.is_none()
-                        && c.is_internal(&m, PATH, &headers, cluster_port).is_some();
+                    let (refused, internal) = match c.check_hop(&m, PATH, &headers, cluster_port) {
+                        HopCheck::Refused(why) => (Some(why), false),
+                        HopCheck::Signed(_) => (None, true),
+                        HopCheck::Outside => (None, false),
+                    };
                     let counted = bad_signatures() - before;
                     let burnt = headers
                         .get(INTERNAL)
@@ -214,10 +220,82 @@ fn verify_takes_exactly_these_values() {
     assert!(verify(SECRET, &good, ts, "c", &m, PATH, &headers).is_none());
 }
 
+/// A request to [`PATH`] with `headers`, as it arrived on the public
+/// port.
+fn request(headers: hyper::HeaderMap) -> Request<()> {
+    let mut req = Request::post(PATH).body(()).unwrap();
+    *req.headers_mut() = headers;
+    req
+}
+
+fn verified() -> u64 {
+    signing::VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The router judges a hop once; the handlers after it (the ingress
+/// check, twice with rate limits, then the actor's) read its verdict and
+/// check nothing again.
+#[tokio::test]
+async fn a_hop_is_verified_once() {
+    let b = receiver(false, true).await;
+    let mut req = request(hop("valid"));
+    let before = verified();
+    assert_eq!(b.judge_hop(&mut req), None);
+    for _ in 0..3 {
+        assert!(b.signed_hop(&req).is_some());
+    }
+    assert_eq!(verified() - before, 1);
+    // The verdict is the router's: what changes after does not undo it
+    // (the body and the replay checks still follow).
+    req.headers_mut()
+        .insert(INTERNAL, "v4 1 a b c".parse().unwrap());
+    assert!(b.signed_hop(&req).is_some());
+    assert_eq!(verified() - before, 1);
+    // Outside and refused hops carry their verdict too.
+    let mut bad = request(hop("bad"));
+    assert_eq!(b.judge_hop(&mut bad), None);
+    let mut forged = request(hop("sender-unbound"));
+    assert!(b.judge_hop(&mut forged).is_some());
+    let at = verified();
+    assert!(b.signed_hop(&bad).is_none());
+    assert!(b.signed_hop(&forged).is_none());
+    assert_eq!(verified(), at);
+}
+
+/// A request no router judged, or judged by another node id's runtime, is
+/// checked where it is read: a verdict never stands in for a check it
+/// was not.
+#[tokio::test]
+async fn a_hop_without_its_own_verdict_is_checked_where_read() {
+    let b = receiver(false, true).await;
+    let req = request(hop("valid"));
+    let before = verified();
+    assert!(b.signed_hop(&req).is_some());
+    assert_eq!(verified() - before, 1);
+    // Judged by another runtime (another node id) as signed: checked
+    // again here, and refused, since it was signed for `b`.
+    let mut other = request(hop("valid"));
+    other.extensions_mut().insert(CheckedHop {
+        node: "c".into(),
+        hop: HopCheck::Outside,
+    });
+    assert!(b.signed_hop(&other).is_some());
+    let mut junk = request(hop("bad"));
+    junk.extensions_mut().insert(CheckedHop {
+        node: "c".into(),
+        hop: match b.check_hop(&hyper::Method::POST, PATH, &hop("valid"), false) {
+            HopCheck::Signed(s) => HopCheck::Signed(s),
+            other => panic!("{other:?}"),
+        },
+    });
+    assert!(b.signed_hop(&junk).is_none());
+    assert_eq!(verified() - before, 4);
+}
+
 const EXPECTED: &str = "\
 refuse=false secret=true cluster_port=true absent: internal=false refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true valid: internal=true refused=None bad=0 burnt=false\n\
-refuse=false secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=0 burnt=false\n\
+refuse=false secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=1 burnt=false\n\
 refuse=false secret=true cluster_port=true no-sender: internal=true refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true sender-twice: internal=false refused=Some(\"hop names its sender twice\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true sender-unbound: internal=false refused=Some(\"hop's sender is not bound to its signature\") bad=0 burnt=false\n\
@@ -249,7 +327,7 @@ refuse=false secret=false cluster_port=false sender-other-app: internal=false re
 refuse=false secret=false cluster_port=false sender-not-live: internal=false refused=None bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true absent: internal=false refused=None bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true valid: internal=true refused=None bad=0 burnt=false\n\
-refuse=true secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=0 burnt=false\n\
+refuse=true secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=1 burnt=false\n\
 refuse=true secret=true cluster_port=true no-sender: internal=true refused=None bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true sender-twice: internal=false refused=Some(\"hop names its sender twice\") bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true sender-unbound: internal=false refused=Some(\"hop's sender is not bound to its signature\") bad=0 burnt=false\n\

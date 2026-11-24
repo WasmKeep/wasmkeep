@@ -65,28 +65,12 @@ impl ActorService {
         // another node of the cluster proving it with the cluster secret
         // (in refuse mode, only on the cluster port: ADR 0011, phase B).
         // A client claiming either is not believed.
-        let on_cluster_port = req
-            .extensions()
-            .get::<crate::http::ArrivedOnClusterPort>()
-            .is_some();
-        let signed_body = match &self.inner.cluster {
-            Some(cluster) => {
-                let path = req
-                    .extensions()
-                    .get::<crate::http::OriginalPath>()
-                    .map_or_else(
-                        || {
-                            req.uri()
-                                .path_and_query()
-                                .map_or("/", |p| p.as_str())
-                                .to_owned()
-                        },
-                        |p| p.0.clone(),
-                    );
-                cluster.is_internal(req.method(), &path, req.headers(), on_cluster_port)
-            }
-            None => None,
-        };
+        // Judged once, by the router (`Cluster::signed_hop`).
+        let signed_body = self
+            .inner
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.signed_hop(&req));
         // A node's signed request with the hand-off's upgrade mark is a
         // relayed upgrade whose `Upgrade` header went missing (ADR 0027):
         // never a call, whatever it signs.
@@ -553,7 +537,7 @@ impl ActorService {
             } = handback;
             let (back_parts, _) = back.into_parts();
             let hop = Request::from_parts(back_parts, http_body_util::Full::new(body.clone()));
-            let response = cluster.forward_buffered(&node, hop).await;
+            let response = cluster.forward(&node, hop).await;
             if elsewhere {
                 if super::routing::not_run_by_peer(&response) {
                     // Not a peer that saw another owner: the ordinary path

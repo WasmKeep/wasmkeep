@@ -368,16 +368,7 @@ impl ActorService {
             }
         }
         if let Some(cluster) = &self.inner.cluster
-            && cluster
-                .is_internal(
-                    req.method(),
-                    req.uri().path_and_query().map_or("/", |p| p.as_str()),
-                    req.headers(),
-                    req.extensions()
-                        .get::<crate::http::ArrivedOnClusterPort>()
-                        .is_some(),
-                )
-                .is_some()
+            && cluster.signed_hop(req).is_some()
         {
             return self.admit_ingress(req);
         }
@@ -449,14 +440,7 @@ impl ActorService {
         let mut client_peer = None;
         let mut charged = false;
         if let Some(cluster) = &self.inner.cluster {
-            if let Some(signed) = cluster.is_internal(
-                req.method(),
-                req.uri().path_and_query().map_or("/", |p| p.as_str()),
-                req.headers(),
-                req.extensions()
-                    .get::<crate::http::ArrivedOnClusterPort>()
-                    .is_some(),
-            ) {
+            if let Some(signed) = cluster.signed_hop(req) {
                 let control = req.headers().contains_key(crate::cluster::TAKE)
                     || req.headers().contains_key(crate::cluster::ALARM_HANDOFF);
                 if let Some(why) = cluster.admission_replayed(&signed, control) {

@@ -16,6 +16,8 @@ pub(super) fn verify(
     path: &str,
     headers: &hyper::HeaderMap,
 ) -> Option<Signed> {
+    #[cfg(test)]
+    VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut parts = given.split(' ');
     let (Some("v4"), Some(ts), Some(nonce), Some(body), Some(mac), None) = (
         parts.next(),
@@ -50,6 +52,10 @@ pub(super) fn verify(
     })
 }
 
+/// How many signatures [`verify`] checked, in this test process.
+#[cfg(test)]
+pub(super) static VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 64 lowercase hex characters as 32 bytes.
 pub(super) fn unhex32(s: &str) -> Option<[u8; 32]> {
     let b = s.as_bytes();
@@ -70,7 +76,7 @@ pub(super) fn unhex32(s: &str) -> Option<[u8; 32]> {
 
 /// A valid node signature on a request, not yet checked against its body
 /// nor recorded as used.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Signed {
     pub(super) mac: [u8; 32],
     /// The signed timestamp (ms): the signature is replayable only within
@@ -82,6 +88,47 @@ pub(crate) struct Signed {
     /// a live node of this app; `None` without one (an older node).
     pub(crate) sender: Option<String>,
 }
+
+/// What a hop's [`INTERNAL`] signature makes of a request
+/// ([`Cluster::check_hop`]).
+#[derive(Debug, Clone)]
+pub(crate) enum HopCheck {
+    /// A client's request: no signature, or one not taken here (junk or a
+    /// burnt copy on the public port; off the cluster port, one that does
+    /// not hold or that no secret can check yet).
+    Outside,
+    /// Refused with 503, never served as a client's request: why.
+    Refused(&'static str),
+    /// A node's call whose signature and sender hold.
+    Signed(Signed),
+}
+
+/// The router's verdict on a request's signature, made once when it
+/// arrived ([`Cluster::judge_hop`]) by the runtime of node `node`, for
+/// the handlers after it ([`Cluster::signed_hop`]). Set by the host only:
+/// a request's extensions never come from the wire.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedHop {
+    pub(super) node: String,
+    pub(super) hop: HopCheck,
+}
+
+/// The path a hop's signature covers: as the request arrived, query
+/// included, before routing cut `/actor/<class>/<name>` off it.
+pub(crate) fn hop_path<B>(req: &Request<B>) -> &str {
+    req.extensions().get::<OriginalPath>().map_or_else(
+        || req.uri().path_and_query().map_or("/", |p| p.as_str()),
+        |p| p.0.as_str(),
+    )
+}
+
+/// Why a hop is refused when no secret is loaded yet.
+pub(super) const SECRET_NOT_LOADED: &str = "cluster secret not loaded yet";
+/// Why a hop on the cluster port is refused when its signature does not
+/// hold: the router's answer and log.
+pub(super) const BAD_SIGNATURE: &str = "bad, expired or misaddressed signature";
+/// The same, logged with its likely causes where no router logs it.
+pub(super) const BAD_SIGNATURE_WHY: &str = "bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)";
 
 /// SHA-256 of a call's body, lowercase hex, as signed in [`INTERNAL`].
 pub(crate) fn body_sha256(body: &[u8]) -> String {
@@ -407,6 +454,89 @@ pub(super) fn signature(
         let _ = write!(hex, "{b:02x}");
     }
     hex
+}
+
+/// The two kinds of signed hop: a node's call ([`INTERNAL`]) and a
+/// forward's proof of its client ([`ADMITTED`]). Both are v4 values; the
+/// kind is also the word their [`SENDER`] binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HopKind {
+    Call,
+    Admitted,
+}
+
+impl HopKind {
+    /// The header the hop's signature goes in.
+    pub(crate) fn header(self) -> &'static str {
+        match self {
+            Self::Call => INTERNAL,
+            Self::Admitted => ADMITTED,
+        }
+    }
+
+    /// The word its [`SENDER`] MAC binds.
+    pub(crate) fn sender_kind(self) -> &'static str {
+        match self {
+            Self::Call => "internal",
+            Self::Admitted => "admitted",
+        }
+    }
+}
+
+/// What a v4 signature signs, but the timestamp (taken when signed) and
+/// the headers (the request's own).
+pub(super) struct V4<'a> {
+    /// The MAC's key: the cluster secret, or a key derived from it.
+    pub(super) key: &'a str,
+    pub(super) nonce: &'a str,
+    /// The node the hop is for.
+    pub(super) to: &'a str,
+    pub(super) method: &'a hyper::Method,
+    /// As sent, query included.
+    pub(super) path: &'a str,
+    /// The body's SHA-256 for a call; the client's identity headers' for a
+    /// forward's proof.
+    pub(super) body: &'a str,
+}
+
+impl Cluster {
+    /// Signs a hop of `kind` in `headers`, over the headers as they are
+    /// now (every signed one must be in place first): its v4 value
+    /// (`v4 <ts> <nonce> <body> <mac>`), then this node named its sender,
+    /// bound to that MAC under the cluster `secret` (ADR 0038, section 5).
+    /// The only place a hop is signed.
+    pub(super) fn sign_hop(
+        &self,
+        headers: &mut hyper::HeaderMap,
+        kind: HopKind,
+        secret: &str,
+        v4: &V4<'_>,
+    ) -> Result<(), String> {
+        let ts = now_ms();
+        let V4 {
+            key,
+            nonce,
+            to,
+            method,
+            path,
+            body,
+        } = *v4;
+        let mac = signature(key, ts, nonce, to, method, path, body, headers);
+        headers.insert(
+            kind.header(),
+            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body} {mac}"))
+                .map_err(|e| e.to_string())?,
+        );
+        if let Ok(v) = hyper::header::HeaderValue::from_str(&sender_value(
+            secret,
+            kind.sender_kind(),
+            &mac,
+            &self.node_id,
+        )) {
+            headers.insert(SENDER, v);
+        }
+        Ok(())
+    }
 }
 
 /// Names the node that sent a signed hop (ADR 0038, section 5): `NODE

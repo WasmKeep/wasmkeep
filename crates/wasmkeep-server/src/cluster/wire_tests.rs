@@ -394,7 +394,7 @@ async fn a_buffered_forward_sends_these_bytes() {
     let req = forwarded(http_body_util::Full::new(bytes::Bytes::from_static(
         b"payload",
     )));
-    let response = me.forward_buffered("owner", req).await;
+    let response = me.forward("owner", req).await;
     assert_eq!(response.status(), StatusCode::OK);
     check_forward(&captured.take(), &base, GOLDEN_FORWARD);
 }
