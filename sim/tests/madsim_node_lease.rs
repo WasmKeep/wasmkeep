@@ -161,6 +161,17 @@ enum Variant {
     /// stepping back [`CLOCK_STEP_MS`] at [`CLOCK_STEP_AT_MS`] (the crash
     /// scenario only).
     StaleClockStep,
+    /// The correct rules under stale reads, with a hot operator: it fences
+    /// four times as often, deleting the lease before every fence, on a
+    /// clock the full skew behind, so its created fences are dated before
+    /// the bodies they follow.
+    StaleHotOperator,
+    /// The hot operator's stale reads, with a created fence ordered against
+    /// named bodies by date alone (the rule before its window).
+    StaleFenceByDate,
+    /// The hot operator's stale reads, with a read that finds a lease
+    /// absent leaving the unpin window running (the rule before).
+    StaleAbsentKeepsWindow,
 }
 
 /// When the clocks step back in [`Variant::StaleClockStep`] (global ms).
@@ -182,6 +193,18 @@ impl Variant {
                 | Self::StaleExhaustedJudged
                 | Self::StaleUnseen
                 | Self::StaleClockStep
+                | Self::StaleHotOperator
+                | Self::StaleFenceByDate
+                | Self::StaleAbsentKeepsWindow
+        )
+    }
+
+    /// Whether the operator deletes before every fence, the full skew
+    /// behind.
+    fn hot_operator(self) -> bool {
+        matches!(
+            self,
+            Self::StaleHotOperator | Self::StaleFenceByDate | Self::StaleAbsentKeepsWindow
         )
     }
 
@@ -190,6 +213,8 @@ impl Variant {
             Self::StaleReadsTrusted => ReadFault::Off,
             Self::StaleReadBackUnchecked => ReadFault::ReadBackUnchecked,
             Self::StaleExhaustedJudged => ReadFault::ExhaustedJudged,
+            Self::StaleFenceByDate => ReadFault::FenceByDate,
+            Self::StaleAbsentKeepsWindow => ReadFault::AbsentKeepsWindow,
             _ => ReadFault::None,
         }
     }
@@ -867,7 +892,11 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
         take_fences();
         // Slots 0 to 2 run n1 to n3; slot 3 runs n1's twin.
         for slot in 0..=TWIN {
-            if scenario && slot == TWIN {
+            // No twin with the hot operator: it deletes a lease so often
+            // that a twin's whole run can fall between the two reads of the
+            // other's start check, which (unlike the server's, which polls)
+            // cannot see it there.
+            if (scenario || variant.hot_operator()) && slot == TWIN {
                 continue;
             }
             let i = if slot == TWIN {
@@ -907,6 +936,11 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
         // Its own stream: the nodes' fault schedule stays as without it.
         let op_skew = i64::try_from(Rng::new(seed ^ 0x05CE_E0FF).below(max_skew * 2 + 1)).unwrap()
             - i64::try_from(max_skew).unwrap();
+        let op_skew = if variant.hot_operator() {
+            -i64::try_from(max_skew).unwrap()
+        } else {
+            op_skew
+        };
         let _operator = handle
             .create_node()
             .name("operator")
@@ -925,7 +959,14 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
                         return;
                     }
                     loop {
-                        sleep(Duration::from_millis(2_000 + rng.below(6_000))).await;
+                        // The hot operator fences four times as often.
+                        let pause = 2_000 + rng.below(6_000);
+                        let pause = if variant.hot_operator() {
+                            pause / 4
+                        } else {
+                            pause
+                        };
+                        sleep(Duration::from_millis(pause)).await;
                         let n = 1 + rng.below(3);
                         let key = format!("{NODES}n{n}");
                         if let Ok(Some((body, _))) = bucket.get(&key).await
@@ -939,7 +980,7 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
                         {
                             shared_op.lock().unwrap().lost_payloads += 1;
                         }
-                        if rng.below(4) == 0 {
+                        if rng.below(4) == 0 || variant.hot_operator() {
                             let _ = bucket.delete(&key).await;
                             shared_op.lock().unwrap().deletions += 1;
                         }
@@ -981,12 +1022,12 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
             // Over four slots at the three-slot schedule's rate per process
             // (one in 40 steps a clog, one in 120 a crash, for each).
             match rng.below(30) {
-                0..=2 => {
+                0..=2 if n < nodes.len() => {
                     net.clog_link(nodes[n], bucket.id());
                     net.clog_link(bucket.id(), nodes[n]);
                     held.push((n, at + 300 + rng.below(3_000)));
                 }
-                3 if !crashed.iter().any(|(c, _)| *c == n) => {
+                3 if n < nodes.len() && !crashed.iter().any(|(c, _)| *c == n) => {
                     // A crash drops its process's claims at once.
                     let mut s = shared.lock().unwrap();
                     if let Some(&(node, process)) = s.running.get(&n) {
@@ -1326,6 +1367,94 @@ fn a_first_stale_read_is_not_closed() {
         caught.is_some(),
         "a first stale read was never caught: the model shows nothing"
     );
+}
+
+/// A hot operator under stale reads (ADR 0020, amendment on lease reads):
+/// every fence is created over a deleted lease, on a clock the full skew
+/// behind, so its date is before the last bodies of the process it ends.
+/// With the correct rules there are never two owners nor one generation
+/// for two holds; the runs do take records over from created fences.
+#[test]
+fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
+    let (mut acquired, mut deletions) = (0, 0);
+    for seed in only_seed().map_or(0..seeds(), |s| s..s + 1) {
+        let o = simulate(seed, Variant::StaleHotOperator, Duration::from_secs(30));
+        if let Some(d) = double_ownership(&o.claims) {
+            panic!("seed {seed}: two owners with a hot operator: {d:?}");
+        }
+        if let Some(pair) = shared_generation(&o.holds) {
+            panic!("seed {seed}: one generation, two holds with a hot operator: {pair:?}");
+        }
+        acquired += o.reasons.get("fenced").copied().unwrap_or(0);
+        deletions += o.deletions;
+    }
+    eprintln!(
+        "{} seeds with a hot operator: {deletions} leases deleted and fenced, \
+         {acquired} acquisitions after a fence",
+        seeds()
+    );
+    let floor = (seeds() / 20).max(1);
+    assert!(acquired >= floor, "{acquired} acquisitions after a fence");
+}
+
+/// The first seed of `variant` with two owners or one generation for two
+/// holds: `known` first (seeds that showed it, so a 200-seed gate run
+/// still checks it), then every seed below `WASMKEEP_SIM_SEEDS`.
+fn first_caught(variant: Variant, known: &[u64]) -> Option<u64> {
+    known.iter().copied().chain(0..seeds()).find(|&seed| {
+        let o = simulate(seed, variant, Duration::from_secs(30));
+        double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
+    })
+}
+
+/// A created fence ordered against named bodies by date alone, under a hot
+/// operator's stale reads, is caught: a predecessor's body dated after the
+/// fence stays the newest held, and served again once the node runs as
+/// another instance it frees the record that instance holds. Rare (about
+/// once in 5,000 seeds), so a seed that showed it is checked first; should
+/// a change to the simulation move it, search again with
+/// `WASMKEEP_SIM_SEEDS=20000` and replace it.
+#[test]
+fn a_created_fence_judged_by_date_is_caught() {
+    let caught = first_caught(Variant::StaleFenceByDate, &[KNOWN_FENCE_BY_DATE]);
+    eprintln!("created fence by date: caught by seed {caught:?}");
+    assert!(caught.is_some(), "a created fence by date was never caught");
+    assert!(
+        !caught_by(KNOWN_FENCE_BY_DATE, Variant::StaleHotOperator),
+        "seed {KNOWN_FENCE_BY_DATE} fails with the correct rules too"
+    );
+}
+
+/// A seed where [`Variant::StaleFenceByDate`] gives two owners.
+const KNOWN_FENCE_BY_DATE: u64 = 4686;
+
+/// A read finding a lease absent that leaves the unpin window running,
+/// under a hot operator's stale reads, is caught: a deleted lease's old
+/// bodies, served again with no current answer counted for the window,
+/// replace the newest held and free the record the node's next process
+/// holds. A seed that showed it is checked first, as above.
+#[test]
+fn an_absent_read_keeping_the_window_is_caught() {
+    let caught = first_caught(Variant::StaleAbsentKeepsWindow, &[KNOWN_ABSENT]);
+    eprintln!("absent read keeping the window: caught by seed {caught:?}");
+    assert!(
+        caught.is_some(),
+        "an absent read keeping the window was never caught"
+    );
+    assert!(
+        !caught_by(KNOWN_ABSENT, Variant::StaleHotOperator),
+        "seed {KNOWN_ABSENT} fails with the correct rules too"
+    );
+}
+
+/// A seed where [`Variant::StaleAbsentKeepsWindow`] gives two owners.
+const KNOWN_ABSENT: u64 = 887;
+
+/// Whether `seed` under `variant` gives two owners or one generation for
+/// two holds.
+fn caught_by(seed: u64, variant: Variant) -> bool {
+    let o = simulate(seed, variant, Duration::from_secs(30));
+    double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
 }
 
 /// The read back after a failed acquisition write judging its rival's

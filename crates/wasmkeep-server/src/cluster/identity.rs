@@ -103,6 +103,17 @@ pub(super) fn checking_message(node: &str, wait: Duration) -> String {
     format!("checking that no other process runs node id {node}; ready in about {secs} s")
 }
 
+/// The start check's line when an operator's fence over this node id's
+/// missing lease holds the first write back (ADR 0020, amendment on lease
+/// reads): seen `when`, and for how long more (whole seconds, rounded up).
+pub(super) fn fence_wait_message(node: &str, when: &str, wait: Duration) -> String {
+    let secs = wait.as_millis().div_ceil(1000);
+    format!(
+        "an operator's fence of node id {node} {when}: its first lease write waits until the \
+         fence is twice the allowed clock skew old on this clock; ready in about {secs} s"
+    )
+}
+
 /// The line once the start check passed and the first lease write landed.
 pub(super) fn checked_message(node: &str) -> String {
     format!("no other process runs node id {node}: ready to take actors")
@@ -448,6 +459,11 @@ impl Cluster {
                         .saturating_sub(now_ms()),
                 )
         };
+        // A moment on this node's clock, as an instant (now, if passed).
+        let at_ms = |ms: u64| {
+            tokio::time::Instant::now() + Duration::from_millis(ms.saturating_sub(now_ms()))
+        };
+        let window = wasmkeep_cluster::node_lease::fence_window_ms(&self.lease_config);
         let mut last = read().await;
         // The lease's ttl plus grace in every case, also with no object: a
         // process whose object was deleted while it ran is given time to
@@ -458,13 +474,13 @@ impl Cluster {
         if let Some((body, _)) = &last {
             // A fence an operator created over a deleted object (no
             // instance, no payload): the first write lands no earlier than
-            // its `written_at` plus ttl and grace on this clock, so this
+            // its `written_at` plus twice the skew on this clock, so this
             // process's bodies are dated after it as `older_than` orders
             // them (ADR 0020, amendment on lease reads).
             if let Some(o) =
                 NodeLeaseObject::decode(body).filter(wasmkeep_cluster::node_lease::created_fence)
             {
-                deadline = deadline.max(lapsed_at(o.written_at_ms));
+                deadline = deadline.max(at_ms(o.written_at_ms.saturating_add(window)));
             }
             match decode(body) {
                 // A node lease (ADR 0020): its process acts only until its
@@ -529,16 +545,26 @@ impl Cluster {
                 if let Some(o) = ended {
                     // It lapsed once its kept `written_at` is ttl plus grace
                     // old: the check goes on then, without the rest of its
-                    // wait (ADR 0020, section 1). An operator's fence over no
-                    // object ends nothing, and the first write lands no
-                    // earlier than its `written_at` plus ttl and grace, as
-                    // for one read first. Any later change is another
-                    // writer.
-                    deadline = if last.is_none() {
-                        deadline.max(lapsed_at(o.written_at_ms))
-                    } else {
-                        deadline.min(lapsed_at(o.written_at_ms))
-                    };
+                    // wait (ADR 0020, section 1). Any later change is
+                    // another writer.
+                    deadline = deadline.min(lapsed_at(o.written_at_ms));
+                    // An operator's fence over no object: the first write
+                    // lands no earlier than its `written_at` plus twice the
+                    // skew, as for one read first.
+                    if o.instance.is_none() {
+                        let fenced = at_ms(o.written_at_ms.saturating_add(window));
+                        if fenced > deadline {
+                            deadline = fenced;
+                        }
+                        tracing::info!(
+                            "{}",
+                            fence_wait_message(
+                                &self.node_id,
+                                "was written during the start check",
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            )
+                        );
+                    }
                     first_instance = None;
                 } else {
                     // Classified as a lease write's re-read classifies it.
@@ -568,12 +594,21 @@ impl Cluster {
             last = now;
             // Over a created fence, on the clock that dates the first write
             // (the wait above runs on the monotonic one).
-            if let Some((body, _)) = &last
+            if tokio::time::Instant::now() >= deadline
+                && let Some((body, _)) = &last
                 && let Some(o) = NodeLeaseObject::decode(body)
                     .filter(wasmkeep_cluster::node_lease::created_fence)
-                && now_ms() < o.written_at_ms.saturating_add(ttl_grace)
+                && now_ms() < o.written_at_ms.saturating_add(window)
             {
-                deadline = deadline.max(lapsed_at(o.written_at_ms));
+                deadline = at_ms(o.written_at_ms.saturating_add(window));
+                tracing::info!(
+                    "{}",
+                    fence_wait_message(
+                        &self.node_id,
+                        "is dated ahead of this clock",
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                );
                 continue;
             }
             if tokio::time::Instant::now() >= deadline {

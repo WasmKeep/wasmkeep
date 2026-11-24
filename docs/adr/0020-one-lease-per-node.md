@@ -54,8 +54,9 @@
   ownership record free is never older than a body of that lease the
   process has already read; an older one is read again, and never frees
   the record. A fence an operator created over a deleted object is newer
-  than every named body dated less than ttl plus grace after it, and a
-  start over one writes no earlier than that. Also defines the app's
+  than every named body dated less than twice the skew after it, and a
+  start over one writes no earlier than that; a read finding a lease
+  absent restarts the unpin window. Also defines the app's
   upgrade floor record, read at start. See "Amendment of 2026-11-24: lease
   reads, and the upgrade floor" at the end.
 - Amended 2026-11-24 (0.8.1): availability. The failover wait ignores a
@@ -1261,7 +1262,7 @@ would leave the actors of a restarted node unfreeable.
   may have stepped back before it (a fence or a release keeps the
   `written_at` of the last `live` write). A fence an operator created
   over a deleted object (`fenced`, no instance) is newer than a body of a
-  named instance dated less than ttl plus grace after it, and older than
+  named instance dated less than twice the skew after it, and older than
   one dated that much after it or more (see "A fence created over a
   deleted object" below). Otherwise the body dated earlier is older; two
   bodies of different instances dated the same are not ordered.
@@ -1277,10 +1278,14 @@ would leave the actors of a restarted node unfreeable.
   replaces it, counted and logged. The window starts at the first such
   read, not at the last confirming one, so an outage with no reads at all
   does not open it early: the first read after an outage is still judged
-  against the newest held. A clock that ran ahead, or one that stepped back
-  across instances, so holds a node's records back for about that long on a
-  process, and the rule is then the one before this amendment, never
-  weaker.
+  against the newest held. A read that finds the lease absent (a judging
+  read, or a heartbeat round that finds the node gone or a body it cannot
+  read) is a current answer too: the window starts again, so the old
+  bodies a replica serves of a deleted lease never replace the newest
+  while the bucket answers that it is gone. A clock that ran ahead, or one
+  that stepped back across instances, so holds a node's records back for
+  about that long on a process, and the rule is then the one before this
+  amendment, never weaker.
 - Counted: `wasmkeep_lease_reads_behind_total` (reads behind, read again),
   `wasmkeep_lease_reads_stale_total` (judgements refused because every read
   was behind) and `wasmkeep_lease_reads_unpinned_total` (entries replaced
@@ -1307,29 +1312,56 @@ the record's, and frees it at once: two owners. The simulation found it
 (`stale_lease_reads_never_free_a_held_record`, seed 5367 of 20,000).
 
 - Ordering: a created fence is newer than every body of a named instance
-  (`live`, `fenced` or `released`) dated less than ttl plus grace after
-  it, and older than one dated at least that much after it. Twice the
-  skew is below ttl plus grace (`grace + safety >= 2 * max_skew`, `safety <
-  ttl`), so every body before the fence is older. Two created fences (one
-  raised to a later date) are ordered by date.
+  (`live`, `fenced` or `released`) dated less than twice the skew allowed
+  after it, and older than one dated at least that much after it. A body
+  written before the fence is dated less than twice the skew after it
+  (its writer's clock at most the skew ahead, the operator's at most the
+  skew behind), so every predecessor's body is older. Two created fences
+  (one raised to a later date) are ordered by date.
 - Starting over one: the start check writes the first `live` body no
-  earlier than the created fence's `written_at` plus ttl plus grace on its
+  earlier than the created fence's `written_at` plus twice the skew on its
   own clock, whether the fence was there at its first read or appeared
-  over no object during the check (before, that check could end at its
-  own wait, ttl plus grace from its first read). The check compares the
-  fence's date with the clock that dates the first write, right before
-  that write, so the body is at least ttl plus grace after the fence
-  whatever the skew. Over a fence read first, this adds at most the
-  fence's lead over this clock to the start (`cluster fence` dates a
-  created fence a second plus the skew past the bucket's time); over one
-  created during the check, the wait runs on to ttl plus grace past the
-  fence, up to ttl plus grace more. Both happen only after an operator's
-  fence over a deleted object.
-- Nodes of the previous patch may start over a created fence earlier: a
-  body of theirs dated less than ttl plus grace after the fence is then
-  read as older than it, refused until the unpin window passes, and under
-  stale reads such a node gets no more than the rule before this
-  amendment.
+  over no object during the check. The check compares the fence's date
+  with the clock that dates the first write, right before that write, so
+  the body is at least twice the skew after the fence whatever the skew,
+  and a successor's bodies are always newer than the fence. With a fence
+  read first, the check's own wait (ttl plus grace from that read) already
+  goes past that when ttl plus grace is at least four times the skew (the
+  defaults: 15 s and 4 s), unless the fence is dated ahead of this clock;
+  a fence created late in the check is where it adds up to twice the skew.
+  The node logs the longer wait, and `cluster fence` warns when this
+  machine's clock is ahead of the bucket's, since that dates the fence
+  ahead.
+- Why not ttl plus grace (this amendment's first form): every body written
+  after a fence but dated less than the window after it makes a reader keep
+  the fence as its newest, and the fence served again frees the record
+  that body's process holds. Nodes of 0.8.0 do not wait for a fence's
+  date, so with ttl plus grace a node of 0.8.0 starting anywhere in the
+  fence's first ttl plus grace was exposed. Twice the skew is the
+  smallest window that still orders every predecessor's body.
+
+### Nodes of 0.8.0 beside this version
+
+Under a bucket that never serves stale reads, none of this matters. Under
+stale reads, in a cluster that mixes 0.8.0 and this version:
+
+- A node of 0.8.0 starting over a created fence does not wait for the
+  fence's date. Over a fence it read first, its own wait still dates its
+  first body past the window at the defaults (a fence not dated ahead);
+  over a fence created during its check, it starts once its own wait
+  ends, and its first body may be dated inside the window when the fence
+  landed within about twice the skew of that end. A reader of this
+  version that then reads that first body, and no later one, takes it for
+  a stale read and keeps the fence; served the fence again once its ttl
+  plus grace has passed, it frees the record that node holds
+  (`node_lease::tests::a_start_inside_the_fence_window_is_not_closed`).
+  Any read of a later body (a renewal, every third of the ttl) ends it.
+- Compared with the rule before this window (dates alone), that is a
+  narrower exposure: dates alone also freed records through a
+  predecessor's body dated after a created fence, in a cluster of any
+  version, and made a reader refuse the current fence. Compared with
+  0.8.0's own rule (every read judged as read), it is narrower still:
+  there, any stale read of an earlier body frees a record.
 
 ### What it does not close
 
@@ -1352,6 +1384,9 @@ the record's, and frees it at once: two owners. The simulation found it
   until older bodies have been read for ttl plus grace with none
   confirming it: a record may stay unfreed on that process that long,
   never freed wrongly.
+- Reads that are all behind for ttl plus grace, with no current answer at
+  all (no body, and no absent answer) in that time, replace the newest
+  held: the rule before this amendment, as said above.
 
 ### The upgrade floor record
 
@@ -1403,21 +1438,27 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
 ### Tests
 
 - `node_lease::tests`:
-  - `which_body_of_a_lease_is_older`: an instance's end is newer than any of its `live` bodies, whatever the dates; a created fence is newer than every named body dated less than ttl plus grace after it, and older than one dated that much after it or more.
+  - `which_body_of_a_lease_is_older`: an instance's end is newer than any of its `live` bodies, whatever the dates; a created fence is newer than every named body dated less than twice the skew after it, and older than one dated that much after it or more.
   - `a_created_fence_is_newer_than_the_bodies_before_it`: a predecessor's `live` body dated after an operator's created fence, served again once the node runs as another instance that holds the actor, is read again and frees nothing (judged by date alone it took the record).
+  - `a_successor_soon_after_a_created_fence_keeps_its_record`: a successor starting 1 s (a node of 0.8.0) or 2 s after the fence, renewed, keeps its record against the current read and the fence served again (a window of ttl plus grace refused the first and freed on the second).
+  - `a_start_inside_the_fence_window_is_not_closed`: the limit above, and the same reads leaving the record to a successor dated past the window.
+  - `an_absent_lease_keeps_the_newest_pinned`: absent answers between stale reads keep the window from opening; without them, it opens.
   - `the_newest_reads_only_move_forward`.
   - `a_body_dated_ahead_holds_the_newest_for_a_window_only`: an older body replaces the held one once older bodies have been read for ttl plus grace with no confirming read. A gap with no reads does not shorten the window, a confirming read ends it, and a clock stepping back counts it from the step.
   - `a_stale_read_of_a_predecessor_frees_nothing`: the bucket serves a predecessor's `released` body after the process read its successor's `live` one. The acquisition is refused as a stale read while every read is stale, and the record is held by the successor once a read is current. Judging the exhausted read anyway, or switching the table off, frees the record.
   - `a_fence_after_a_clock_step_back_frees_after_ttl_and_grace`.
   - `the_read_back_never_judges_a_stale_body`.
 - `cluster::tests::heartbeat_reads_raise_the_newest_lease_bodies`: the server's heartbeat reads feed the table that its ownership records use, and a later-issued stale read does not lower it.
-- `cluster::tests::a_start_over_a_created_fence_dates_its_body_after_it`: over a created fence dated ahead at the first read, or created over no object late in the check, the first `live` body is dated at least ttl plus grace after the fence.
+- `cluster::tests::a_start_over_a_created_fence_dates_its_body_after_it`: over a created fence dated ahead at the first read, or created over no object late in the check, the first `live` body is dated at least twice the skew after the fence (both fail on the start check before).
 - `sim/tests/madsim_node_lease.rs`:
   - `stale_lease_reads_never_free_a_held_record`: the record clients' reads of node leases return the body served before the newest one served, one read in three. There are never two owners and never one generation for two holds, and reads behind the newest are met and read again.
   - In `each_broken_variant_is_caught`, `StaleReadsTrusted` (the same reads judged as read) and `StaleExhaustedJudged` (an exhausted read judged anyway) both give two owners.
   - `a_read_back_judging_as_read_is_caught`: the read back judging its rival's lease as read gives two owners, rarely, so the search runs to 1,000 seeds.
   - `a_first_stale_read_is_not_closed`: a stale read older than what the bucket held when the process last read, though never given to it, does give two owners. This is the limit above.
   - `a_killed_holder_is_taken_over_under_stale_reads_and_a_clock_step`: every clock steps back 2 s, and then the holder is killed. A survivor holds the actor within the bound the waiters' test uses, on every seed.
+  - `stale_lease_reads_with_a_hot_operator_never_free_a_held_record`: an operator that fences four times as often, deletes the lease before every fence and runs the full skew behind, so its created fences are dated before the bodies they follow; never two owners. Its runs have no twin: the simulation's start check reads twice where the server's polls, and a twin's whole run can fall between those reads when leases are deleted that often.
+  - `a_created_fence_judged_by_date_is_caught` and `an_absent_read_keeping_the_window_is_caught`: the same runs with dates alone for created fences, or with absent answers leaving the window running, give two owners (about once in 5,000 and in 1,000 seeds; a seed that showed each is checked first, and the correct rules pass it).
+  - The start bound has no broken variant here: the simulation's start check waits ttl plus grace after reading a created fence, which at its timings (1.5 s, four times the skew 1.4 s) already dates past the window, and it starts its check again over a fence written during it. The server's test above covers the bound.
 - `app_format::tests`: the floor's exact body, refused forms and key.
 - `cluster::tests::a_floor_above_this_version_stops_the_start`:
   - a floor above the binary's minor version, or an unreadable one: refused, and no lease written;

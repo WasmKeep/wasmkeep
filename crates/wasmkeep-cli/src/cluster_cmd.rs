@@ -258,6 +258,16 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
             ))
             .map_err(|e| anyhow::anyhow!("moving the fence to the bucket's time: {e:?}"))?;
             *written_at_ms = bucket_ms;
+        } else if *written_at_ms > bucket_ms {
+            // Dated ahead: the node's next process writes its first lease
+            // body only once the fence is twice the skew old on its clock
+            // (ADR 0020, amendment on lease reads).
+            eprintln!(
+                "warning: this machine's clock is {:.1} s ahead of the bucket's; node {} can start \
+                 again only once the fence's date has passed on its clock",
+                (*written_at_ms - modified) as f64 / 1000.0,
+                args.node
+            );
         }
     }
     let free_at = |at: u64| {

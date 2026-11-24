@@ -724,6 +724,10 @@ bucket controls the cluster, as with the call secret.
 - **How fast a removed node loses access:** revoke a node's process with
   `wasmkeep cluster fence <node> --bucket ...` (ADR 0020): it stops at its
   next heartbeat write, and its actors are free 15 s after its last write.
+  If its heartbeat was deleted, the fence is created and dated by the
+  bucket's time: a process of that node id starting over it writes its
+  first heartbeat only once the fence is twice the allowed clock skew old
+  on its clock (2 s with the defaults), and logs that wait.
   A service manager that restarts it brings it back as a new process; to
   remove a machine, stop and disable its service too, and rotate its
   bucket credentials ([security](security.md#layers), "Revocation"). A

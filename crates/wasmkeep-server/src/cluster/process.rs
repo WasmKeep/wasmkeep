@@ -410,14 +410,14 @@ impl Transport {
     ///   starts it again).
     ///
     /// `apply` gets every node as last read (by id), the same judged, and
-    /// the nodes this call replaced. `ttl_grace_ms` is the app's lease ttl
-    /// plus grace, which orders a created fence in the newest lease bodies
-    /// read ([`wasmkeep_cluster::node_lease::older_than`]).
+    /// the nodes this call replaced. `lease` is the app's lease, whose skew
+    /// orders a created fence in the newest lease bodies read
+    /// ([`wasmkeep_cluster::node_lease::older_than`]).
     pub(super) fn note_heartbeats<R>(
         &self,
         read: Heartbeats,
         issued: std::time::Instant,
-        ttl_grace_ms: u64,
+        lease: &wasmkeep_cluster::lease::LeaseConfig,
         apply: impl FnOnce(&[NodeInfo], &[NodeInfo], &[String]) -> R,
     ) -> R {
         let now = crate::cluster_tls::now_ms();
@@ -432,7 +432,7 @@ impl Transport {
                         instance: n.instance.clone(),
                         written_at_ms: n.written_at_ms,
                     },
-                    ttl_grace_ms,
+                    lease,
                 );
             }
         };
@@ -440,8 +440,12 @@ impl Transport {
             Heartbeats::Listed(listed) => listed.iter().for_each(|n| observe(&n.id, n)),
             Heartbeats::Read(reads) => {
                 for (id, r) in reads {
-                    if let HeartbeatRead::Found(n) = r {
-                        observe(id, n);
+                    match r {
+                        HeartbeatRead::Found(n) => observe(id, n),
+                        // A current answer: the newest lease body held for
+                        // it is not merely pinned by its date.
+                        HeartbeatRead::Gone => self.lease_reads.absent(id),
+                        HeartbeatRead::Failed(_) => {}
                     }
                 }
             }
