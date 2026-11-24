@@ -48,6 +48,18 @@ impl<'a> From<&'a NodeInfo> for Seen<'a> {
     }
 }
 
+/// How a body given to [`OwnerWatch::observe_kept`] was come by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// Read just now.
+    Read,
+    /// Held as last read, not read just now by this reader (its read
+    /// failed, or another reader of the process made the read).
+    Kept,
+    /// Read just now, but older than a body of that lease already read.
+    Older,
+}
+
 /// What this node knows about the holder of an actor it cannot serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -147,24 +159,26 @@ impl OwnerWatch {
     /// One listing of the node leases, at `now_ms`: every object it
     /// showed. A node it does not show is forgotten.
     pub fn observe<'a>(&mut self, listed: impl IntoIterator<Item = Seen<'a>>, now_ms: u64) {
-        self.observe_kept(listed, |_| false, now_ms);
+        self.observe_kept(listed, |_| Shown::Read, now_ms);
     }
 
-    /// [`Self::observe`], for bodies some of which were not read just now:
-    /// those `kept` names. A kept body is one held as last read after its
-    /// read failed, or one older than a body of that lease the process
-    /// already read ([`crate::node_lease::older_than`]), served late by a
-    /// replica or a cache. Neither says anything new about its node, so
-    /// its entry stays as the last read showed it: it is neither seen
-    /// again unchanged (which would make a node that still writes look
-    /// stale) nor taken as a change (an older instance would look like a
-    /// restart, an older `live` body would undo a fence), and this node's
-    /// own fence of it still holds. A node shown only kept and never
-    /// before is taken as shown; one left out is forgotten, as before.
+    /// [`Self::observe`], for bodies some of which were not read just now
+    /// ([`Shown`], as `shown` says of each node). A body kept as last read
+    /// that is the one the watch holds, or a body older than one the
+    /// process already read ([`crate::node_lease::older_than`]), served
+    /// late by a replica or a cache, says nothing new about its node: its
+    /// entry stays as the last read showed it. It is neither seen again
+    /// unchanged (which would make a node that still writes look stale)
+    /// nor taken as a change (an older instance would look like a restart,
+    /// an older `live` body would undo a fence), and this node's own fence
+    /// of it still holds. A kept body that is not the one the watch holds
+    /// was read since by another reader of the process, and is taken as
+    /// read. A node never seen before is taken as shown; one left out is
+    /// forgotten, as before.
     pub fn observe_kept<'a>(
         &mut self,
         listed: impl IntoIterator<Item = Seen<'a>>,
-        kept: impl Fn(&str) -> bool,
+        shown: impl Fn(&str) -> Shown,
         now_ms: u64,
     ) {
         let mut nodes = HashMap::new();
@@ -174,9 +188,16 @@ impl OwnerWatch {
                 continue;
             }
             let before = self.nodes.get(seen.id);
-            if kept(seen.id)
-                && let Some(before) = before
-            {
+            let keep = match shown(seen.id) {
+                Shown::Read => false,
+                Shown::Older => true,
+                Shown::Kept => before.is_some_and(|b| {
+                    b.state == seen.state
+                        && b.instance.as_deref() == seen.instance
+                        && b.written_at_ms == seen.written_at_ms
+                }),
+            };
+            if keep && let Some(before) = before {
                 nodes.insert(seen.id.to_owned(), before.clone());
                 if self.nudged.iter().any(|n| n == seen.id) {
                     still_nudged.push(seen.id.to_owned());
@@ -735,7 +756,7 @@ mod tests {
         // read of it, so it stays as the last read showed it.
         let mut w = watch();
         w.observe([live("i1", T)], T + 100);
-        let kept = |id: &str| id == "a";
+        let kept = |id: &str| if id == "a" { Shown::Kept } else { Shown::Read };
         w.observe_kept([live("i1", T)], kept, T + HORIZON + 5_000);
         assert_eq!(w.verdict("a", T + HORIZON + 5_000, None), Verdict::Forward);
         // A read that answers again judges it as before.
@@ -756,6 +777,36 @@ mod tests {
         w.observe_kept([], kept, T + 200);
         w.connect_failed("a", T + 300);
         assert_eq!(w.verdict("a", T + 300, None), Verdict::Forward);
+        // A kept body other than the one the watch holds was read since by
+        // another reader of the process (another app's round): taken.
+        let mut w = watch();
+        w.observe([live("i1", T)], T + 100);
+        w.observe_kept(
+            [seen("a", Some(NodeState::Fenced), "i1", T)],
+            kept,
+            T + 1_000,
+        );
+        assert!(matches!(
+            w.verdict("a", T + 1_000, None),
+            Verdict::Stopping { .. }
+        ));
+    }
+
+    #[test]
+    fn a_writer_whose_clock_stepped_back_stays_in_view_until_its_fence() {
+        // Its bodies are all older than the newest the process read: the
+        // watch keeps its last entry (in view), and a fence of it, newer
+        // than any of its live bodies, is taken.
+        let mut w = watch();
+        w.observe([live("i1", T)], T + 100);
+        let older = |id: &str| if id == "a" { Shown::Older } else { Shown::Read };
+        w.observe_kept([live("i1", T - 2_000)], older, T + HORIZON + 5_000);
+        assert_eq!(w.verdict("a", T + HORIZON + 5_000, None), Verdict::Forward);
+        w.observe(
+            [seen("a", Some(NodeState::Fenced), "i1", T - 2_000)],
+            T + 20_000,
+        );
+        assert_eq!(w.verdict("a", T + 20_000, None), Verdict::Free);
     }
 
     #[test]
@@ -765,7 +816,7 @@ mod tests {
         w.observe([live("i1", T)], T + 100);
         w.observe([live("i2", T + 12_000)], T + 12_100);
         let held_since = T + 12_200;
-        let older = |id: &str| id == "a";
+        let older = |id: &str| if id == "a" { Shown::Older } else { Shown::Read };
         w.observe_kept([live("i1", T)], older, T + 12_300);
         assert_eq!(
             w.verdict("a", T + 12_300, Some(held_since)),

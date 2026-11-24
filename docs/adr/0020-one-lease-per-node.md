@@ -1393,7 +1393,14 @@ are.
   failed) or whose body is older than one this process already read
   (`node_lease::older_than` against the newest-reads table, without
   touching that table) is not news: its entry stays as the last real read
-  left it, and this node's own fence of it still holds. Before, a kept
+  left it, and this node's own fence of it still holds. A kept body that
+  differs from the one the watch holds was read since by another app of
+  the process (the heartbeats as last read are shared) and is taken as
+  read, so a fence another app found reaches this app's wait at its next
+  view, although its own rounds no longer read a stopped node. A nudge
+  (this node's own fence) of a node the rounds no longer read lasts until
+  a read shows that node again, at worst the next listing: it only allows
+  tries the acquisition then decides. Before, a kept
   body was judged again with a later clock. A node that still wrote but
   could not be read for a horizon looked stale, and a request for its
   actors was kept until the deadline waiting for a fence that no read
@@ -1445,12 +1452,14 @@ are.
 ### Tests
 
 - `failover::tests`:
-  `a_body_kept_as_last_read_neither_starts_nor_ends_a_wait` and
-  `an_older_body_read_late_neither_restarts_nor_stales_a_node`.
+  `a_body_kept_as_last_read_neither_starts_nor_ends_a_wait`,
+  `an_older_body_read_late_neither_restarts_nor_stales_a_node` and
+  `a_writer_whose_clock_stepped_back_stays_in_view_until_its_fence`.
 - `cluster::tests`:
   `a_peer_kept_as_last_read_is_not_stale_to_the_failover_wait` and
   `an_older_lease_body_read_later_misleads_no_kept_request` (before: `Stale`
-  and `Restarted`), `a_round_caps_its_reads_in_flight` (before: 80 at
+  and `Restarted`), `a_fence_another_app_read_reaches_this_apps_failover_wait`
+  (two apps in one process), `a_round_caps_its_reads_in_flight` (before: 80 at
   once), `a_gone_node_leaves_the_live_senders_at_once`,
   `gone_nodes_are_forgotten_once_no_earlier_read_can_land`,
   `a_runtime_joining_a_process_does_not_wait_for_a_slow_listing` (LIST 3 s

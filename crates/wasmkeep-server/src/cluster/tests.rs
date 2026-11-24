@@ -6137,3 +6137,51 @@ async fn a_runtime_joining_a_process_does_not_wait_for_a_slow_listing() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Two apps in one process share the heartbeats as last read. When one
+/// app's read finds a peer fenced, the other app's failover wait takes
+/// the fence at its next view, though its own read was not the one that
+/// found it (its rounds no longer read a stopped node).
+#[tokio::test]
+async fn a_fence_another_app_read_reaches_this_apps_failover_wait() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        // A 3 h ttl, so nothing runs in the background.
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = runtime("shop-1", "shop");
+    let blog = runtime("blog-1", "blog");
+    let at = now_ms();
+    put_b(&store, node_lease_body("b", "live", "beef", at)).await;
+    let c = node_lease_body("c", "live", "f00d", at);
+    store
+        .inner
+        .put(&StorePath::from("nodes/c"), c.into_bytes().into())
+        .await
+        .unwrap();
+    assert!(
+        shop.read_heartbeats(&["b".to_owned(), "c".to_owned()])
+            .await
+    );
+    assert!(
+        blog.read_heartbeats(&["b".to_owned(), "c".to_owned()])
+            .await
+    );
+    assert_eq!(blog.failover.verdict("b"), Verdict::Forward);
+    put_b(&store, node_lease_body("b", "fenced", "beef", at)).await;
+    assert!(shop.read_heartbeats(&["b".to_owned()]).await);
+    // Blog reads another node only.
+    assert!(blog.read_heartbeats(&["c".to_owned()]).await);
+    assert!(
+        matches!(blog.failover.verdict("b"), Verdict::Stopping { .. }),
+        "{:?}",
+        blog.failover.verdict("b")
+    );
+}

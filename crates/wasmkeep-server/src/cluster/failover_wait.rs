@@ -151,13 +151,18 @@ impl FailoverWait {
     /// A listing of the heartbeats: every node lease it showed.
     #[cfg(test)]
     pub(super) fn observe(&self, all: &[NodeInfo], now: u64) {
-        self.observe_read(all, |_| false, now);
+        self.observe_read(all, |_| wasmkeep_cluster::failover::Shown::Read, now);
     }
 
-    /// Every node lease as last read, of which those `kept` names were not
-    /// read just now: kept after a failed read, or older than a body the
-    /// process already read ([`OwnerWatch::observe_kept`]).
-    pub(super) fn observe_read(&self, all: &[NodeInfo], kept: impl Fn(&str) -> bool, now: u64) {
+    /// Every node lease as last read, each as `kept` says it was come by:
+    /// read just now by this app, kept as last read, or older than a body
+    /// the process already read ([`OwnerWatch::observe_kept`]).
+    pub(super) fn observe_read(
+        &self,
+        all: &[NodeInfo],
+        kept: impl Fn(&str) -> wasmkeep_cluster::failover::Shown,
+        now: u64,
+    ) {
         if self.enabled() {
             self.watch()
                 .observe_kept(all.iter().map(Seen::from), kept, now);

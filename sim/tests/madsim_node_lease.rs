@@ -57,7 +57,7 @@ use std::time::Duration;
 use madsim::net::NetSim;
 use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
-use wasmkeep_cluster::failover::{OwnerWatch, Seen, Step, Verdict, Waiter};
+use wasmkeep_cluster::failover::{OwnerWatch, Seen, Shown, Step, Verdict, Waiter};
 use wasmkeep_cluster::lease::{Bucket, BucketError, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
     AcquireError, Hold, NodeLeaseObject, NodeState, OwnerRecord, ReadFault, frees, operator_fence,
@@ -582,7 +582,17 @@ async fn run_node(
                     written_at_ms: o.as_ref().map_or(0, |o| o.written_at_ms),
                 });
                 listed_ms = clock.now_ms();
-                watch.observe_kept(seen, |id| kept.iter().any(|k| k == id), listed_ms);
+                watch.observe_kept(
+                    seen,
+                    |id| {
+                        if kept.iter().any(|k| k == id) {
+                            Shown::Kept
+                        } else {
+                            Shown::Read
+                        }
+                    },
+                    listed_ms,
+                );
             }
             if node.lost() {
                 // Exit at once: no releases. The claims end now.

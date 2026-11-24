@@ -1060,26 +1060,30 @@ impl Cluster {
         // actors are free: no bucket request. Only those just read and
         // not older than a body of that lease the process already read
         // are news: a body kept after a failed read, or an earlier one a
-        // replica served late, leaves the watch's entry as it was.
+        // replica served late, leaves the watch's entry as it was. A body
+        // another app of the process read since is news here too, unless
+        // it is older.
         let kept = |id: &str| {
-            if !fresh.iter().any(|f| f == id) {
-                return true;
+            use wasmkeep_cluster::failover::Shown;
+            let older = all.iter().find(|n| n.id == id).is_some_and(|n| {
+                n.lease.is_some_and(|state| {
+                    let body = wasmkeep_cluster::node_lease::NodeLeaseObject {
+                        state,
+                        instance: n.instance.clone(),
+                        written_at_ms: n.written_at_ms,
+                    };
+                    self.transport.lease_reads.newest(id).is_some_and(|newest| {
+                        wasmkeep_cluster::node_lease::older_than(&body, &newest)
+                    })
+                })
+            });
+            if older {
+                Shown::Older
+            } else if fresh.iter().any(|f| f == id) {
+                Shown::Read
+            } else {
+                Shown::Kept
             }
-            let Some(n) = all.iter().find(|n| n.id == id) else {
-                return false;
-            };
-            let Some(state) = n.lease else {
-                return false;
-            };
-            let body = wasmkeep_cluster::node_lease::NodeLeaseObject {
-                state,
-                instance: n.instance.clone(),
-                written_at_ms: n.written_at_ms,
-            };
-            self.transport
-                .lease_reads
-                .newest(id)
-                .is_some_and(|newest| wasmkeep_cluster::node_lease::older_than(&body, &newest))
         };
         self.failover.observe_read(all, kept, now);
         // Last, and handed to the fence task: a fence awaits the bucket,
