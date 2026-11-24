@@ -722,7 +722,7 @@ pub(super) async fn execute_settled(
                 if journal["before_restore"].is_null() {
                     let create_args = Create { bucket: args.bucket.clone(), to: args.from.clone(),
                         app: Some(args.app.clone()), all: false, history: History::Head,
-                        require_continuous: Some(true), cache: None, to_env: None };
+                        require_continuous: Some(true), history_retention_secs: 3600, cache: None, to_env: None };
                     let fence_bytes = read(target, &fence, META_MAX).await?;
                     let undo = create_undo(&create_args, target, tp, archive, ap, Some(&fence_bytes)).await?;
                     verify_undo(archive, ap, &undo, args.force).await?;

@@ -181,7 +181,19 @@ enum Idle {
     /// A mutation, for the restore oracles: the idle snapshot's body
     /// misses the head's own position.
     StaleSnapshot,
+    /// As designed, with the retention window: `Safe`, the pass deleting
+    /// only objects last modified at least `IDLE_WINDOW_MS` before it, on
+    /// its node's clock (`Safe` deletes at once, ignoring the window).
+    /// For the backup reader racing passes (`madsim_backup.rs`).
+    Windowed,
 }
+
+/// The retention window of `Idle::Windowed`, in ms: above ADR 0033's
+/// bound for the reader of `madsim_backup.rs` (twice its read deadline
+/// plus the skew bound; see `IDLE_READER_DEADLINE_MS` there).
+pub(crate) const IDLE_WINDOW_MS: u64 = 4_000;
+/// The skew bound between the nodes' clocks and the bucket's, in ms.
+pub(crate) const MAX_SKEW_MS: u64 = 300;
 
 /// Deletes (ADR 0028): a reset, the snapshot at it, then the erase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,6 +1081,22 @@ async fn compact(
             }
         }
         Idle::DropSnapshot => gone.push(snapshot_key(s)),
+        Idle::Windowed => {
+            // The retention window (ADR 0012): only what was last modified
+            // longer than `IDLE_WINDOW_MS` ago on this node's clock, from
+            // a listing with times (one more LIST, as the server's
+            // `Collector::list` reads `last_modified` from its listing).
+            let Ok(timed) = bucket.list_versions(PREFIX).await else {
+                return Vec::new();
+            };
+            let now = wasmkeep_cluster::lease::Clock::now_ms(node.clock()).saturating_sub(EPOCH_MS);
+            let old: BTreeSet<String> = timed
+                .into_iter()
+                .filter(|(_, _, modified)| modified.saturating_add(IDLE_WINDOW_MS) <= now)
+                .filter_map(|(k, _, _)| k.strip_prefix(PREFIX).map(str::to_owned))
+                .collect();
+            gone.retain(|k| old.contains(k));
+        }
         _ => {}
     }
     let violations = pass_violations(&objects, &gone, s);
@@ -1416,6 +1444,9 @@ fn simulate_with_exports(seed: u64, rules: Rules, duration: Duration, export: bo
 }
 
 type Observer = Box<dyn FnMut(&Store, &[SegmentId], &BackupHistory)>;
+/// The bucket's contents as an observer sees them.
+#[allow(dead_code)]
+pub(crate) type ObservedStore = Store;
 #[allow(dead_code)]
 pub(crate) fn backup_simulation(seed: u64, observer: Observer) {
     simulate_observed(
@@ -1425,6 +1456,35 @@ pub(crate) fn backup_simulation(seed: u64, observer: Observer) {
         false,
         Some(observer),
     );
+}
+/// What the idle passes of an observed run did, for `madsim_backup.rs`.
+#[allow(dead_code)]
+pub(crate) struct IdleObserved {
+    /// Passes that sent at least one delete.
+    pub(crate) passes_deleted: u64,
+    /// The first violation of the replication checks, per pass or final.
+    pub(crate) problem: Option<String>,
+}
+/// Idle compaction (ADR 0042) and nothing else deleting, observed:
+/// `windowed` passes delete only what the retention window allows
+/// (`Idle::Windowed`), the others ignore it (`Idle::Safe`, which deletes
+/// at once).
+#[allow(dead_code)]
+pub(crate) fn idle_backup_simulation(
+    seed: u64,
+    windowed: bool,
+    duration: Duration,
+    observer: Observer,
+) -> IdleObserved {
+    let rules = Rules {
+        idle: if windowed { Idle::Windowed } else { Idle::Safe },
+        ..SAFE_IDLE
+    };
+    let outcome = simulate_observed(seed, rules, duration, false, Some(observer));
+    IdleObserved {
+        passes_deleted: outcome.idle.deleted,
+        problem: check(&outcome).err(),
+    }
 }
 fn simulate_observed(
     seed: u64,
@@ -1446,7 +1506,7 @@ fn simulate_observed(
     QUIET_UNTIL.with(|q| q.set(None));
     let _ = take_fences();
     let config = LeaseConfig::new(1_000, 500, 200, 300).unwrap();
-    let max_skew_ms = 300;
+    let max_skew_ms = MAX_SKEW_MS;
     let rt = Runtime::with_seed_and_config(seed, madsim::Config::default());
     let acked = Arc::new(Mutex::new(Vec::new()));
     let resets = Arc::new(Mutex::new(Vec::new()));
@@ -1464,6 +1524,9 @@ fn simulate_observed(
         let export_store = Arc::clone(&store);
         let node_store = Arc::clone(&store);
         let mut pending_export: Option<(Plan, Vec<SegmentId>, usize)> = None;
+        // Listings with last-modified times, from the same instant as the
+        // nodes' global clock, only for the window's passes.
+        let _timestamps = (rules.idle == Idle::Windowed).then(bucket::reset_modified);
         let handle = Handle::current();
         let time = GlobalTime(Instant::now());
         let mut rng = Rng::new(seed ^ 0x5EED_0007);
