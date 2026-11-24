@@ -266,7 +266,12 @@ pub(super) async fn join_read_loop(
     if !identity_unique(cluster.clone()).await {
         return;
     }
+    // When each id was last read for a signed call (a hello, a hop, this
+    // node looking for it), and apart, for a certificate's name: anyone
+    // can present a certificate naming a node, and such a read must not
+    // take the slot a genuine call of that node would use.
     let mut read_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut name_read_at: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
         // Over TLS, a node that just joined is refused at the handshake
         // until its pin is listed: the name on its certificate (a few a
@@ -285,26 +290,33 @@ pub(super) async fn join_read_loop(
         while let Ok(id) = wanted.try_recv() {
             ids.push(id);
         }
-        if let Some(t) = &tls {
-            ids.extend(t.pins().take_unknown_names());
-        }
+        let mut names = tls
+            .as_ref()
+            .map(|t| t.pins().take_unknown_names())
+            .unwrap_or_default();
         let Some(c) = cluster.upgrade() else {
             return;
         };
         let now = tokio::time::Instant::now();
         let every = c.heartbeat_every;
         read_at.retain(|_, at| now.saturating_duration_since(*at) < every);
+        name_read_at.retain(|_, at| now.saturating_duration_since(*at) < every);
         ids.sort_unstable();
         ids.dedup();
         ids.retain(|id| *id != c.node_id && !read_at.contains_key(id));
-        if ids.is_empty() {
-            continue;
-        }
+        names.retain(|n| *n != c.node_id && !ids.contains(n) && !name_read_at.contains_key(n));
         for id in &ids {
             read_at.insert(id.clone(), now);
         }
+        for name in &names {
+            name_read_at.insert(name.clone(), now);
+        }
+        ids.extend(names);
+        if ids.is_empty() {
+            continue;
+        }
         tracing::debug!(nodes = ?ids, "reading the heartbeats of nodes that called before they were seen");
-        c.read_heartbeats(&ids).await;
+        c.read_joined(&ids).await;
     }
 }
 
@@ -873,26 +885,54 @@ impl Cluster {
     }
 
     /// Reads the heartbeats of `ids`, all at once, each within one
-    /// attempt, and applies what came back: a node whose read failed stays
-    /// as last read. True if every read answered.
+    /// attempt, and applies what came back as it lands (whatever answered
+    /// together, each batch stamped with its earliest read's send time): a
+    /// read that hangs holds up the renewal of no other node, and a node
+    /// whose read failed stays as last read. A round: its slowest read
+    /// plans the early reads. True if every read answered.
     pub(super) async fn read_heartbeats(&self, ids: &[String]) -> bool {
-        let started = std::time::Instant::now();
-        let issued = std::time::Instant::now();
-        let reads = self
+        self.read_and_apply(ids, true).await
+    }
+
+    /// [`Self::read_heartbeats`] for join reads (a hello, a hop, the name
+    /// on an unknown certificate): they do not plan the early reads, since
+    /// anyone reaching the cluster port can cause one.
+    pub(super) async fn read_joined(&self, ids: &[String]) -> bool {
+        self.read_and_apply(ids, false).await
+    }
+
+    async fn read_and_apply(&self, ids: &[String], round: bool) -> bool {
+        use futures_util::StreamExt as _;
+        let mut landed = self
             .transport
-            .read_each(ids, self.heartbeat_read_attempt)
-            .await;
+            .read_stream(ids, self.heartbeat_read_attempt)
+            .ready_chunks(super::process::HEARTBEAT_READ_CONCURRENCY);
+        let (mut failed, mut slowest) = (Vec::new(), Duration::ZERO);
+        while let Some(batch) = landed.next().await {
+            let Some(issued) = batch.iter().map(|l| l.sent).min() else {
+                continue;
+            };
+            let mut reads = Vec::with_capacity(batch.len());
+            for l in batch {
+                slowest = slowest.max(l.took);
+                match l.read {
+                    super::process::HeartbeatRead::Failed(e) => {
+                        failed.push(format!("{}: {e}", l.id));
+                    }
+                    read => reads.push((l.id, read)),
+                }
+            }
+            if !reads.is_empty() {
+                self.apply_heartbeats(Heartbeats::Read(reads), issued);
+            }
+        }
         // The reads went out at once: the round took its slowest one (a
         // timed-out read at the attempt).
-        self.slowest_read_ms.store(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let mut failed = Vec::new();
-        for (id, read) in &reads {
-            if let super::process::HeartbeatRead::Failed(e) = read {
-                failed.push(format!("{id}: {e}"));
-            }
+        if round {
+            self.slowest_read_ms.store(
+                u64::try_from(slowest.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         if !failed.is_empty() {
             crate::metrics::METRICS.heartbeat_read_failures.fetch_add(
@@ -904,12 +944,7 @@ impl Cluster {
                 "reading some nodes' heartbeats failed; each stays as last read, until its own horizon"
             );
         }
-        let answered = failed.is_empty();
-        if failed.len() == reads.len() {
-            return false;
-        }
-        self.apply_heartbeats(Heartbeats::Read(reads), issued);
-        answered
+        failed.is_empty()
     }
 
     /// Reads `ids` before the next round ([`Self::early_reads_due`]),

@@ -1400,7 +1400,12 @@ are.
   view, although its own rounds no longer read a stopped node. A nudge
   (this node's own fence) of a node the rounds no longer read lasts until
   a read shows that node again, at worst the next listing: it only allows
-  tries the acquisition then decides. Before, a kept
+  tries the acquisition then decides, and only while the watch holds the
+  node `live` (or does not know it): a `fenced` or `released` entry is
+  judged by its date. A `live` body the watch never saw and nothing read
+  just now (an app that joins the process while that node's reads fail)
+  counts as in view: nothing this app read shows that node stopped
+  writing. A `fenced` or `released` one takes its date. Before, a kept
   body was judged again with a later clock. A node that still wrote but
   could not be read for a horizon looked stale, and a request for its
   actors was kept until the deadline waiting for a fence that no read
@@ -1410,9 +1415,20 @@ are.
   A peer whose clock stepped back writes bodies older than the newest held:
   the watch keeps its last entry, in view, until a body not older is read
   or a fence lands (the fence watch is unchanged, and sees every fresh read).
-- **At most 32 reads in flight in a round** (`HEARTBEAT_READ_CONCURRENCY`).
-  Each read's attempt starts when the read is sent, so past 32 known nodes
-  a round can take more than one attempt. Up to 32 nodes, nothing changes.
+- **At most 32 reads in flight in a round** (`HEARTBEAT_READ_CONCURRENCY`),
+  landing in any order: a new read is sent as soon as any read in flight
+  lands, so reads that hang do not queue behind one another, and a round
+  ends in about its slowest read (at most one attempt) unless more than
+  32 reads hang at once. What answered is applied as it lands, in batches
+  of whatever landed together, each stamped with its earliest read's send
+  time (the order rule above compares that stamp, which is never later
+  than the read's own). So a read that hangs delays no other node's
+  renewal: the trust in the nodes that answered is renewed while the hung
+  ones are still out, and a hung node keeps the trust its last heartbeat
+  gave, to that heartbeat's horizon, as before. Only rounds and early
+  reads set the latency the early reads are planned on; join reads (a
+  hello, a hop, a certificate's name) do not, since anyone reaching the
+  cluster port can cause one.
 - **A node found gone leaves the live senders at once.** The process's
   table of live senders (the sender check of hops) drops a node that no
   heartbeat as last read names any more (its object is gone), as the pins
@@ -1438,9 +1454,13 @@ are.
   one, [ADR 0038](0038-several-apps-per-process.md)) and, if it is a valid
   node id, reads `nodes/<name>` by key on the join-read task, as for a
   hello. That name was not verified: it only chooses what to read, and
-  trust still comes from the heartbeat read. At most four such names a
-  period, each read at most once a period, so a stranger reaching the
-  cluster port cannot make the node read the bucket more than that. A
+  trust still comes from the heartbeat read. At most four such names are
+  kept a period (taking them does not renew that budget, and past it a
+  certificate is not even parsed), and the join-read task reads each name
+  at most once a period, counted apart from the reads signed calls ask
+  for, so that a certificate naming a real node never takes the read that
+  node's own hello would make. A stranger reaching the cluster port thus
+  makes the node read the bucket at most four times a period. A
   process with a name serving several apps finds nothing under its name
   and waits for the listing, as before.
 - **The hellos wait for a live peer of this app.** The first round of
@@ -1453,8 +1473,10 @@ are.
 
 - `failover::tests`:
   `a_body_kept_as_last_read_neither_starts_nor_ends_a_wait`,
-  `an_older_body_read_late_neither_restarts_nor_stales_a_node` and
-  `a_writer_whose_clock_stepped_back_stays_in_view_until_its_fence`.
+  `an_older_body_read_late_neither_restarts_nor_stales_a_node`,
+  `a_writer_whose_clock_stepped_back_stays_in_view_until_its_fence`,
+  `a_live_body_first_shown_kept_is_in_view_and_a_stopped_one_takes_its_date`
+  and `this_nodes_own_fence_counts_only_while_the_node_looks_live`.
 - `cluster::tests`:
   `a_peer_kept_as_last_read_is_not_stale_to_the_failover_wait` and
   `an_older_lease_body_read_later_misleads_no_kept_request` (before: `Stale`
@@ -1463,8 +1485,15 @@ are.
   once), `a_gone_node_leaves_the_live_senders_at_once`,
   `gone_nodes_are_forgotten_once_no_earlier_read_can_land`,
   `a_runtime_joining_a_process_does_not_wait_for_a_slow_listing` (LIST 3 s
-  late; before, the first round waited two attempts) and
-  `only_live_peers_of_this_app_count_as_found_for_the_hellos`.
+  late; before, the first round waited two attempts),
+  `only_live_peers_of_this_app_count_as_found_for_the_hellos`,
+  `hung_reads_past_the_cap_hold_up_neither_the_round_nor_the_answers`
+  (three hung reads over 70 peers: answers applied within 300 ms, the round
+  in about one attempt; before, nothing applied until the round ended,
+  one attempt per hung read), `join_reads_do_not_plan_the_early_reads`,
+  `an_app_joining_while_a_peers_reads_fail_keeps_no_request_for_it`,
+  `another_apps_older_read_misleads_no_kept_request` and
+  `a_late_read_does_not_bring_a_gone_node_back`.
 - `cluster_tls::tests::the_name_on_an_unknown_certificate_is_kept_to_read_by_key`.
 - `tests/cluster/slow_bucket.rs`:
   `a_joining_node_is_seen_from_its_first_call_while_listing_is_slow` (LIST

@@ -737,6 +737,9 @@ mod tests {
             pins.note_unknown_name(named(id).cert_der());
         }
         assert_eq!(pins.take_unknown_names(), ids[..UNKNOWN_NAMES_A_PERIOD]);
+        // Taking them does not give the period its budget back.
+        pins.note_unknown_name(named("n-late").cert_der());
+        assert!(pins.take_unknown_names().is_empty());
     }
 
     #[tokio::test]
@@ -1483,11 +1486,12 @@ pub(crate) mod pinning {
         /// A certificate whose pin was not known was presented: keeps the
         /// name on it ([`certificate_name`]) to read by key, at most
         /// [`UNKNOWN_NAMES_A_PERIOD`] names a period (the longest period
-        /// of the loops listing for this set, 1 s before one is known).
+        /// of the loops listing for this set, 1 s before one is known),
+        /// counted when kept and not reset by [`Self::take_unknown_names`].
+        /// Once that many are kept, a certificate is not even parsed. The
+        /// join-read task then reads each name at most once a period,
+        /// apart from the reads that signed calls ask for.
         pub(crate) fn note_unknown_name(&self, cert: &[u8]) {
-            let Some(name) = certificate_name(cert) else {
-                return;
-            };
             let now = super::now_ms();
             let period = match self.period_ms.load(std::sync::atomic::Ordering::Relaxed) {
                 0 => 1_000,
@@ -1498,7 +1502,13 @@ pub(crate) mod pinning {
                 unknown.since_ms = now;
                 unknown.taken = 0;
             }
-            if unknown.taken >= UNKNOWN_NAMES_A_PERIOD || unknown.names.contains(&name) {
+            if unknown.taken >= UNKNOWN_NAMES_A_PERIOD {
+                return;
+            }
+            let Some(name) = certificate_name(cert) else {
+                return;
+            };
+            if unknown.names.contains(&name) {
                 return;
             }
             unknown.taken += 1;

@@ -188,7 +188,8 @@ impl OwnerWatch {
                 continue;
             }
             let before = self.nodes.get(seen.id);
-            let keep = match shown(seen.id) {
+            let shown = shown(seen.id);
+            let keep = match shown {
                 Shown::Read => false,
                 Shown::Older => true,
                 Shown::Kept => before.is_some_and(|b| {
@@ -210,13 +211,19 @@ impl OwnerWatch {
                 Some(_) => Some(now_ms),
                 None => None,
             };
+            // A `live` body this watch never saw, which nothing read just
+            // now: no proof that its node stopped writing, so in view (the
+            // node's own reads judge it). A stopped one takes its date.
+            let unproven =
+                before.is_none() && shown != Shown::Read && seen.state == Some(NodeState::Live);
             nodes.insert(
                 seen.id.to_owned(),
                 Node {
                     state: seen.state,
                     instance: seen.instance.map(str::to_owned),
                     written_at_ms: seen.written_at_ms,
-                    in_view: now_ms.saturating_sub(seen.written_at_ms) <= self.horizon_ms,
+                    in_view: unproven
+                        || now_ms.saturating_sub(seen.written_at_ms) <= self.horizon_ms,
                     moved: same_process
                         && before.is_some_and(|b| seen.written_at_ms > b.written_at_ms),
                     restarted_at_ms,
@@ -307,7 +314,14 @@ impl OwnerWatch {
         if node == self.me {
             return Verdict::Forward;
         }
-        if self.nudged.iter().any(|n| n == node) {
+        // This node's own fence attempt: a hint while the node looks live
+        // (or is not known); a stopped node is judged by its date.
+        if self.nudged.iter().any(|n| n == node)
+            && self
+                .nodes
+                .get(node)
+                .is_none_or(|n| n.state == Some(NodeState::Live))
+        {
             return Verdict::Free;
         }
         let Some(n) = self.nodes.get(node) else {
@@ -786,6 +800,46 @@ mod tests {
             kept,
             T + 1_000,
         );
+        assert!(matches!(
+            w.verdict("a", T + 1_000, None),
+            Verdict::Stopping { .. }
+        ));
+    }
+
+    #[test]
+    fn a_live_body_first_shown_kept_is_in_view_and_a_stopped_one_takes_its_date() {
+        // Another reader of the process last read it long ago, and this
+        // watch never saw it: an old `live` body is no proof that its node
+        // stopped writing (nothing here read it), so it is forwarded to.
+        for shown in [Shown::Kept, Shown::Older] {
+            let mut w = watch();
+            w.observe_kept([live("i1", T)], |_| shown, T + HORIZON + 5_000);
+            assert_eq!(
+                w.verdict("a", T + HORIZON + 5_000, None),
+                Verdict::Forward,
+                "{shown:?}"
+            );
+            // A fenced or released one is judged by its date, as read.
+            let mut w = watch();
+            w.observe_kept(
+                [seen("a", Some(NodeState::Fenced), "i1", T)],
+                |_| shown,
+                T + 1_000,
+            );
+            assert!(matches!(
+                w.verdict("a", T + 1_000, None),
+                Verdict::Stopping { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn this_nodes_own_fence_counts_only_while_the_node_looks_live() {
+        // Known `released` with its actors free only later: a nudge (say,
+        // a fence attempt that found it not live) does not free them early.
+        let mut w = watch();
+        w.observe([seen("a", Some(NodeState::Released), "i1", T)], T + 1_000);
+        w.nudge("a");
         assert!(matches!(
             w.verdict("a", T + 1_000, None),
             Verdict::Stopping { .. }

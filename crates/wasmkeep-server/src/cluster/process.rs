@@ -653,33 +653,69 @@ impl Transport {
 
     /// The heartbeats of the nodes `ids` names, read at once, at most
     /// [`HEARTBEAT_READ_CONCURRENCY`] in flight, each within `attempt` (ADR
-    /// 0020, amendment of 2026-11-20): one slow or hung read costs one
-    /// attempt, not the others' reads. Each with what its read found, in
-    /// the order given.
+    /// 0020, amendments of 2026-11-20 and 2026-11-24): one slow or hung
+    /// read costs one attempt, not the others' reads. Each with what its
+    /// read found, in the order given, once all have landed.
+    #[cfg(test)]
     pub(super) async fn read_each(
         &self,
         ids: &[String],
         attempt: std::time::Duration,
     ) -> Vec<(String, HeartbeatRead)> {
         use futures_util::StreamExt as _;
+        let mut landed: Vec<Landed> = self.read_stream(ids, attempt).collect().await;
+        landed.sort_by_key(|l| ids.iter().position(|id| *id == l.id));
+        landed.into_iter().map(|l| (l.id, l.read)).collect()
+    }
+
+    /// [`Self::read_each`]'s reads, each as it lands, in whatever order:
+    /// a hung read holds up no other, and the next read is sent as soon
+    /// as any read in flight lands, so a round ends in about the slowest
+    /// read's time (at most one attempt) however many hang, and what
+    /// answered can be applied at once.
+    pub(super) fn read_stream(
+        &self,
+        ids: &[String],
+        attempt: std::time::Duration,
+    ) -> impl futures_util::Stream<Item = Landed> + use<> {
+        use futures_util::StreamExt as _;
         // Owned, each its own future, collected first: nothing borrowed is
         // held across the reads. Each read's attempt starts when it is
-        // sent, so past the cap a round can take more than one attempt.
+        // sent.
         let reads: Vec<_> = ids
             .iter()
-            .map(|id| read_one(self.nodes.clone(), id.clone(), attempt))
+            .map(|id| {
+                let (nodes, id) = (self.nodes.clone(), id.clone());
+                async move {
+                    let sent = std::time::Instant::now();
+                    let (id, read) = read_one(nodes, id, attempt).await;
+                    Landed {
+                        sent,
+                        took: sent.elapsed(),
+                        id,
+                        read,
+                    }
+                }
+            })
             .collect();
-        futures_util::stream::iter(reads)
-            .buffered(HEARTBEAT_READ_CONCURRENCY)
-            .collect()
-            .await
+        futures_util::stream::iter(reads).buffer_unordered(HEARTBEAT_READ_CONCURRENCY)
     }
+}
+
+/// One heartbeat read that landed ([`Transport::read_stream`]).
+pub(super) struct Landed {
+    /// When it was sent, and how long it took.
+    pub(super) sent: std::time::Instant,
+    pub(super) took: std::time::Duration,
+    pub(super) id: String,
+    pub(super) read: HeartbeatRead,
 }
 
 /// The most heartbeat reads a round has in flight at once: a round of a
 /// prefix with many nodes does not send a GET (and open a connection) per
-/// node in one burst. Twice what a listing's reads use, so a round of up
-/// to 32 nodes still ends within one attempt.
+/// node in one burst. Twice what a listing's reads use. Reads land in any
+/// order, and a new one is sent as each lands, so hung reads do not queue
+/// behind one another.
 pub(super) const HEARTBEAT_READ_CONCURRENCY: usize = 32;
 
 /// One read of node `id`'s heartbeat, within `attempt`.
