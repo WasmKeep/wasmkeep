@@ -261,14 +261,32 @@ pub(super) async fn join_read_loop(
     cluster: std::sync::Weak<Cluster>,
     mut wanted: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    // Held apart from the cluster, so waiting does not keep it alive.
+    let tls = cluster.upgrade().and_then(|c| c.transport.tls.clone());
     if !identity_unique(cluster.clone()).await {
         return;
     }
     let mut read_at: HashMap<String, tokio::time::Instant> = HashMap::new();
-    while let Some(first) = wanted.recv().await {
-        let mut ids = vec![first];
+    loop {
+        // Over TLS, a node that just joined is refused at the handshake
+        // until its pin is listed: the name on its certificate (a few a
+        // period, `PinSet::note_unknown_name`) is read by key too, so it
+        // need not wait for the listing. Whether or not it is in the view:
+        // a node restarted under its id has a new key, which its object
+        // names. A process's name is no node id when it serves several
+        // apps: that read finds nothing.
+        let mut ids = tokio::select! {
+            first = wanted.recv() => match first {
+                Some(first) => vec![first],
+                None => return,
+            },
+            () = unknown_names(&tls) => Vec::new(),
+        };
         while let Ok(id) = wanted.try_recv() {
             ids.push(id);
+        }
+        if let Some(t) = &tls {
+            ids.extend(t.pins().take_unknown_names());
         }
         let Some(c) = cluster.upgrade() else {
             return;
@@ -287,6 +305,16 @@ pub(super) async fn join_read_loop(
         }
         tracing::debug!(nodes = ?ids, "reading the heartbeats of nodes that called before they were seen");
         c.read_heartbeats(&ids).await;
+    }
+}
+
+/// Resolves when a certificate whose pin was not known left its name to
+/// read ([`crate::cluster_tls::pinning::PinSet::note_unknown_name`]); never
+/// without TLS.
+async fn unknown_names(tls: &Option<Arc<ClusterTls>>) {
+    match tls {
+        Some(t) => t.pins().unknown_name_seen().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1117,6 +1145,15 @@ impl Cluster {
             return;
         }
         let _ = self.reads_wanted.send(id.to_owned());
+    }
+
+    /// Whether node `id` is among the nodes as last read (no read asked).
+    pub(crate) fn knows(&self, id: &str) -> bool {
+        self.known_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|n| n == id)
     }
 
     /// Whether the last refresh found a peer to say hello to: a live node

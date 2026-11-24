@@ -18,6 +18,7 @@ http-body.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+rustls-webpki.workspace = true
 wasmkeep-runtime.workspace = true
 wasmkeep-storage.workspace = true
 wasmkeep-wit.workspace = true

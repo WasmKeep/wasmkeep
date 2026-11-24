@@ -234,9 +234,12 @@ jobs:
 
   # Three jobs, not a matrix: a matrix skipped as a whole reports one check
   # under its unexpanded name, and each of these names is a required check.
+  # 60 minutes: the full suite took 44 of 45 here. A limit costs the queue
+  # nothing until a run hangs; splitting the TLS copy of the cluster suite
+  # into its own job would take a second runner and a second build.
   test-linux:
     name: test (ubuntu-latest)
-    timeout-minutes: 45
+    timeout-minutes: 60
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.result != 'skipped' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest

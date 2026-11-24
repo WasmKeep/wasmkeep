@@ -694,6 +694,51 @@ mod tests {
     use super::*;
     use tower_service::Service;
 
+    /// ADR 0020, amendment of 2026-11-20 (second part): a node that just
+    /// joined is refused at the handshake until its pin is listed; the
+    /// name on its certificate is kept, so that its object is read by key
+    /// at once rather than at the next listing. Only valid node ids, each
+    /// once, and at most a few a period: anyone reaching the port can
+    /// present a certificate.
+    #[tokio::test]
+    async fn the_name_on_an_unknown_certificate_is_kept_to_read_by_key() {
+        use pinning::{UNKNOWN_NAMES_A_PERIOD, certificate_name};
+        let named = |name: &str| Identity::generate(name, "n.test").unwrap();
+        assert_eq!(
+            certificate_name(named("c-1").cert_der()).as_deref(),
+            Some("c-1")
+        );
+        assert_eq!(certificate_name(named("Not A Node").cert_der()), None);
+        assert_eq!(certificate_name(b"not a certificate"), None);
+        // At the handshake: b knows no pin of c's.
+        let (b, listener, addr) = listener("b").await;
+        let c = Arc::new(ClusterTls::generate("c-1", "https://c.test:7443").unwrap());
+        refresh(
+            &c,
+            &vec![("b".into(), Some(b.advertise().into()), vec![b.pin()])],
+        );
+        let accepted = accept_one(&b, listener);
+        let mut connector = ClusterConnector::new(Some(Arc::clone(&c)), false);
+        let _ = connector
+            .call(format!("https://{addr}/").parse().unwrap())
+            .await;
+        assert!(accepted.await.unwrap().is_err(), "an unknown pin accepted");
+        assert_eq!(b.pins().take_unknown_names(), ["c-1"]);
+        assert!(b.pins().take_unknown_names().is_empty());
+        // A few a period, each once.
+        let pins = pinning::PinSet::default();
+        let ids: Vec<String> = (0..UNKNOWN_NAMES_A_PERIOD + 2)
+            .map(|i| format!("n-{i}"))
+            .collect();
+        let first = named(&ids[0]);
+        pins.note_unknown_name(first.cert_der());
+        pins.note_unknown_name(first.cert_der());
+        for id in &ids[1..] {
+            pins.note_unknown_name(named(id).cert_der());
+        }
+        assert_eq!(pins.take_unknown_names(), ids[..UNKNOWN_NAMES_A_PERIOD]);
+    }
+
     #[tokio::test]
     async fn plain_connects_and_https_is_refused_without_tls() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1267,6 +1312,89 @@ pub(crate) mod pinning {
         /// The longest period of the loops listing for this set (ms): an
         /// asked-for listing may come only at the next period.
         period_ms: std::sync::atomic::AtomicU64,
+        /// The names on certificates whose pin was not known, to read by
+        /// key ([`PinSet::take_unknown_names`]).
+        unknown_names: std::sync::Mutex<UnknownNames>,
+        /// Woken when such a name was kept.
+        unknown_name: tokio::sync::Notify,
+    }
+
+    /// At most this many names of unknown certificates are taken a
+    /// period: anyone who reaches the cluster port can present one, so
+    /// strangers cannot make this node read the bucket more than that.
+    pub(crate) const UNKNOWN_NAMES_A_PERIOD: usize = 4;
+
+    /// [`PinSet::unknown_names`].
+    #[derive(Debug, Default)]
+    struct UnknownNames {
+        /// When the current period began (ms), and the names taken in it.
+        since_ms: u64,
+        taken: usize,
+        /// Not yet handed out.
+        names: Vec<String>,
+    }
+
+    /// The name on a node certificate (its common name, which is its
+    /// node id, or its process's name when the process has one, ADR
+    /// 0038), if it is a valid node id. Read from a certificate nobody
+    /// verified yet: a hint for what to read, never a credential.
+    pub(crate) fn certificate_name(cert: &[u8]) -> Option<String> {
+        let der = rustls::pki_types::CertificateDer::from(cert);
+        let parsed = webpki::EndEntityCert::try_from(&der).ok()?;
+        let name = common_name(parsed.subject())?;
+        wasmkeep_cluster::membership::validate_node_id(&name).ok()?;
+        Some(name)
+    }
+
+    /// The first common name (2.5.4.3) in the contents of a DER `Name`: a
+    /// sequence of sets of (type, value) sequences.
+    fn common_name(mut name: &[u8]) -> Option<String> {
+        const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+        while !name.is_empty() {
+            let (set, rest) = der_element(name, 0x31)?;
+            name = rest;
+            let mut set = set;
+            while !set.is_empty() {
+                let (attribute, rest) = der_element(set, 0x30)?;
+                set = rest;
+                let (oid, value) = der_element(attribute, 0x06)?;
+                if oid != COMMON_NAME {
+                    continue;
+                }
+                // UTF8String or PrintableString.
+                let tag = *value.first()?;
+                if tag != 0x0c && tag != 0x13 {
+                    return None;
+                }
+                let (text, _) = der_element(value, tag)?;
+                return std::str::from_utf8(text).ok().map(str::to_owned);
+            }
+        }
+        None
+    }
+
+    /// The contents of the DER element of tag `tag` at the start of
+    /// `input`, and what follows it. Definite lengths up to two bytes only:
+    /// a node certificate's names are short.
+    fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+        let (&first, rest) = input.split_first()?;
+        if first != tag {
+            return None;
+        }
+        let (&len, rest) = rest.split_first()?;
+        let (len, rest) = match len {
+            0..=0x7f => (usize::from(len), rest),
+            0x81 => {
+                let (&l, rest) = rest.split_first()?;
+                (usize::from(l), rest)
+            }
+            0x82 => {
+                let (l, rest) = rest.split_at_checked(2)?;
+                (usize::from(u16::from_be_bytes([l[0], l[1]])), rest)
+            }
+            _ => return None,
+        };
+        rest.split_at_checked(len)
     }
 
     impl PinSet {
@@ -1350,6 +1478,50 @@ pub(crate) mod pinning {
         /// Resolves once a pin was not known since the last wait.
         pub(crate) async fn unknown_seen(&self) {
             self.unknown.notified().await;
+        }
+
+        /// A certificate whose pin was not known was presented: keeps the
+        /// name on it ([`certificate_name`]) to read by key, at most
+        /// [`UNKNOWN_NAMES_A_PERIOD`] names a period (the longest period
+        /// of the loops listing for this set, 1 s before one is known).
+        pub(crate) fn note_unknown_name(&self, cert: &[u8]) {
+            let Some(name) = certificate_name(cert) else {
+                return;
+            };
+            let now = super::now_ms();
+            let period = match self.period_ms.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => 1_000,
+                ms => ms,
+            };
+            let mut unknown = self.unknown_names.lock().unwrap_or_else(|p| p.into_inner());
+            if now.saturating_sub(unknown.since_ms) >= period || now < unknown.since_ms {
+                unknown.since_ms = now;
+                unknown.taken = 0;
+            }
+            if unknown.taken >= UNKNOWN_NAMES_A_PERIOD || unknown.names.contains(&name) {
+                return;
+            }
+            unknown.taken += 1;
+            unknown.names.push(name);
+            drop(unknown);
+            self.unknown_name.notify_one();
+        }
+
+        /// Resolves once [`Self::note_unknown_name`] kept a name since the
+        /// last wait.
+        pub(crate) async fn unknown_name_seen(&self) {
+            self.unknown_name.notified().await;
+        }
+
+        /// The names [`Self::note_unknown_name`] kept since the last call.
+        pub(crate) fn take_unknown_names(&self) -> Vec<String> {
+            std::mem::take(
+                &mut self
+                    .unknown_names
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .names,
+            )
         }
 
         /// The node a certificate belongs to, if its pin is live: listed,
@@ -1439,6 +1611,9 @@ pub(crate) mod pinning {
             match self.pins.node_of(end_entity) {
                 Some(_) => Ok(rustls::server::danger::ClientCertVerified::assertion()),
                 None => {
+                    // A node that just joined, most likely: its object is
+                    // read by key, so it need not wait for a listing.
+                    self.pins.note_unknown_name(end_entity);
                     self.pins.note_unknown();
                     Err(rustls::Error::General(
                         "not a live node's certificate".into(),
