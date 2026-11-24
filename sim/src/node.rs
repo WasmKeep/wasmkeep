@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use wasmkeep_cluster::holds::{self, Parked, PendingEntry, Validity};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
-    AcquireError, Fence, FenceWatch, Hold, NodeLease, NodeLeaseError, NodeLeaseObject, NodeState,
-    Owners, Released, fence,
+    AcquireError, Fence, FenceWatch, Hold, NewestReads, NodeLease, NodeLeaseError, NodeLeaseObject,
+    NodeState, Owners, Released, fence,
 };
 
 use crate::driver::Env;
@@ -95,6 +95,10 @@ pub struct Breaks {
     /// validity: with [`Self::release_before_stop`], a hold an event gives
     /// up after a lapse acts until its release is answered.
     pub act_on_cell_only: bool,
+    /// The ownership records are judged on every node lease body as read,
+    /// even one older than a body of that lease this process read before
+    /// (ADR 0020 before its amendment on lease reads).
+    pub trust_stale_reads: bool,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -244,9 +248,17 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         } else {
             UNRESOLVED_WAIT_MS
         };
+        // One table of newest lease reads for the process, as the server's
+        // transport holds one for all its apps.
+        let reads = Arc::new(if setup.breaks.trust_stale_reads {
+            NewestReads::off()
+        } else {
+            NewestReads::new()
+        });
         let owners = |b| {
             Owners::new(b, clock, &setup.id, instance, &setup.nodes_prefix, cfg)
                 .with_unresolved_wait_ms(wait)
+                .with_reads(Arc::clone(&reads))
         };
         let mut shared = Shared::default();
         let _ = shared
@@ -289,6 +301,12 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
     /// Whether the lease was lost: the process exits.
     pub fn lost(&self) -> bool {
         lock(&self.shared).lost
+    }
+
+    /// Lease reads this process found older than one it read before, and
+    /// read again ([`NewestReads::behind_count`]).
+    pub fn behind_reads(&self) -> u64 {
+        self.owners.reads().behind_count()
     }
 
     /// Fences this node wrote over peers.
@@ -701,6 +719,11 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
                 .ok()
                 .flatten()
                 .and_then(|(body, _)| NodeLeaseObject::decode(&body));
+            // As the server's heartbeat rounds do: every lease body read
+            // raises the process's newest reads.
+            if let Some(o) = &seen {
+                self.owners.reads().observe(&peer, o);
+            }
             match seen.filter(|o| o.state == NodeState::Live) {
                 Some(o) => {
                     let Some(instance) = o.instance.clone() else {

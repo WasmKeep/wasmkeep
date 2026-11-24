@@ -50,6 +50,12 @@
   write (by a sibling app of the process, or from a replica behind), for a
   twin; a hello goes to the peers of its own app only. See "Amendment of 2026-11-23: a predecessor's body read
   back" at the end.
+- Amended 2026-11-24: lease reads. A node lease read to judge an
+  ownership record free is never older than a body of that lease the
+  process has already read; an older one is read again, and never frees
+  the record. Also defines the app's upgrade floor record, read at start.
+  See "Amendment of 2026-11-24: lease reads, and the upgrade floor" at the
+  end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -1208,3 +1214,119 @@ Such refusals are now counted, `wasmkeep_signatures_bad_total`.
   `a_restart_says_hello_to_its_own_apps_peers_only` (two processes serving
   two apps each, one restarted: no call refused for its signature; before,
   18).
+
+## Amendment of 2026-11-24: lease reads, and the upgrade floor
+
+A record naming node A and instance *i* is free on a read of A's lease
+made after the read of the record: `live` naming another instance, or
+`fenced` or `released` once its `written_at` is ttl plus grace old. The
+rule trusts that read. A read that returns an earlier body of A's lease (a
+replica or a cache behind the bucket's latest write) can free a record the
+current instance holds: A ran as *h*, stopped, and now runs as *i* and
+holds the actor; a stale read of *h*'s `released` body, long past its ttl
+and grace, or of *h*'s last `live` body (another instance than *i*), frees
+the record while *i* acts as its owner.
+
+Comparing the record's instance with the body's does not close it. A
+record naming *i* with a body naming *k* is right when *k* came after *i*
+(*i* died, *k* started, *k* stopped or runs) and wrong when *k* came
+before. Requiring the two to match would leave such an actor held for
+ever, and nothing in the record or the lease says which came first.
+
+### The rule
+
+- Every process keeps the newest body of each node's lease it has read,
+  from any read: its heartbeat rounds and listings (every app of the
+  process, as their heartbeats as last read), and the reads made to judge
+  a record. It only moves forward. A body is older than another when it is
+  dated earlier, or dated the same and `live` where the other is the
+  `fenced` or `released` body of the same instance (a fence or a release
+  keeps the `written_at` of the last `live` write, and that instance never
+  writes `live` again). Two bodies dated the same that name different
+  instances are not ordered.
+- A read made to judge a record (the acquisition's, and the read back after
+  an acquisition's failed write) that returns a body older than the newest
+  held for that node is read again, up to three reads in all. If every read
+  is older, the read counts as unanswered: the acquisition is refused as
+  unavailable (nothing written), and the read back stays unresolved, as for
+  a failed read. Such a body is never judged.
+- Nothing changes in the stored records or leases, so nodes of the
+  previous patch run beside this one: each judges by its own reads.
+
+### What it does not close
+
+- A first read that is stale: a process that has never read a body of
+  A's lease newer than the stale one cannot tell. Closing it needs the
+  ownership record to carry the date (or version) of its holder's lease
+  when it acquired, so a reader can refuse a body dated before it. That is
+  a format change, gated as every format change is.
+- Order across instances rests on their writers' clocks. A successor's
+  first `live` write follows its predecessor's last body by at least the
+  start check (ttl plus grace from its first read when the predecessor
+  crashed), longer than the skew allowed; after a clean stop it may follow
+  at once, and two bodies dated within the skew of each other may then be
+  ordered wrongly. A body dated ahead of the reader's clock holds the
+  newest until the successor's dates pass it: a record may stay unfreed
+  that long on that process, never freed wrongly.
+
+### The upgrade floor record
+
+The app's upgrade floor is `formats/<tenant>/<app>/floor` under the bucket
+prefix, beside the recorded-head setting
+([ADR 0035](0035-a-recorded-head-on-hand-over.md), section 5), and outside
+`state/` and `apps/`. Its body is exactly:
+
+```
+wasmkeep-floor 1
+<major>.<minor>
+```
+
+each line ending in a newline, the version in decimal without leading
+zeros (`0.9`). It names the lowest minor version allowed to serve the app.
+
+- Read by every node at start since 0.8.1, after the bucket check and
+  before its first lease write. A floor above the binary's own minor
+  version stops the start; the message names both versions. A missing
+  record starts as before. A body in any other form (another header, a
+  third number, a trailing space, CRLF) refuses to start, as an unreadable
+  format setting refuses service. A read with no answer is retried and
+  neither starts nor refuses.
+- Read again right after the first lease write, before the node serves.
+  The start check keeps a starting node silent for at least ttl plus grace
+  before that write, so a writer listing the live nodes cannot see it
+  then; a floor written meanwhile stops it at this second read, and its
+  lease is written `released` (it held nothing).
+- Not read after that: a node already serving when a floor above it is
+  written keeps serving until it stops.
+- Nothing lists or deletes `formats/`: the floor outlives an app's delete
+  and recreate, as the format setting does.
+- Written from 0.9.0, by `wasmkeep cluster upgrade finalize`, once every
+  live node runs the new minor version. Nothing in 0.8.1 writes it. A node
+  of the previous minor version that was offline when the upgrade was
+  finalized then cannot start into the cluster.
+
+### Tests
+
+- `node_lease::tests`: `which_body_of_a_lease_is_older`,
+  `the_newest_reads_only_move_forward` and
+  `a_stale_read_of_a_predecessor_frees_nothing` (the bucket serves a
+  predecessor's `released` body after the process read its successor's
+  `live` one: refused as unavailable while every read is stale, held by the
+  successor once a read is current; with the table switched off, the same
+  read frees the record).
+- `cluster::tests::heartbeat_reads_raise_the_newest_lease_bodies` (the
+  server's heartbeat reads feed the table its ownership records use; a
+  later-issued stale read does not lower it).
+- `sim/tests/madsim_node_lease.rs`:
+  `stale_lease_reads_never_free_a_held_record` (the record clients' reads
+  of node leases return the body served before the newest one served, one
+  read in three: never two owners, never one generation for two holds,
+  and reads behind the newest are met and read again), and in
+  `each_broken_variant_is_caught`, `StaleReadsTrusted` (the same reads
+  judged as read: two owners).
+- `app_format::tests`: the floor's exact body, refused forms and key;
+  `cluster::tests::a_floor_above_this_version_stops_the_start` (a floor
+  above the binary's minor version or an unreadable one: refused, no lease
+  written; one written during the start check: refused after the first
+  write, the lease left `released`; the binary's own minor version or no
+  record: it starts).

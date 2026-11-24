@@ -185,6 +185,7 @@ impl NodeProcess {
                     nodes,
                     live: RwLock::default(),
                     heard: Mutex::default(),
+                    lease_reads: Arc::default(),
                     instances: Mutex::default(),
                 });
                 *slot = Some(Arc::clone(&t));
@@ -274,6 +275,12 @@ pub(crate) struct Transport {
     /// read that fails changes nothing: its node stays as last read,
     /// trusted until that heartbeat's own horizon and no longer.
     heard: Mutex<Heard>,
+    /// The newest body of each node's lease that any read of the process
+    /// found, heartbeat reads and the reads that judge an ownership record
+    /// alike: never moved back by a later read (ADR 0020, amendment on
+    /// lease reads). Every app's ownership records are judged against it,
+    /// so a stale read is read again instead of freeing a record.
+    pub(super) lease_reads: Arc<wasmkeep_cluster::node_lease::NewestReads>,
     /// The instances each node id ran under in this process, one runtime
     /// after another ([`Transport::note_instance`]): a heartbeat of an
     /// earlier one is a stopped predecessor's, never a twin's.
@@ -348,6 +355,30 @@ impl Transport {
         apply: impl FnOnce(&[NodeInfo], &[NodeInfo], &[String]) -> R,
     ) -> R {
         let now = crate::cluster_tls::now_ms();
+        // Whatever the issue order below: the newest lease bodies seen
+        // only move forward.
+        let observe = |id: &str, n: &NodeInfo| {
+            if let Some(state) = n.lease {
+                self.lease_reads.observe(
+                    id,
+                    &wasmkeep_cluster::node_lease::NodeLeaseObject {
+                        state,
+                        instance: n.instance.clone(),
+                        written_at_ms: n.written_at_ms,
+                    },
+                );
+            }
+        };
+        match &read {
+            Heartbeats::Listed(listed) => listed.iter().for_each(|n| observe(&n.id, n)),
+            Heartbeats::Read(reads) => {
+                for (id, r) in reads {
+                    if let HeartbeatRead::Found(n) = r {
+                        observe(id, n);
+                    }
+                }
+            }
+        }
         let mut heard = self.heard.lock().unwrap_or_else(|p| p.into_inner());
         let Heard { bodies, first_seen } = &mut *heard;
         let stopped_instance = |held: Option<&(std::time::Instant, Option<NodeInfo>)>| {

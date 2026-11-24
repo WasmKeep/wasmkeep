@@ -22,6 +22,10 @@
 //! on the reader's clock. The fenced process's validity ended at
 //! `written_at + ttl - safety` on its own clock, and `grace + safety >=
 //! 2 * max_skew` puts the reader's moment after it, whoever wrote the fence.
+//! That read is never judged when it is older than a body of the same
+//! lease the process has already read ([`NewestReads`]): it is read again,
+//! and counts as unanswered if it stays older (ADR 0020, amendment on
+//! lease reads).
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
@@ -155,6 +159,138 @@ pub fn frees(
             }
         },
     }
+}
+
+/// Whether `body` is provably older than `seen`, two bodies of one node's
+/// lease ([ADR 0020], amendment on lease reads): dated earlier, or dated
+/// the same and `live` where `seen` is the `fenced` or `released` body of
+/// the same instance (a fence or a release keeps the `written_at` of the
+/// last `live` write, and that instance never writes `live` again). Two
+/// bodies dated the same that name different instances are not ordered.
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+pub fn older_than(body: &NodeLeaseObject, seen: &NodeLeaseObject) -> bool {
+    if body.written_at_ms != seen.written_at_ms {
+        return body.written_at_ms < seen.written_at_ms;
+    }
+    body.instance == seen.instance && body.state == NodeState::Live && seen.state != NodeState::Live
+}
+
+/// How many times a node lease read after a record is made before its
+/// caller gives up, when each read returns a body older than one this
+/// process has already read ([`NewestReads`]).
+pub const BEHIND_READS: usize = 3;
+
+/// The newest body of each node's lease that a process has read, from any
+/// of its reads (heartbeat rounds and listings, the reads that judge a
+/// record free), shared by every [`Owners`] of the process ([ADR 0020],
+/// amendment on lease reads). It only ever moves forward, by
+/// [`older_than`]. A read made to judge a record free that returns a body
+/// older than the one held here is a stale read (the bucket or a cache in
+/// front of it serving an earlier version): it is read again, never
+/// trusted.
+///
+/// This closes a read that goes back behind what the process has already
+/// seen, not a first read that is stale: that needs the ownership record
+/// to carry its holder's lease date, which is a format change.
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+#[derive(Debug, Default)]
+pub struct NewestReads {
+    newest: std::sync::Mutex<std::collections::HashMap<String, NodeLeaseObject>>,
+    /// Reads found older than the newest held, since the start.
+    behind: std::sync::atomic::AtomicU64,
+    /// Remembers nothing: every body is judged as read. Only for the
+    /// simulation's variant that shows the rule is needed.
+    off: bool,
+}
+
+impl NewestReads {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A table that remembers nothing, so every read is trusted (the rule
+    /// before the amendment): for a simulation's broken variant only.
+    pub fn off() -> Self {
+        Self {
+            off: true,
+            ..Self::default()
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, NodeLeaseObject>> {
+        self.newest.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Notes `body`, just read for node `node`: it becomes the newest held
+    /// if the one held is older than it.
+    pub fn observe(&self, node: &str, body: &NodeLeaseObject) {
+        if self.off {
+            return;
+        }
+        let mut newest = self.lock();
+        match newest.get_mut(node) {
+            Some(held) => {
+                if older_than(held, body) {
+                    *held = body.clone();
+                }
+            }
+            None => {
+                newest.insert(node.to_owned(), body.clone());
+            }
+        }
+    }
+
+    /// Whether `body`, just read for node `node`, is older than the newest
+    /// held (counted when it is); if not, it is noted ([`Self::observe`]).
+    pub fn behind(&self, node: &str, body: &NodeLeaseObject) -> bool {
+        if self.off {
+            return false;
+        }
+        let mut newest = self.lock();
+        match newest.get_mut(node) {
+            Some(held) if older_than(body, held) => {
+                self.behind
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            Some(held) => {
+                if older_than(held, body) {
+                    *held = body.clone();
+                }
+                false
+            }
+            None => {
+                newest.insert(node.to_owned(), body.clone());
+                false
+            }
+        }
+    }
+
+    /// The newest body held for node `node`.
+    pub fn newest(&self, node: &str) -> Option<NodeLeaseObject> {
+        self.lock().get(node).cloned()
+    }
+
+    /// How many reads were found older than the newest held, since the
+    /// start.
+    pub fn behind_count(&self) -> u64 {
+        self.behind.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A read of a node's lease made to judge a record, as
+/// [`Owners`] makes it.
+enum LeaseRead {
+    /// The lease as read (`None`: absent, or in a format that frees
+    /// nothing), never older than the newest this process read.
+    Read(Option<NodeLeaseObject>),
+    /// No answer, or every read older than one the process read before.
+    Unknown,
 }
 
 /// Why a node lease write did not succeed.
@@ -969,6 +1105,8 @@ pub struct Owners<B, C> {
     /// The app has enabled the recorded-head format (ADR 0035, section 5):
     /// acquisitions and releases write version 2.
     recorded_head: std::sync::atomic::AtomicBool,
+    /// The newest node lease bodies the process has read.
+    reads: std::sync::Arc<NewestReads>,
 }
 
 impl<B: Bucket, C: Clock> Owners<B, C> {
@@ -991,7 +1129,42 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
             config,
             unresolved_wait_ms: UNRESOLVED_WAIT_MS,
             recorded_head: std::sync::atomic::AtomicBool::new(false),
+            reads: std::sync::Arc::default(),
         }
+    }
+
+    /// Judges node leases against `reads`, the process's newest bodies
+    /// read ([`NewestReads`]; by default a table of this value's own).
+    /// Every `Owners` of a process, and its heartbeat reads, should share
+    /// one.
+    #[must_use]
+    pub fn with_reads(mut self, reads: std::sync::Arc<NewestReads>) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// The table this value judges node leases against.
+    pub fn reads(&self) -> &std::sync::Arc<NewestReads> {
+        &self.reads
+    }
+
+    /// Node `node`'s lease, read after a record to judge it: a body older
+    /// than the newest this process has read of that lease is read again,
+    /// up to [`BEHIND_READS`] reads in all, and never trusted. A failed
+    /// read is [`LeaseRead::Unknown`] at once, as every reader before.
+    async fn read_lease(&self, node: &str) -> LeaseRead {
+        let key = format!("{}{node}", self.nodes_prefix);
+        for _ in 0..BEHIND_READS {
+            let Ok(read) = self.bucket.get(&key).await else {
+                return LeaseRead::Unknown;
+            };
+            let obj = read.and_then(|(b, _)| NodeLeaseObject::decode(&b));
+            match &obj {
+                Some(o) if self.reads.behind(node, o) => continue,
+                _ => return LeaseRead::Read(obj),
+            }
+        }
+        LeaseRead::Unknown
     }
 
     /// How long an unresolved acquire waits for a record that has not
@@ -1155,13 +1328,11 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 if let Some((node, instance)) = &record.holder
                     && !(node == &self.node && instance == &self.instance)
                 {
-                    // Read after the record, never from a view.
-                    let obj = self
-                        .bucket
-                        .get(&format!("{}{node}", self.nodes_prefix))
-                        .await
-                        .map_err(|_| AcquireError::Unavailable)?
-                        .and_then(|(b, _)| NodeLeaseObject::decode(&b));
+                    // Read after the record, never from a view, and never
+                    // behind a body of it this process read before.
+                    let LeaseRead::Read(obj) = self.read_lease(node).await else {
+                        return Err(AcquireError::Unavailable);
+                    };
                     if !frees(instance, obj.as_ref(), self.clock.now_ms(), &self.config) {
                         return Err(AcquireError::Held {
                             node: node.clone(),
@@ -1336,12 +1507,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 }
             }
             Some(((node, instance), _)) => {
-                let lease = self
-                    .bucket
-                    .get(&format!("{}{node}", self.nodes_prefix))
-                    .await;
-                let Ok(obj) = lease.map(|o| o.and_then(|(b, _)| NodeLeaseObject::decode(&b)))
-                else {
+                let LeaseRead::Read(obj) = self.read_lease(&node).await else {
                     return Err(unresolved);
                 };
                 if frees(&instance, obj.as_ref(), self.clock.now_ms(), &self.config) {
@@ -2416,6 +2582,123 @@ mod tests {
         // Fenced or released: only after written_at + ttl + grace.
         assert!(!frees("i1", Some(&fenced), 1_000 + 15_000, &c));
         assert!(frees("i1", Some(&fenced), 1_000 + 15_001, &c));
+    }
+
+    #[test]
+    fn which_body_of_a_lease_is_older() {
+        let body = |state, i: Option<&str>, at| NodeLeaseObject {
+            state,
+            instance: i.map(str::to_owned),
+            written_at_ms: at,
+        };
+        let live = |i, at| body(NodeState::Live, Some(i), at);
+        // Dated earlier, whatever the instance or the state.
+        assert!(older_than(&live("i1", 1_000), &live("i1", 1_001)));
+        assert!(older_than(
+            &body(NodeState::Released, Some("i1"), 1_000),
+            &live("i2", 1_001)
+        ));
+        assert!(!older_than(&live("i1", 1_001), &live("i1", 1_000)));
+        // Dated the same: a live body before its own fence or release.
+        for end in [NodeState::Fenced, NodeState::Released] {
+            assert!(older_than(
+                &live("i1", 1_000),
+                &body(end, Some("i1"), 1_000)
+            ));
+            assert!(!older_than(
+                &body(end, Some("i1"), 1_000),
+                &live("i1", 1_000)
+            ));
+            // Another instance's: not ordered either way.
+            assert!(!older_than(
+                &live("i2", 1_000),
+                &body(end, Some("i1"), 1_000)
+            ));
+        }
+        // The same body is not older than itself.
+        assert!(!older_than(&live("i1", 1_000), &live("i1", 1_000)));
+    }
+
+    #[test]
+    fn the_newest_reads_only_move_forward() {
+        let live = |i: &str, at| NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some(i.into()),
+            written_at_ms: at,
+        };
+        let reads = NewestReads::new();
+        assert!(!reads.behind("b", &live("i1", 1_000)));
+        assert!(!reads.behind("b", &live("i2", 2_000)));
+        // An earlier body is behind, and leaves the newest as it was.
+        assert!(reads.behind("b", &live("i1", 1_000)));
+        reads.observe("b", &live("i1", 1_500));
+        assert_eq!(reads.newest("b"), Some(live("i2", 2_000)));
+        assert_eq!(reads.behind_count(), 1);
+        // Per node.
+        assert!(!reads.behind("c", &live("i1", 1_000)));
+        // Off: nothing held, nothing behind.
+        let off = NewestReads::off();
+        off.observe("b", &live("i2", 2_000));
+        assert!(!off.behind("b", &live("i1", 1_000)));
+        assert_eq!(off.newest("b"), None);
+    }
+
+    /// A stale read of a predecessor's body never frees a record its
+    /// current instance holds, once this process has read that instance's
+    /// lease: b's i1 stopped cleanly long ago, b runs as i2 and holds the
+    /// actor, and the bucket serves i1's `released` body to a's next reads.
+    /// Read again, then refused as unavailable while it stays stale; taken
+    /// over as before once b's lease really frees it.
+    #[test]
+    fn a_stale_read_of_a_predecessor_frees_nothing() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_000);
+        let old = NodeLeaseObject {
+            state: NodeState::Released,
+            instance: Some("i1".into()),
+            written_at_ms: 1_000,
+        }
+        .encode();
+        mem.overwrite("nodes/b", Some(&old));
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        let v = run((&mem).get("nodes/b")).unwrap().unwrap().1;
+        run(lb.start(Some(&v))).unwrap();
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(hold.generation, 1);
+        let reads = std::sync::Arc::new(NewestReads::new());
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+        // a's heartbeat reads saw b live as i2.
+        let current =
+            NodeLeaseObject::decode(&run((&mem).get("nodes/b")).unwrap().unwrap().0).unwrap();
+        reads.observe("b", &current);
+        // Stale on every read: refused, nothing written.
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), BEHIND_READS as u32));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Unavailable)
+        );
+        assert_eq!(reads.behind_count(), BEHIND_READS as u64);
+        // Stale once: read again, and the current body says b holds it.
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), 1));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held {
+                node: "b".into(),
+                instance: "i2".into()
+            })
+        );
+        // Without the table (the rule before), the same stale read frees it.
+        let trusting = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg())
+            .with_reads(std::sync::Arc::new(NewestReads::off()));
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), 1));
+        assert_eq!(
+            run(trusting.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(2),
+            "the unfixed rule takes the record b holds"
+        );
     }
 
     /// A version 2 record (ADR 0035) is read everywhere a version 1 record

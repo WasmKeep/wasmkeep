@@ -850,7 +850,8 @@ impl Cluster {
                 instance.clone(),
                 NODES_PREFIX,
                 config.lease,
-            ),
+            )
+            .with_reads(Arc::clone(&transport.lease_reads)),
             pending: Pending::default(),
             judged: std::sync::Mutex::default(),
             membership,

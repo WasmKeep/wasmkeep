@@ -227,6 +227,9 @@ pub(crate) mod tests {
         pub(crate) refuse_next_write: Cell<bool>,
         /// After this many more successful reads, one read fails.
         pub(crate) fail_get_after: Cell<Option<u32>>,
+        /// The next `n` reads of `key` return `body` (an earlier version
+        /// a stale replica or cache still serves), whatever is stored.
+        pub(crate) serve_stale: RefCell<Option<(String, Vec<u8>, u32)>>,
     }
 
     impl Mem {
@@ -261,6 +264,16 @@ pub(crate) mod tests {
                 }
                 Some(n) => self.fail_get_after.set(Some(n - 1)),
                 None => {}
+            }
+            {
+                let mut stale = self.serve_stale.borrow_mut();
+                if let Some((k, body, n)) = stale.as_mut()
+                    && k == key
+                    && *n > 0
+                {
+                    *n -= 1;
+                    return Ok(Some((body.clone(), Version("0".into()))));
+                }
             }
             Ok(self
                 .objects

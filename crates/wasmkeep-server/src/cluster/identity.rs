@@ -260,6 +260,54 @@ impl Cluster {
         None
     }
 
+    /// The app's upgrade floor ([`wasmkeep_cluster::app_format::floor`]),
+    /// read before this node writes its first lease: `Some(why)` if the
+    /// node must not start, because the floor is above this binary's minor
+    /// version (the message names both) or the record is unreadable (fail
+    /// closed, as an unreadable format setting). Absent: `None`, the start
+    /// goes on as before. A read with no answer proves nothing and is
+    /// tried again every half period.
+    pub(super) async fn check_floor(&self) -> Option<String> {
+        use wasmkeep_cluster::app_format::floor;
+        let key = object_store::path::Path::from(floor::key_of(&self.root));
+        let Some(this) = floor::Minor::of_version(env!("CARGO_PKG_VERSION")) else {
+            return Some(format!(
+                "this binary's version {} has no minor version to check the app's upgrade \
+                 floor against",
+                env!("CARGO_PKG_VERSION")
+            ));
+        };
+        loop {
+            let read = tokio::time::timeout(self.lease_attempt, async {
+                match self.store.get(&key).await {
+                    Ok(got) => got.bytes().await.map(Some),
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+            let body = match read {
+                Ok(Ok(body)) => body,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "reading the app's upgrade floor failed; retrying before starting");
+                    tokio::time::sleep(self.heartbeat_every / 2).await;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "reading the app's upgrade floor timed out; retrying before starting"
+                    );
+                    tokio::time::sleep(self.heartbeat_every / 2).await;
+                    continue;
+                }
+            };
+            return match floor::decode(body.as_deref()) {
+                Ok(found) => floor::allows(found, this).err(),
+                Err(e) => Some(e.to_string()),
+            };
+        }
+    }
+
     /// Waits while any heartbeat in a format from before node leases
     /// (headers 1 and 2) is recent: its node may still hold per-actor
     /// leases, which it renews on a task of its own, so only one older than

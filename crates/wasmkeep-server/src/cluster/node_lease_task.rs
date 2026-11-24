@@ -158,7 +158,8 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
 }
 
 impl Cluster {
-    /// The bucket check, the start check, then the first write. A first
+    /// The bucket check, the upgrade floor, the start check, the first
+    /// write, then the upgrade floor again. A first
     /// write that fails its condition goes back to the start check (ADR
     /// 0020, section 1): a peer may have fenced a stopped predecessor
     /// meanwhile, or a twin started. It keeps this process's instance.
@@ -168,6 +169,13 @@ impl Cluster {
         lease: &mut NodeLease<ObjectStoreBucket, SystemClock>,
     ) -> bool {
         if let Some(why) = self.check_bucket().await {
+            tracing::error!("{why}");
+            self.identity.send_replace(Identity::Refused(why));
+            return false;
+        }
+        // Before any write: a binary below the app's upgrade floor never
+        // writes a lease, so it never holds or serves anything.
+        if let Some(why) = self.check_floor().await {
             tracing::error!("{why}");
             self.identity.send_replace(Identity::Refused(why));
             return false;
@@ -198,6 +206,16 @@ impl Cluster {
                 }
             };
             if self.first_write(lease, expected.as_ref()).await.is_ok() {
+                // Again once live: a floor written while this node was in
+                // its start check (and so not yet live for the writer's
+                // listing) stops it here, before it serves anything. Its
+                // lease is written `released`: it held nothing.
+                if let Some(why) = self.check_floor().await {
+                    tracing::error!("{why}");
+                    self.release_node_lease(lease).await;
+                    self.identity.send_replace(Identity::Refused(why));
+                    return false;
+                }
                 return true;
             }
             tracing::warn!(
