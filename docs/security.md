@@ -168,7 +168,9 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
 - Host tables (`_wasmkeep_*`) invisible to guests: a guest can neither read
   nor write them, nor give a table, view, index or trigger such a name,
   rename onto one, or declare a foreign key to a host table. Their names and
-  schema (not their rows) show in `sqlite_master`. Host statements run with
+  schema (not their rows) show in `sqlite_master`, which stays readable:
+  guests read their own schema there (a migration checks which tables
+  exist). Host statements run with
   triggers and foreign key enforcement off, so they run nothing a guest
   wrote.
 - Before 0.8 a guest could give a view, index or trigger a reserved name,
@@ -564,7 +566,10 @@ in ten parts (front door, guest boundary, cluster); each fix came with a
 test that fails without it. Later hardening: plain HTTP between nodes
 refused by default, outbound HTTP refusing the ports browsers block, and
 limits on what actors print reaching the node's log (all described above).
-No independent third-party audit has been done yet.
+In November 2026, before 0.8.0, a second internal review covered the
+guest boundary, the cluster's signatures, uploads and local files; its
+fixes are in 0.8.0 and 0.8.1 (their release notes list what changed for
+operators). No independent third-party audit has been done yet.
 
 ## Reporting a vulnerability
 

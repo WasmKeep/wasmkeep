@@ -11,3 +11,4 @@ data
 **/.wasmkeep
 bench/results
 docs
+deploy/compose/.env

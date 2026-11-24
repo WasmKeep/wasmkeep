@@ -1,6 +1,7 @@
 name: release
 
-# A tag `vX.Y.Z` (equal to the workspace version) builds the release
+# A tag `vX.Y.Z` (equal to the workspace version, annotated and signed, with
+# a signature GitHub verifies) builds the release
 # binaries, signs them and opens a draft pre-release with them, once CI has
 # passed on the tagged commit (the `ci` job waits for it), its text
 # taken from the version's section of CHANGELOG.md; a maintainer reviews and
@@ -96,6 +97,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       actions: read
+      contents: read
     steps:
       # A run by hand signs files and pushes images (`dev`) with this
       # workflow's identity, whatever ref it is started on: a copy of this
@@ -116,6 +118,31 @@ jobs:
           fi
           echo "::error::run by hand on $REF: start this workflow on a release tag (vX.Y.Z) or on main"
           exit 1
+      # A release tag is an annotated tag on this commit whose signature
+      # GitHub verifies (a key of the account that made it, docs/releasing.md).
+      # A lightweight or unsigned tag stops the release here. The tag
+      # ruleset decides who may push one.
+      - name: The tag is signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          [ "$REF_TYPE" = tag ] || { echo "not a tag: nothing to check"; exit 0; }
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object | "\(.type) \(.sha)"')
+          read -r type object <<<"$ref"
+          [ "$type" = tag ] || {
+            echo "::error::$TAG is a lightweight tag: tag the release with git tag -s"; exit 1; }
+          tag=$(gh api "repos/$GH_REPO/git/tags/$object" \
+            --jq '"\(.verification.verified) \(.verification.reason) \(.object.type) \(.object.sha)"')
+          read -r verified reason kind target <<<"$tag"
+          [ "$kind $target" = "commit $SHA" ] || {
+            echo "::error::$TAG points at $kind $target, not at commit $SHA"; exit 1; }
+          [ "$verified" = true ] || {
+            echo "::error::$TAG has no signature GitHub verifies ($reason): tag the release with git tag -s, with a signing key added to your GitHub account"; exit 1; }
+          echo "$TAG: signed tag, verified ($reason)"
       - name: Wait for CI on the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}

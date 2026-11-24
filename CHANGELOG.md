@@ -51,6 +51,17 @@ The text under a version's heading is its GitHub release text
   reads at once, and each closes (its file or response) when its event
   ends; a wait for a read the guest gives up no longer loses bytes. The WIT
   documents these caps and `actors.call`'s header, size and chain limits.
+- Hardening and small fixes: the single-node guide's systemd unit drops
+  every capability, filters system calls to `@system-service`, limits
+  address families and writes only the data and cache directories (add
+  the new lines to an existing unit; see the guide). The compose demo's
+  bucket key and Grafana password come from `WASMKEEP_DEMO_*` variables
+  (a `.env` file), and their public defaults are marked insecure. A release
+  tag must be a signed tag GitHub verifies. A batched write dropped because
+  another writer replaced the node's lease (a fence, a twin) now counts as
+  `lost_lease` in `wasmkeep_plain_events_dropped_total`, where it counted as
+  `lapse`; the label set is unchanged. An actor that traps on its full
+  resource table logs a line of its own, as the front does.
 
 ## 0.8.0
 

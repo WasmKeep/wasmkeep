@@ -18,6 +18,7 @@ agent.env
 hub.env
 secrets.key
 token.txt
+/deploy/compose/.env
 
 # Local agent settings and notes
 /.claude/

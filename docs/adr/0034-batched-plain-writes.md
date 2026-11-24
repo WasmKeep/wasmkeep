@@ -527,7 +527,7 @@ and alarm rules below.
 | --- | --- | --- | --- |
 | `ActorState::abandon` (`state.rs`): a failed upload or capture | drop now | none | counted `failure` |
 | `ensure_owner_with`, "whatever ran before may be stale" (`state.rs`): a hold that lapsed | drop now | none | counted `lapse` |
-| The node lease lost or fenced (ADR 0020, section 1: every hold dropped) | drop now | none | counted `lost_lease` |
+| The node lease lost or fenced (ADR 0020, section 1: every hold dropped): another writer replaced it (a fence, a twin, a deletion). The same sites as a lapse find the hold ended (`ensure_owner_with`, `hand_over`, `move_out`, an activation cut by the lease) and tell the two apart by the node's verdict, published before the holds end | drop now | none | counted `lost_lease` |
 | `finish`, the database worker failed (`state.rs`) | drop now | none | counted `failure` |
 | A panic in an event (the mailbox's `CatchUnwind` drops the state) | drop now, never parked | none | counted `panic` |
 | `hand_over` and `move_out` finding the hold lapsed (`drain.rs`, `moving.rs`) | drop now | none | counted `lapse` |

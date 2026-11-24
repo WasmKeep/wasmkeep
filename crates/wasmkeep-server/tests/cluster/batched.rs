@@ -1411,3 +1411,44 @@ async fn timing_start_rule_wait_with_held_upload() {
         .unwrap();
     assert!(sum >= 0.1, "held upload wait: {sum}");
 }
+
+/// A batched hold whose node lease is fenced while a write is still
+/// going up counts that write as `lost_lease`, not as a lapse (ADR 0034,
+/// sections 6 and 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_node_lease_counts_its_pending_writes_as_lost_lease() {
+    let p = batched_pair(Duration::from_secs(30), |_| {}).await;
+    warmed(&p).await;
+    p.flaky.hold_wal_puts.send_replace(true);
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"), "{}", r.body);
+    eventually("the segment is held", async || {
+        p.flaky.held_wal_puts.load(Ordering::SeqCst) > 0
+    })
+    .await;
+
+    // As `wasmkeep cluster fence a` does.
+    let store: Arc<dyn ObjectStore> = p.flaky.clone();
+    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, "");
+    wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
+        .await
+        .unwrap();
+    let why = tokio::time::timeout(Duration::from_secs(5), p.a.service.node_id_lost())
+        .await
+        .expect("the fence was never noticed");
+    assert!(why.contains("fenced"), "{why}");
+
+    // The next event finds the hold ended and drops it.
+    let r = send(p.a.addr, "POST", "/actor/t/x/plain", "").await;
+    assert_ne!(r.status, 200, "still served after the fence: {}", r.body);
+    p.flaky.hold_wal_puts.send_replace(false);
+    eventually("the drop is counted", async || {
+        !dropped_by_reason().is_empty()
+    })
+    .await;
+    let dropped = dropped_by_reason();
+    assert!(
+        dropped.iter().all(|(why, _)| *why == "lost_lease"),
+        "{dropped:?}"
+    );
+}

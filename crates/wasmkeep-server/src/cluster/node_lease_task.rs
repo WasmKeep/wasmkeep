@@ -350,7 +350,6 @@ impl Cluster {
     /// (ADR 0020, section 1), through the same path as a twin found by the
     /// listing: holds dropped without releasing, `wasmkeep serve` exits.
     fn node_lease_lost(&self, cause: wasmkeep_cluster::node_lease::LostCause) {
-        self.invalidate_node_lease(false);
         let stopped = Stopped::of(cause);
         let then = match stopped {
             Stopped::Fenced => {
@@ -382,7 +381,11 @@ impl Cluster {
         if let Identity::Taken(_, why) = &verdict {
             tracing::error!("{why}");
         }
+        // The verdict first, then the holds end, as for a twin found by
+        // the listing: a hold that ends sees why (`lost_lease`, not a
+        // lapse, ADR 0034, section 10).
         self.identity.send_replace(verdict);
+        self.invalidate_node_lease(false);
     }
 
     /// A clean stop's last write: the node lease made locally invalid

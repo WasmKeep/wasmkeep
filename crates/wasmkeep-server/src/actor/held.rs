@@ -43,8 +43,7 @@ pub(super) enum Dropped {
     Failure,
     /// The hold lapsed.
     Lapse,
-    /// The node lease was lost or fenced.
-    #[allow(dead_code, reason = "a batched hold's end (ADR 0034, section 6)")]
+    /// Another writer replaced the node lease: a fence, a twin, a deletion.
     LostLease,
     /// An event panicked.
     Panic,

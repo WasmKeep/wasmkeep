@@ -7,10 +7,13 @@
 name: wasmkeep
 
 x-bucket-env: &bucket-env
-  # Demo credentials, known to everyone who reads this file: replace them
-  # (and MinIO's below) before the bucket holds anything you care about.
-  AWS_ACCESS_KEY_ID: wasmkeep-demo
-  AWS_SECRET_ACCESS_KEY: wasmkeep-demo-secret
+  # INSECURE DEMO CREDENTIALS. Unless WASMKEEP_DEMO_S3_KEY and
+  # WASMKEEP_DEMO_S3_SECRET are set (in the environment or a .env file
+  # beside this one), the bucket's key is the public default below, known
+  # to everyone who reads this file, and whoever can write the bucket can
+  # run code on the cluster. README.md says how to generate your own.
+  AWS_ACCESS_KEY_ID: ${WASMKEEP_DEMO_S3_KEY:-wasmkeep-demo}
+  AWS_SECRET_ACCESS_KEY: ${WASMKEEP_DEMO_S3_SECRET:-INSECURE-public-demo-secret}
   AWS_REGION: us-east-1
   AWS_ENDPOINT: http://minio:9000
   AWS_ALLOW_HTTP: "true"
@@ -45,8 +48,9 @@ services:
     image: cgr.dev/chainguard/minio:latest@sha256:cee9a8e35885e93f14b3cb32960e5017aff74e2adfb52ba87c65003b0163886b
     command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: wasmkeep-demo
-      MINIO_ROOT_PASSWORD: wasmkeep-demo-secret
+      # The same insecure defaults as above, unless overridden.
+      MINIO_ROOT_USER: ${WASMKEEP_DEMO_S3_KEY:-wasmkeep-demo}
+      MINIO_ROOT_PASSWORD: ${WASMKEEP_DEMO_S3_SECRET:-INSECURE-public-demo-secret}
     volumes:
       - minio:/data
     ports:
