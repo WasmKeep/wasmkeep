@@ -156,7 +156,9 @@ async fn a_port_client_that_stops_reading_gives_its_slot_back() {
     assert_eq!(served, Ok(200), "the stalled connection kept its slot");
 }
 
-/// A public port serving one static asset of `size` bytes at `/big.bin`.
+/// A public port serving one static asset of `size` bytes at `/big.bin`
+/// (for the Linux-only real-socket test below).
+#[cfg(target_os = "linux")]
 async fn start_with_asset(size: usize, limits: ServeLimits) -> std::net::SocketAddr {
     use crate::assets::{Content, Deployed, File, Index, digest};
     use object_store::ObjectStoreExt;
