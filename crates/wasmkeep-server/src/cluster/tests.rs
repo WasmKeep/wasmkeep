@@ -3972,7 +3972,10 @@ async fn a_floor_above_this_version_stops_the_start() {
         "{why}"
     );
     let why = refused(b"wasmkeep-floor 1\nnine\n".to_vec()).await;
-    assert!(why.contains("unreadable"), "{why}");
+    assert!(
+        why.contains("unreadable") && why.contains("formats/t/default/floor"),
+        "{why}"
+    );
     // Written while the node is in its start check (ttl plus grace, 1.2 s,
     // before its first write): the read after the first write stops it,
     // and its lease is left `released`.
@@ -3983,6 +3986,27 @@ async fn a_floor_above_this_version_stops_the_start() {
     let why = a.identity().await.unwrap_err();
     assert!(why.contains(&above.to_string()), "{why}");
     let lease = store
+        .get(&StorePath::from("nodes/a"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        wasmkeep_cluster::node_lease::NodeLeaseObject::decode(&lease).map(|o| o.state),
+        Some(wasmkeep_cluster::node_lease::NodeState::Released)
+    );
+    // The read after the first write gets no answer: bounded by the lease's
+    // validity (it is not renewed meanwhile), then refused, the lease left
+    // `released`.
+    let slow = Arc::new(SlowNodeReads::default());
+    let a = fast_node("a", &(Arc::clone(&slow) as Arc<dyn ObjectStore>));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    *slow.hang.lock().unwrap() = Some(key.as_ref().to_owned());
+    let why = a.identity().await.unwrap_err();
+    assert!(why.contains("no answer") && why.contains("floor"), "{why}");
+    let lease = slow
+        .inner
         .get(&StorePath::from("nodes/a"))
         .await
         .unwrap()
@@ -5097,17 +5121,6 @@ impl ObjectStore for SlowNodeReads {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            let hang = self.hang.lock().unwrap().as_deref() == Some(key);
-            if hang {
-                std::future::pending::<()>().await;
-            }
-            let fail = self.fail.lock().unwrap().as_deref() == Some(key);
-            if fail {
-                return Err(object_store::Error::Generic {
-                    store: "test",
-                    source: "read refused".into(),
-                });
-            }
         } else {
             let delay = self
                 .others_delay_ms
@@ -5115,6 +5128,17 @@ impl ObjectStore for SlowNodeReads {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
+        }
+        let hang = self.hang.lock().unwrap().as_deref() == Some(key);
+        if hang {
+            std::future::pending::<()>().await;
+        }
+        let fail = self.fail.lock().unwrap().as_deref() == Some(key);
+        if fail {
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "read refused".into(),
+            });
         }
         self.inner.get_opts(location, options).await
     }

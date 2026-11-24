@@ -261,15 +261,19 @@ impl Cluster {
     }
 
     /// The app's upgrade floor ([`wasmkeep_cluster::app_format::floor`]),
-    /// read before this node writes its first lease: `Some(why)` if the
-    /// node must not start, because the floor is above this binary's minor
-    /// version (the message names both) or the record is unreadable (fail
-    /// closed, as an unreadable format setting). Absent: `None`, the start
-    /// goes on as before. A read with no answer proves nothing and is
-    /// tried again every half period.
-    pub(super) async fn check_floor(&self) -> Option<String> {
+    /// read before this node writes its first lease and again right after
+    /// it: `Some(why)` if the node must not start, because the floor is
+    /// above this binary's minor version (the message names both) or the
+    /// record is unreadable (fail closed, as an unreadable format setting;
+    /// the message names the key). Absent: `None`, the start goes on as
+    /// before. A read with no answer proves nothing and is tried again
+    /// every half period; with `by` (the read after the first write, whose
+    /// lease is not renewed meanwhile), only until then, and no answer by
+    /// then refuses.
+    pub(super) async fn check_floor(&self, by: Option<tokio::time::Instant>) -> Option<String> {
         use wasmkeep_cluster::app_format::floor;
-        let key = object_store::path::Path::from(floor::key_of(&self.root));
+        let name = floor::key_of(&self.root);
+        let key = object_store::path::Path::from(name.as_str());
         let Some(this) = floor::Minor::of_version(env!("CARGO_PKG_VERSION")) else {
             return Some(format!(
                 "this binary's version {} has no minor version to check the app's upgrade \
@@ -278,7 +282,13 @@ impl Cluster {
             ));
         };
         loop {
-            let read = tokio::time::timeout(self.lease_attempt, async {
+            let limit = match by {
+                Some(by) => self
+                    .lease_attempt
+                    .min(by.saturating_duration_since(tokio::time::Instant::now())),
+                None => self.lease_attempt,
+            };
+            let read = tokio::time::timeout(limit, async {
                 match self.store.get(&key).await {
                     Ok(got) => got.bytes().await.map(Some),
                     Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -286,25 +296,29 @@ impl Cluster {
                 }
             })
             .await;
-            let body = match read {
-                Ok(Ok(body)) => body,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "reading the app's upgrade floor failed; retrying before starting");
-                    tokio::time::sleep(self.heartbeat_every / 2).await;
-                    continue;
+            let why = match read {
+                Ok(Ok(body)) => {
+                    return match floor::decode(body.as_deref()) {
+                        Ok(found) => floor::allows(found, this).err(),
+                        Err(e) => Some(format!(
+                            "the app's upgrade floor `{name}` is unreadable ({} bytes); \
+                             refusing to start",
+                            e.len
+                        )),
+                    };
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        "reading the app's upgrade floor timed out; retrying before starting"
-                    );
-                    tokio::time::sleep(self.heartbeat_every / 2).await;
-                    continue;
-                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "no answer".to_owned(),
             };
-            return match floor::decode(body.as_deref()) {
-                Ok(found) => floor::allows(found, this).err(),
-                Err(e) => Some(e.to_string()),
-            };
+            let pause = self.heartbeat_every / 2;
+            if by.is_some_and(|by| tokio::time::Instant::now() + pause >= by) {
+                return Some(format!(
+                    "reading the app's upgrade floor `{name}` after this node's first lease write \
+                     got no answer while that lease was valid ({why}); refusing to start"
+                ));
+            }
+            tracing::warn!(error = %why, "reading the app's upgrade floor failed; retrying before starting");
+            tokio::time::sleep(pause).await;
         }
     }
 

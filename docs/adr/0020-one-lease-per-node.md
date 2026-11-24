@@ -1227,11 +1227,13 @@ holds the actor; a stale read of *h*'s `released` body, long past its ttl
 and grace, or of *h*'s last `live` body (another instance than *i*), frees
 the record while *i* acts as its owner.
 
-Comparing the record's instance with the body's does not close it. A
-record naming *i* with a body naming *k* is right when *k* came after *i*
-(*i* died, *k* started, *k* stopped or runs) and wrong when *k* came
-before. Requiring the two to match would leave such an actor held for
-ever, and nothing in the record or the lease says which came first.
+Matching the body's instance against the record's is no remedy. A body
+of another instance is the normal proof that a holder is gone: its
+process exited, the node id started again, and that newer process may
+itself have stopped since. The same body names another instance when it
+is an earlier process's, read late. Neither the record nor the lease
+carries anything that tells the two apart, and refusing every mismatch
+would leave the actors of a restarted node unfreeable.
 
 ### The rule
 
@@ -1260,14 +1262,17 @@ ever, and nothing in the record or the lease says which came first.
   ownership record to carry the date (or version) of its holder's lease
   when it acquired, so a reader can refuse a body dated before it. That is
   a format change, gated as every format change is.
-- Order across instances rests on their writers' clocks. A successor's
-  first `live` write follows its predecessor's last body by at least the
-  start check (ttl plus grace from its first read when the predecessor
-  crashed), longer than the skew allowed; after a clean stop it may follow
-  at once, and two bodies dated within the skew of each other may then be
-  ordered wrongly. A body dated ahead of the reader's clock holds the
-  newest until the successor's dates pass it: a record may stay unfreed
-  that long on that process, never freed wrongly.
+- Order across instances rests on their writers' clocks. A successor
+  writes its first `live` body only after its start check has watched the
+  object for ttl plus grace and, over a `fenced` or `released` body, until
+  that body's `written_at` is ttl plus grace old on its own clock (section
+  1), which is more than twice the skew allowed. So a successor's
+  bodies are dated after its predecessor's. Twins (two processes started
+  with one id by mistake) write in turn and may be dated within the skew
+  of each other: their bodies can be ordered wrongly, and the rule then
+  gives no more than the rule before. A body dated ahead of the reader's
+  clock holds the newest until the later bodies' dates pass it: a record
+  may stay unfreed on that process meanwhile, never freed wrongly.
 
 ### The upgrade floor record
 
@@ -1291,15 +1296,18 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
   third number, a trailing space, CRLF) refuses to start, as an unreadable
   format setting refuses service. A read with no answer is retried and
   neither starts nor refuses.
-- Read again right after the first lease write, before the node serves.
-  The start check keeps a starting node silent for at least ttl plus grace
-  before that write, so a writer listing the live nodes cannot see it
-  then; a floor written meanwhile stops it at this second read, and its
-  lease is written `released` (it held nothing).
+- Read a second time once the first lease write has landed, before the
+  node serves. Until that write the node has no live lease, so whoever
+  writes the floor after checking the live nodes cannot know a node is
+  starting; the second read catches a floor written in between. That read
+  is bounded by the new lease's validity, since the lease is not renewed
+  until it ends: a floor above the binary's version, an unreadable body, or
+  no answer in time stops the node, and its lease is written `released`
+  (it held nothing).
 - Not read after that: a node already serving when a floor above it is
   written keeps serving until it stops.
-- Nothing lists or deletes `formats/`: the floor outlives an app's delete
-  and recreate, as the format setting does.
+- No command removes it: app deletion, `--recreate` and restores work
+  under `state/` and `apps/`, never `formats/`, as for the format setting.
 - Written from 0.9.0, by `wasmkeep cluster upgrade finalize`, once every
   live node runs the new minor version. Nothing in 0.8.1 writes it. A node
   of the previous minor version that was offline when the upgrade was
@@ -1327,6 +1335,6 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
 - `app_format::tests`: the floor's exact body, refused forms and key;
   `cluster::tests::a_floor_above_this_version_stops_the_start` (a floor
   above the binary's minor version or an unreadable one: refused, no lease
-  written; one written during the start check: refused after the first
-  write, the lease left `released`; the binary's own minor version or no
+  written; one written during the start check, or a second read with no
+  answer: refused after the first write, the lease left `released`; the binary's own minor version or no
   record: it starts).

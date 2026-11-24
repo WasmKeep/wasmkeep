@@ -175,7 +175,7 @@ impl Cluster {
         }
         // Before any write: a binary below the app's upgrade floor never
         // writes a lease, so it never holds or serves anything.
-        if let Some(why) = self.check_floor().await {
+        if let Some(why) = self.check_floor(None).await {
             tracing::error!("{why}");
             self.identity.send_replace(Identity::Refused(why));
             return false;
@@ -210,7 +210,12 @@ impl Cluster {
                 // its start check (and so not yet live for the writer's
                 // listing) stops it here, before it serves anything. Its
                 // lease is written `released`: it held nothing.
-                if let Some(why) = self.check_floor().await {
+                // Bounded by the lease's validity: it is not renewed until
+                // this returns, so no answer by then refuses (fail closed)
+                // rather than let it lapse live.
+                let valid_ms = lease.valid_until_ms().unwrap_or(0).saturating_sub(now_ms());
+                let by = tokio::time::Instant::now() + Duration::from_millis(valid_ms);
+                if let Some(why) = self.check_floor(Some(by)).await {
                     tracing::error!("{why}");
                     self.release_node_lease(lease).await;
                     self.identity.send_replace(Identity::Refused(why));
