@@ -561,3 +561,290 @@ fn cancellation_drops_queued_hung_and_backing_off_discovery() {
         });
     }
 }
+
+// ADR 0042, Tests, "Other sims": after an idle pass, an acquirer proves
+// the recorded head at its exact position. Each seed writes an actor's
+// history over several generations (periodic snapshots now and then),
+// the last writer's hold acknowledging its head H through the real hold
+// cell (`hold_cell::verify`, `acknowledge`, `end`) and releasing with
+// what it froze (`Requirement::frozen`, `Requirement::stored`, encoded
+// and decoded as a version 2 record, as `Owners::release_written` writes
+// it). An idle snapshot is taken at H (or, on some seeds, none: the
+// threshold was not met, and the pass compacts from a periodic snapshot
+// of H's generation below H, with segments after it). The pass acquires
+// the released record (one generation up), inherits its requirement
+// (`combine` of its node's local evidence and the record), lists, applies
+// `idle_collectable` with the released generation, deletes, and releases
+// unverified: it freezes what it inherited. Sometimes a late segment of an
+// earlier generation lands after the pass (a slow upload of an older
+// owner, ADR 0012's reason for keeping the segment at P).
+//
+// An acquirer on another node then reads the pass's record
+// (`Requirement::of_record`), lists, plans with the real planner and
+// judges with the real `prove`. Checked: the record still requires H,
+// complete, stamped by H's writer; the plan's head is H; and the proof is
+// the exact one (H on the chain with H's checksum), never "a generation
+// above the stamp" nor `linked_back`. Mutations, each caught on some
+// seed: the pass also deletes the segment at P, or `S`, or a segment
+// between `S` and H; the idle snapshot holds another position's
+// database; the pass's release drops what it inherited.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassBreak {
+    None,
+    DropSegmentAtP,
+    DropSnapshot,
+    DropBetween,
+    StaleSnapshot,
+    ForgetInherited,
+}
+
+/// One seed: `Err(why)` if the acquirer did not prove H exactly; `Ok` with
+/// whether the pass deleted anything and whether `S` was below H.
+fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool), String> {
+    use std::sync::Mutex;
+    use wasmkeep_cluster::hold_cell::{self, HoldHead};
+    use wasmkeep_cluster::lease::Version;
+    use wasmkeep_cluster::local_heads::combine;
+    use wasmkeep_cluster::node_lease::{Hold, OwnerRecord};
+    use wasmkeep_cluster::replication::idle_collectable;
+    let mut rng = Rng::new(seed ^ 0x0042_0035);
+    // The history: (key, checksum after it); snapshots hold the database
+    // at their position.
+    let mut keys: BTreeMap<String, u64> = BTreeMap::new();
+    let mut txid = 0u64;
+    let mut parent = 0u64;
+    let gens = 1 + rng.below(4);
+    let mut since_snapshot = 0;
+    for g in 1..=gens {
+        let writes = 1 + rng.below(9);
+        for _ in 0..writes {
+            txid += 1;
+            let id = SegmentId {
+                generation: g,
+                txid,
+            };
+            keys.insert(
+                segment_key(&Segment {
+                    id,
+                    parent_generation: parent,
+                }),
+                sum(id, 0),
+            );
+            parent = g;
+            since_snapshot += 1;
+            if since_snapshot == 5 || rng.chance(10) {
+                keys.insert(snapshot_key(id), sum(id, 0));
+                since_snapshot = 0;
+            }
+        }
+    }
+    let head = SegmentId {
+        generation: gens,
+        txid,
+    };
+    let at = |id: SegmentId| Position::Known {
+        generation: id.generation,
+        txid: id.txid,
+        checksum: sum(id, 0),
+    };
+    // The writer's hold: verified at its restore, its last upload
+    // acknowledged, then ended and released (version 2).
+    let cell = Mutex::new(Some(Hold {
+        key: "owners/t/c/a".into(),
+        generation: gens,
+        version: Version("v1".into()),
+        previous: None,
+        head: HoldHead {
+            recorded: true,
+            ..HoldHead::default()
+        },
+    }));
+    hold_cell::verify(&cell, || true, Position::Empty).unwrap();
+    hold_cell::acknowledge(&cell, || true, Some(at(head))).unwrap();
+    let writer = hold_cell::end(&cell).unwrap();
+    let writer_floor = Requirement::frozen(&writer).unwrap();
+    let released = OwnerRecord {
+        holder: None,
+        generation: gens,
+        recorded: Some(Requirement::stored(Some(writer_floor), false, None)),
+    };
+    let released = OwnerRecord::decode(&released.encode()).expect("a valid record");
+    // The idle snapshot at H, unless the threshold was not met (one seed
+    // in three) or one is there already.
+    let below = rng.chance(33)
+        && keys.keys().any(|k| {
+            Listing::from_keys([k.as_str()])
+                .snapshots
+                .first()
+                .is_some_and(|s| s.generation == gens && s.txid < head.txid)
+        });
+    if !below {
+        let body = if breaks == PassBreak::StaleSnapshot {
+            sum(
+                SegmentId {
+                    generation: gens,
+                    txid: head.txid - 1,
+                },
+                0,
+            )
+        } else {
+            sum(head, 0)
+        };
+        keys.insert(snapshot_key(head), body);
+    }
+    // The pass: one generation up, unchanged record, its requirement
+    // inherited from its node's local evidence (the writer's frozen head)
+    // and the record.
+    let inherited = combine(
+        Some((writer_floor, gens)),
+        Requirement::of_record(&released).map(|r| (r, released.generation)),
+    );
+    let pass = Hold {
+        key: "owners/t/c/a".into(),
+        generation: released.generation + 1,
+        version: Version("v2".into()),
+        previous: None,
+        head: HoldHead {
+            inherited,
+            recorded: true,
+            ..HoldHead::default()
+        },
+    };
+    let listing = Listing::from_keys(keys.keys().map(String::as_str));
+    let Some((s, mut gone)) = idle_collectable(&listing, released.generation) else {
+        return Err("no snapshot of the released generation".into());
+    };
+    let boundary = |id: SegmentId| {
+        listing
+            .segments
+            .iter()
+            .find(|seg| seg.id == id)
+            .map(segment_key)
+    };
+    match breaks {
+        PassBreak::DropSegmentAtP => gone.extend(boundary(s)),
+        PassBreak::DropSnapshot => gone.push(snapshot_key(s)),
+        PassBreak::DropBetween if s.txid < head.txid => gone.extend(boundary(SegmentId {
+            generation: gens,
+            txid: s.txid + 1,
+        })),
+        _ => {}
+    }
+    let deleted = !gone.is_empty();
+    for key in &gone {
+        keys.remove(key);
+    }
+    // Released unverified: it freezes what it inherited.
+    let frozen = if breaks == PassBreak::ForgetInherited {
+        None
+    } else {
+        Requirement::frozen(&pass)
+    };
+    let after = OwnerRecord {
+        holder: None,
+        generation: pass.generation,
+        recorded: Some(Requirement::stored(frozen, false, None)),
+    };
+    let after = OwnerRecord::decode(&after.encode()).expect("a valid record");
+    // A late segment of an earlier generation, landing after the pass.
+    if gens > 1 && rng.chance(40) {
+        let late = SegmentId {
+            generation: gens - 1,
+            txid: head.txid + 1,
+        };
+        keys.insert(
+            segment_key(&Segment {
+                id: late,
+                parent_generation: gens - 1,
+            }),
+            sum(late, 1),
+        );
+    }
+    // The acquirer: the record's requirement, the plan, the proof.
+    let floor = Requirement::of_record(&after).ok_or("the pass's record lost the head")?;
+    if floor.head != at(head)
+        || floor.set_at != gens
+        || floor.completeness != Completeness::Complete
+    {
+        return Err(format!("the pass's record requires {floor:?}"));
+    }
+    let listing = Listing::from_keys(keys.keys().map(String::as_str));
+    let plan = plan_restore(&listing).map_err(|e| format!("plan: {e:?}"))?;
+    if plan.head() != head {
+        return Err(format!("planned {:?}, not {head:?}", plan.head()));
+    }
+    let chain: Vec<(SegmentId, Option<u64>)> = plan
+        .snapshot
+        .map(|s| (s, keys[&snapshot_key(s)]))
+        .into_iter()
+        .chain(plan.segments.iter().map(|id| {
+            let key = listing
+                .segments
+                .iter()
+                .find(|seg| seg.id == *id)
+                .map(segment_key)
+                .unwrap();
+            (*id, keys[&key])
+        }))
+        .map(|(id, sum)| (id, Some(sum)))
+        .collect();
+    let verdict = prove(Some(&floor), &chain);
+    if verdict != Proof::Proven {
+        return Err(format!("proof {verdict:?} over {chain:?}"));
+    }
+    // And by the exact branch: nothing above the stamp to prove it
+    // otherwise, H on the chain with its checksum.
+    if chain.iter().any(|(id, _)| id.generation > floor.set_at) {
+        return Err("a generation above the stamp".into());
+    }
+    if !chain.contains(&(head, Some(sum(head, 0)))) {
+        return Err(format!("H not on the chain with its checksum: {chain:?}"));
+    }
+    Ok((deleted, s.txid < head.txid))
+}
+
+#[test]
+fn after_an_idle_pass_an_acquirer_proves_the_recorded_head_exactly() {
+    let (mut deleted, mut below) = (0, 0);
+    for seed in 0..seeds() {
+        let (d, b) = proof_after_a_pass(seed, PassBreak::None)
+            .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        deleted += u64::from(d);
+        below += u64::from(b);
+    }
+    eprintln!(
+        "{} seeds: an exact proof after every pass; {deleted} passes deleted, {below} from a \
+         snapshot below the head",
+        seeds()
+    );
+    assert!(
+        deleted >= seeds() / 2 && below >= seeds() / 10,
+        "deleted {deleted}, below {below}"
+    );
+}
+
+#[test]
+fn a_broken_idle_pass_fails_the_recorded_head_proof() {
+    for breaks in [
+        PassBreak::DropSegmentAtP,
+        PassBreak::DropSnapshot,
+        PassBreak::DropBetween,
+        PassBreak::StaleSnapshot,
+        PassBreak::ForgetInherited,
+    ] {
+        let mut first = None;
+        let mut caught = 0;
+        for seed in 0..seeds() {
+            if let Err(why) = proof_after_a_pass(seed, breaks) {
+                first.get_or_insert((seed, why));
+                caught += 1;
+            }
+        }
+        eprintln!(
+            "{breaks:?}: caught on {caught} of {} seeds, first {first:?}",
+            seeds()
+        );
+        assert!(caught > 0, "{breaks:?} not caught");
+    }
+}

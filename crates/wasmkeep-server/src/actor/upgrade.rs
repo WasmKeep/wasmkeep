@@ -28,25 +28,16 @@ impl ActorService {
         // A node's signature, if this is one: only the front's hand-off is
         // relayed signed. Anything else (a client's forged mark or caller,
         // a bad signature) is an outside upgrade.
-        let signed = self.inner.cluster.as_ref().and_then(|cluster| {
-            let on_cluster_port = req
-                .extensions()
-                .get::<crate::http::ArrivedOnClusterPort>()
-                .is_some();
-            let path = req
-                .extensions()
-                .get::<crate::http::OriginalPath>()
-                .map_or_else(
-                    || {
-                        req.uri()
-                            .path_and_query()
-                            .map_or("/", |p| p.as_str())
-                            .to_owned()
-                    },
-                    |p| p.0.clone(),
-                );
-            cluster.is_internal(req.method(), &path, req.headers(), on_cluster_port)
-        });
+        // Judged once, by the router (`Cluster::signed_hop`); a hop it
+        // refused stays refused.
+        let signed = match self.inner.cluster.as_ref().map(|c| c.signed_hop(&req)) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(signed))) => Some(signed),
+            Some(Err(why)) => {
+                tracing::warn!(reason = why, "a signed hop refused");
+                return crate::cluster::hop_refusal(req.headers());
+            }
+        };
         // A relayed upgrade from a node of another app (or of an older
         // version) is refused first (ADR 0022); the header never reaches
         // a guest.

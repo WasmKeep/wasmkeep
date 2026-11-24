@@ -367,19 +367,13 @@ impl ActorService {
                 return Some(crate::cluster::unavailable("app unavailable; retry\n"));
             }
         }
-        if let Some(cluster) = &self.inner.cluster
-            && cluster
-                .is_internal(
-                    req.method(),
-                    req.uri().path_and_query().map_or("/", |p| p.as_str()),
-                    req.headers(),
-                    req.extensions()
-                        .get::<crate::http::ArrivedOnClusterPort>()
-                        .is_some(),
-                )
-                .is_some()
-        {
-            return self.admit_ingress(req);
+        if let Some(cluster) = &self.inner.cluster {
+            match cluster.signed_hop(req) {
+                Ok(Some(_)) => return self.admit_ingress(req),
+                Ok(None) => {}
+                // Refused by the router already; never a client's here.
+                Err(_) => return Some(crate::cluster::hop_refusal(req.headers())),
+            }
         }
         if !read_lock(&self.inner.limits).is_empty()
             && !req.headers().contains_key(crate::cluster::APP)
@@ -449,14 +443,11 @@ impl ActorService {
         let mut client_peer = None;
         let mut charged = false;
         if let Some(cluster) = &self.inner.cluster {
-            if let Some(signed) = cluster.is_internal(
-                req.method(),
-                req.uri().path_and_query().map_or("/", |p| p.as_str()),
-                req.headers(),
-                req.extensions()
-                    .get::<crate::http::ArrivedOnClusterPort>()
-                    .is_some(),
-            ) {
+            let signed = match cluster.signed_hop(req) {
+                Ok(signed) => signed,
+                Err(_) => return Some(crate::cluster::hop_refusal(req.headers())),
+            };
+            if let Some(signed) = signed {
                 let control = req.headers().contains_key(crate::cluster::TAKE)
                     || req.headers().contains_key(crate::cluster::ALARM_HANDOFF);
                 if let Some(why) = cluster.admission_replayed(&signed, control) {

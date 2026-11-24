@@ -465,7 +465,17 @@ plan (section 1), in this order:
 
 With `--history all`, `--require-continuous` defaults to true: a gap in
 history observed at listing makes create report the gap and exit nonzero.
-An explicit false permits the ranges that actually survived. Verification
+An explicit false permits the ranges that actually survived. (Amended in
+0.8.1: after a miss, create lists the actor again. A key gone from below
+a listed snapshot whose segment is listed too, the shape collection
+leaves by `collectable`, and last modified at least the retention window
+before (`--history-retention-secs`, default 3600), is recorded as
+`collected`, not as a gap: a listing made after that collection would
+not have shown it either. A key still listed whose read missed, or a gap
+while the listing changed, reads the actor again, within the 8 attempts.
+Any other key gone, a delete's erase among them, stays a gap. The tool
+does not see the ownership record; see ADR 0042, "As built: the backup
+retry and the last simulations".) Verification
 replays every position inside each recorded range, including historical
 snapshot boundaries and segment chains. Runs spaced closer than retention
 alone do not ensure continuity: reads can cross expiry, and deletes erase

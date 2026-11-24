@@ -109,14 +109,11 @@ impl App {
         // A signed hop that is refused answers 503: it never runs as a
         // client's request (ADR 0038, section 5).
         if let Some(actors) = &self.actors
-            && let Some(why) = actors.hop_refused(&req)
+            && let Some(why) = actors.judge_hop(&mut req)
         {
             tracing::warn!(reason = why, "a signed hop refused");
             // A placed call refused so never ran: its sender runs it.
-            return crate::cluster::refuse_if_placed(
-                req.headers(),
-                crate::cluster::unavailable("this hop is refused; retry\n"),
-            );
+            return crate::cluster::hop_refusal(req.headers());
         }
         if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
             || req.headers().contains_key(crate::cluster::FORWARDED))
