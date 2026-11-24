@@ -417,7 +417,10 @@ func Put(key string, body cm.List[uint8], options WriteOptions) (result cm.Resul
 
 // OpenRead represents the imported function "open-read".
 //
-// Streams a file, or the bytes `[start, start + length)` of it.
+// Streams a file, or the bytes `[start, start + length)` of it. At
+// most 16 streams are open at once (else `not-allowed`): a stream is
+// open until it is dropped or read to its end, and every stream closes
+// when the event ends.
 //
 //	open-read: func(key: string, range: option<tuple<u64, u64>>) -> result<option<tuple<blob-info,
 //	input-stream>>, blob-error>
@@ -432,7 +435,9 @@ func OpenRead(key string, range_ cm.Option[[2]uint64]) (result cm.Result[OptionT
 
 // OpenWrite represents the imported function "open-write".
 //
-// Starts a streamed write; nothing is visible until `finish`.
+// Starts a streamed write; nothing is visible until `finish`. At most
+// 16 are open at once (else `not-allowed`), and one left open is
+// abandoned when the event ends.
 //
 //	open-write: func(key: string, options: write-options) -> result<upload, blob-error>
 //

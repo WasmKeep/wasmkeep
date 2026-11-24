@@ -43,6 +43,7 @@ under `crates/`). Per-node and per-app limits are local to a node's process.
 | Statement | Compiled instructions (`quota-exceeded`) | 2,000,000 | `db.rs` (`GUEST_MAX_VDBE_OPS`) |
 | Node | SQLite heap, temporary data included | 4 GiB | `db.rs` (`SQLITE_HEAP_LIMIT_BYTES`) |
 | Instance | Streamed file writes open at once | 16 | `wasmkeep-server/src/blobs.rs` (`MAX_OPEN_WRITES`) |
+| Instance | Streamed file reads open at once, all closed at the event's end | 16 | `blobs.rs` (`MAX_OPEN_READS`) |
 | App | Spooled file bytes | 1 GiB (at least one `--max-blob-bytes` file, at most half the node's) | `blobs.rs` (`APP_SPOOL`) |
 | Node | Spooled file bytes | 4 GiB (at least two such files) | `blobs.rs` (`NODE_SPOOL`) |
 | Upload link | Idle body, then minimum rate after 30 s (408) | 60 s, 16 KiB/s | `wasmkeep-server/src/blobs/serve.rs` (`UPLOAD_*`) |
