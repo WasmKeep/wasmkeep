@@ -408,6 +408,232 @@ impl Cluster {
     }
 }
 
+/// A body a forward sends ([`Cluster::forward`]), each on the peer
+/// client built for it.
+pub(crate) trait ForwardBody:
+    hyper::body::Body<Data = bytes::Bytes, Error: Into<Box<dyn std::error::Error + Send + Sync>>>
+    + Send
+    + Unpin
+    + 'static
+    + Sized
+{
+    /// The client that sends it.
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self>;
+}
+
+/// A client's request, its body streaming through.
+impl ForwardBody for Incoming {
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self> {
+        clients.request.clone()
+    }
+}
+
+/// A request whose body was read into memory.
+impl ForwardBody for http_body_util::Full<bytes::Bytes> {
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self> {
+        clients.call.clone()
+    }
+}
+
+impl Cluster {
+    /// A response from `base` (over TLS): `None` if the peer that answered
+    /// is no longer trusted there (its pin lapsed while it worked on the
+    /// request), else the response, its body cut if that happens while it
+    /// streams.
+    pub(super) fn trusted_response(
+        &self,
+        base: &str,
+        node: &str,
+        response: Response<Incoming>,
+    ) -> Option<Response<HyperOutgoingBody>> {
+        let pin = response
+            .extensions()
+            .get::<crate::cluster_tls::PeerPin>()
+            .map(|p| p.0);
+        let still = self.revocation(base, node).map(|r| r(pin));
+        if still.as_ref().is_some_and(|s| !s()) {
+            return None;
+        }
+        Some(response.map(|b| {
+            let body = b.map_err(Into::into).boxed_unsync();
+            match still {
+                Some(s) => crate::cluster_tls::revocable_body(body, s),
+                None => body,
+            }
+        }))
+    }
+
+    /// What every forward does before it is sent (to `owner`): never a
+    /// second hop, the owner's address and the original path, the
+    /// connection headers dropped, the forwarded mark, the app and the
+    /// proof (ADR 0038), counted, and the target checked. The base it goes
+    /// to, or the answer that sends nothing.
+    pub(crate) async fn prepare_forward<B>(
+        &self,
+        owner: &str,
+        req: &mut Request<B>,
+    ) -> Result<String, Box<Response<HyperOutgoingBody>>> {
+        if never_forward(req) {
+            // Two nodes disagree about who owns the actor (a lease is
+            // changing hands). Do not bounce; let the client retry.
+            return Err(Box::new(unavailable(
+                "actor ownership is changing; retry\n",
+            )));
+        }
+        let Some(base) = self.address_of(owner) else {
+            return Err(Box::new(unavailable(
+                "the actor's node is not reachable; retry\n",
+            )));
+        };
+        // Routing cut `/actor/<class>/<name>` off the path; send the original.
+        let path = match req.extensions().get::<OriginalPath>() {
+            Some(original) => original.0.clone(),
+            None => return Err(Box::new(unavailable("cannot forward this request\n"))),
+        };
+        let Ok(uri) = format!("{}{path}", base.trim_end_matches('/')).parse::<hyper::Uri>() else {
+            return Err(Box::new(unavailable("bad advertised address\n")));
+        };
+        *req.uri_mut() = uri;
+        // The client's connection headers are for its hop to this node: a
+        // `Connection: close` passed on would close the pooled connection to
+        // the owner (over TLS, a handshake per request). The body streams
+        // through unchanged, so its framing headers stay. HTTP/1.0 would
+        // close the connection after each response; the hop to the owner
+        // is HTTP/1.1 whatever the client speaks (a 1.0 body is never
+        // chunked, so its framing still holds).
+        strip_hop_by_hop(req.headers_mut(), Framing::Keep);
+        *req.version_mut() = hyper::Version::HTTP_11;
+        // This node answers a client's `Expect: 100-continue` itself, as
+        // soon as the body starts streaming to the owner, which is at
+        // once. Passed on, it would tell the owner that the sender waits
+        // before sending, and to leave an unread body unread (see
+        // `CappedBody`).
+        req.headers_mut().remove(hyper::header::EXPECT);
+        req.headers_mut()
+            .insert(FORWARDED, hyper::header::HeaderValue::from_static("1"));
+        // This node's app, never the client's (ADR 0022).
+        match self.app_header() {
+            Ok(app) => req.headers_mut().insert(APP, app),
+            Err(_) => return Err(Box::new(unavailable("cannot forward this request\n"))),
+        };
+        if self.sign_admission(owner, &path, req).await.is_err() {
+            return Err(Box::new(unavailable(
+                "cannot authenticate ingress admission; retry\n",
+            )));
+        }
+        crate::metrics::inc(&crate::metrics::METRICS.forwards.get(&[("kind", "request")]));
+        // Bound the wait for the owner's response headers (a hung node or a
+        // half-open connection); the body then streams as the owner sends it.
+        if let Err(e) = self.check_tls_target(&base) {
+            tracing::warn!(owner, error = %e, "forwarding refused");
+            return Err(Box::new(unavailable(
+                "the actor's node is not reachable; retry\n",
+            )));
+        }
+        Ok(base)
+    }
+
+    /// Forwards a request for an actor to the node that owns it: a
+    /// client's, its body streaming through ([`Incoming`]), or one whose
+    /// body was read into memory (a placed request that ran here after
+    /// all, ADR 0041, section 6, whose actor another node took meanwhile).
+    pub(crate) async fn forward<B: ForwardBody>(
+        &self,
+        owner: &str,
+        mut req: Request<B>,
+    ) -> Response<HyperOutgoingBody> {
+        let base = match self.prepare_forward(owner, &mut req).await {
+            Ok(base) => base,
+            Err(response) => return *response,
+        };
+        let client = B::client(&self.clients());
+        match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
+            // The owner answered, so it read the request: it may have run.
+            Ok(Ok(response)) => self
+                .trusted_response(&base, owner, response)
+                .unwrap_or_else(|| {
+                    tracing::warn!(owner, "forwarding: the node is no longer trusted");
+                    outcome_unknown("the actor's node is no longer trusted")
+                }),
+            // Every failure before an answer, none sent again from here:
+            // a connection that could not be opened, a request the client
+            // handed back unsent on a new connection, and a request
+            // written into a connection that then failed, which the owner
+            // may have read. (hyper-util itself sends an unsent request
+            // again only on a reused pooled connection, and drops one it
+            // finds closed when it takes it from the pool.) The body
+            // streams from the client, so the first two cannot be sent
+            // again here either. Of the three users of the peer clients,
+            // `actors.call` (`Cluster::call`) and a WebSocket upgrade
+            // (`Cluster::forward_upgrade`, which has no body) send again,
+            // once, a request the owner provably never read
+            // (`never_read_by_peer`: refused at the TLS handshake, or
+            // handed back unsent on a new TLS connection), and nothing
+            // else; this path answers 503 for all of them, saying whether
+            // the owner may have run it ([`failed_forward`]).
+            Ok(Err(e)) => {
+                // No connection could be opened: requests that arrive
+                // later for this node's actors may be kept (`keep`). This
+                // one is answered as ever.
+                self.failover.connect_failed(owner, &e);
+                tracing::warn!(owner, error = %e, "forwarding failed");
+                failed_forward(&base, &e)
+            }
+            Err(_) => {
+                tracing::warn!(owner, "forwarding timed out");
+                mark_unknown(text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "the actor's node did not answer in time\n",
+                ))
+            }
+        }
+    }
+}
+
+/// The answer for a forward to `base` that failed before an answer: the
+/// plain retryable 503 when the owner provably never got the request (no
+/// connection, or [`never_read_by_peer`]), else 503 with the outcome
+/// unknown ([`OUTCOME`]): it was written to the owner, which may have run
+/// it and lost the connection.
+fn failed_forward(
+    base: &str,
+    error: &hyper_util::client::legacy::Error,
+) -> Response<HyperOutgoingBody> {
+    if error.is_connect() || never_read_by_peer(base, error) {
+        unavailable("the actor's node did not answer; retry\n")
+    } else {
+        outcome_unknown("the actor's node did not answer")
+    }
+}
+
+/// Whether a request to the peer at `base` failed in a way that proves the
+/// peer never read it, so that sending it again cannot run it twice. Two
+/// cases:
+///
+/// - The peer refused the TLS handshake
+///   ([`crate::cluster_tls::handshake_refused`]: one of a fixed list of
+///   fatal alerts arrived). The request may have been written, TLS 1.3
+///   letting this side write before the refusal arrives, but the peer did
+///   not read it: a rustls server sends those alerts only while it handles
+///   the ClientHello, the client's certificate or its CertificateVerify,
+///   states in which it passes no application data on. (It reads
+///   application data before its handshake is done only as early data,
+///   which the cluster listener leaves off, with resumption.) Once its
+///   handshake is done, it sends none of them. Checked in the source of
+///   rustls 0.23.46, the server's side of TLS 1.3, the only version
+///   between nodes; to check again when that dependency changes.
+/// - Over TLS, the HTTP client handed the request back before writing any
+///   of it ([`crate::cluster_tls::request_unsent`]) on a new connection
+///   (a request it gets back on a connection reused from the pool, it
+///   sends on another connection itself). A refusal that closes the
+///   connection before the write looks like this; so does any other close
+///   of a new connection before the write, which is as safe to send
+///   again.
+pub(super) fn never_read_by_peer(base: &str, error: &hyper_util::client::legacy::Error) -> bool {
+    crate::cluster_tls::handshake_refused(error)
+        || (base.starts_with("https://") && crate::cluster_tls::request_unsent(error))
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;

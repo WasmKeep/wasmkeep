@@ -649,3 +649,312 @@ pub(super) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+impl Cluster {
+    /// What a request's [`INTERNAL`] signature makes of it, checked once
+    /// for the hop (ADR 0038, section 5): a node's call, a hop refused
+    /// with 503, or a client's request. The signature matches `method`,
+    /// `path` (as sent, `/actor/...`), the signed headers, this node's id
+    /// and a timestamp within a minute, and the sender it names checks
+    /// ([`Self::sender_checked`]). Uses the secret only if already loaded
+    /// (never fetches it for a stranger).
+    ///
+    /// [`HopCheck::Signed`] holds the signature: the request is a node's only if
+    /// its body matches [`Signed::body`] and [`Cluster::first_use`] accepts
+    /// it.
+    ///
+    /// In refuse mode, only a request that arrived on the cluster port
+    /// (`on_cluster_port`) can be a node's: on the public port the request
+    /// counts as coming from outside, and a valid signature there is spent
+    /// (without the body check) in a record of its own, which the cluster
+    /// port's checks read, so that copy does not become a node's call on
+    /// the cluster port later. That record is bounded and, full, drops new
+    /// ones rather than refusing anything: the cluster port's mutual TLS
+    /// remains what keeps such a copy out then.
+    ///
+    /// Refused ([`HopCheck::Refused`]), rather than served as a client's: a
+    /// signature that does not hold on the cluster port, or with no secret
+    /// loaded yet there, and on any port a sender that is forged, named
+    /// twice, of another app or (on the cluster port) not live. The caller
+    /// logs a refusal; this logs and counts the rest.
+    pub(crate) fn check_hop(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> HopCheck {
+        let Some(given) = headers.get(INTERNAL).and_then(|v| v.to_str().ok()) else {
+            return HopCheck::Outside;
+        };
+        let public_port = self.refuse_plaintext && !on_cluster_port;
+        let Some(secret) = self.secret.get() else {
+            if on_cluster_port {
+                return HopCheck::Refused(SECRET_NOT_LOADED);
+            }
+            if !public_port {
+                self.note_refused(SECRET_NOT_LOADED);
+            }
+            return HopCheck::Outside;
+        };
+        let now = now_ms();
+        match verify(secret, given, now, &self.node_id, method, path, headers) {
+            Some(signed) if public_port => {
+                // Burnt, never honoured here, apart from the records the
+                // cluster port spends in: those only a node holding a
+                // pinned certificate can fill. Dropped (and counted) once
+                // this record is full.
+                self.seen_public.spend(signed.mac, signed.ts, now);
+                self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
+                HopCheck::Outside
+            }
+            Some(signed) => {
+                match self.sender_checked(
+                    headers,
+                    secret,
+                    HopKind::Call,
+                    given,
+                    path,
+                    on_cluster_port,
+                ) {
+                    Ok(sender) => HopCheck::Signed(Signed { sender, ..signed }),
+                    Err(why) => HopCheck::Refused(why),
+                }
+            }
+            // Junk on the public port is an outside request like any other.
+            None if public_port => HopCheck::Outside,
+            None => {
+                crate::metrics::inc(&crate::metrics::METRICS.signatures_bad);
+                if on_cluster_port {
+                    return HopCheck::Refused(BAD_SIGNATURE);
+                }
+                self.note_refused(BAD_SIGNATURE_WHY);
+                HopCheck::Outside
+            }
+        }
+    }
+
+    /// The signature of a node's call in `headers` ([`Self::check_hop`]),
+    /// for a request no router judged first (a hello): a refusal is logged
+    /// here.
+    pub(crate) fn is_internal(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<Signed> {
+        match self.check_hop(method, path, headers, on_cluster_port) {
+            HopCheck::Signed(signed) => Some(signed),
+            HopCheck::Refused(why) => {
+                self.note_refused(if why == BAD_SIGNATURE {
+                    BAD_SIGNATURE_WHY
+                } else {
+                    why
+                });
+                None
+            }
+            HopCheck::Outside => None,
+        }
+    }
+
+    /// The signature of a node's call in `req`, as this runtime's router
+    /// judged it on arrival ([`CheckedHop`]); judged now if it was not, or
+    /// by another runtime (another app of the process, under the same node
+    /// id). `Ok(None)`: a client's request. `Err`: a hop refused, answered
+    /// with [`hop_refusal`], never served as a client's.
+    pub(crate) fn signed_hop<B>(&self, req: &Request<B>) -> Result<Option<Signed>, &'static str> {
+        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
+            && *by == self.instance
+        {
+            return match hop {
+                HopCheck::Signed(signed) => Ok(Some(signed.clone())),
+                HopCheck::Refused(why) => Err(why),
+                HopCheck::Outside => Ok(None),
+            };
+        }
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        match self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port) {
+            HopCheck::Signed(signed) => Ok(Some(signed)),
+            HopCheck::Refused(why) => {
+                self.note_refused(if why == BAD_SIGNATURE {
+                    BAD_SIGNATURE_WHY
+                } else {
+                    why
+                });
+                Err(why)
+            }
+            HopCheck::Outside => Ok(None),
+        }
+    }
+
+    /// Why [`Self::check_hop`] refuses a hop with 503, if it does.
+    #[cfg(test)]
+    pub(super) fn hop_refused(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<&'static str> {
+        match self.check_hop(method, path, headers, on_cluster_port) {
+            HopCheck::Refused(why) => Some(why),
+            HopCheck::Signed(_) | HopCheck::Outside => None,
+        }
+    }
+
+    /// Judges `req`'s signature once ([`Self::check_hop`]) and keeps the
+    /// verdict on it ([`CheckedHop`]) for the handlers after the router:
+    /// why it must be refused with 503 rather than served as a client's
+    /// request, if it must.
+    pub(crate) fn judge_hop<B>(&self, req: &mut Request<B>) -> Option<&'static str> {
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        let hop = self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port);
+        let refused = match &hop {
+            HopCheck::Refused(why) => Some(*why),
+            HopCheck::Signed(_) | HopCheck::Outside => None,
+        };
+        req.extensions_mut().insert(CheckedHop {
+            by: self.instance.clone(),
+            hop,
+        });
+        refused
+    }
+
+    /// The sender a signed hop names, checked (ADR 0038, section 5): bound
+    /// to the hop's signature (`given`, its [`INTERNAL`] or [`ADMITTED`]
+    /// value), named once, and a live node of this app. `Ok(None)`: no
+    /// sender (a node of an older version, rolling upgrade stage 1). A
+    /// hello may come from a node not listed yet (it asks for a listing);
+    /// over plain HTTP between nodes (`accept`) an unlisted sender is taken
+    /// as an unsigned-sender hop was, its app checked when known.
+    pub(super) fn sender_checked(
+        &self,
+        headers: &hyper::HeaderMap,
+        secret: &str,
+        kind: HopKind,
+        given: &str,
+        path: &str,
+        on_cluster_port: bool,
+    ) -> Result<Option<String>, &'static str> {
+        let mut values = headers.get_all(SENDER).iter();
+        let Some(first) = values.next() else {
+            // Required once several apps share the process (ADR 0038,
+            // section 5): every live node then sends it.
+            if self.several_apps() {
+                return Err("hop names no sender (several apps per process require it)");
+            }
+            return Ok(None);
+        };
+        if values.next().is_some() {
+            return Err("hop names its sender twice");
+        }
+        let primary = given.rsplit(' ').next().unwrap_or_default();
+        let sender = first
+            .to_str()
+            .ok()
+            .and_then(|v| verify_sender(secret, kind.sender_kind(), primary, v))
+            .ok_or("hop's sender is not bound to its signature")?;
+        if path == HELLO_PATH {
+            return Ok(Some(sender));
+        }
+        // The process's view of the live nodes, every runtime's listings
+        // merged, as its pins are: a node a sibling runtime listed first is
+        // live here too. This runtime's own peers cover the rest.
+        let app = self.transport.live_app(&sender).or_else(|| {
+            self.peers
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sender)
+                .map(|p| p.app.clone())
+        });
+        match app {
+            Some(app) if app == self.serves => Ok(Some(sender)),
+            Some(_) => Err("hop's sender is a node of another app"),
+            None if on_cluster_port || self.refuse_plaintext => {
+                self.want_listing();
+                self.read_soon(&sender);
+                Err("hop's sender is not a live node")
+            }
+            None => Ok(Some(sender)),
+        }
+    }
+
+    /// Read-only early replay check; body verification still spends the
+    /// signature later, so a bad-body copy cannot burn the legitimate call.
+    /// Why the early check refuses it, if it does: a full record is left
+    /// to [`Self::first_use`], which spends.
+    pub(crate) fn admission_replayed(
+        &self,
+        signed: &Signed,
+        control: bool,
+    ) -> Option<SignatureRefused> {
+        if self.seen_public.holds(&signed.mac, signed.ts) {
+            self.note_refused("signature already spent on the public port");
+            return Some(SignatureRefused::Used);
+        }
+        match self.record(control).peek(signed.mac, signed.ts, now_ms()) {
+            signing::Spent::Fresh | signing::Spent::Full => None,
+            signing::Spent::Used => {
+                self.note_refused("signature already used");
+                Some(SignatureRefused::Used)
+            }
+            signing::Spent::BeforeStart => {
+                self.note_before_start();
+                Some(SignatureRefused::BeforeStart)
+            }
+        }
+    }
+
+    /// Records a signature whose body matched, or says why it is refused.
+    /// Only then is it spent: a copy sent ahead with another body is
+    /// refused without using up the real call's signature. `control`: a
+    /// take or an alarm hand-off, recorded apart from other calls.
+    pub(crate) fn first_use(&self, signed: &Signed, control: bool) -> Result<(), SignatureRefused> {
+        let now = now_ms();
+        // Sent on the public port first: spent there, read only here.
+        if self.seen_public.holds(&signed.mac, signed.ts) {
+            self.note_refused("signature already spent on the public port");
+            return Err(SignatureRefused::Used);
+        }
+        match self.record(control).spend(signed.mac, signed.ts, now) {
+            signing::Spent::Fresh => Ok(()),
+            signing::Spent::Used => {
+                self.note_refused("signature already used");
+                Err(SignatureRefused::Used)
+            }
+            signing::Spent::BeforeStart => {
+                self.note_before_start();
+                Err(SignatureRefused::BeforeStart)
+            }
+            // Not a replay: more node calls than the record holds.
+            signing::Spent::Full if control => {
+                self.note_refused(
+                    "record of used signatures full (control: takes and alarm hand-offs)",
+                );
+                Err(SignatureRefused::Full)
+            }
+            signing::Spent::Full => {
+                self.note_refused("record of used signatures full (calls)");
+                Err(SignatureRefused::Full)
+            }
+        }
+    }
+
+    /// Counts and logs a call refused as signed before this node started.
+    fn note_before_start(&self) {
+        crate::metrics::inc(&crate::metrics::METRICS.signatures_before_start);
+        self.note_refused(
+            "signature made before this node started (a replay, or the sender's clock behind this one's)",
+        );
+    }
+
+    /// The record of used signatures for control calls, or for the rest.
+    fn record(&self, control: bool) -> &SeenSignatures {
+        if control {
+            &self.seen_control
+        } else {
+            &self.seen
+        }
+    }
+}

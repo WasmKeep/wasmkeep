@@ -1,0 +1,202 @@
+//! Collecting the history a snapshot makes unneeded.
+
+use super::*;
+
+/// Deletes per batch in a collection pass; the lease is checked before each.
+pub(super) const COLLECT_BATCH: usize = 100;
+
+/// Garbage collection of one actor's history by its owner (ADR 0012),
+/// detached from the replica: the owner's generation, and a view of its
+/// lease, checked before every batch of deletes.
+#[derive(Clone)]
+pub(crate) struct Collector {
+    pub(super) store: Arc<dyn ObjectStore>,
+    pub(super) prefix: String,
+    pub(super) generation: u64,
+    pub(super) lease: LeaseView,
+}
+
+impl Collector {
+    /// The owner's generation.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the hold this collector belongs to is still valid.
+    pub(crate) fn lease_valid(&self) -> bool {
+        self.lease.is_valid()
+    }
+
+    /// One pass after the owner's created and acknowledged snapshot at
+    /// `snapshot` (the caller checks that): lists the prefix, and deletes
+    /// what `collectable` allows that is older than `retention` (by the
+    /// bucket's `last_modified`), in batches, while the lease is valid.
+    /// Returns how many objects were deleted (objects already gone count
+    /// as deleted).
+    pub(crate) async fn collect(
+        &self,
+        snapshot: SegmentId,
+        retention: std::time::Duration,
+    ) -> Result<usize, ReplicaError> {
+        if !self.lease.is_valid() {
+            return Ok(0);
+        }
+        let listed = self.list().await?;
+        let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
+        let gone = collectable(&listing, self.generation, snapshot);
+        Ok(self
+            .delete_older(&listed, gone, retention, &|| false)
+            .await?
+            .0)
+    }
+
+    /// The collector of an idle pass (ADR 0042, section 3): `generation`
+    /// is the released record's, which the pass's own hold acquired
+    /// unchanged, and `lease` is the view of that new hold. Built from the
+    /// cluster: the pass restores nothing and has no replica.
+    pub(crate) fn idle(
+        cluster: &Cluster,
+        address: &ActorAddress,
+        generation: u64,
+        lease: LeaseView,
+    ) -> Self {
+        Self {
+            store: Arc::clone(&cluster.store),
+            prefix: format!("{}/", cluster.history_key(address)),
+            generation,
+            lease,
+        }
+    }
+
+    /// An idle pass's collection (ADR 0042, section 3, steps 4 and 5): one
+    /// listing; the snapshot and keys [`idle_collectable`] gives for this
+    /// collector's generation (the released one); and the deletes of
+    /// those older than `retention` by `last_modified`, in batches, the
+    /// lease checked before each, and `stop` too: the pass stops deleting
+    /// once it says so (its deadline, an event waiting behind it, a drain),
+    /// and what is left waits for the actor's next write. A lease already
+    /// invalid is [`ReplicaError::Late`], nothing listed.
+    pub(crate) async fn collect_idle(
+        &self,
+        retention: std::time::Duration,
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<IdleCollected, ReplicaError> {
+        if !self.lease.is_valid() {
+            return Err(ReplicaError::Late);
+        }
+        let listed = self.list().await?;
+        let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
+        let Some((snapshot, gone)) = idle_collectable(&listing, self.generation) else {
+            return Ok(IdleCollected::NoSnapshot);
+        };
+        let (deleted, kept, stopped) = self.delete_older(&listed, gone, retention, stop).await?;
+        Ok(IdleCollected::Collected {
+            snapshot,
+            deleted,
+            kept,
+            stopped,
+        })
+    }
+
+    /// The prefix, listed once: each key relative to it, with the exact
+    /// location and last-modified time the listing returned. As in `list`:
+    /// compared in the store's encoding, and the deletes use the exact
+    /// locations listed.
+    async fn list(&self) -> Result<Vec<(String, object_store::ObjectMeta)>, ReplicaError> {
+        use futures_util::TryStreamExt;
+        let base = StorePath::from(self.prefix.trim_end_matches('/'));
+        let encoded = format!("{}/", base.as_ref());
+        let metas: Vec<object_store::ObjectMeta> = self
+            .store
+            .list(Some(&base))
+            .try_collect()
+            .await
+            .map_err(|e| ReplicaError::Bucket(e.to_string()))?;
+        Ok(metas
+            .into_iter()
+            .filter_map(|m| {
+                let rel = m
+                    .location
+                    .as_ref()
+                    .strip_prefix(encoded.as_str())?
+                    .to_owned();
+                Some((rel, m))
+            })
+            .collect())
+    }
+
+    /// Deletes the listed objects `gone` names that are older than
+    /// `retention`, in batches, while the lease is valid and `stop` says
+    /// nothing. Returns how many were deleted (already gone counts), how
+    /// many were kept for being younger than the window, and whether
+    /// `stop` cut the deletes short.
+    async fn delete_older(
+        &self,
+        listed: &[(String, object_store::ObjectMeta)],
+        gone: Vec<String>,
+        retention: std::time::Duration,
+        stop: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(usize, usize, bool), ReplicaError> {
+        use futures_util::StreamExt;
+        let gone: std::collections::HashSet<String> = gone.into_iter().collect();
+        let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+        let cutoff = crate::alarm::now_ms_i64().saturating_sub(retention_ms);
+        let (mut doomed, mut kept) = (Vec::new(), 0);
+        for (k, m) in listed {
+            if !gone.contains(k) {
+                continue;
+            }
+            if retention.is_zero() || m.last_modified.timestamp_millis() <= cutoff {
+                doomed.push(m.location.clone());
+            } else {
+                kept += 1;
+            }
+        }
+        let (mut deleted, mut stopped) = (0, false);
+        for batch in doomed.chunks(COLLECT_BATCH) {
+            // ADR 0012, condition 3.
+            if !self.lease.is_valid() {
+                break;
+            }
+            if stop() {
+                stopped = true;
+                break;
+            }
+            // The stream outlives the batch: it takes its own copies.
+            let owned: Vec<StorePath> = batch.to_vec();
+            let locations = futures_util::stream::iter(owned.into_iter().map(Ok)).boxed();
+            let results: Vec<object_store::Result<StorePath>> =
+                self.store.delete_stream(locations).collect().await;
+            for r in results {
+                match r {
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => {
+                        deleted += 1;
+                        // Counted as it happens: a pass that fails later
+                        // still counts what it deleted.
+                        crate::metrics::inc(&crate::metrics::METRICS.history_collected);
+                    }
+                    Err(e) => return Err(ReplicaError::Bucket(e.to_string())),
+                }
+            }
+        }
+        Ok((deleted, kept, stopped))
+    }
+}
+
+/// What an idle pass's collection did ([`Collector::collect_idle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleCollected {
+    /// The listing has no snapshot of the released generation with its
+    /// segment (a read-only wake's release, say): nothing deleted.
+    NoSnapshot,
+    /// Compacted below the snapshot at `snapshot`: `deleted` objects gone
+    /// (already gone counts), `kept` collectable ones left for being
+    /// younger than the retention window.
+    Collected {
+        snapshot: SegmentId,
+        deleted: usize,
+        kept: usize,
+        /// The pass's stop condition cut the deletes short.
+        stopped: bool,
+    },
+}
