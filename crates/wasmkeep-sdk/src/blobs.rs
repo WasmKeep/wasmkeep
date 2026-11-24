@@ -248,7 +248,9 @@ impl io::Read for Reader {
 
 /// The file's information and a reader of its bytes `[start, start +
 /// length)` (cut at the end), or of all of them; `None` if there is none.
-/// The reader works within the event that opened it.
+/// The reader works within the event that opened it. At most 16 are open
+/// at once (`not-allowed` past it): a reader counts until it is read to
+/// its end or dropped, so one read only partly counts until dropped.
 ///
 /// # Errors
 /// What the host refused or failed.

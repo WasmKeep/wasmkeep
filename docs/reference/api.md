@@ -292,9 +292,9 @@ A fully buffered request, delivered to the callee's
 | --- | --- |
 | `invalid-address(string)` | The address is not `class/name`, or the class does not exist. |
 | `reentrant` | The call would re-enter an actor already waiting in this call chain (including the caller itself), which would deadlock. |
-| `too-large` | The request or response exceeded the body limit (16 MB). |
+| `too-large` | The request or response exceeded the body limit (16 MB), or the request has more than 96 headers or more than 62 KiB of path and headers together (each header counted as its name, its value and 4 bytes). |
 | `timeout` | The callee did not answer by the caller's call deadline. |
-| `failed(string)` | The callee trapped, or the host could not deliver the call. |
+| `failed(string)` | The callee trapped, or the host could not deliver the call; also a call chain longer than 16 callers, the caller included. |
 
 ### `actor-address` (record)
 
@@ -598,7 +598,10 @@ Writes the whole file, up to 16 MiB. Returns once it is durable.
 open-read: func(key: string, range: option<tuple<u64, u64>>) -> result<option<tuple<blob-info, input-stream>>, blob-error>;
 ```
 
-Streams a file, or the bytes `[start, start + length)` of it.
+Streams a file, or the bytes `[start, start + length)` of it. At
+most 16 streams are open at once (else `not-allowed`): a stream is
+open until it is dropped or read to its end, and every stream closes
+when the event ends.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |
@@ -610,7 +613,9 @@ Streams a file, or the bytes `[start, start + length)` of it.
 open-write: func(key: string, options: write-options) -> result<upload, blob-error>;
 ```
 
-Starts a streamed write; nothing is visible until `finish`.
+Starts a streamed write; nothing is visible until `finish`. At most
+16 are open at once (else `not-allowed`), and one left open is
+abandoned when the event ends.
 
 | Rust | TypeScript | Python | C | Zig |
 | --- | --- | --- | --- | --- |

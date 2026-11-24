@@ -120,9 +120,7 @@ pub(crate) fn run(options: DevOptions) -> anyhow::Result<()> {
         "give at least one actor crate directory"
     );
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = wasmkeep_cli::serving_runtime()?;
     let _entered = rt.enter();
     let runtime = Runtime::new(&RuntimeConfig::default())?;
 

@@ -154,59 +154,166 @@ impl Source {
     }
 }
 
-/// A file's bytes as an `input-stream`.
-pub(crate) struct ReadStream {
-    source: Option<Source>,
-    buffer: Bytes,
-    failed: Option<String>,
-    alive: Alive,
+/// What a read stream still has to read, shared with its instance's
+/// [`ReadStreams`] so the event's end can close it while the stream stays
+/// in the guest's table. `None`: read to its end, failed or closed.
+type Slot = Arc<tokio::sync::Mutex<Option<Reading>>>;
+
+/// A read under way on disk: it owns the file until it ends.
+type DiskRead = tokio::task::JoinHandle<std::io::Result<(std::fs::File, Vec<u8>)>>;
+
+/// A read stream's source while it has bytes left.
+enum Reading {
+    Bucket(BoxStream<'static, object_store::Result<Bytes>>),
+    /// The file and the bytes left in it, or the read under way. Kept
+    /// here, so a wait the guest gives up (a `poll` another pollable won)
+    /// loses neither bytes nor the file.
+    Disk {
+        file: Option<std::fs::File>,
+        left: u64,
+        pending: Option<DiskRead>,
+    },
 }
 
-impl ReadStream {
-    pub(crate) fn new(source: Source, alive: Alive) -> Self {
-        Self {
-            source: Some(source),
+/// An instance's open read streams: at most [`super::MAX_OPEN_READS`], each
+/// closed when its event ends.
+#[derive(Default)]
+pub(crate) struct ReadStreams {
+    open: Vec<std::sync::Weak<tokio::sync::Mutex<Option<Reading>>>>,
+}
+
+impl ReadStreams {
+    /// Streams the guest still holds that have bytes left.
+    pub(crate) fn open(&mut self) -> usize {
+        self.open.retain(|w| {
+            w.upgrade()
+                .is_some_and(|slot| slot.try_lock().map_or(true, |r| r.is_some()))
+        });
+        self.open.len()
+    }
+
+    /// Closes every stream: its file, or its response, goes now. A stream
+    /// in the middle of a read (none is, between host calls) closes when
+    /// that read ends, as its event is over.
+    pub(crate) fn close_all(&mut self) {
+        for w in self.open.drain(..) {
+            if let Some(slot) = w.upgrade()
+                && let Ok(mut r) = slot.try_lock()
+            {
+                *r = None;
+            }
+        }
+    }
+
+    /// `source` as an `input-stream` of the event `alive` stands for.
+    pub(crate) fn stream(&mut self, source: Source, alive: Alive) -> ReadStream {
+        let reading = match source {
+            Source::Bucket(s) => Some(Reading::Bucket(s)),
+            Source::Disk { file, left } => Some(Reading::Disk {
+                file: Some(file),
+                left,
+                pending: None,
+            }),
+            Source::Empty => None,
+        };
+        let slot = Arc::new(tokio::sync::Mutex::new(reading));
+        self.open.push(Arc::downgrade(&slot));
+        ReadStream {
+            slot,
             buffer: Bytes::new(),
             failed: None,
             alive,
         }
     }
+}
 
+/// A file's bytes as an `input-stream`.
+pub(crate) struct ReadStream {
+    slot: Slot,
+    buffer: Bytes,
+    failed: Option<String>,
+    alive: Alive,
+}
+
+/// What one fill did.
+enum Filled {
+    /// Bytes, and the source has more.
+    More(Bytes),
+    /// The last bytes: the source is done.
+    Last(Bytes),
+    Failed(String),
+    Done,
+}
+
+impl ReadStream {
     async fn fill(&mut self) {
-        match self.source.take() {
-            None | Some(Source::Empty) => {}
-            Some(Source::Bucket(mut s)) => match s.next().await {
-                Some(Ok(b)) => {
-                    self.buffer = b;
-                    self.source = Some(Source::Bucket(s));
-                }
-                Some(Err(e)) => self.failed = Some(e.to_string()),
-                None => {}
+        let slot = Arc::clone(&self.slot);
+        let mut guard = slot.lock().await;
+        let filled = match guard.as_mut() {
+            None => return,
+            Some(Reading::Bucket(s)) => match s.next().await {
+                Some(Ok(b)) => Filled::More(b),
+                Some(Err(e)) => Filled::Failed(e.to_string()),
+                None => Filled::Done,
             },
-            Some(Source::Disk { mut file, left }) => {
-                let want = (left as usize).min(CHUNK);
-                let read = tokio::task::spawn_blocking(move || {
-                    let mut buf = vec![0u8; want];
-                    let n = file.read(&mut buf)?;
-                    buf.truncate(n);
-                    Ok::<_, std::io::Error>((file, buf))
-                })
-                .await;
+            Some(Reading::Disk {
+                file,
+                left,
+                pending,
+            }) => {
+                let handle = match pending {
+                    Some(h) => h,
+                    None => {
+                        let Some(mut f) = file.take() else {
+                            return;
+                        };
+                        let want = usize::try_from(*left).unwrap_or(usize::MAX).min(CHUNK);
+                        pending.insert(tokio::task::spawn_blocking(move || {
+                            let mut buf = vec![0u8; want];
+                            let n = f.read(&mut buf)?;
+                            buf.truncate(n);
+                            Ok::<_, std::io::Error>((f, buf))
+                        }))
+                    }
+                };
+                // Cancel-safe: given up here, the read stays in `pending`
+                // and the next wait takes its answer.
+                let read = handle.await;
+                *pending = None;
                 match read {
                     Ok(Ok((_, buf))) if buf.is_empty() => {
-                        self.failed = Some("the file ended early".into());
+                        Filled::Failed("the file ended early".into())
                     }
-                    Ok(Ok((file, buf))) => {
-                        let left = left - buf.len() as u64;
-                        self.buffer = Bytes::from(buf);
-                        if left > 0 {
-                            self.source = Some(Source::Disk { file, left });
+                    Ok(Ok((f, buf))) => {
+                        *left -= buf.len() as u64;
+                        if *left > 0 {
+                            *file = Some(f);
+                            Filled::More(Bytes::from(buf))
+                        } else {
+                            Filled::Last(Bytes::from(buf))
                         }
                     }
-                    Ok(Err(e)) => self.failed = Some(e.to_string()),
-                    Err(e) => self.failed = Some(e.to_string()),
+                    Ok(Err(e)) => Filled::Failed(e.to_string()),
+                    Err(e) => Filled::Failed(e.to_string()),
                 }
             }
+        };
+        match filled {
+            Filled::More(b) => self.buffer = b,
+            Filled::Last(b) => {
+                self.buffer = b;
+                *guard = None;
+            }
+            Filled::Failed(e) => {
+                self.failed = Some(e);
+                *guard = None;
+            }
+            Filled::Done => *guard = None,
+        }
+        // The event ended while this read was under way: nothing more is
+        // read, and the source goes now.
+        if !self.alive.load(Ordering::Acquire) {
+            *guard = None;
         }
     }
 }
@@ -235,9 +342,10 @@ impl InputStream for ReadStream {
                 "reading the file failed: {e}"
             )));
         }
-        match self.source {
-            None => Err(StreamError::Closed),
-            Some(_) => Ok(Bytes::new()),
+        // Locked only while a read is under way, which has more to give.
+        match self.slot.try_lock() {
+            Ok(r) if r.is_none() => Err(StreamError::Closed),
+            _ => Ok(Bytes::new()),
         }
     }
 }

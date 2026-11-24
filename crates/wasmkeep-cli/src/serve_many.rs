@@ -98,9 +98,7 @@ pub(crate) fn serve_many(file: &NodeFile, base: &ServeArgs) -> anyhow::Result<()
     let socket_budget =
         wasmkeep_server::SocketBudget::new(requested_sockets, effective.socket_sessions);
     let cache = ComponentCache::new(runtime.clone(), &base.cache_dir)?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = wasmkeep_cli::serving_runtime()?;
     let _entered = rt.enter();
     // Before a second app is enabled anywhere, every live node must run a
     // version that knows it (ADR 0038, section 10).
@@ -259,6 +257,9 @@ async fn start_runtime(
     config.egress = egress.clone();
     config.guest_log = shared.guest_log.clone();
     config.storage.max_sql_cpu_per_event = std::time::Duration::from_millis(args.sql_cpu_budget_ms);
+    config.storage.sqlite_heap_bytes = args
+        .sqlite_heap_bytes
+        .unwrap_or(wasmkeep_storage::DEFAULT_SQLITE_HEAP_BYTES);
     config.config = deployed.config;
     config.requires = deployed.requires;
     config.batched = deployed.batched;

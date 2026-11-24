@@ -15,6 +15,7 @@ rustix.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 lz4_flex.workspace = true
+tracing.workspace = true
 
 [features]
 # Test-only: `faults::fail_next` makes named operations fail once.

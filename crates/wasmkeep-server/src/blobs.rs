@@ -49,6 +49,10 @@ pub(crate) const NODE_SPOOL: u64 = 4 * 1024 * 1024 * 1024;
 pub(crate) const APP_SPOOL: u64 = 1024 * 1024 * 1024;
 /// Streamed writes one instance may have open at once.
 pub(crate) const MAX_OPEN_WRITES: usize = 16;
+/// Read streams one instance may have open at once: a stream counts until
+/// the guest drops it or reads it to its end, and the event's end closes
+/// every one (on disk, its descriptor; on a bucket, its response).
+pub(crate) const MAX_OPEN_READS: usize = 16;
 
 /// The process's spool budget, shared by every app runtime.
 fn node_spool() -> Arc<streams::Budget> {

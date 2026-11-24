@@ -20,6 +20,26 @@ The text under a version's heading is its GitHub release text
   above its minor version, or an unreadable one, stops the start; a read
   with no answer is retried. No format changes
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)).
+- Guest limits: SQLite's process-wide heap cap is configurable
+  (`serve --sqlite-heap-bytes`, or `sqlite-heap-bytes` in a node file's
+  `[limits]`; default 4 GiB as before, at least 64 MiB). `LIKE` and `GLOB`
+  are the host's, as `instr`, `replace` and `trim` are: SQLite's answers,
+  stopped at the statement's time and CPU budgets, and no deep recursion on
+  a pattern full of wildcards, also on the offline connections that verify
+  backups, exports and restores. Like any replaced `like()`, they no longer
+  narrow an indexed search to a prefix, which changes two cases: `GLOB` on
+  a `BINARY` column (write `path >= 'a/' AND path < 'a0'` for
+  `path GLOB 'a/*'`) and `LIKE` on a `COLLATE NOCASE` column (write
+  `name >= 'a' AND name < 'b'` for `name LIKE 'a%'`); `LIKE` on any other
+  column never used an index. Offline verification no longer refuses a
+  guest object with the `_wasmkeep_` prefix, only one holding a host
+  table's name.
+  At open, a database's guest objects that use the reserved `_wasmkeep_`
+  prefix (made before 0.8) are logged once and kept as they are, closed to
+  the guest's schema changes. An instance holds at most 16 streamed file
+  reads at once, and each closes (its file or response) when its event
+  ends; a wait for a read the guest gives up no longer loses bytes. The WIT
+  documents these caps and `actors.call`'s header, size and chain limits.
 
 ## 0.8.0
 

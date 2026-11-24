@@ -41,8 +41,9 @@ under `crates/`). Per-node and per-app limits are local to a node's process.
 | Actor | Database size, value, query result | 1 GiB, 16 MiB, 16 MiB | `wasmkeep-storage/src/db.rs` (`max_db_bytes`, `max_value_bytes`, `max_result_bytes`) |
 | Actor | Write-ahead log between captures | 256 MiB | `db.rs` (`max_wal_bytes`) |
 | Statement | Compiled instructions (`quota-exceeded`) | 2,000,000 | `db.rs` (`GUEST_MAX_VDBE_OPS`) |
-| Node | SQLite heap, temporary data included | 4 GiB | `db.rs` (`SQLITE_HEAP_LIMIT_BYTES`) |
+| Node | SQLite heap, temporary data included | 4 GiB (`--sqlite-heap-bytes`, at least 64 MiB) | `db.rs` (`DEFAULT_SQLITE_HEAP_BYTES`) |
 | Instance | Streamed file writes open at once | 16 | `wasmkeep-server/src/blobs.rs` (`MAX_OPEN_WRITES`) |
+| Instance | Streamed file reads open at once, all closed at the event's end | 16 | `blobs.rs` (`MAX_OPEN_READS`) |
 | App | Spooled file bytes | 1 GiB (at least one `--max-blob-bytes` file, at most half the node's) | `blobs.rs` (`APP_SPOOL`) |
 | Node | Spooled file bytes | 4 GiB (at least two such files) | `blobs.rs` (`NODE_SPOOL`) |
 | Upload link | Idle body, then minimum rate after 30 s (408) | 60 s, 16 KiB/s | `wasmkeep-server/src/blobs/serve.rs` (`UPLOAD_*`) |
@@ -170,28 +171,49 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   schema (not their rows) show in `sqlite_master`. Host statements run with
   triggers and foreign key enforcement off, so they run nothing a guest
   wrote.
+- Before 0.8 a guest could give a view, index or trigger a reserved name,
+  rename a table onto one, or declare a foreign key to a host table. Such
+  objects found in a database are logged once per process at open (a
+  warning naming a few of them) and left as they are: nothing is dropped
+  or renamed, the actor opens, and its backups and exports verify (only an
+  object holding a host table's own name fails verification). The guest can neither change them (drop,
+  alter, reindex, or a new object naming one) nor read a table or view so
+  named, so a renamed table's rows are kept but out of its reach; an index
+  or trigger so named on one of its own tables keeps working, and a table
+  carrying such a trigger cannot be dropped.
 - 1 GB per database; 16 MiB per value and per query result. The result
   budget counts text/blob payloads after UTF-8 replacement, column names
   once, and conservative result/row/cell, allocation and vector-capacity
   overhead, including empty values ([details](concepts.md#storage)). A statement
   is stopped at the event's wall clock and SQL CPU budget, checked between
-  steps of SQLite's virtual machine and inside `instr`, `replace` and
-  `trim`. A stop inside one of these functions fails the statement only;
-  it does not roll back the guest's open transaction (a stop between steps
-  of a statement that writes does). A single step over a large value is
-  not interrupted, so a statement can overrun the budgets; `LIKE` and
-  `GLOB` are the costliest, their time growing with the value's length
-  times the pattern's (up to SQLite's 50,000-byte patterns). Host
-  statements have the same wall-clock limit.
+  steps of SQLite's virtual machine and inside `instr`, `replace`, `trim`,
+  `LIKE` and `GLOB`. These are the host's, with SQLite's answers, and match
+  without recursion, also on the offline connections that verify, read and
+  inspect exports (their `integrity_check` recomputes a guest's indexes,
+  under the same 5 s deadline). SQLite's own `LIKE` and `GLOB` can narrow
+  an indexed search to a prefix; the host's cannot. That changes two
+  cases: `GLOB` on a column with the default (`BINARY`) collation
+  (`path GLOB 'a/*'` scans the table; `path >= 'a/' AND path < 'a0'` uses
+  the index), and `LIKE` on a column declared `COLLATE NOCASE`
+  (`name LIKE 'a%'` scans; `name >= 'a' AND name < 'b'` uses the index).
+  `LIKE` on any other column never used an index. A stop inside one
+  of these functions fails the statement only; it does not roll back the
+  guest's open transaction (a stop between steps of a statement that writes
+  does). Another single step over a large value is not interrupted, so a
+  statement can still overrun the budgets by as long as such a step takes.
+  Host statements have the same wall-clock limit.
 - At most 2,000,000 instructions per compiled statement (past it,
   `quota-exceeded`). SQLite's own limits on columns, function arguments,
   expression depth and compound `SELECT` terms are kept, set explicitly:
   SQLite also applies them when it loads a stored schema, so lower ones
   would make existing databases unreadable. SQLite's heap is capped at
-  4 GiB for the whole process, temporary data (sorts, materialised
-  subqueries) included, as it stays in memory: a statement that needs more
-  fails with `quota-exceeded`. The cap is shared, so while one statement
-  holds most of it, others can fail too.
+  4 GiB for the whole process by default (`--sqlite-heap-bytes`, or
+  `sqlite-heap-bytes` in a node file's `[limits]`; at least 64 MiB),
+  temporary data (sorts, materialised subqueries) included, as it stays in
+  memory: a statement that needs more fails with `quota-exceeded`. The cap
+  is shared, so while one statement holds most of it, others can fail too.
+  Size it to the node's memory: the default leaves room for 1,000 resident
+  actors' page caches and for statements on 16 MiB values.
 - 256 MB of write-ahead log between two captures: past it, statements that
   write fail until the event ends (reads, commit and rollback still run),
   or, when another connection reading the database keeps the log from

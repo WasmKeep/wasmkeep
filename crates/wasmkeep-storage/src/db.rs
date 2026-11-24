@@ -52,7 +52,25 @@ pub struct StorageConfig {
     /// running statement is stopped and later ones refused until
     /// [`ActorDb::end_event`].
     pub max_sql_cpu_per_event: Duration,
+    /// SQLite's heap for the whole process, temporary data included
+    /// (`PRAGMA hard_heap_limit`; default [`DEFAULT_SQLITE_HEAP_BYTES`]).
+    /// Past it an allocation fails, and the statement with it
+    /// (`quota-exceeded`). Set at the first open, and only ever lowered
+    /// after: the lowest value any open asked for wins. At least
+    /// [`MIN_SQLITE_HEAP_BYTES`]; 0 is read as the minimum (SQLite reads 0
+    /// as no cap).
+    pub sqlite_heap_bytes: u64,
 }
+
+/// [`StorageConfig::sqlite_heap_bytes`] by default: room for the default
+/// 1,000 resident actors' page caches (about 2 MiB each) and for
+/// statements holding 16 MiB values and sorting in memory
+/// (`temp_store = MEMORY`).
+pub const DEFAULT_SQLITE_HEAP_BYTES: u64 = 4 << 30;
+
+/// The lowest [`StorageConfig::sqlite_heap_bytes`]: a few statements on
+/// 16 MiB values.
+pub const MIN_SQLITE_HEAP_BYTES: u64 = 64 << 20;
 
 impl StorageConfig {
     /// Defaults with the given data directory.
@@ -65,6 +83,7 @@ impl StorageConfig {
             max_result_bytes: 16 * 1024 * 1024,
             max_wal_bytes: 256 * 1024 * 1024,
             max_sql_cpu_per_event: Duration::from_secs(2),
+            sqlite_heap_bytes: DEFAULT_SQLITE_HEAP_BYTES,
         }
     }
 }
@@ -181,6 +200,18 @@ impl Storage {
             })?;
         }
         let mut db = open_retrying(&path, &self.config)?;
+        match db.find_reserved() {
+            Ok(found) => db.reserved = found,
+            // Not a reason to keep the actor closed: the sandbox refuses
+            // what it would refuse anyway.
+            Err(e) if first_warning(&path, Warning::Failed) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not look for guest objects with the reserved _wasmkeep_ prefix"
+            ),
+            Err(_) => {}
+        }
+        warn_reserved(&path, &db.reserved);
         *self
             .open
             .lock()
@@ -299,6 +330,58 @@ impl Storage {
 /// Meta key holding `tenant/class/name`.
 const ADDRESS_KEY: &str = "address";
 
+/// What [`first_warning`] is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Warning {
+    /// Guest objects with the reserved prefix were found.
+    Found,
+    /// Looking for them failed.
+    Failed,
+}
+
+/// Whether `what` is to be logged for the database at `path`: the first
+/// time in this process only, and for at most 10,000 files.
+fn first_warning(path: &Path, what: Warning) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const MAX_WARNED: usize = 10_000;
+    static WARNED: OnceLock<Mutex<HashSet<(PathBuf, Warning)>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    warned.len() < MAX_WARNED && warned.insert((path.to_owned(), what))
+}
+
+/// Logs, once per database file and process, the guest objects with the
+/// reserved prefix it holds: at most a few, each name shortened and
+/// escaped (a guest chose them).
+fn warn_reserved(path: &Path, found: &[ReservedObject]) {
+    if found.is_empty() || !first_warning(path, Warning::Found) {
+        return;
+    }
+    let names: Vec<String> = found
+        .iter()
+        .take(8)
+        .map(|o| {
+            let name: String = o.name.chars().take(64).collect();
+            let how = match o.uses {
+                ReservedUse::Named => "named",
+                ReservedUse::References => "naming a host table",
+            };
+            format!("{} {name:?} ({how})", o.kind)
+        })
+        .collect();
+    tracing::warn!(
+        path = %path.display(),
+        count = found.len(),
+        objects = %names.join(", "),
+        "the database holds guest objects that use the reserved _wasmkeep_ prefix (made \
+         before 0.8): kept as they are; the guest can change none of them, nor read a table \
+         so named"
+    );
+}
+
 /// `*.db` files at `<root>/<class>/`.
 fn db_files(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
     let read = |dir: &Path| -> Result<Vec<PathBuf>, StorageError> {
@@ -392,6 +475,8 @@ pub struct ActorDb {
     failed_checkpoints: u64,
     batch_hold: Option<std::sync::Weak<()>>,
     segment_byte_cap: u64,
+    /// Guest objects found at open that use the reserved prefix.
+    reserved: Vec<ReservedObject>,
     /// Last, so it is released after the connection has closed.
     open_guard: Option<OpenGuard>,
 }
@@ -632,8 +717,13 @@ impl ActorDb {
         conn.pragma_update(None, "temp_store", "MEMORY")
             .map_err(open_err)?;
         // Process-wide, and it only ever lowers the cap: the lowest set wins.
-        conn.pragma_update(None, "hard_heap_limit", SQLITE_HEAP_LIMIT_BYTES)
-            .map_err(open_err)?;
+        let heap = config.sqlite_heap_bytes.max(MIN_SQLITE_HEAP_BYTES);
+        conn.pragma_update(
+            None,
+            "hard_heap_limit",
+            i64::try_from(heap).unwrap_or(i64::MAX),
+        )
+        .map_err(open_err)?;
         let page_size: i64 = conn
             .pragma_query_value(None, "page_size", |r| r.get(0))
             .map_err(open_err)?;
@@ -715,8 +805,13 @@ impl ActorDb {
             deadline: Arc::clone(&deadline),
             cpu_deadline: Arc::clone(&cpu_deadline),
         };
-        crate::guest_functions::register(&conn, &budget, config.max_value_bytes)
-            .map_err(open_err)?;
+        crate::guest_functions::register(
+            &conn,
+            &budget,
+            config.max_value_bytes,
+            GUEST_MAX_LIKE_PATTERN as usize,
+        )
+        .map_err(open_err)?;
         // While a writing guest statement runs during capture, the WAL is
         // checked too: one statement must not grow it far past its cap.
         let wal_cap = Arc::new(AtomicU64::new(0));
@@ -767,8 +862,74 @@ impl ActorDb {
             failed_checkpoints: 0,
             batch_hold: None,
             segment_byte_cap: crate::wal::DEFAULT_SEGMENT_BYTES,
+            reserved: Vec::new(),
             open_guard: None,
         })
+    }
+
+    /// Guest objects in the schema that use the reserved prefix: a guest
+    /// could give one a reserved name before 0.8 (a view, an index, a
+    /// trigger, or a table renamed onto one), or name a host table in its
+    /// definition (a foreign key to one). Found once, at open; at most
+    /// 64 are listed.
+    ///
+    /// They are left as they are: dropping one could lose the guest's rows
+    /// (a renamed table holds them) and renaming one changes the guest's
+    /// schema behind its back, both replicated as ordinary changes, while
+    /// refusing to open would take the actor down. The sandbox already
+    /// keeps them out of the guest's reach: no schema change may name one
+    /// (drop, alter, reindex, or a new object naming it), a reserved table
+    /// or view can be neither read nor written, and host statements run
+    /// none of its triggers or cascades. What still works for the guest is
+    /// an index or a trigger so named on a table of its own: the index is
+    /// used and the trigger fires. A table carrying such a trigger cannot
+    /// be dropped; one carrying only such an index can, and the index goes
+    /// with it.
+    #[must_use]
+    pub fn reserved_objects(&self) -> &[ReservedObject] {
+        &self.reserved
+    }
+
+    /// Reads [`Self::reserved_objects`] from the schema.
+    fn find_reserved(&mut self) -> Result<Vec<ReservedObject>, SqlError> {
+        let rows = self.internal(|conn| {
+            // Narrowed by SQLite, judged here as guest DDL is judged; no
+            // LIKE, where `_` is a wildcard.
+            let mut stmt = conn.prepare(
+                "SELECT type, name, sql FROM main.sqlite_schema \
+                 WHERE instr(lower(name), '_wasmkeep_') OR instr(lower(sql), '_wasmkeep_')",
+            )?;
+            // Classified row by row; only the kind, name and use are
+            // kept, of at most `MAX_RESERVED_KEPT` objects.
+            let mut found = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                if kind == "table" && HOST_TABLES.contains(&name.as_str()) {
+                    continue;
+                }
+                let uses = if is_reserved(&name) {
+                    ReservedUse::Named
+                } else if r
+                    .get_ref(2)?
+                    .as_str_or_null()
+                    .ok()
+                    .flatten()
+                    .is_some_and(names_reserved)
+                {
+                    ReservedUse::References
+                } else {
+                    continue;
+                };
+                found.push(ReservedObject { kind, name, uses });
+                if found.len() == MAX_RESERVED_KEPT {
+                    break;
+                }
+            }
+            Ok(found)
+        })?;
+        Ok(rows)
     }
 
     /// Starts capturing committed changes for replication: turns automatic
@@ -1730,6 +1891,34 @@ fn bind(params: &[SqlValue]) -> rusqlite::ParamsFromIter<Vec<rusqlite::types::Va
 /// Tables reserved for the host. Guests can neither read nor write them.
 const RESERVED_PREFIX: &str = "_wasmkeep_";
 
+/// Guest objects with the reserved prefix kept per database
+/// ([`ActorDb::reserved_objects`]); past it, the rest go unlisted.
+const MAX_RESERVED_KEPT: usize = 64;
+
+/// The host's own tables, made at the first open of every database.
+const HOST_TABLES: &[&str] = &["_wasmkeep_meta", "_wasmkeep_alarm"];
+
+/// A guest object in the schema that uses the reserved prefix
+/// ([`ActorDb::reserved_objects`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedObject {
+    /// `table`, `view`, `index` or `trigger`, as `sqlite_schema` says.
+    pub kind: String,
+    /// Its name, as the guest wrote it.
+    pub name: String,
+    pub uses: ReservedUse,
+}
+
+/// How a [`ReservedObject`] uses the reserved prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedUse {
+    /// Its name has it.
+    Named,
+    /// Its definition names something that has it (a foreign key to a
+    /// host table, say).
+    References,
+}
+
 /// SQLite virtual machine steps between deadline checks.
 const PROGRESS_STEPS: std::ffi::c_int = 10_000;
 
@@ -1754,8 +1943,9 @@ const GUEST_MAX_COMPOUND_SELECT: i32 = 500;
 /// SQLite answers "out of memory".
 const GUEST_MAX_VDBE_OPS: i32 = 2_000_000;
 /// Bytes in a `LIKE` or `GLOB` pattern: SQLite's default (50,000), as set
-/// explicitly. A match costs up to the value's length times the pattern's,
-/// in one step the progress handler cannot interrupt.
+/// explicitly. The host's `like` and `glob` check it as SQLite's do; a
+/// match costs up to the value's length times the pattern's, under the
+/// statement's budgets ([`crate::guest_functions`]).
 const GUEST_MAX_LIKE_PATTERN: i32 = 50_000;
 /// rusqlite's busy timeout, which a checkpoint that does not wait for
 /// readers sets aside for a moment.
@@ -1763,12 +1953,6 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The WAL's header and each frame's header, in bytes.
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_HEADER_BYTES: u64 = 24;
-/// SQLite's heap, for the whole process (`PRAGMA hard_heap_limit`): past it
-/// an allocation fails and the statement with it, instead of the process
-/// running out of memory. Room for the default 1,000 resident actors' page
-/// caches (about 2 MiB each) and for statements holding 16 MiB values and
-/// sorting in memory (`temp_store = MEMORY`).
-const SQLITE_HEAP_LIMIT_BYTES: i64 = 4 << 30;
 
 /// Virtual table modules guests may use; others (and `fts3_tokenizer`,
 /// which takes a raw function pointer) could reach into the host.

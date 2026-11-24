@@ -53,7 +53,10 @@ declare module 'wasmkeep:actor/actors@0.2.0' {
     tag: 'reentrant',
   }
   /**
-   * The request or response exceeded the body limit (16 MB).
+   * The request or response exceeded the body limit (16 MB), or the
+   * request has more than 96 headers or more than 62 KiB of path and
+   * headers together (each header counted as its name, its value and
+   * 4 bytes).
    */
   export interface CallErrorTooLarge {
     tag: 'too-large',
@@ -65,7 +68,8 @@ declare module 'wasmkeep:actor/actors@0.2.0' {
     tag: 'timeout',
   }
   /**
-   * The callee trapped, or the host could not deliver the call.
+   * The callee trapped, or the host could not deliver the call; also
+   * a call chain longer than 16 callers, the caller included.
    */
   export interface CallErrorFailed {
     tag: 'failed',

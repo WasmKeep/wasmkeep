@@ -83,7 +83,10 @@ func (self *CallError) Reentrant() bool {
 
 // CallErrorTooLarge returns a [CallError] of case "too-large".
 //
-// The request or response exceeded the body limit (16 MB).
+// The request or response exceeded the body limit (16 MB), or the
+// request has more than 96 headers or more than 62 KiB of path and
+// headers together (each header counted as its name, its value and
+// 4 bytes).
 func CallErrorTooLarge() CallError {
 	var data struct{}
 	return cm.New[CallError](2, data)
@@ -109,7 +112,8 @@ func (self *CallError) Timeout() bool {
 
 // CallErrorFailed returns a [CallError] of case "failed".
 //
-// The callee trapped, or the host could not deliver the call.
+// The callee trapped, or the host could not deliver the call; also
+// a call chain longer than 16 callers, the caller included.
 func CallErrorFailed(data string) CallError {
 	return cm.New[CallError](4, data)
 }

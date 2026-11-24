@@ -39,6 +39,21 @@ pub fn parse_bucket(url: &str) -> anyhow::Result<(&str, &str)> {
     Ok((bucket, prefix.trim_matches('/')))
 }
 
+/// Stack for every thread of the serving runtime, its blocking pool
+/// included (tokio's default is 2 MiB). SQLite runs on those threads, and
+/// its own `LIKE` and `GLOB` recurse once per wildcard: a 44 KB pattern
+/// overflowed 2 MiB and aborted the process. The host's versions do not
+/// recurse; this is the margin for anything of SQLite's that still does.
+pub const SERVING_THREAD_STACK: usize = 8 << 20;
+
+/// The multi-threaded runtime `serve` and `dev` run on.
+pub fn serving_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(SERVING_THREAD_STACK)
+        .build()
+}
+
 /// Runs a command with signal cancellation and background runtime shutdown.
 pub fn run_async(
     work: impl std::future::Future<Output = anyhow::Result<()>>,

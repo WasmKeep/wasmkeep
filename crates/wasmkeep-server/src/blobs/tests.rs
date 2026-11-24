@@ -173,7 +173,9 @@ async fn whole_file_calls_stop_at_16_mib() {
             Err(BlobError::TooLarge)
         ));
         assert_eq!(
-            read_streamed(&c, &mut table, "big", None).await.unwrap(),
+            read_streamed(&mut c, &mut table, "big", None)
+                .await
+                .unwrap(),
             big
         );
     }
@@ -209,7 +211,7 @@ async fn write_streamed(
 }
 
 async fn read_streamed(
-    c: &Caller,
+    c: &mut Caller,
     table: &mut ResourceTable,
     key: &str,
     range: Option<(u64, u64)>,
@@ -259,31 +261,31 @@ async fn streams_read_ranges_and_write_with_conditions() {
             Err(BlobError::Conflict)
         ));
         assert_eq!(
-            read_streamed(&c, &mut table, "s/x.bin", None)
+            read_streamed(&mut c, &mut table, "s/x.bin", None)
                 .await
                 .unwrap(),
             body
         );
         assert_eq!(
-            read_streamed(&c, &mut table, "s/x.bin", Some((1_000, 70_000)))
+            read_streamed(&mut c, &mut table, "s/x.bin", Some((1_000, 70_000)))
                 .await
                 .unwrap(),
             &body[1_000..71_000]
         );
         assert_eq!(
-            read_streamed(&c, &mut table, "s/x.bin", Some((199_990, 100)))
+            read_streamed(&mut c, &mut table, "s/x.bin", Some((199_990, 100)))
                 .await
                 .unwrap(),
             &body[199_990..]
         );
         assert!(
-            read_streamed(&c, &mut table, "s/x.bin", Some((200_000, 5)))
+            read_streamed(&mut c, &mut table, "s/x.bin", Some((200_000, 5)))
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(matches!(
-            read_streamed(&c, &mut table, "s/x.bin", Some((200_001, 5))).await,
+            read_streamed(&mut c, &mut table, "s/x.bin", Some((200_001, 5))).await,
             Err(BlobError::NotAllowed(_))
         ));
         assert!(
@@ -1338,4 +1340,124 @@ async fn one_app_cannot_take_the_whole_node_budget() {
     );
     first.abort();
     let _ = first.await;
+}
+
+/// Descriptors this process holds open on files under `dir`.
+#[cfg(target_os = "linux")]
+fn fds_under(dir: &std::path::Path) -> usize {
+    let dir = dir.canonicalize().unwrap();
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&dir))
+        .count()
+}
+
+async fn open_one(
+    c: &mut Caller,
+    table: &mut ResourceTable,
+) -> Result<wasmtime::component::Resource<wasmtime_wasi::p2::DynInputStream>, BlobError> {
+    c.open_read(table, "r".into(), None)
+        .await
+        .unwrap()
+        .map(|found| found.unwrap().1)
+}
+
+/// A guest's read streams: at most 16 open at once, a stream read to its
+/// end or dropped no longer counts, and the event's end closes the rest
+/// (on disk, their descriptors), so none outlives its event in a resident
+/// actor's table.
+#[tokio::test]
+async fn a_guest_opens_at_most_16_read_streams_and_the_event_closes_them() {
+    for (i, f) in both().into_iter().enumerate() {
+        let on_disk = i == 1;
+        let mut c = caller(&f, Namespace::actor("c", "n", "0"));
+        let mut table = ResourceTable::new();
+        let body = vec![7u8; 300_000];
+        write_streamed(&mut c, &mut table, "r", &body, any())
+            .await
+            .unwrap();
+        let mut open = Vec::new();
+        for _ in 0..MAX_OPEN_READS {
+            open.push(open_one(&mut c, &mut table).await.unwrap());
+        }
+        #[cfg(target_os = "linux")]
+        if on_disk {
+            assert_eq!(fds_under(f._tmp.path()), MAX_OPEN_READS);
+        }
+        assert!(matches!(
+            open_one(&mut c, &mut table).await,
+            Err(BlobError::NotAllowed(_))
+        ));
+        // One dropped, another may open.
+        table.delete(open.pop().unwrap()).unwrap();
+        open.push(open_one(&mut c, &mut table).await.unwrap());
+        // One read to its end, but still held: it no longer counts.
+        let s = table.get_mut(&open[0]).unwrap();
+        let mut read = 0;
+        loop {
+            s.ready().await;
+            match s.read(1 << 20) {
+                Ok(b) => read += b.len(),
+                Err(wasmtime_wasi::p2::StreamError::Closed) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(read, body.len());
+        open.push(open_one(&mut c, &mut table).await.unwrap());
+        // The event ends with every stream still in the table: each is
+        // closed, and its descriptor with it.
+        c.end_event();
+        #[cfg(target_os = "linux")]
+        assert_eq!(fds_under(f._tmp.path()), 0, "on disk: {on_disk}");
+        for s in &open {
+            let s = table.get_mut(s).unwrap();
+            s.ready().await;
+            assert!(matches!(
+                s.read(10),
+                Err(wasmtime_wasi::p2::StreamError::Closed)
+            ));
+        }
+        // The next event may open 16 again, the old handles still held.
+        c.new_event(Gate::Free);
+        for _ in 0..MAX_OPEN_READS {
+            open_one(&mut c, &mut table).await.unwrap();
+        }
+    }
+}
+
+/// A wait for a read stream that is given up (the guest polled it beside
+/// another pollable that was ready first) loses no bytes: the stream
+/// carries on where it was.
+#[tokio::test]
+async fn a_read_whose_wait_was_given_up_loses_nothing() {
+    for f in both() {
+        let mut c = caller(&f, Namespace::actor("c", "n", "0"));
+        let mut table = ResourceTable::new();
+        let body: Vec<u8> = (0..500_000u32).map(|i| (i % 253) as u8).collect();
+        write_streamed(&mut c, &mut table, "r", &body, any())
+            .await
+            .unwrap();
+        let stream = open_one(&mut c, &mut table).await.unwrap();
+        let s = table.get_mut(&stream).unwrap();
+        let mut out = Vec::new();
+        loop {
+            // Polled once, then dropped, before every real wait.
+            {
+                let mut ready = std::pin::pin!(s.ready());
+                let waker = futures_util::task::noop_waker();
+                let _ = ready
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker));
+            }
+            s.ready().await;
+            match s.read(1 << 20) {
+                Ok(b) => out.extend_from_slice(&b),
+                Err(wasmtime_wasi::p2::StreamError::Closed) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(out.len(), body.len());
+        assert!(out == body);
+    }
 }

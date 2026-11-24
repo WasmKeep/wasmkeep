@@ -13,7 +13,7 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 
 use super::keys::{check_key, check_prefix, content_type};
-use super::streams::{Alive, ReadStream, Spool};
+use super::streams::{Alive, ReadStreams, Spool};
 use super::{Blobs, MAX_PAGE, Namespace, Write};
 use crate::cluster::LeaseView;
 
@@ -54,6 +54,8 @@ pub(crate) struct Caller {
     alive: Alive,
     /// The streamed writes opened in this event, abandoned at the next.
     open: Vec<Spool>,
+    /// The read streams opened in this event, closed at its end.
+    reads: ReadStreams,
     /// Links made in this event (at most 1,000).
     links: u32,
     /// The actor was deleted in this event: nothing more is written.
@@ -91,6 +93,7 @@ impl Caller {
             gate,
             alive: Arc::new(AtomicBool::new(true)),
             open: Vec::new(),
+            reads: ReadStreams::default(),
             links: 0,
             deleted: false,
         }
@@ -122,10 +125,12 @@ impl Caller {
         self.links = 0;
     }
 
-    /// The event ended: its streams read and write nothing more, and its
-    /// open uploads are abandoned.
+    /// The event ended: its streams read and write nothing more, its read
+    /// streams close (their files and responses go, though the guest may
+    /// keep the handles), and its open uploads are abandoned.
     pub(crate) fn end_event(&mut self) {
         self.alive.store(false, Ordering::Release);
+        self.reads.close_all();
         for spool in self.open.drain(..) {
             spool.abandon();
         }
@@ -213,7 +218,7 @@ impl Caller {
     }
 
     pub(crate) async fn open_read(
-        &self,
+        &mut self,
         table: &mut ResourceTable,
         key: String,
         range: Option<(u64, u64)>,
@@ -225,12 +230,18 @@ impl Caller {
             Ok(b) => b,
             Err(e) => return Ok(Err(e)),
         };
+        if self.reads.open() >= super::MAX_OPEN_READS {
+            return Ok(Err(BlobError::NotAllowed(format!(
+                "at most {} read streams open at once: read one to its end or drop it first",
+                super::MAX_OPEN_READS
+            ))));
+        }
         let (info, source) = match blobs.open_read(&self.ns, &key, range).await {
             Ok(Some(found)) => found,
             Ok(None) => return Ok(Ok(None)),
             Err(e) => return Ok(Err(e)),
         };
-        let stream: DynInputStream = Box::new(ReadStream::new(source, Arc::clone(&self.alive)));
+        let stream: DynInputStream = Box::new(self.reads.stream(source, Arc::clone(&self.alive)));
         Ok(Ok(Some((info, table.push(stream)?))))
     }
 

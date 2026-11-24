@@ -20,7 +20,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 /// Host resources one store may hold at once (wasmtime's default is
 /// 1,000,000). An event holds its request, headers, body and streams, its
 /// response and body, the pollables it waits on, and about ten more per
-/// outbound request (at most 16 in flight per actor) or open blob stream.
+/// outbound request (at most 16 in flight per actor) or open blob stream
+/// (at most 16 reads and 16 writes open, all closed at the event's end).
 /// The examples and the language tests peak at about 150 in one event
 /// (jobs and outbound fetch fan-outs), and a resident actor stays flat
 /// across thousands of events. Past the cap, the call that would add one
