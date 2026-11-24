@@ -990,7 +990,7 @@ impl Cluster {
         // node left), every pooled connection is dropped. A node kept as
         // last read has the same pins there: nothing is dropped for it.
         self.transport
-            .refresh_trust(&nodes, self.heartbeat_horizon_ms);
+            .refresh_trust(&nodes, all, self.heartbeat_horizon_ms);
         if self.refuse_plaintext {
             self.note_plain_peers(&nodes, now);
         }
@@ -1007,8 +1007,31 @@ impl Cluster {
             *view = peers;
         }
         // The same bodies, for the requests kept until a dead node's
-        // actors are free: no bucket request.
-        self.failover.observe(all, now);
+        // actors are free: no bucket request. Only those just read and
+        // not older than a body of that lease the process already read
+        // are news: a body kept after a failed read, or an earlier one a
+        // replica served late, leaves the watch's entry as it was.
+        let kept = |id: &str| {
+            if !fresh.iter().any(|f| f == id) {
+                return true;
+            }
+            let Some(n) = all.iter().find(|n| n.id == id) else {
+                return false;
+            };
+            let Some(state) = n.lease else {
+                return false;
+            };
+            let body = wasmkeep_cluster::node_lease::NodeLeaseObject {
+                state,
+                instance: n.instance.clone(),
+                written_at_ms: n.written_at_ms,
+            };
+            self.transport
+                .lease_reads
+                .newest(id)
+                .is_some_and(|newest| wasmkeep_cluster::node_lease::older_than(&body, &newest))
+        };
+        self.failover.observe_read(all, kept, now);
         // Last, and handed to the fence task: a fence awaits the bucket,
         // and neither this view nor the next listing may wait for it. Only
         // the heartbeats just read are watched as seen again: one kept as

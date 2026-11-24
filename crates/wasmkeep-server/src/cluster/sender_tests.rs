@@ -386,14 +386,14 @@ async fn an_answer_is_trusted_only_while_its_destination_node_id_is() {
         n
     };
     let now = now_ms();
-    me.transport
-        .refresh_trust(&[n("shop-1", now), n("blog-1", now)], 60_000);
+    let both = [n("shop-1", now), n("blog-1", now)];
+    me.transport.refresh_trust(&both, &both, 60_000);
     let base = "https://p.test:7443";
     let shop = me.revocation(base, "shop-1").unwrap()(Some(k.pin()));
     let blog = me.revocation(base, "blog-1").unwrap()(Some(k.pin()));
     assert!(shop() && blog());
-    me.transport
-        .refresh_trust(&[n("shop-1", now), n("blog-1", now - 120_000)], 60_000);
+    let lapsed = [n("shop-1", now), n("blog-1", now - 120_000)];
+    me.transport.refresh_trust(&lapsed, &lapsed, 60_000);
     assert!(shop(), "the healthy node id's answer streams on");
     assert!(!blog(), "the lapsed node id's is cut");
 }
@@ -434,7 +434,8 @@ async fn a_sender_a_sibling_runtime_listed_is_live() {
     fresh.id = "shop-2".into();
     fresh.app = "t/shop".into();
     fresh.written_at_ms = now_ms();
-    blog.transport.refresh_trust(&[fresh], 60_000);
+    let fresh = [fresh];
+    blog.transport.refresh_trust(&fresh, &fresh, 60_000);
     let m = hyper::Method::POST;
     let hop = call("shop-1", PATH, Some("shop-2"));
     assert!(shop.is_internal(&m, PATH, &hop, true).is_some());
@@ -447,7 +448,7 @@ async fn a_sender_a_sibling_runtime_listed_is_live() {
 async fn a_refused_signed_hop_is_named_for_its_503() {
     let b = node("b").await;
     *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
-    b.transport.refresh_trust(&[], 60_000);
+    b.transport.refresh_trust(&[], &[], 60_000);
     let m = hyper::Method::POST;
     // A forged sender, on either port.
     let mut forged = call("b", PATH, Some("a"));

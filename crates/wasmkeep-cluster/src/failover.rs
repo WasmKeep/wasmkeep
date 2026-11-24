@@ -147,12 +147,42 @@ impl OwnerWatch {
     /// One listing of the node leases, at `now_ms`: every object it
     /// showed. A node it does not show is forgotten.
     pub fn observe<'a>(&mut self, listed: impl IntoIterator<Item = Seen<'a>>, now_ms: u64) {
+        self.observe_kept(listed, |_| false, now_ms);
+    }
+
+    /// [`Self::observe`], for bodies some of which were not read just now:
+    /// those `kept` names. A kept body is one held as last read after its
+    /// read failed, or one older than a body of that lease the process
+    /// already read ([`crate::node_lease::older_than`]), served late by a
+    /// replica or a cache. Neither says anything new about its node, so
+    /// its entry stays as the last read showed it: it is neither seen
+    /// again unchanged (which would make a node that still writes look
+    /// stale) nor taken as a change (an older instance would look like a
+    /// restart, an older `live` body would undo a fence), and this node's
+    /// own fence of it still holds. A node shown only kept and never
+    /// before is taken as shown; one left out is forgotten, as before.
+    pub fn observe_kept<'a>(
+        &mut self,
+        listed: impl IntoIterator<Item = Seen<'a>>,
+        kept: impl Fn(&str) -> bool,
+        now_ms: u64,
+    ) {
         let mut nodes = HashMap::new();
+        let mut still_nudged = Vec::new();
         for seen in listed {
             if seen.id == self.me {
                 continue;
             }
             let before = self.nodes.get(seen.id);
+            if kept(seen.id)
+                && let Some(before) = before
+            {
+                nodes.insert(seen.id.to_owned(), before.clone());
+                if self.nudged.iter().any(|n| n == seen.id) {
+                    still_nudged.push(seen.id.to_owned());
+                }
+                continue;
+            }
             let same_process = before.is_some_and(|b| b.instance.as_deref() == seen.instance);
             let restarted_at_ms = match before {
                 Some(b) if same_process => b.restarted_at_ms,
@@ -173,8 +203,9 @@ impl OwnerWatch {
             );
         }
         self.nodes = nodes;
-        // A listing replaces what a fence attempt said.
-        self.nudged.clear();
+        // A listing replaces what a fence attempt said, except for the
+        // nodes it did not read just now.
+        self.nudged = still_nudged;
         let (nodes, alive) = (&self.nodes, &mut self.alive);
         let (skew, horizon) = (self.max_skew_ms, self.horizon_ms);
         self.marks.retain(|id, mark| {
@@ -695,6 +726,56 @@ mod tests {
             w.verdict("a", T + 19_000, Some(T + 12_000)),
             Verdict::Forward
         );
+    }
+
+    #[test]
+    fn a_body_kept_as_last_read_neither_starts_nor_ends_a_wait() {
+        // The node writes; then its reads fail for longer than the
+        // horizon, and the body as last read is shown again: nothing was
+        // read of it, so it stays as the last read showed it.
+        let mut w = watch();
+        w.observe([live("i1", T)], T + 100);
+        let kept = |id: &str| id == "a";
+        w.observe_kept([live("i1", T)], kept, T + HORIZON + 5_000);
+        assert_eq!(w.verdict("a", T + HORIZON + 5_000, None), Verdict::Forward);
+        // A read that answers again judges it as before.
+        w.observe([live("i1", T)], T + HORIZON + 6_000);
+        assert!(matches!(
+            w.verdict("a", T + HORIZON + 6_000, None),
+            Verdict::Stale { .. }
+        ));
+        // This node's own fence holds while the fenced node's reads fail.
+        w.nudge("a");
+        w.observe_kept([live("i1", T)], kept, T + HORIZON + 7_000);
+        assert_eq!(w.verdict("a", T + HORIZON + 7_000, None), Verdict::Free);
+        // A node first shown kept is taken as shown.
+        let mut w = watch();
+        w.observe_kept([live("i1", T)], kept, T + 100);
+        assert_eq!(w.verdict("a", T + 100, None), Verdict::Forward);
+        // A node left out is still forgotten.
+        w.observe_kept([], kept, T + 200);
+        w.connect_failed("a", T + 300);
+        assert_eq!(w.verdict("a", T + 300, None), Verdict::Forward);
+    }
+
+    #[test]
+    fn an_older_body_read_late_neither_restarts_nor_stales_a_node() {
+        // i2 replaced i1; a stale read shows i1's last body again.
+        let mut w = watch();
+        w.observe([live("i1", T)], T + 100);
+        w.observe([live("i2", T + 12_000)], T + 12_100);
+        let held_since = T + 12_200;
+        let older = |id: &str| id == "a";
+        w.observe_kept([live("i1", T)], older, T + 12_300);
+        assert_eq!(
+            w.verdict("a", T + 12_300, Some(held_since)),
+            Verdict::Forward
+        );
+        // A fenced node read again as its earlier live body: still fenced.
+        let mut w = watch();
+        w.observe([seen("a", Some(NodeState::Fenced), "i1", T)], T + 1_000);
+        w.observe_kept([live("i1", T)], older, T + 16_000);
+        assert_eq!(w.verdict("a", T + 16_000, None), Verdict::Free);
     }
 
     const RETRY: u64 = 1_100;
