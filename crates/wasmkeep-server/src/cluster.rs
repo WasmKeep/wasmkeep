@@ -945,6 +945,12 @@ impl Cluster {
                 "plain HTTP between nodes refused: node calls only on the cluster port, peers without a cluster listener not used"
             );
         }
+        // How long the process remembers a node found gone: longer than
+        // any read of this app's may take, so none issued before lands
+        // after it was forgotten.
+        cluster
+            .transport
+            .keep_gone_for(cluster.listing_limit().saturating_mul(2));
         tokio::spawn(node_lease_loop(Arc::downgrade(&cluster)));
         tokio::spawn(pending_loop(Arc::downgrade(&cluster)));
         tokio::spawn(heartbeat_loop(Arc::downgrade(&cluster), config.heartbeat));

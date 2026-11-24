@@ -271,6 +271,42 @@ async fn a_node_that_joins_while_listing_is_slow_is_trusted_from_its_hello() {
     drop((b, c));
 }
 
+/// The same join, with a never looking for c: only c's own calls tell a
+/// about it. Plain, c's hello is read by key. Over TLS, c's first hello is
+/// refused at the handshake (its pin is not listed yet); a reads by key the
+/// node the certificate names, so c is in a's view well before the 3 s
+/// listing lands. Before, over TLS, only that listing showed c.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joining_node_is_seen_from_its_first_call_while_listing_is_slow() {
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky_a = Arc::new(Flaky::new(Arc::clone(&shared), Arc::default()));
+    let seen_by_a: Arc<dyn ObjectStore> = Arc::clone(&flaky_a) as Arc<dyn ObjectStore>;
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let idle = Duration::from_secs(30);
+    let a = node_unplaced("a", da.path(), &seen_by_a, idle, "t", test_actor_wasm()).await;
+    let b = node_unplaced("b", db.path(), &shared, idle, "t", test_actor_wasm()).await;
+    settle().await;
+    reaches_all(&a.service, &["b"]).await;
+    flaky_a.delay_node_lists_ms.store(3_000, Ordering::SeqCst);
+    let c = node_unplaced("c", dc.path(), &shared, idle, "t", test_actor_wasm()).await;
+    let joined = std::time::Instant::now();
+    // Under the 3 s listing delay: not the listing's doing.
+    let limit = Duration::from_secs(2);
+    while !a.service.knows_node("c") {
+        assert!(
+            joined.elapsed() < limit,
+            "a did not see c within {limit:?} of its start while listings took 3 s"
+        );
+        tokio::time::sleep(SAMPLE).await;
+    }
+    eprintln!("a saw c {:?} after it started", joined.elapsed());
+    drop((b, c));
+}
+
 /// A rolling restart: b stops cleanly (its lease `released`) and starts
 /// again under the same id, a new instance. a's rounds leave a released
 /// node out, so a must read b's object by key when b' calls (its hello,

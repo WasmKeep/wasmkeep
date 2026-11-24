@@ -9,6 +9,17 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Cluster availability: a request kept for a dead node's actors is no
+  longer kept for a peer that only could not be read, or for a body
+  older than one already read; a round has at most 32 heartbeat reads in
+  flight; a node whose object is gone leaves the live senders at once and
+  is forgotten a minute later; an app joining a process reads the known
+  nodes by key instead of waiting for a slow listing; over TLS, a joining
+  node is read by the name on its certificate, so it no longer waits for
+  a listing; the start hellos are not spent before a live peer of the app
+  is found. The full test job's time limit on ubuntu-latest is 60
+  minutes. No lease rule or format changes
+  ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-availability)).
 - Leases: a node lease read to judge an actor's ownership record free is
   never older than a body of that lease the process has already read; an
   older one (a stale replica or cache) is read again and never frees the

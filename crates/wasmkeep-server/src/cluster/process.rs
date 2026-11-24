@@ -185,6 +185,7 @@ impl NodeProcess {
                     nodes,
                     live: RwLock::default(),
                     heard: Mutex::default(),
+                    keep_gone_ms: std::sync::atomic::AtomicU64::new(0),
                     lease_reads: Arc::new(
                         wasmkeep_cluster::node_lease::NewestReads::new()
                             .with_report(report_lease_read),
@@ -278,6 +279,11 @@ pub(crate) struct Transport {
     /// read that fails changes nothing: its node stays as last read,
     /// trusted until that heartbeat's own horizon and no longer.
     heard: Mutex<Heard>,
+    /// How long (ms) a node found gone stays in `heard` as gone: longer
+    /// than any read of the process's apps may take, so that a read issued
+    /// before lands while it is still remembered (the most any app asked,
+    /// [`Transport::keep_gone_for`]). Zero: for ever.
+    keep_gone_ms: std::sync::atomic::AtomicU64,
     /// The newest body of each node's lease that any read of the process
     /// found, heartbeat reads and the reads that judge an ownership record
     /// alike: never moved back by a later read (ADR 0020, amendment on
@@ -479,10 +485,13 @@ impl Transport {
                     }
                 }
                 drop(put);
+                // A node already found gone keeps when it was found so:
+                // a listing that leaves it out again tells nothing new, and
+                // must not keep it remembered for ever.
                 let gone: Vec<String> = bodies
-                    .keys()
-                    .filter(|id| !listed_ids.contains(*id))
-                    .cloned()
+                    .iter()
+                    .filter(|(id, (_, body))| body.is_some() && !listed_ids.contains(*id))
+                    .map(|(id, _)| id.clone())
                     .collect();
                 for id in gone {
                     if bodies.get(&id).is_some_and(|(at, _)| *at <= issued) {
@@ -507,6 +516,15 @@ impl Transport {
                 drop(put);
             }
         }
+        // A node found gone is remembered only while a read issued before
+        // that could still land: none takes longer than `keep_gone_ms`.
+        let keep = self.keep_gone_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if keep > 0 {
+            let keep = std::time::Duration::from_millis(keep);
+            bodies.retain(|_, (at, body)| {
+                body.is_some() || issued.saturating_duration_since(*at) <= keep
+            });
+        }
         let mut all: Vec<NodeInfo> = bodies.values().filter_map(|(_, b)| b.clone()).collect();
         all.sort_by(|a, b| a.id.cmp(&b.id));
         first_seen.retain(|id| all.iter().any(|n| n.id == id));
@@ -519,6 +537,57 @@ impl Transport {
             })
             .collect();
         apply(&all, &judged, &fresh)
+    }
+
+    /// Node ids found gone are remembered at least `keep` (an app's
+    /// longest read, twice).
+    pub(super) fn keep_gone_for(&self, keep: std::time::Duration) {
+        self.keep_gone_ms.fetch_max(
+            u64::try_from(keep.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The nodes whose heartbeat as last read may still be written to: not
+    /// gone, and not `released` or `fenced` (that instance never writes
+    /// again). What a round reads by key.
+    pub(super) fn heard_writers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bodies
+            .iter()
+            .filter(|(_, (_, body))| {
+                body.as_ref().is_some_and(|b| {
+                    !matches!(
+                        b.lease,
+                        Some(
+                            wasmkeep_cluster::node_lease::NodeState::Released
+                                | wasmkeep_cluster::node_lease::NodeState::Fenced
+                        )
+                    )
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The node ids in the heartbeats as last read, gone ones included.
+    #[cfg(test)]
+    pub(super) fn heard_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bodies
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Node `id`'s heartbeat as last read.
@@ -540,8 +609,11 @@ impl Transport {
     /// Renews the trust table from the live `nodes` (their pins trusted
     /// for `horizon_ms` after their heartbeat was written); when an
     /// address changed hands (or its node left), drops every pooled
-    /// connection, so none to a previous holder is used.
-    pub(super) fn refresh_trust(&self, nodes: &[NodeInfo], horizon_ms: u64) {
+    /// connection, so none to a previous holder is used. `all`: every node
+    /// as last read; a live sender none of them names any more (its object
+    /// is gone) is dropped at once, as its pins are, rather than at its
+    /// horizon.
+    pub(super) fn refresh_trust(&self, nodes: &[NodeInfo], all: &[NodeInfo], horizon_ms: u64) {
         {
             let now = crate::cluster_tls::now_ms();
             let mut live = self.live.write().unwrap_or_else(|p| p.into_inner());
@@ -552,7 +624,7 @@ impl Transport {
                     *at = (n.app.clone(), until);
                 }
             }
-            live.retain(|_, (_, until)| *until >= now);
+            live.retain(|id, (_, until)| *until >= now && all.iter().any(|n| n.id == *id));
         }
         if let Some(tls) = &self.tls
             && tls.refresh(nodes, horizon_ms)
@@ -579,24 +651,72 @@ impl Transport {
         wasmkeep_cluster::membership::all_heartbeats(&self.nodes).await
     }
 
-    /// The heartbeats of the nodes `ids` names, all read at once, each
-    /// within `attempt` (ADR 0020, amendment of 2026-11-20): one slow or
-    /// hung read costs one attempt, not the others' reads. Each with what
-    /// its read found, in the order given.
+    /// The heartbeats of the nodes `ids` names, read at once, at most
+    /// [`HEARTBEAT_READ_CONCURRENCY`] in flight, each within `attempt` (ADR
+    /// 0020, amendments of 2026-11-20 and 2026-11-24): one slow or hung
+    /// read costs one attempt, not the others' reads. Each with what its
+    /// read found, in the order given, once all have landed.
+    #[cfg(test)]
     pub(super) async fn read_each(
         &self,
         ids: &[String],
         attempt: std::time::Duration,
     ) -> Vec<(String, HeartbeatRead)> {
+        use futures_util::StreamExt as _;
+        let mut landed: Vec<Landed> = self.read_stream(ids, attempt).collect().await;
+        landed.sort_by_key(|l| ids.iter().position(|id| *id == l.id));
+        landed.into_iter().map(|l| (l.id, l.read)).collect()
+    }
+
+    /// [`Self::read_each`]'s reads, each as it lands, in whatever order:
+    /// a hung read holds up no other, and the next read is sent as soon
+    /// as any read in flight lands, so a round ends in about the slowest
+    /// read's time (at most one attempt) however many hang, and what
+    /// answered can be applied at once.
+    pub(super) fn read_stream(
+        &self,
+        ids: &[String],
+        attempt: std::time::Duration,
+    ) -> impl futures_util::Stream<Item = Landed> + use<> {
+        use futures_util::StreamExt as _;
         // Owned, each its own future, collected first: nothing borrowed is
-        // held across the joined reads.
+        // held across the reads. Each read's attempt starts when it is
+        // sent.
         let reads: Vec<_> = ids
             .iter()
-            .map(|id| read_one(self.nodes.clone(), id.clone(), attempt))
+            .map(|id| {
+                let (nodes, id) = (self.nodes.clone(), id.clone());
+                async move {
+                    let sent = std::time::Instant::now();
+                    let (id, read) = read_one(nodes, id, attempt).await;
+                    Landed {
+                        sent,
+                        took: sent.elapsed(),
+                        id,
+                        read,
+                    }
+                }
+            })
             .collect();
-        futures_util::future::join_all(reads).await
+        futures_util::stream::iter(reads).buffer_unordered(HEARTBEAT_READ_CONCURRENCY)
     }
 }
+
+/// One heartbeat read that landed ([`Transport::read_stream`]).
+pub(super) struct Landed {
+    /// When it was sent, and how long it took.
+    pub(super) sent: std::time::Instant,
+    pub(super) took: std::time::Duration,
+    pub(super) id: String,
+    pub(super) read: HeartbeatRead,
+}
+
+/// The most heartbeat reads a round has in flight at once: a round of a
+/// prefix with many nodes does not send a GET (and open a connection) per
+/// node in one burst. Twice what a listing's reads use. Reads land in any
+/// order, and a new one is sent as each lands, so hung reads do not queue
+/// behind one another.
+pub(super) const HEARTBEAT_READ_CONCURRENCY: usize = 32;
 
 /// One read of node `id`'s heartbeat, within `attempt`.
 async fn read_one(

@@ -5130,6 +5130,8 @@ struct SlowNodeReads {
     delay_ms: std::sync::atomic::AtomicU64,
     /// Reads of this key never answer.
     hang: std::sync::Mutex<Option<String>>,
+    /// Reads of these keys never answer either.
+    hang_all: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Reads of this key fail at once.
     fail: std::sync::Mutex<Option<String>>,
     /// Every other read and listing (`control/`, the app's intents) waits
@@ -5137,6 +5139,12 @@ struct SlowNodeReads {
     others_delay_ms: std::sync::atomic::AtomicU64,
     /// Reads of `nodes/` objects, counted.
     node_gets: std::sync::atomic::AtomicU64,
+    /// Reads of peers' `nodes/` objects (not `nodes/a`) in flight now, and
+    /// the most at once.
+    node_gets_in_flight: std::sync::atomic::AtomicU64,
+    node_gets_peak: std::sync::atomic::AtomicU64,
+    /// Every listing of `nodes/` waits this long first (ms).
+    list_nodes_delay_ms: std::sync::atomic::AtomicU64,
     /// The next write of this key lands, and its answer is lost (once).
     lose_put_reply: std::sync::Mutex<Option<String>>,
 }
@@ -5182,11 +5190,20 @@ impl ObjectStore for SlowNodeReads {
     ) -> object_store::Result<object_store::GetResult> {
         let key = location.as_ref();
         if key.starts_with("nodes/") {
-            self.node_gets
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            use std::sync::atomic::Ordering::SeqCst;
+            self.node_gets.fetch_add(1, SeqCst);
+            // Peers' objects only: the node's own start check reads its own.
+            let peer = key != "nodes/a";
+            if peer {
+                let now = self.node_gets_in_flight.fetch_add(1, SeqCst) + 1;
+                self.node_gets_peak.fetch_max(now, SeqCst);
+            }
+            let delay = self.delay_ms.load(SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            if peer {
+                self.node_gets_in_flight.fetch_sub(1, SeqCst);
             }
         } else {
             let delay = self
@@ -5196,7 +5213,8 @@ impl ObjectStore for SlowNodeReads {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
         }
-        let hang = self.hang.lock().unwrap().as_deref() == Some(key);
+        let hang = self.hang.lock().unwrap().as_deref() == Some(key)
+            || self.hang_all.lock().unwrap().contains(key);
         if hang {
             std::future::pending::<()>().await;
         }
@@ -5227,7 +5245,14 @@ impl ObjectStore for SlowNodeReads {
             .others_delay_ms
             .load(std::sync::atomic::Ordering::SeqCst);
         let listing = self.inner.list(prefix);
-        if delay == 0 || prefix.is_some_and(|p| p.as_ref() == "nodes") {
+        let nodes = prefix.is_some_and(|p| p.as_ref() == "nodes");
+        let delay = if nodes {
+            self.list_nodes_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            delay
+        };
+        if delay == 0 {
             return listing;
         }
         futures_util::stream::once(async move {
@@ -5886,4 +5911,447 @@ fn quiet_node(store: &Arc<SlowNodeReads>) -> Arc<Cluster> {
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
     Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
+}
+
+/// Writes `body` as node b's object on `store`.
+async fn put_b(store: &SlowNodeReads, body: String) {
+    store
+        .inner
+        .put(&StorePath::from("nodes/b"), body.into_bytes().into())
+        .await
+        .unwrap();
+}
+
+/// A peer whose heartbeat reads fail past its horizon is kept as last
+/// read, and the failover wait sees nothing new of it: the watch does not
+/// take it for a node that stopped writing (a kept request would then wait
+/// for a fence its reads cannot bring). A read that answers again judges
+/// it as before.
+#[tokio::test]
+async fn a_peer_kept_as_last_read_is_not_stale_to_the_failover_wait() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    // Horizon 400 ms.
+    let a = quiet_tls_node(&store, 100);
+    put_b(&store, node_lease_body("b", "live", "beef", now_ms())).await;
+    assert!(a.refresh_view(true).await);
+    assert_eq!(a.failover.verdict("b"), Verdict::Forward);
+    *store.fail.lock().unwrap() = Some("nodes/b".to_owned());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!a.refresh_view(false).await);
+    assert_eq!(
+        a.failover.verdict("b"),
+        Verdict::Forward,
+        "a body kept after a failed read was judged as read again"
+    );
+    *store.fail.lock().unwrap() = None;
+    assert!(a.refresh_view(false).await);
+    assert!(matches!(a.failover.verdict("b"), Verdict::Stale { .. }));
+}
+
+/// A read that returns a body older than one the process already read
+/// (ADR 0020, amendment on lease reads: a replica or a cache serving an
+/// earlier version) is not news to the failover wait: an earlier
+/// instance's body does not look like a restart to a kept request.
+#[tokio::test]
+async fn an_older_lease_body_read_later_misleads_no_kept_request() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    let t0 = now_ms();
+    put_b(&store, node_lease_body("b", "live", "cafe", t0)).await;
+    assert!(a.refresh_view(true).await);
+    let held_since = now_ms();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    // A stale read: the predecessor's last body, dated before.
+    put_b(&store, node_lease_body("b", "live", "beef", t0 - 1_000)).await;
+    assert!(a.refresh_view(false).await);
+    assert_eq!(
+        a.failover.verdict_since("b", held_since),
+        Verdict::Forward,
+        "an older instance's body read late looked like a restart"
+    );
+}
+
+/// The heartbeat reads of a round go out at once, but at most
+/// `HEARTBEAT_READ_CONCURRENCY` at a time: a prefix with many nodes does
+/// not open a connection per node in one burst. Every node is still read,
+/// in the order given.
+#[tokio::test]
+async fn a_round_caps_its_reads_in_flight() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    let ids: Vec<String> = (0..80).map(|i| format!("n{i:02}")).collect();
+    store
+        .delay_ms
+        .store(20, std::sync::atomic::Ordering::SeqCst);
+    let reads = a.transport.read_each(&ids, Duration::from_secs(5)).await;
+    let peak = store
+        .node_gets_peak
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak <= super::process::HEARTBEAT_READ_CONCURRENCY as u64,
+        "{peak} reads in flight at once"
+    );
+    assert!(peak > 1, "the reads went out one at a time");
+    let got: Vec<&String> = reads.iter().map(|(id, _)| id).collect();
+    assert_eq!(got, ids.iter().collect::<Vec<_>>());
+}
+
+/// A node whose object is gone (`cluster forget`) leaves the process's
+/// table of live senders at the first read that shows it, as its pins do,
+/// not only once its last heartbeat's horizon has passed.
+#[tokio::test]
+async fn a_gone_node_leaves_the_live_senders_at_once() {
+    let store = Arc::new(SlowNodeReads::default());
+    // Horizon 3.3 s: nothing expires during the test.
+    let a = quiet_tls_node(&store, 3_000);
+    publish_tls(&store, "b", now_ms(), 1).await;
+    assert!(a.refresh_view(true).await);
+    assert!(a.transport.live_app("b").is_some());
+    store
+        .inner
+        .delete(&StorePath::from("nodes/b"))
+        .await
+        .unwrap();
+    assert!(a.refresh_view(true).await);
+    assert_eq!(a.transport.live_app("b"), None, "a gone node kept as live");
+}
+
+/// A node found gone is remembered (so that a read issued before, landing
+/// late, does not bring it back) only as long as such a read can still
+/// land: the heartbeats as last read do not grow with every node id the
+/// prefix ever had.
+#[tokio::test]
+async fn gone_nodes_are_forgotten_once_no_earlier_read_can_land() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    let t0 = std::time::Instant::now();
+    let body =
+        NodeInfo::decode(node_lease_body("b", "released", "beef", 1_000).as_bytes()).unwrap();
+    let limit = a.listing_limit();
+    a.transport.note_heartbeats(
+        Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(body)))]),
+        t0,
+        |_, _, _| (),
+    );
+    a.transport.note_heartbeats(
+        Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Gone)]),
+        t0 + Duration::from_millis(1),
+        |_, _, _| (),
+    );
+    assert_eq!(a.transport.heard_ids(), ["b"], "gone, and remembered");
+    // Within the longest a read may take: still remembered.
+    a.transport
+        .note_heartbeats(Heartbeats::Listed(Vec::new()), t0 + limit, |_, _, _| ());
+    assert_eq!(a.transport.heard_ids(), ["b"]);
+    // Past it: forgotten.
+    a.transport.note_heartbeats(
+        Heartbeats::Listed(Vec::new()),
+        t0 + limit * 2 + Duration::from_millis(2),
+        |_, _, _| (),
+    );
+    assert!(
+        a.transport.heard_ids().is_empty(),
+        "{:?}",
+        a.transport.heard_ids()
+    );
+}
+
+/// A node that starts on a prefix holding only stopped nodes (or nodes of
+/// other apps) has no peer to say hello to: its first round of hellos is
+/// kept for the first peer of its app that shows up live, rather than
+/// spent on nobody (`say_hello` sends to those peers only).
+#[tokio::test]
+async fn only_live_peers_of_this_app_count_as_found_for_the_hellos() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    let b = |state: &str, instance: &str| {
+        format!(
+            "wasmkeep-node 3\n{state} {instance}\n{}\nb\nhttp://b\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            now_ms()
+        )
+    };
+    put_b(&store, b("released", "beef")).await;
+    let other = format!(
+        "wasmkeep-node 3\nlive f00d\n{}\nc\nhttp://c\n0.0.0\nt/other\n\n\nserving\n\ntake\n",
+        now_ms()
+    );
+    store
+        .inner
+        .put(&StorePath::from("nodes/c"), other.into_bytes().into())
+        .await
+        .unwrap();
+    assert!(a.refresh_view(true).await);
+    assert!(!a.found_peers(), "a stopped node or another app's counted");
+    put_b(&store, b("live", "cafe")).await;
+    assert!(a.refresh_view(true).await);
+    assert!(a.found_peers());
+}
+
+/// A runtime that starts in a process that already read the nodes (a
+/// second app, or a runtime restarted in place) reads them by key in its
+/// first round, and leaves the listing to the listing task: a slow LIST
+/// holds up neither its view nor, so, its early reads. A process that read
+/// nothing yet still lists first, to find its peers.
+#[tokio::test]
+async fn a_runtime_joining_a_process_does_not_wait_for_a_slow_listing() {
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let shared = || Arc::clone(&store) as Arc<dyn ObjectStore>;
+    // Shop, which never gets past its start check, read b already.
+    let mut config = ClusterConfig::new("shop-1", "http://shop-1", shared());
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+    config.process = Some(Arc::clone(&process));
+    let shop = Cluster::new(&config, &StateRoot::new("", "t", "shop")).unwrap();
+    put_b(&store, node_lease_body("b", "live", "beef", now_ms())).await;
+    assert!(shop.read_heartbeats(&["b".to_owned()]).await);
+    // Every LIST of `nodes/` 3 s late: past the two attempts (2 s) an
+    // inline listing gets.
+    store
+        .list_nodes_delay_ms
+        .store(3_000, std::sync::atomic::Ordering::SeqCst);
+    // Blog joins with a short lease: its start check ends in about 1.2 s.
+    let mut config = ClusterConfig::new("blog-1", "http://blog-1", shared());
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+    config.process = Some(Arc::clone(&process));
+    let blog = Cluster::new(&config, &StateRoot::new("", "t", "blog")).unwrap();
+    let mut identity = blog.identity.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        identity.wait_for(|s| *s == super::identity::Identity::Unique),
+    )
+    .await
+    .expect("blog never started")
+    .unwrap();
+    let unique = std::time::Instant::now();
+    let attempt = blog.heartbeat_read_attempt;
+    loop {
+        if blog.known_nodes.lock().unwrap().iter().any(|n| n == "b") {
+            break;
+        }
+        assert!(
+            unique.elapsed() < attempt,
+            "blog's first round waited for the slow listing"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Two apps in one process share the heartbeats as last read. When one
+/// app's read finds a peer fenced, the other app's failover wait takes
+/// the fence at its next view, though its own read was not the one that
+/// found it (its rounds no longer read a stopped node).
+#[tokio::test]
+async fn a_fence_another_app_read_reaches_this_apps_failover_wait() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        // A 3 h ttl, so nothing runs in the background.
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = runtime("shop-1", "shop");
+    let blog = runtime("blog-1", "blog");
+    let at = now_ms();
+    put_b(&store, node_lease_body("b", "live", "beef", at)).await;
+    let c = node_lease_body("c", "live", "f00d", at);
+    store
+        .inner
+        .put(&StorePath::from("nodes/c"), c.into_bytes().into())
+        .await
+        .unwrap();
+    assert!(
+        shop.read_heartbeats(&["b".to_owned(), "c".to_owned()])
+            .await
+    );
+    assert!(
+        blog.read_heartbeats(&["b".to_owned(), "c".to_owned()])
+            .await
+    );
+    assert_eq!(blog.failover.verdict("b"), Verdict::Forward);
+    put_b(&store, node_lease_body("b", "fenced", "beef", at)).await;
+    assert!(shop.read_heartbeats(&["b".to_owned()]).await);
+    // Blog reads another node only.
+    assert!(blog.read_heartbeats(&["c".to_owned()]).await);
+    assert!(
+        matches!(blog.failover.verdict("b"), Verdict::Stopping { .. }),
+        "{:?}",
+        blog.failover.verdict("b")
+    );
+}
+
+/// Past the cap on reads in flight, hung reads do not queue behind one
+/// another: with three reads that never answer spread over 70 peers
+/// (more than 32 apart), the round ends in about one attempt, and the
+/// peers that answered are applied as they land, before the round ends,
+/// so their trust is renewed while the others hang.
+#[tokio::test]
+async fn hung_reads_past_the_cap_hold_up_neither_the_round_nor_the_answers() {
+    let store = Arc::new(SlowNodeReads::default());
+    // Heartbeat reads time out after 1 s.
+    let a = quiet_tls_node(&store, 3_000);
+    let ids: Vec<String> = (0..70).map(|i| format!("n{i:02}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        publish_tls(&store, id, now_ms(), u8::try_from(i + 1).unwrap()).await;
+    }
+    assert!(a.refresh_view(true).await);
+    let newer = now_ms() + 1;
+    for (i, id) in ids.iter().enumerate() {
+        publish_tls(&store, id, newer, u8::try_from(i + 1).unwrap()).await;
+    }
+    *store.hang_all.lock().unwrap() = ["nodes/n00", "nodes/n33", "nodes/n66"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let started = std::time::Instant::now();
+    let round = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move { a.refresh_view(false).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        a.transport.heard_body("n40").map(|n| n.written_at_ms),
+        Some(newer),
+        "an answered read waited for the round's hung ones"
+    );
+    assert!(!round.await.unwrap(), "hung reads are a failed round");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(1_800),
+        "the round took {took:?}"
+    );
+    assert_ne!(
+        a.transport.heard_body("n33").map(|n| n.written_at_ms),
+        Some(newer),
+        "a hung read's node stays as last read"
+    );
+    assert!(a.transport.heard_body("n33").is_some());
+}
+
+/// Join reads (a hello, a hop, or the name on an unknown certificate,
+/// which anyone reaching the cluster port can present) do not set the
+/// latency the early reads are planned on: only rounds do.
+#[tokio::test]
+async fn join_reads_do_not_plan_the_early_reads() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    publish_tls(&store, "b", now_ms(), 1).await;
+    store
+        .delay_ms
+        .store(200, std::sync::atomic::Ordering::SeqCst);
+    let slowest = || a.slowest_read_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let before = slowest();
+    a.read_joined(&["b".to_owned()]).await;
+    assert_eq!(slowest(), before, "a join read set the planned latency");
+    a.read_heartbeats(&["b".to_owned()]).await;
+    assert!(slowest() >= 200);
+}
+
+/// Two apps in one process: blog joins while every read of x fails, and
+/// sees x only as the process last read it, long ago. Nothing blog read
+/// shows x stopped writing, so a request for x's actors is not kept.
+#[tokio::test]
+async fn an_app_joining_while_a_peers_reads_fail_keeps_no_request_for_it() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        // Horizon 400 ms; a 3 h ttl, so nothing runs in the background.
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = runtime("shop-1", "shop");
+    let x = node_lease_body("x", "live", "beef", now_ms());
+    store
+        .inner
+        .put(&StorePath::from("nodes/x"), x.into_bytes().into())
+        .await
+        .unwrap();
+    put_b(&store, node_lease_body("b", "live", "cafe", now_ms())).await;
+    assert!(
+        shop.read_heartbeats(&["x".to_owned(), "b".to_owned()])
+            .await
+    );
+    *store.fail.lock().unwrap() = Some("nodes/x".to_owned());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let blog = runtime("blog-1", "blog");
+    put_b(&store, node_lease_body("b", "live", "cafe", now_ms())).await;
+    assert!(blog.read_heartbeats(&["b".to_owned()]).await);
+    assert_eq!(blog.failover.verdict("x"), Verdict::Forward);
+}
+
+/// Another app's read of an older body (a replica behind) is no news to
+/// this app's failover wait either: it does not look like a restart.
+#[tokio::test]
+async fn another_apps_older_read_misleads_no_kept_request() {
+    use wasmkeep_cluster::failover::Verdict;
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let runtime = |id: &str, app: &str| {
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut config = ClusterConfig::new(id, format!("http://{id}"), shared);
+        config.heartbeat = Duration::from_millis(100);
+        config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+        config.process = Some(Arc::clone(&process));
+        Cluster::new(&config, &StateRoot::new("", "t", app)).unwrap()
+    };
+    let shop = runtime("shop-1", "shop");
+    let blog = runtime("blog-1", "blog");
+    let t0 = now_ms();
+    put_b(&store, node_lease_body("b", "live", "cafe", t0)).await;
+    assert!(blog.read_heartbeats(&["b".to_owned()]).await);
+    let held_since = now_ms();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    // Shop's read is served the predecessor's last body.
+    put_b(&store, node_lease_body("b", "live", "beef", t0 - 1_000)).await;
+    assert!(shop.read_heartbeats(&["b".to_owned()]).await);
+    // Blog applies the process's view again, reading only its own object.
+    blog.read_heartbeats(&["blog-1".to_owned()]).await;
+    assert_eq!(
+        blog.failover.verdict_since("b", held_since),
+        Verdict::Forward
+    );
+}
+
+/// A read issued before a node was found gone, landing while the gone
+/// mark is kept, does not bring the node back.
+#[tokio::test]
+async fn a_late_read_does_not_bring_a_gone_node_back() {
+    use super::process::{HeartbeatRead, Heartbeats};
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 100);
+    let t0 = std::time::Instant::now();
+    let body = || {
+        Box::new(NodeInfo::decode(node_lease_body("b", "live", "beef", 1_000).as_bytes()).unwrap())
+    };
+    a.transport.note_heartbeats(
+        Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(body()))]),
+        t0,
+        |_, _, _| (),
+    );
+    a.transport.note_heartbeats(
+        Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Gone)]),
+        t0 + Duration::from_millis(10),
+        |_, _, _| (),
+    );
+    let all = a.transport.note_heartbeats(
+        Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(body()))]),
+        t0 + Duration::from_millis(5),
+        |all, _, _| all.to_vec(),
+    );
+    assert!(all.is_empty(), "a late read brought a gone node back");
+    assert_eq!(a.transport.heard_ids(), ["b"], "still remembered as gone");
 }

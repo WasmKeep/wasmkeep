@@ -843,6 +843,14 @@ impl ActorService {
         self.inner.cluster.as_ref().is_some_and(|c| c.reaches(node))
     }
 
+    /// Whether node `node` is in this node's view of the cluster, live or
+    /// not, as its last reads left it; unlike [`Self::reaches_node`], asks
+    /// for no read. False outside a cluster. For tests and diagnostics.
+    #[doc(hidden)]
+    pub fn knows_node(&self, node: &str) -> bool {
+        self.inner.cluster.as_ref().is_some_and(|c| c.knows(node))
+    }
+
     /// The idle passes this node remembers (ADR 0042, section 3), due
     /// first: each record key and the generation its release kept. Empty
     /// outside a cluster. For tests and diagnostics.

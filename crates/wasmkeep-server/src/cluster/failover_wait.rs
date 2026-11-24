@@ -149,9 +149,23 @@ impl FailoverWait {
     }
 
     /// A listing of the heartbeats: every node lease it showed.
+    #[cfg(test)]
     pub(super) fn observe(&self, all: &[NodeInfo], now: u64) {
+        self.observe_read(all, |_| wasmkeep_cluster::failover::Shown::Read, now);
+    }
+
+    /// Every node lease as last read, each as `kept` says it was come by:
+    /// read just now by this app, kept as last read, or older than a body
+    /// the process already read ([`OwnerWatch::observe_kept`]).
+    pub(super) fn observe_read(
+        &self,
+        all: &[NodeInfo],
+        kept: impl Fn(&str) -> wasmkeep_cluster::failover::Shown,
+        now: u64,
+    ) {
         if self.enabled() {
-            self.watch().observe(all.iter().map(Seen::from), now);
+            self.watch()
+                .observe_kept(all.iter().map(Seen::from), kept, now);
             self.bump();
         }
     }
@@ -359,6 +373,14 @@ impl Drop for Ticket<'_> {
 impl FailoverWait {
     pub(super) fn verdict(&self, node: &str) -> wasmkeep_cluster::failover::Verdict {
         self.watch().verdict(node, now_ms(), None)
+    }
+
+    pub(super) fn verdict_since(
+        &self,
+        node: &str,
+        held_since_ms: u64,
+    ) -> wasmkeep_cluster::failover::Verdict {
+        self.watch().verdict(node, now_ms(), Some(held_since_ms))
     }
 
     pub(super) fn kept(&self) -> usize {
