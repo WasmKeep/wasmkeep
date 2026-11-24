@@ -533,3 +533,588 @@ fn rereview_truncated_valid_snapshot_is_not_owner_history() {
         Err(Failure::Content)
     );
 }
+
+// ADR 0042, Tests, "Other sims": a backup reader racing idle passes, and
+// ADR 0033's bound on its attempts. The replication model runs idle
+// compaction alone (no periodic collection, no deletes: every delete is a
+// pass's), its passes deleting only what the retention window allows
+// (`IDLE_WINDOW_MS`). A reader with no lease lists the actor at once,
+// plans with the real planner, and reads the plan (the snapshot, the
+// segment at its position, the segments after it: what `--history head`
+// copies), its reads spread over its deadline and its oldest object read
+// last, while the owners and passes keep running under the model's
+// faults. A read that finds an object gone starts the actor again (list,
+// plan, read); the reader gives the actor up after
+// `IDLE_READER_ATTEMPTS`.
+//
+// ADR 0033, section 1: with each attempt within `d` and `2d + ε < W`, a
+// reader needs at most two attempts. Here `d` is held below
+// `IDLE_READER_DEADLINE_MS` (asserted), and `W` is above twice it plus
+// the skew bound. Oracles:
+// - no reader gives up within two attempts;
+// - every completed backup is the owners' history at its head, with every
+//   write acknowledged before its listing (`oracle_history`; mutation: a
+//   reader that skips an object it finds gone instead of starting again);
+// - the replication model's own checks, per pass and final.
+// In this model the race is rare; the focused model further down
+// reaches it on most seeds and checks the first oracle against its
+// mutations (passes ignoring the window, a window below the bound).
+use replication::{IDLE_WINDOW_MS, MAX_SKEW_MS, idle_backup_simulation};
+
+/// The attempts the reader makes for one backup: the bound under test.
+const IDLE_READER_ATTEMPTS: usize = 2;
+/// The longest one attempt may take, listing to last read (ms).
+const IDLE_READER_DEADLINE_MS: u64 = 1_800;
+/// The observer's tick (`simulate_observed` calls it every 50 ms).
+const TICK_MS: u64 = 50;
+const _: () = assert!(2 * IDLE_READER_DEADLINE_MS + MAX_SKEW_MS < IDLE_WINDOW_MS);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleBreak {
+    None,
+    /// The reader skips an object it finds gone, keeping the rest.
+    SkipMissing,
+}
+
+#[derive(Default)]
+struct IdleReader {
+    tick: u64,
+    /// The attempt in progress: when it listed, what is left to read.
+    listed_at: u64,
+    /// Ticks between two reads of the attempt.
+    pace: u64,
+    fetching: Option<Vec<String>>,
+    attempt: usize,
+    manifest: Manifest,
+    destination: Bodies,
+    expected: Bodies,
+    owners: OwnerHistory,
+    acked: Vec<SegmentId>,
+    /// Backups completed, and those that needed a second attempt.
+    completed: usize,
+    second_attempts: usize,
+    /// Reads that found an object of the plan gone (a pass's delete,
+    /// landed between the listing and the read).
+    misses: usize,
+    /// Backups given up after `IDLE_READER_ATTEMPTS`.
+    exhausted: usize,
+    /// The longest attempt, listing to last read (ms).
+    longest_ms: u64,
+    failure: Option<Failure>,
+}
+
+impl IdleReader {
+    fn start(
+        &mut self,
+        store: &replication::ObservedStore,
+        acked: &[SegmentId],
+        owners: &OwnerHistory,
+    ) {
+        let keys: Vec<String> = store
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|k| k.strip_prefix(PREFIX))
+            .map(str::to_owned)
+            .collect();
+        let listing = Listing::from_keys(keys.iter().map(String::as_str));
+        let Ok(plan) = plan_restore(&listing) else {
+            return; // a missing link: list again at the next tick
+        };
+        if plan.head() == wasmkeep_cluster::replication::EMPTY {
+            return; // nothing written yet
+        }
+        let segment = |id: SegmentId| listing.segments.iter().find(|s| s.id == id).copied();
+        let mut wanted = Vec::new();
+        if let Some(s) = plan.snapshot {
+            wanted.push(snapshot_key(s));
+            if let Some(boundary) = segment(s) {
+                wanted.push(segment_key(&boundary));
+            }
+        }
+        for id in &plan.segments {
+            wanted.push(segment_key(&segment(*id).expect("planned segment listed")));
+        }
+        self.expected = wanted
+            .iter()
+            .filter_map(|k| Some((k.clone(), owner_body(k, owners)?)))
+            .collect();
+        self.owners = owners.clone();
+        self.acked = acked.to_vec();
+        self.manifest.clear();
+        self.listed_at = self.tick;
+        // As slow as the deadline allows: the reads spread over it, so
+        // every attempt is as exposed to the passes as the bound permits.
+        let ticks = IDLE_READER_DEADLINE_MS / TICK_MS;
+        self.pace = (ticks / (wanted.len() as u64 + 1)).max(1);
+        // Popped from the end: the plan's first object (its oldest, the
+        // one a pass deletes) is read last, the most exposed order. The
+        // bound does not depend on the order; `backup create` reads the
+        // plan first to last.
+        self.fetching = Some(wanted);
+    }
+
+    fn step(
+        &mut self,
+        store: &replication::ObservedStore,
+        acked: &[SegmentId],
+        owners: &OwnerHistory,
+        broken: IdleBreak,
+    ) {
+        self.tick += 1;
+        if self.failure.is_some() {
+            return;
+        }
+        let Some(mut remaining) = self.fetching.take() else {
+            self.start(store, acked, owners);
+            return;
+        };
+        if !(self.tick - self.listed_at).is_multiple_of(self.pace) {
+            self.fetching = Some(remaining);
+            return;
+        }
+        if let Some(key) = remaining.pop() {
+            let body = store
+                .lock()
+                .unwrap()
+                .get(&format!("{PREFIX}{key}"))
+                .map(|(b, _)| b.clone());
+            match body {
+                Some(body) => {
+                    let reference = format!("{key}:{body:?}");
+                    self.destination.entry(reference.clone()).or_insert(body);
+                    self.manifest.insert(key, reference);
+                }
+                None => {
+                    self.misses += 1;
+                    if broken == IdleBreak::SkipMissing {
+                        self.expected.remove(&key);
+                    } else {
+                        self.attempt += 1;
+                        if self.attempt >= IDLE_READER_ATTEMPTS {
+                            self.exhausted += 1;
+                            self.attempt = 0;
+                        }
+                        return; // the next tick lists again
+                    }
+                }
+            }
+            self.fetching = Some(remaining);
+            return;
+        }
+        // Every object of the plan read: the backup is done.
+        let took = (self.tick - self.listed_at) * TICK_MS;
+        self.longest_ms = self.longest_ms.max(took);
+        let manifest = std::mem::take(&mut self.manifest);
+        if let Err(e) = oracle_history(
+            &manifest,
+            &self.destination,
+            &self.expected,
+            &self.owners,
+            &self.acked,
+        ) {
+            self.failure = Some(e);
+            return;
+        }
+        self.completed += 1;
+        if self.attempt == 1 {
+            self.second_attempts += 1;
+        }
+        self.attempt = 0;
+    }
+}
+
+struct IdleRun {
+    reader: IdleReader,
+    passes_deleted: u64,
+    problem: Option<String>,
+}
+
+fn idle_run(seed: u64, broken: IdleBreak) -> IdleRun {
+    let reader = Arc::new(Mutex::new(IdleReader::default()));
+    let observer = reader.clone();
+    let observed = idle_backup_simulation(
+        seed,
+        true,
+        std::time::Duration::from_secs(60),
+        Box::new(move |store, acked, owners| {
+            observer.lock().unwrap().step(store, acked, owners, broken);
+        }),
+    );
+    IdleRun {
+        reader: Arc::try_unwrap(reader).ok().unwrap().into_inner().unwrap(),
+        passes_deleted: observed.passes_deleted,
+        problem: observed.problem,
+    }
+}
+
+#[test]
+fn a_backup_reader_racing_idle_passes_finishes_within_two_attempts() {
+    let (mut completed, mut second, mut misses, mut deleted, mut longest) = (0, 0, 0, 0, 0);
+    let mut empty = 0;
+    for seed in 0..seeds() {
+        let run = idle_run(seed, IdleBreak::None);
+        assert_eq!(run.problem, None, "seed {seed}: replication");
+        let r = run.reader;
+        assert_eq!(r.failure, None, "seed {seed}: backup content");
+        assert_eq!(r.exhausted, 0, "seed {seed}: a reader gave up");
+        assert!(
+            r.longest_ms <= IDLE_READER_DEADLINE_MS,
+            "seed {seed}: an attempt took {} ms, over the deadline the window assumes",
+            r.longest_ms
+        );
+        // A seed whose faults keep the actor from being written has
+        // nothing to back up (seed 564 of 2,000).
+        if r.completed == 0 {
+            empty += 1;
+        }
+        completed += r.completed;
+        second += r.second_attempts;
+        misses += r.misses;
+        deleted += run.passes_deleted;
+        longest = longest.max(r.longest_ms);
+    }
+    eprintln!(
+        "backup racing idle passes: {} seeds x 60 s: {completed} backups, {second} on a second \
+         attempt after {misses} reads found a pass's delete, none gave up; {deleted} passes \
+         deleted; longest attempt {longest} ms (deadline {IDLE_READER_DEADLINE_MS} ms, window \
+         {IDLE_WINDOW_MS} ms)",
+        seeds()
+    );
+    assert!(
+        empty <= (seeds() / 100).max(1),
+        "{empty} seeds backed nothing up"
+    );
+    // Non-vacuity: passes deleted, and some deleted under a reader. In this
+    // model that race is rare (2 reads in 200 seeds): a plan the passes
+    // delete from is usually read before the pass runs, or starts at a
+    // periodic snapshot younger than the window. `madsim_backup`'s
+    // focused model below reaches it on most seeds.
+    assert!(deleted > 0, "no pass deleted");
+    if seeds() >= 200 {
+        assert!(misses > 0 && second > 0, "no race reached");
+    }
+}
+
+#[test]
+fn a_reader_skipping_an_object_a_pass_deleted_is_caught() {
+    // The content oracle against its mutation, in the replication model:
+    // a reader that skips an object it finds gone instead of starting
+    // again. The race is rare there (see above), so over at least 200
+    // seeds.
+    let seeds = seeds().max(200);
+    let skip = (0..seeds).find(|&seed| {
+        idle_run(seed, IdleBreak::SkipMissing)
+            .reader
+            .failure
+            .is_some()
+    });
+    eprintln!("a reader skipping a missing object: caught first at seed {skip:?}");
+    assert!(
+        skip.is_some(),
+        "a reader skipping a missing object not caught"
+    );
+}
+
+// The same race in a focused model, where it is common: one writer, no
+// faults, discrete 10 ms steps. Each wake is a new generation that
+// writes 1 to 6 segments (a periodic snapshot every 5), then hibernates:
+// an idle snapshot at the head, and a pass 0 to 3 s later unless the
+// actor woke first (its record changed), with `idle_collectable` of the
+// released generation, deleting what is older than the window on its
+// clock (skewed by up to the bound), each delete landing up to 400 ms
+// after it was sent. The pass's delay is not the window here, which is
+// more adversarial than the server (whose pass waits a window after the
+// release): the bound rests on the objects' age alone. The reader is the
+// one above, paced to its deadline and reading the plan's oldest object
+// last, and its restore is compared with every position written up to
+// its head (one writer: one chain).
+struct Focused {
+    completed: usize,
+    second_attempts: usize,
+    misses: usize,
+    exhausted: usize,
+    longest_ms: u64,
+    passes_deleted: usize,
+    failure: Option<String>,
+}
+
+fn decode(body: &[u8]) -> std::collections::BTreeSet<SegmentId> {
+    std::str::from_utf8(body)
+        .unwrap()
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (g, t) = p.split_once(':').unwrap();
+            SegmentId {
+                generation: g.parse().unwrap(),
+                txid: t.parse().unwrap(),
+            }
+        })
+        .collect()
+}
+
+/// The reader's attempt in progress: when it listed, its pace, what is
+/// left to read, what it read, the plan's head.
+type Attempt = (u64, u64, Vec<String>, BTreeMap<String, Vec<u8>>, SegmentId);
+
+/// One seed of the focused model: `window` in ms, `None` to ignore it.
+fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
+    use wasmkeep_cluster::replication::{EMPTY, Segment, idle_collectable};
+    const STEP: u64 = 10;
+    const END: u64 = 60_000;
+    let mut rng = wasmkeep_sim::rng::Rng::new(seed ^ 0x0042_0033);
+    let skew = i64::try_from(rng.below(2 * MAX_SKEW_MS + 1)).unwrap()
+        - i64::try_from(MAX_SKEW_MS).unwrap();
+    let mut out = Focused {
+        completed: 0,
+        second_attempts: 0,
+        misses: 0,
+        exhausted: 0,
+        longest_ms: 0,
+        passes_deleted: 0,
+        failure: None,
+    };
+    // The bucket: key -> (last modified, body).
+    let mut store: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
+    let mut written: Vec<SegmentId> = Vec::new();
+    let (mut generation, mut parent, mut since_snapshot) = (0u64, 0u64, 0u64);
+    // The writer: awake with writes left (and when the next is due), or
+    // resting until a wake.
+    let (mut writes_left, mut next_write, mut wake_at) = (0u64, 0u64, 0u64);
+    // A pass due: when, and the released generation.
+    let mut pass: Option<(u64, u64)> = None;
+    let mut landing: Vec<(u64, String)> = Vec::new();
+    // The reader.
+    let mut attempt = 0usize;
+    let mut reading: Option<Attempt> = None;
+    let snapshot_body = |written: &[SegmentId]| {
+        written
+            .iter()
+            .map(|p| format!("{}:{}", p.generation, p.txid))
+            .collect::<Vec<_>>()
+            .join(",")
+            .into_bytes()
+    };
+    let mut now = 0;
+    while now < END {
+        now += STEP;
+        // Deletes landing.
+        landing.retain(|(at, key)| {
+            if *at <= now {
+                store.remove(key);
+                false
+            } else {
+                true
+            }
+        });
+        // The writer.
+        if writes_left == 0 && now >= wake_at {
+            // A wake: a new generation (a pass not yet run finds its
+            // record changed, and is dropped).
+            pass = None;
+            generation += 1;
+            writes_left = 1 + rng.below(6);
+            next_write = now + 20 + rng.below(150);
+        }
+        if writes_left > 0 && now >= next_write {
+            let id = SegmentId {
+                generation,
+                txid: written.len() as u64 + 1,
+            };
+            let key = segment_key(&Segment {
+                id,
+                parent_generation: parent,
+            });
+            store.insert(key, (now, b"x".to_vec()));
+            written.push(id);
+            parent = generation;
+            since_snapshot += 1;
+            if since_snapshot == 5 {
+                store.insert(snapshot_key(id), (now, snapshot_body(&written)));
+                since_snapshot = 0;
+            }
+            writes_left -= 1;
+            next_write = now + 20 + rng.below(150);
+            if writes_left == 0 {
+                // Hibernation: the idle snapshot at the head, the release,
+                // the pass to come, and a rest.
+                if since_snapshot > 0 {
+                    store.insert(snapshot_key(id), (now, snapshot_body(&written)));
+                    since_snapshot = 0;
+                }
+                pass = Some((now + rng.below(3_000), generation));
+                wake_at = now
+                    + if rng.chance(50) {
+                        100 + rng.below(1_500)
+                    } else {
+                        3_000 + rng.below(5_000)
+                    };
+            }
+        }
+        if let Some((at, released)) = pass
+            && now >= at
+        {
+            pass = None;
+            let listing = Listing::from_keys(store.keys().map(String::as_str));
+            if let Some((_, gone)) = idle_collectable(&listing, released) {
+                let clock = now.saturating_add_signed(skew);
+                let mut sent = 0;
+                for key in gone {
+                    let old = window.is_none_or(|w| store[&key].0.saturating_add(w) <= clock);
+                    if old {
+                        landing.push((now + rng.below(400), key));
+                        sent += 1;
+                    }
+                }
+                if sent > 0 {
+                    out.passes_deleted += 1;
+                }
+            }
+        }
+        // The reader.
+        let Some((listed_at, pace, mut wanted, mut manifest, head)) = reading.take() else {
+            let listing = Listing::from_keys(store.keys().map(String::as_str));
+            let Ok(plan) = plan_restore(&listing) else {
+                continue;
+            };
+            if plan.head() == EMPTY {
+                continue;
+            }
+            let segment = |id: SegmentId| listing.segments.iter().find(|s| s.id == id).copied();
+            let mut keys = Vec::new();
+            if let Some(s) = plan.snapshot {
+                keys.push(snapshot_key(s));
+                if let Some(boundary) = segment(s) {
+                    keys.push(segment_key(&boundary));
+                }
+            }
+            for id in &plan.segments {
+                keys.push(segment_key(&segment(*id).unwrap()));
+            }
+            let pace = (IDLE_READER_DEADLINE_MS / STEP / (keys.len() as u64 + 1)).max(1);
+            reading = Some((now, pace, keys, BTreeMap::new(), plan.head()));
+            continue;
+        };
+        if !((now - listed_at) / STEP).is_multiple_of(pace) {
+            reading = Some((listed_at, pace, wanted, manifest, head));
+            continue;
+        }
+        if let Some(key) = wanted.pop() {
+            match store.get(&key) {
+                Some((_, body)) => {
+                    manifest.insert(key, body.clone());
+                }
+                None => {
+                    out.misses += 1;
+                    if !skip_missing {
+                        attempt += 1;
+                        if attempt >= IDLE_READER_ATTEMPTS {
+                            out.exhausted += 1;
+                            attempt = 0;
+                        }
+                        continue; // list again at the next step
+                    }
+                }
+            }
+            reading = Some((listed_at, pace, wanted, manifest, head));
+            continue;
+        }
+        out.longest_ms = out.longest_ms.max(now - listed_at);
+        // What the copy restores, against every position up to its head.
+        let listing = Listing::from_keys(manifest.keys().map(String::as_str));
+        let restored = plan_restore(&listing)
+            .ok()
+            .filter(|p| p.head() == head)
+            .map(|plan| {
+                let mut positions = plan
+                    .snapshot
+                    .map(|s| decode(&manifest[&snapshot_key(s)]))
+                    .unwrap_or_default();
+                positions.extend(plan.segments);
+                positions
+            });
+        let truth: std::collections::BTreeSet<_> = written
+            .iter()
+            .copied()
+            .filter(|p| p.txid <= head.txid)
+            .collect();
+        if restored.as_ref() != Some(&truth) {
+            out.failure = Some(format!("backup at {head:?} restores {restored:?}"));
+            return out;
+        }
+        out.completed += 1;
+        if attempt == 1 {
+            out.second_attempts += 1;
+        }
+        attempt = 0;
+    }
+    out
+}
+
+#[test]
+fn a_reader_racing_idle_passes_in_the_focused_model_needs_two_attempts_at_most() {
+    let (mut completed, mut second, mut misses, mut deleted, mut raced) = (0, 0, 0, 0, 0);
+    for seed in 0..seeds() {
+        let r = focused(seed, Some(IDLE_WINDOW_MS), false);
+        assert_eq!(r.failure, None, "seed {seed}");
+        assert_eq!(r.exhausted, 0, "seed {seed}: a reader gave up");
+        assert!(
+            r.longest_ms <= IDLE_READER_DEADLINE_MS,
+            "seed {seed}: {} ms",
+            r.longest_ms
+        );
+        completed += r.completed;
+        second += r.second_attempts;
+        misses += r.misses;
+        deleted += r.passes_deleted;
+        raced += usize::from(r.second_attempts > 0);
+    }
+    eprintln!(
+        "focused backup racing idle passes: {} seeds x 60 s: {completed} backups, {second} on a \
+         second attempt (on {raced} seeds) after {misses} reads found a pass's delete, none gave \
+         up; {deleted} passes deleted",
+        seeds()
+    );
+    assert!(deleted > 0 && second > 0, "no race reached");
+    assert!(
+        raced as u64 >= seeds() / 4,
+        "the race on only {raced} seeds"
+    );
+}
+
+#[test]
+fn the_focused_reader_oracles_catch_their_mutations() {
+    let count = |window, skip| {
+        let mut first = None;
+        let mut caught = 0;
+        for seed in 0..seeds() {
+            let r = focused(seed, window, skip);
+            if (skip && r.failure.is_some()) || (!skip && r.exhausted > 0) {
+                first.get_or_insert(seed);
+                caught += 1;
+            }
+        }
+        (first, caught)
+    };
+    for (what, window, skip) in [
+        ("passes ignoring the window", None, false),
+        (
+            "a window at the read deadline, below the bound",
+            Some(IDLE_READER_DEADLINE_MS),
+            false,
+        ),
+        (
+            "a reader skipping a missing object",
+            Some(IDLE_WINDOW_MS),
+            true,
+        ),
+    ] {
+        let (first, caught) = count(window, skip);
+        eprintln!(
+            "{what}: caught on {caught} of {} seeds, first {first:?}",
+            seeds()
+        );
+        assert!(caught > 0, "{what}: not caught");
+    }
+}
