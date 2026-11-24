@@ -39,3 +39,14 @@ fn socket_options_are_documented_in_help() {
     assert!(help.contains("--max-sockets-per-app"));
     assert!(help.contains("Zero refuses all WebSockets"));
 }
+
+#[test]
+fn the_sqlite_heap_cap_is_a_serve_flag() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wasmkeep"))
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--sqlite-heap-bytes"), "{help}");
+}

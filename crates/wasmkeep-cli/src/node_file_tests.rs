@@ -17,6 +17,7 @@ metrics-hosts = ["Node1.Internal.", "node1.internal"]
 
 [limits]
 max-sockets-per-node = 50000
+sqlite-heap-bytes = 2147483648
 
 [[app]]
 name = "acme/shop"
@@ -97,6 +98,7 @@ fn the_adr_example_parses_every_field_with_paths_from_the_file() {
     assert_eq!(f.listen.metrics, Some("127.0.0.1:9100".parse().unwrap()));
     assert_eq!(f.listen.metrics_hosts, ["node1.internal"]);
     assert_eq!(f.limits.max_sockets_per_node, Some(50_000));
+    assert_eq!(f.limits.sqlite_heap_bytes, Some(2 << 30));
     assert_eq!(f.apps.len(), 1);
     let a = &f.apps[0];
     assert_eq!((a.tenant.as_str(), a.name.as_str()), ("acme", "shop"));
@@ -285,6 +287,16 @@ fn invalid_values_are_refused_naming_the_field() {
                 + &app("acme/shop", "shop-1", "max-sockets = 11"),
             "max-sockets",
         ),
+        (
+            format!("[limits]\nsqlite-heap-bytes = 1048576\n{LISTEN}")
+                + &app("acme/shop", "shop-1", ""),
+            "sqlite-heap-bytes",
+        ),
+        (
+            format!("[limits]\nsqlite-heap-bytes = \"4 GiB\"\n{LISTEN}")
+                + &app("acme/shop", "shop-1", ""),
+            "sqlite-heap-bytes",
+        ),
         ("app = 1\n".into(), "[[app]]"),
     ] {
         let e = err(&text);
@@ -455,6 +467,8 @@ const EVERY_APP_FLAG: &[&str] = &[
     "127.0.0.1:9100",
     "--max-sockets-per-node",
     "40000",
+    "--sqlite-heap-bytes",
+    "1073741824",
     "--max-sockets-per-app",
     "20000",
     "--data-dir",
@@ -551,6 +565,7 @@ metrics = "127.0.0.1:9100"
 
 [limits]
 max-sockets-per-node = 40000
+sqlite-heap-bytes = 1073741824
 
 [[app]]
 name = "acme/shop"
@@ -646,6 +661,7 @@ fn the_node_file_flag_refuses_the_flags_it_replaces() {
         &["--env", "c=f"],
         &["--front-cpu-budget-ms", "5"],
         &["--max-sockets-per-app", "5"],
+        &["--sqlite-heap-bytes", "1073741824"],
         &["--no-alarms"],
         &["--actor", "c=c.wasm"],
     ] {
@@ -654,6 +670,11 @@ fn the_node_file_flag_refuses_the_flags_it_replaces() {
         let e = serve(&argv).unwrap_err();
         assert!(e.contains("cannot be used with"), "{extra:?}: {e}");
     }
+    // The heap cap has a floor, as in the file.
+    for low in ["0", "1048576"] {
+        assert!(serve(&["--sqlite-heap-bytes", low]).is_err(), "{low}");
+    }
+    assert!(serve(&["--sqlite-heap-bytes", "67108864"]).is_ok());
     // Process flags stay.
     assert!(
         serve(&[

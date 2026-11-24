@@ -52,7 +52,25 @@ pub struct StorageConfig {
     /// running statement is stopped and later ones refused until
     /// [`ActorDb::end_event`].
     pub max_sql_cpu_per_event: Duration,
+    /// SQLite's heap for the whole process, temporary data included
+    /// (`PRAGMA hard_heap_limit`; default [`DEFAULT_SQLITE_HEAP_BYTES`]).
+    /// Past it an allocation fails, and the statement with it
+    /// (`quota-exceeded`). Set at the first open, and only ever lowered
+    /// after: the lowest value any open asked for wins. At least
+    /// [`MIN_SQLITE_HEAP_BYTES`]; 0 is read as the minimum (SQLite reads 0
+    /// as no cap).
+    pub sqlite_heap_bytes: u64,
 }
+
+/// [`StorageConfig::sqlite_heap_bytes`] by default: room for the default
+/// 1,000 resident actors' page caches (about 2 MiB each) and for
+/// statements holding 16 MiB values and sorting in memory
+/// (`temp_store = MEMORY`).
+pub const DEFAULT_SQLITE_HEAP_BYTES: u64 = 4 << 30;
+
+/// The lowest [`StorageConfig::sqlite_heap_bytes`]: a few statements on
+/// 16 MiB values.
+pub const MIN_SQLITE_HEAP_BYTES: u64 = 64 << 20;
 
 impl StorageConfig {
     /// Defaults with the given data directory.
@@ -65,6 +83,7 @@ impl StorageConfig {
             max_result_bytes: 16 * 1024 * 1024,
             max_wal_bytes: 256 * 1024 * 1024,
             max_sql_cpu_per_event: Duration::from_secs(2),
+            sqlite_heap_bytes: DEFAULT_SQLITE_HEAP_BYTES,
         }
     }
 }
@@ -688,8 +707,13 @@ impl ActorDb {
         conn.pragma_update(None, "temp_store", "MEMORY")
             .map_err(open_err)?;
         // Process-wide, and it only ever lowers the cap: the lowest set wins.
-        conn.pragma_update(None, "hard_heap_limit", SQLITE_HEAP_LIMIT_BYTES)
-            .map_err(open_err)?;
+        let heap = config.sqlite_heap_bytes.max(MIN_SQLITE_HEAP_BYTES);
+        conn.pragma_update(
+            None,
+            "hard_heap_limit",
+            i64::try_from(heap).unwrap_or(i64::MAX),
+        )
+        .map_err(open_err)?;
         let page_size: i64 = conn
             .pragma_query_value(None, "page_size", |r| r.get(0))
             .map_err(open_err)?;
@@ -1906,12 +1930,6 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The WAL's header and each frame's header, in bytes.
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_HEADER_BYTES: u64 = 24;
-/// SQLite's heap, for the whole process (`PRAGMA hard_heap_limit`): past it
-/// an allocation fails and the statement with it, instead of the process
-/// running out of memory. Room for the default 1,000 resident actors' page
-/// caches (about 2 MiB each) and for statements holding 16 MiB values and
-/// sorting in memory (`temp_store = MEMORY`).
-const SQLITE_HEAP_LIMIT_BYTES: i64 = 4 << 30;
 
 /// Virtual table modules guests may use; others (and `fts3_tokenizer`,
 /// which takes a raw function pointer) could reach into the host.

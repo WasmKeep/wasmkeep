@@ -38,6 +38,7 @@ metrics-hosts = ["node1.internal"]  # names scrapers use, besides addresses
 
 [limits]
 max-sockets-per-node = 50000
+sqlite-heap-bytes = 4294967296      # SQLite's heap for the process
 
 [[app]]
 name = "acme/shop"
@@ -88,7 +89,12 @@ Relative paths are read from the file's directory.
 IP addresses and `localhost`, see [monitoring](../monitoring.md#metrics)).
 `cluster` and `cluster-advertise` go together.
 
-`[limits]`: `max-sockets-per-node`, as `--max-sockets-per-node`.
+`[limits]`: `max-sockets-per-node`, as `--max-sockets-per-node`, and
+`sqlite-heap-bytes`, as `--sqlite-heap-bytes`: SQLite's heap for the whole
+process, temporary data included, in bytes (default 4 GiB, at least
+64 MiB; past it a statement that needs more fails with `quota-exceeded`,
+see [security](../security.md)). Both are the process's, shared by every
+app of the file.
 
 `[[app]]`, one per app:
 

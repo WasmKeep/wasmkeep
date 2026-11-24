@@ -20,6 +20,20 @@ The text under a version's heading is its GitHub release text
   above its minor version, or an unreadable one, stops the start; a read
   with no answer is retried. No format changes
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)).
+- Guest limits: SQLite's process-wide heap cap is configurable
+  (`serve --sqlite-heap-bytes`, or `sqlite-heap-bytes` in a node file's
+  `[limits]`; default 4 GiB as before, at least 64 MiB). `LIKE` and `GLOB`
+  are the host's, as `instr`, `replace` and `trim` are: SQLite's answers,
+  stopped at the statement's time and CPU budgets, and no deep recursion on
+  a pattern full of wildcards. Like any replaced `like()`, they no longer
+  narrow an indexed search to a prefix: a query such as `path GLOB 'a/*'`
+  scans its table; write `path >= 'a/' AND path < 'a0'` to keep the index.
+  At open, a database's guest objects that use the reserved `_wasmkeep_`
+  prefix (made before 0.8) are logged once and kept as they are, closed to
+  the guest's schema changes. An instance holds at most 16 streamed file
+  reads at once, and each closes (its file or response) when its event
+  ends; a wait for a read the guest gives up no longer loses bytes. The WIT
+  documents these caps and `actors.call`'s header, size and chain limits.
 
 ## 0.8.0
 

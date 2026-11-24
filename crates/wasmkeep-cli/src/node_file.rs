@@ -53,6 +53,9 @@ pub(crate) struct Listen {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub(crate) max_sockets_per_node: Option<usize>,
+    /// `sqlite-heap-bytes`: SQLite's heap for the whole process, as
+    /// `--sqlite-heap-bytes`.
+    pub(crate) sqlite_heap_bytes: Option<u64>,
 }
 
 /// One `[[app]]`.
@@ -111,7 +114,7 @@ const LISTEN: &[&str] = &[
     "metrics",
     "metrics-hosts",
 ];
-const LIMITS: &[&str] = &["max-sockets-per-node"];
+const LIMITS: &[&str] = &["max-sockets-per-node", "sqlite-heap-bytes"];
 const APP: &[&str] = &[
     "name",
     "node-id",
@@ -243,6 +246,18 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
     if let Some(t) = table(&src, root, "limits")? {
         known_keys(&src, t, "[limits]", LIMITS)?;
         file.limits.max_sockets_per_node = count(&src, t, "max-sockets-per-node", "[limits]")?;
+        let heap = count(&src, t, "sqlite-heap-bytes", "[limits]")?;
+        let min = wasmkeep_storage::MIN_SQLITE_HEAP_BYTES;
+        if let Some(bytes) = heap
+            && (bytes as u64) < min
+        {
+            let span = get(t, "sqlite-heap-bytes").map_or(0..0, |(_, v)| v.span());
+            return src.err(
+                span,
+                format!("[limits] sqlite-heap-bytes: at least {min} (64 MiB), not {bytes}"),
+            );
+        }
+        file.limits.sqlite_heap_bytes = heap.map(|b| b as u64);
     }
     let node_sockets = file
         .limits
@@ -749,6 +764,7 @@ impl NodeFile {
             },
             limits: Limits {
                 max_sockets_per_node: args.max_sockets_per_node,
+                sqlite_heap_bytes: args.sqlite_heap_bytes,
             },
             apps: vec![AppEntry {
                 at: "the command line".to_owned(),
@@ -836,6 +852,7 @@ impl NodeFile {
         args.metrics_listen = self.listen.metrics;
         args.metrics_hosts.clone_from(&self.listen.metrics_hosts);
         args.max_sockets_per_node = self.limits.max_sockets_per_node;
+        args.sqlite_heap_bytes = self.limits.sqlite_heap_bytes;
         if let Some(dir) = self.data_dir_of(a) {
             args.data_dir = dir.to_path_buf();
         }

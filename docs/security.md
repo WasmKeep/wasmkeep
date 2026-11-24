@@ -41,7 +41,7 @@ under `crates/`). Per-node and per-app limits are local to a node's process.
 | Actor | Database size, value, query result | 1 GiB, 16 MiB, 16 MiB | `wasmkeep-storage/src/db.rs` (`max_db_bytes`, `max_value_bytes`, `max_result_bytes`) |
 | Actor | Write-ahead log between captures | 256 MiB | `db.rs` (`max_wal_bytes`) |
 | Statement | Compiled instructions (`quota-exceeded`) | 2,000,000 | `db.rs` (`GUEST_MAX_VDBE_OPS`) |
-| Node | SQLite heap, temporary data included | 4 GiB | `db.rs` (`SQLITE_HEAP_LIMIT_BYTES`) |
+| Node | SQLite heap, temporary data included | 4 GiB (`--sqlite-heap-bytes`, at least 64 MiB) | `db.rs` (`DEFAULT_SQLITE_HEAP_BYTES`) |
 | Instance | Streamed file writes open at once | 16 | `wasmkeep-server/src/blobs.rs` (`MAX_OPEN_WRITES`) |
 | Instance | Streamed file reads open at once, all closed at the event's end | 16 | `blobs.rs` (`MAX_OPEN_READS`) |
 | App | Spooled file bytes | 1 GiB (at least one `--max-blob-bytes` file, at most half the node's) | `blobs.rs` (`APP_SPOOL`) |
@@ -200,10 +200,13 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   expression depth and compound `SELECT` terms are kept, set explicitly:
   SQLite also applies them when it loads a stored schema, so lower ones
   would make existing databases unreadable. SQLite's heap is capped at
-  4 GiB for the whole process, temporary data (sorts, materialised
-  subqueries) included, as it stays in memory: a statement that needs more
-  fails with `quota-exceeded`. The cap is shared, so while one statement
-  holds most of it, others can fail too.
+  4 GiB for the whole process by default (`--sqlite-heap-bytes`, or
+  `sqlite-heap-bytes` in a node file's `[limits]`; at least 64 MiB),
+  temporary data (sorts, materialised subqueries) included, as it stays in
+  memory: a statement that needs more fails with `quota-exceeded`. The cap
+  is shared, so while one statement holds most of it, others can fail too.
+  Size it to the node's memory: the default leaves room for 1,000 resident
+  actors' page caches and for statements on 16 MiB values.
 - 256 MB of write-ahead log between two captures: past it, statements that
   write fail until the event ends (reads, commit and rollback still run),
   or, when another connection reading the database keeps the log from

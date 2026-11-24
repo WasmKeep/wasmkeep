@@ -259,6 +259,9 @@ async fn start_runtime(
     config.egress = egress.clone();
     config.guest_log = shared.guest_log.clone();
     config.storage.max_sql_cpu_per_event = std::time::Duration::from_millis(args.sql_cpu_budget_ms);
+    config.storage.sqlite_heap_bytes = args
+        .sqlite_heap_bytes
+        .unwrap_or(wasmkeep_storage::DEFAULT_SQLITE_HEAP_BYTES);
     config.config = deployed.config;
     config.requires = deployed.requires;
     config.batched = deployed.batched;

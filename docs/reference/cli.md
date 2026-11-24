@@ -177,6 +177,7 @@ Usage: `wasmkeep serve [OPTIONS] [COMPONENT]`
 | `--max-instances <MAX_INSTANCES>` | `1000` | Maximum concurrently live instances (pooling allocator slots) |
 | `--cpu-budget-ms <CPU_BUDGET_MS>` | `50` | Guest CPU time allowed per actor event, in milliseconds. |
 | `--sql-cpu-budget-ms <SQL_CPU_BUDGET_MS>` | `2000` | CPU time one event's SQL statements may use together, in milliseconds (SQLite runs in the host, outside --cpu-budget-ms) |
+| `--sqlite-heap-bytes <BYTES>` |  | SQLite's heap for the whole process, in bytes (default 4 GiB, at least 64 MiB), temporary data such as sorts included: past it, the statement that needs more fails with `quota-exceeded`. |
 | `--usage-ping` |  | Send an anonymous usage report (version, OS, cluster or not, and bucketed counts of classes and resident actors) a minute after start and daily. |
 | `--metrics-listen <ADDR>` |  | Serve Prometheus metrics at `http://ADDR/metrics` (e.g. `127.0.0.1:9100`). |
 | `--metrics-host <NAME>` |  | A name the metrics page answers to, for a scraper that names this node by a dotted host name (`node1.internal`). |

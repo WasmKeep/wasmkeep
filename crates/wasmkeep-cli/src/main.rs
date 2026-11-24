@@ -665,6 +665,7 @@ struct ServeArgs {
     #[arg(long, value_name = "FILE", requires = "bucket", conflicts_with_all = [
         "app", "actors", "component", "node_id", "advertise", "listen", "cluster_listen",
         "cluster_advertise", "metrics_listen", "metrics_hosts", "max_sockets_per_node", "max_sockets_per_app",
+        "sqlite_heap_bytes",
         "data_dir", "secrets_keys", "no_secrets", "env", "front_env", "access",
         "allow_outbound", "allow_outbound_port", "outbound_ca", "max_front_requests",
         "front_cpu_budget_ms", "no_alarms", "blob_link_base", "max_app_blob_bytes",
@@ -749,6 +750,13 @@ struct ServeArgs {
     /// milliseconds (SQLite runs in the host, outside --cpu-budget-ms).
     #[arg(long, default_value_t = 2000)]
     sql_cpu_budget_ms: u64,
+
+    /// SQLite's heap for the whole process, in bytes (default 4 GiB, at
+    /// least 64 MiB), temporary data such as sorts included: past it, the
+    /// statement that needs more fails with `quota-exceeded`. In a node
+    /// file, `[limits]` `sqlite-heap-bytes`.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(wasmkeep_storage::MIN_SQLITE_HEAP_BYTES..))]
+    sqlite_heap_bytes: Option<u64>,
 
     /// Send an anonymous usage report (version, OS, cluster or not, and
     /// bucketed counts of classes and resident actors) a minute after start
@@ -1795,6 +1803,9 @@ fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
         config.guest_log = guest_log.clone();
         config.storage.max_sql_cpu_per_event =
             std::time::Duration::from_millis(args.sql_cpu_budget_ms);
+        config.storage.sqlite_heap_bytes = args
+            .sqlite_heap_bytes
+            .unwrap_or(wasmkeep_storage::DEFAULT_SQLITE_HEAP_BYTES);
         if let (Some((tenant, name)), Some(bucket)) = (&args.app, &args.bucket) {
             let (store, prefix) = open_bucket(bucket)?;
             // Before anything reads or writes the app's state (ADR 0022).

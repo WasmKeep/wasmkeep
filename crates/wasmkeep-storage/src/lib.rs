@@ -22,8 +22,9 @@ mod value;
 pub mod wal;
 
 pub use db::{
-    ActorDb, CaptureHold, DataRoot, PendingAlarms, ReservedObject, ReservedUse, StateDir, Storage,
-    StorageConfig, prepare_data_root,
+    ActorDb, CaptureHold, DEFAULT_SQLITE_HEAP_BYTES, DataRoot, MIN_SQLITE_HEAP_BYTES,
+    PendingAlarms, ReservedObject, ReservedUse, StateDir, Storage, StorageConfig,
+    prepare_data_root,
 };
 pub use error::{SqlError, SqlErrorKind, StorageError};
 pub use local::local_is_at;
