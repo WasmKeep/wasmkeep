@@ -9,6 +9,12 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Calls between nodes: a hop's signature is checked once on arrival, and
+  every later check of that request reads the result; one code path signs
+  every hop and one forwards every request. What is signed and sent is
+  unchanged byte for byte (pinned by tests), so 0.8.0 and later nodes
+  verify each other. A bad signature on the cluster port is now counted in
+  `wasmkeep_signatures_bad_total`, as documented.
 - Cluster availability: a request kept for a dead node's actors is no
   longer kept for a peer that only could not be read, or for a body
   older than one already read; a round has at most 32 heartbeat reads in
