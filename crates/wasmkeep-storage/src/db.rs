@@ -204,11 +204,12 @@ impl Storage {
             Ok(found) => db.reserved = found,
             // Not a reason to keep the actor closed: the sandbox refuses
             // what it would refuse anyway.
-            Err(e) => tracing::warn!(
+            Err(e) if first_warning(&path, Warning::Failed) => tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "could not look for guest objects with the reserved _wasmkeep_ prefix"
             ),
+            Err(_) => {}
         }
         warn_reserved(&path, &db.reserved);
         *self
@@ -329,26 +330,35 @@ impl Storage {
 /// Meta key holding `tenant/class/name`.
 const ADDRESS_KEY: &str = "address";
 
+/// What [`first_warning`] is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Warning {
+    /// Guest objects with the reserved prefix were found.
+    Found,
+    /// Looking for them failed.
+    Failed,
+}
+
+/// Whether `what` is to be logged for the database at `path`: the first
+/// time in this process only, and for at most 10,000 files.
+fn first_warning(path: &Path, what: Warning) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const MAX_WARNED: usize = 10_000;
+    static WARNED: OnceLock<Mutex<HashSet<(PathBuf, Warning)>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    warned.len() < MAX_WARNED && warned.insert((path.to_owned(), what))
+}
+
 /// Logs, once per database file and process, the guest objects with the
 /// reserved prefix it holds: at most a few, each name shortened and
 /// escaped (a guest chose them).
 fn warn_reserved(path: &Path, found: &[ReservedObject]) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    /// Files warned about; past this many, no more warnings.
-    const MAX_WARNED: usize = 10_000;
-    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    if found.is_empty() {
+    if found.is_empty() || !first_warning(path, Warning::Found) {
         return;
-    }
-    {
-        let mut warned = WARNED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if warned.len() >= MAX_WARNED || !warned.insert(path.to_owned()) {
-            return;
-        }
     }
     let names: Vec<String> = found
         .iter()
@@ -860,7 +870,8 @@ impl ActorDb {
     /// Guest objects in the schema that use the reserved prefix: a guest
     /// could give one a reserved name before 0.8 (a view, an index, a
     /// trigger, or a table renamed onto one), or name a host table in its
-    /// definition (a foreign key to one). Found once, at open.
+    /// definition (a foreign key to one). Found once, at open; at most
+    /// 64 are listed.
     ///
     /// They are left as they are: dropping one could lose the guest's rows
     /// (a renamed table holds them) and renaming one changes the guest's
@@ -888,29 +899,37 @@ impl ActorDb {
                 "SELECT type, name, sql FROM main.sqlite_schema \
                  WHERE instr(lower(name), '_wasmkeep_') OR instr(lower(sql), '_wasmkeep_')",
             )?;
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        })?;
-        Ok(rows
-            .into_iter()
-            .filter(|(kind, name, _)| !(kind == "table" && HOST_TABLES.contains(&name.as_str())))
-            .filter_map(|(kind, name, sql)| {
+            // Classified row by row; only the kind, name and use are
+            // kept, of at most `MAX_RESERVED_KEPT` objects.
+            let mut found = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                if kind == "table" && HOST_TABLES.contains(&name.as_str()) {
+                    continue;
+                }
                 let uses = if is_reserved(&name) {
                     ReservedUse::Named
-                } else if sql.as_deref().is_some_and(names_reserved) {
+                } else if r
+                    .get_ref(2)?
+                    .as_str_or_null()
+                    .ok()
+                    .flatten()
+                    .is_some_and(names_reserved)
+                {
                     ReservedUse::References
                 } else {
-                    return None;
+                    continue;
                 };
-                Some(ReservedObject { kind, name, uses })
-            })
-            .collect())
+                found.push(ReservedObject { kind, name, uses });
+                if found.len() == MAX_RESERVED_KEPT {
+                    break;
+                }
+            }
+            Ok(found)
+        })?;
+        Ok(rows)
     }
 
     /// Starts capturing committed changes for replication: turns automatic
@@ -1871,6 +1890,10 @@ fn bind(params: &[SqlValue]) -> rusqlite::ParamsFromIter<Vec<rusqlite::types::Va
 
 /// Tables reserved for the host. Guests can neither read nor write them.
 const RESERVED_PREFIX: &str = "_wasmkeep_";
+
+/// Guest objects with the reserved prefix kept per database
+/// ([`ActorDb::reserved_objects`]); past it, the rest go unlisted.
+const MAX_RESERVED_KEPT: usize = 64;
 
 /// The host's own tables, made at the first open of every database.
 const HOST_TABLES: &[&str] = &["_wasmkeep_meta", "_wasmkeep_alarm"];

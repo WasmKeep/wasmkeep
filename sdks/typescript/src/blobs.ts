@@ -15,7 +15,8 @@
  * `@wasmkeep/sdk/front`: a component that does not import it imports no
  * `wasmkeep:actor/blobs`, and links on a node of any release. The calls
  * are buffered (a whole file, up to 16 MiB); streams are not in this SDK
- * yet. A key is 1 to 512 bytes of `[A-Za-z0-9._~-]` and `/`, in segments
+ * yet (the host's `open-read` streams count against a cap of 16 open at
+ * once, a partly read one until its handle is dropped). A key is 1 to 512 bytes of `[A-Za-z0-9._~-]` and `/`, in segments
  * that are not empty, `.` or `..`.
  *
  * Every call throws a {@link BlobError} when the host refuses or fails it.

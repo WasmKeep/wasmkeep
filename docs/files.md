@@ -65,7 +65,7 @@ key order, 1,000 at most per page.
 | streamed writes and upload links being spooled, the process | 4 GiB, or two files of the largest `--max-blob-bytes` if that is more |
 | an upload link's body | nothing for 60 s, or slower than 16 KiB/s on average after its first 30 s: aborted |
 | streamed writes open at once | 16 per actor instance (and per front instance) |
-| streamed reads open at once | 16 per actor instance (and per front instance); a read counts until it is dropped or read to its end, and every read closes when its event ends |
+| streamed reads open at once | 16 per actor instance (and per front instance); a read counts until it is dropped or read to its end (one read only partly counts until its handle is dropped), and every read closes when its event ends |
 | bodies of one upload link at once | 1 per node |
 | a listing page | 1,000 |
 | link expiry | 3,600 s at most |

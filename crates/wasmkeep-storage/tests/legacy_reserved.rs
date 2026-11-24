@@ -157,3 +157,18 @@ fn a_guest_table_with_a_reserved_trigger_is_kept() {
         }]
     );
 }
+
+/// At most 64 are kept, however many the schema holds.
+#[test]
+fn at_most_64_reserved_objects_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = storage(&dir);
+    drop(store.open("c", "a").unwrap());
+    let raw = rusqlite::Connection::open(dir.path().join("actors/t/c/a.db")).unwrap();
+    let views: String = (0..100)
+        .map(|i| format!("CREATE VIEW _wasmkeep_v{i} AS SELECT {i};"))
+        .collect();
+    raw.execute_batch(&views).unwrap();
+    let db = store.open("c", "a").unwrap();
+    assert_eq!(db.reserved_objects().len(), 64);
+}

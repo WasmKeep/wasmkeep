@@ -175,7 +175,8 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   rename a table onto one, or declare a foreign key to a host table. Such
   objects found in a database are logged once per process at open (a
   warning naming a few of them) and left as they are: nothing is dropped
-  or renamed, and the actor opens. The guest can neither change them (drop,
+  or renamed, the actor opens, and its backups and exports verify (only an
+  object holding a host table's own name fails verification). The guest can neither change them (drop,
   alter, reindex, or a new object naming one) nor read a table or view so
   named, so a renamed table's rows are kept but out of its reach; an index
   or trigger so named on one of its own tables keeps working, and a table
