@@ -74,6 +74,7 @@ impl Fixture {
             all: false,
             history: History::All,
             require_continuous: None,
+            history_retention_secs: 3600,
             cache: Some(self._dir.path().join("cache")),
             to_env: None,
         }
@@ -462,6 +463,7 @@ async fn a_listed_key_that_keeps_missing_is_retried_then_a_gap() {
         dp: "",
         cache: None,
         all: true,
+        retention: std::time::Duration::ZERO,
     };
     let actor = copier
         .actor(
@@ -497,6 +499,7 @@ async fn source_is_list_get_only_and_idle_actor_costs_no_gets() {
         dp: "",
         cache: None,
         all: false,
+        retention: std::time::Duration::ZERO,
     };
     let prefix = "state/acme/shop/actors/counter/alice/";
     let first = copier
@@ -627,6 +630,7 @@ async fn collector_between_listing_and_get_forces_a_fresh_plan() {
         dp: "",
         cache: None,
         all: false,
+        retention: std::time::Duration::ZERO,
     };
     let actor = copier
         .actor(
@@ -696,6 +700,7 @@ async fn snapshot_must_match_its_boundary_even_when_both_ltx_files_are_valid() {
             dp: "",
             cache: cache.as_deref(),
             all: false,
+            retention: std::time::Duration::ZERO,
         };
         let error = copier
             .actor(
@@ -791,6 +796,7 @@ async fn history_all_reports_listed_get_miss() {
         dp: "",
         cache: None,
         all: true,
+        retention: std::time::Duration::ZERO,
     };
     let actor = copier
         .actor(
@@ -859,6 +865,8 @@ async fn a_miss_no_collection_explains_stays_a_gap() {
         });
         let mut args = f.args();
         args.require_continuous = continuous;
+        // Old enough: only the shape is wrong.
+        args.history_retention_secs = 0;
         let raced = create(&args, &source, "", &f.dest, "").await;
         let refused = continuous.is_none();
         assert_eq!(raced.is_err(), refused, "{continuous:?}");
@@ -934,6 +942,9 @@ async fn backup_create_during_an_idle_pass() {
         let mut args = f.args();
         args.history = history;
         args.require_continuous = continuous;
+        // The objects here were written a moment ago: a window of 0 lets
+        // the pass's delete be older than it, as a pass's deletes are.
+        args.history_retention_secs = 0;
         let run_id = create(&args, &source, "", &f.dest, "")
             .await
             .unwrap_or_else(|e| panic!("{history:?} {continuous:?}: {e:#}"));
@@ -952,6 +963,54 @@ async fn backup_create_during_an_idle_pass() {
             assert_eq!(actor["collected"], json!([gone[0]]));
         }
     }
+}
+
+/// The same race with the key younger than the window (the default hour):
+/// no collection by the rule could have deleted it, whatever the shape, so
+/// a continuous run refuses it as a gap; the next run, listed after the
+/// delete, completes.
+#[tokio::test]
+async fn a_key_younger_than_the_window_gone_below_a_snapshot_stays_a_gap() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    let at_head = SegmentId {
+        generation: 1,
+        txid: 2,
+    };
+    let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 500).unwrap();
+    put(
+        &f.source,
+        &format!("{prefix}{}", snapshot_key(at_head)),
+        bytes.clone(),
+        false,
+    )
+    .await
+    .unwrap();
+    let first = snapshot_key(SegmentId {
+        generation: 1,
+        txid: 1,
+    });
+    let source: Store = Arc::new(ReadOnly {
+        inner: f.source.clone(),
+        gets: Default::default(),
+        collect: std::sync::Mutex::new(Some((
+            Key::from(format!("{prefix}{first}")),
+            Key::from("elsewhere/unrelated"),
+            bytes,
+        ))),
+        collect_after: 0,
+        fail_collect: false,
+    });
+    let args = f.args();
+    assert_eq!(args.history_retention_secs, 3600);
+    assert!(create(&args, &source, "", &f.dest, "").await.is_err());
+    let run_id = latest(&f.dest, "").await.unwrap().unwrap();
+    let actor = disk_actor(&load(&f.dest, "", &run_id).await.unwrap().actors[0]).unwrap();
+    assert_eq!(actor["status"], "failed");
+    assert_eq!(actor["gaps"], json!([first]));
+    assert_eq!(actor["collected"], json!([]));
+    create(&args, &source, "", &f.dest, "").await.unwrap();
 }
 
 #[tokio::test]
@@ -1129,6 +1188,7 @@ async fn a_collected_historical_segment_splits_ranges_without_a_gap() {
         });
         let mut args = f.args();
         args.require_continuous = Some(continuous);
+        args.history_retention_secs = 0;
         // Segment 2 went from below the snapshot at 4 and its segment: a
         // collection (cut short, or its deletes landing one at a time) may
         // leave exactly this. Not a gap, so the continuous run completes;
@@ -1191,6 +1251,7 @@ async fn newer_snapshot_cannot_hide_a_broken_historical_chain() {
         dp: "",
         cache: None,
         all: true,
+        retention: std::time::Duration::ZERO,
     };
     let error = copier
         .actor(
@@ -1398,6 +1459,7 @@ async fn rereview_retry_observations_include_vanished_non_head() {
         dp: "",
         cache: None,
         all: true,
+        retention: std::time::Duration::ZERO,
     };
     let actor = copier.actor(prefix, initial, None).await.unwrap();
     // Every key observed by any attempt is accounted for: the first
@@ -1583,6 +1645,7 @@ async fn fix4_retry_preserves_copied_reference_after_expiry() {
         dp: "",
         cache: None,
         all: true,
+        retention: std::time::Duration::ZERO,
     };
     let actor = copier
         .actor(prefix, list_bounded(&source, prefix).await.unwrap(), None)
@@ -1679,6 +1742,7 @@ async fn fix4_retry_references_require_current_size_etag_and_version() {
             dp: "",
             cache: None,
             all: true,
+            retention: std::time::Duration::ZERO,
         };
         let actor = copier
             .attempt(prefix, &listed, None, &mut validated)

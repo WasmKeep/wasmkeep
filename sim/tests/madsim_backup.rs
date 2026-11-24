@@ -1085,10 +1085,14 @@ fn a_reader_racing_idle_passes_in_the_focused_model_needs_two_attempts_at_most()
 
 #[test]
 fn the_focused_reader_oracles_catch_their_mutations() {
+    // Pure computation: at least 400 seeds, so the rarest mutation (a
+    // window below the bound, first caught at seed 166) is reached at any
+    // seed count.
+    let seeds = seeds().max(400);
     let count = |window, skip| {
         let mut first = None;
         let mut caught = 0;
-        for seed in 0..seeds() {
+        for seed in 0..seeds {
             let r = focused(seed, window, skip);
             if (skip && r.failure.is_some()) || (!skip && r.exhausted > 0) {
                 first.get_or_insert(seed);
@@ -1113,7 +1117,7 @@ fn the_focused_reader_oracles_catch_their_mutations() {
         let (first, caught) = count(window, skip);
         eprintln!(
             "{what}: caught on {caught} of {} seeds, first {first:?}",
-            seeds()
+            seeds
         );
         assert!(caught > 0, "{what}: not caught");
     }

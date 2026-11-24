@@ -101,6 +101,7 @@ Usage: `wasmkeep backup create [OPTIONS] --bucket <BUCKET> --to <TO>`
 | `--all` |  |  |
 | `--history <HISTORY>` | `head] [possible values: head, all` |  |
 | `--require-continuous <REQUIRE_CONTINUOUS>` |  | Fail if listed retained history could not be archived (default for all) One of: true, false. |
+| `--history-retention-secs <SECS>` | `3600` | The cluster's history retention window: with --history all, a key gone during the run from below a kept snapshot and its segment, and last modified at least this long before, was collected and is not a gap |
 | `--cache <CACHE>` |  | Local verified content cache; contains plaintext actor data |
 | `--to-env <TO_ENV>` |  | Destination AWS_* settings, without changing the source environment |
 

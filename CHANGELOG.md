@@ -22,8 +22,10 @@ The text under a version's heading is its GitHub release text
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-availability)).
 - Backups: `backup create --history all` lists an actor again after a
   read misses. A key gone from below a retained snapshot and its
-  segment, as history collection and idle compaction leave it, is
-  recorded under the actor's `collected` and is no longer a gap, so a
+  segment, as history collection and idle compaction leave it, and older
+  than the retention window (new `--history-retention-secs`, default
+  3600, as on `serve`), is recorded under the actor's `collected` and is
+  no longer a gap, so a
   continuous run that races a collection or an idle pass completes
   instead of failing as partial; a key still listed whose read missed is
   read again, up to 8 attempts; any other key gone is a gap as before.
