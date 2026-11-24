@@ -1653,7 +1653,7 @@ fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) -> String {
     counter(
         &mut out,
         "wasmkeep_lease_reads_unpinned_total",
-        "Newest node lease bodies replaced by an older one after no read confirmed them for ttl plus grace.",
+        "Newest node lease bodies replaced by an older one after older bodies were read for ttl plus grace with none confirming them.",
         m.lease_reads_unpinned.load(Ordering::Relaxed),
     );
     counter(
