@@ -1127,6 +1127,34 @@ async fn save_blob(
     put(dest, &key(dp, &format!("data/{hash}")), bytes, false).await?;
     Ok(entry)
 }
+/// How many times one actor is listed, planned and read before the run
+/// gives it up (ADR 0033, section 1).
+const ATTEMPTS: usize = 8;
+/// Whether `key`, absent from `listing`, is a key collection could have
+/// deleted: below a listed snapshot whose segment is listed too, by the
+/// shared rule (`collectable`, which the idle pass's `idle_collectable`
+/// applies as well). The tool sees neither the retention window nor the
+/// ownership record: this judges the shape collection leaves, the shape a
+/// listing made after the collection would have shown.
+fn collected_by_rule(listing: &Listing, key: &str) -> bool {
+    use wasmkeep_cluster::replication::collectable;
+    let gone = Listing::from_keys([key]);
+    if gone.segments.is_empty() && gone.snapshots.is_empty() {
+        return false;
+    }
+    let mut with = listing.clone();
+    with.segments.extend(gone.segments);
+    with.snapshots.extend(gone.snapshots);
+    listing
+        .snapshots
+        .iter()
+        .filter(|s| listing.segments.iter().any(|seg| seg.id == **s))
+        .any(|s| {
+            collectable(&with, s.generation, *s)
+                .iter()
+                .any(|k| k == key)
+        })
+}
 fn same(meta: &ObjectMeta, old: &Value) -> bool {
     meta.e_tag.is_some()
         && old["size"].as_u64() == Some(meta.size)
@@ -1151,9 +1179,13 @@ impl Copier<'_> {
         let mut reason = String::new();
         let mut expected: BTreeSet<_> = objects.keys().cloned().collect();
         let mut validated = serde_json::Map::new();
-        for attempt in 0..8 {
+        let mut relisted = None;
+        for attempt in 0..ATTEMPTS {
             if attempt > 0 {
-                objects = list_bounded(self.source, prefix).await?;
+                objects = match relisted.take() {
+                    Some(objects) => objects,
+                    None => list_bounded(self.source, prefix).await?,
+                };
             }
             validated.retain(|k, entry| objects.get(k).is_none_or(|meta| same(meta, entry)));
             expected.extend(objects.keys().cloned());
@@ -1184,7 +1216,7 @@ impl Copier<'_> {
             {
                 Ok(mut actor) => {
                     let copied = actor["objects"].as_object().context("missing objects")?;
-                    let gaps: Vec<_> = if self.all {
+                    let mut gaps: Vec<_> = if self.all {
                         expected
                             .iter()
                             .filter(|k| !copied.contains_key(*k))
@@ -1193,7 +1225,35 @@ impl Copier<'_> {
                     } else {
                         Vec::new()
                     };
+                    let mut collected = Vec::new();
+                    if !gaps.is_empty() {
+                        // Listed, then gone before its read: list again. A
+                        // key gone from below a listed snapshot and its
+                        // segment, by the collection rule (ADR 0012; ADR
+                        // 0042's idle pass applies the same), is what a
+                        // collection leaves, as if it had run before the
+                        // listing: not a gap. Anything else is one.
+                        let now = list_bounded(self.source, prefix).await?;
+                        let listing = Listing::from_keys(now.keys().map(String::as_str));
+                        (collected, gaps) = gaps
+                            .into_iter()
+                            .partition(|k| !now.contains_key(k) && collected_by_rule(&listing, k));
+                        // A gap left while the actor changed, or a read
+                        // that missed a key still listed: list, plan and
+                        // read again, within the attempts. Then the gaps
+                        // stand.
+                        if !gaps.is_empty()
+                            && attempt + 1 < ATTEMPTS
+                            && (gaps.iter().any(|k| now.contains_key(k))
+                                || !now.keys().eq(objects.keys()))
+                        {
+                            reason = format!("retained history gone while read: {gaps:?}");
+                            relisted = Some(now);
+                            continue;
+                        }
+                    }
                     actor["gaps"] = json!(gaps);
+                    actor["collected"] = json!(collected);
                     return Ok(actor);
                 }
                 Err(e)
@@ -1213,7 +1273,9 @@ impl Copier<'_> {
                 Err(e) => return Err(e),
             }
         }
-        bail!("{reason}; collected faster than read: raise --history-retention-secs (8 attempts)")
+        bail!(
+            "{reason}; collected faster than read: raise --history-retention-secs ({ATTEMPTS} attempts)"
+        )
     }
     async fn cached_replay(
         &self,

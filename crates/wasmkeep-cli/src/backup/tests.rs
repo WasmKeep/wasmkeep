@@ -347,6 +347,137 @@ impl ObjectStore for ReadOnly {
         panic!("source COPY")
     }
 }
+/// A source that lists `key` but answers every read of it as missing,
+/// counting them: a key that keeps changing under the reader.
+#[derive(Debug)]
+struct Unreadable {
+    inner: Store,
+    key: Key,
+    misses: std::sync::atomic::AtomicUsize,
+}
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source with an unreadable key")
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for Unreadable {
+    async fn put_opts(
+        &self,
+        _: &Key,
+        _: object_store::PutPayload,
+        _: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        panic!("source PUT")
+    }
+    async fn put_multipart_opts(
+        &self,
+        _: &Key,
+        _: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        panic!("source multipart")
+    }
+    async fn get_opts(
+        &self,
+        path: &Key,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if *path == self.key {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(object_store::Error::NotFound {
+                path: path.to_string(),
+                source: "listed, never readable".into(),
+            });
+        }
+        self.inner.get_opts(path, opts).await
+    }
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        futures_util::stream::unfold(self.inner.list(prefix), |mut stream| async {
+            stream.next().await.map(|meta| (meta, stream))
+        })
+        .boxed()
+    }
+    fn delete_stream(
+        &self,
+        _: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        panic!("source DELETE")
+    }
+    async fn list_with_delimiter(
+        &self,
+        _: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        panic!("unexpected delimiter list")
+    }
+    async fn copy_opts(
+        &self,
+        _: &Key,
+        _: &Key,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        panic!("source COPY")
+    }
+}
+/// A retained key still listed whose every read misses: the actor is read
+/// again a bounded number of times (`ATTEMPTS`), then kept with the key
+/// as a gap, never retried for ever and never given up as a whole.
+#[tokio::test]
+async fn a_listed_key_that_keeps_missing_is_retried_then_a_gap() {
+    let mut f = Fixture::new().await;
+    f.increment().await;
+    let prefix = "state/acme/shop/actors/counter/alice/";
+    // A snapshot at the head, so the first one is off the plan.
+    let bytes = f.db.snapshot().unwrap().to_ltx(1, 2, 500).unwrap();
+    put(
+        &f.source,
+        &format!(
+            "{prefix}{}",
+            snapshot_key(SegmentId {
+                generation: 1,
+                txid: 2
+            })
+        ),
+        bytes,
+        false,
+    )
+    .await
+    .unwrap();
+    let first = snapshot_key(SegmentId {
+        generation: 1,
+        txid: 1,
+    });
+    let unreadable = Arc::new(Unreadable {
+        inner: f.source.clone(),
+        key: Key::from(format!("{prefix}{first}")),
+        misses: Default::default(),
+    });
+    let source: Store = unreadable.clone();
+    let copier = Copier {
+        source: &source,
+        dest: &f.dest,
+        dp: "",
+        cache: None,
+        all: true,
+    };
+    let actor = copier
+        .actor(
+            prefix,
+            history::list_objects(&source, prefix).await.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(actor["gaps"], json!([first]));
+    assert_eq!(actor["collected"], json!([]));
+    assert_eq!(
+        unreadable.misses.load(std::sync::atomic::Ordering::SeqCst),
+        ATTEMPTS
+    );
+}
 #[tokio::test]
 async fn source_is_list_get_only_and_idle_actor_costs_no_gets() {
     use std::sync::atomic::Ordering;
@@ -669,7 +800,76 @@ async fn history_all_reports_listed_get_miss() {
         )
         .await
         .unwrap();
-    assert!(!array(&actor, "gaps").unwrap().is_empty());
+    // The first snapshot went from below the second and its segment: what
+    // collection deletes, so recorded as collected, not as a gap.
+    assert_eq!(array(&actor, "gaps").unwrap().len(), 0);
+    assert_eq!(
+        actor["collected"],
+        json!([snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1
+        })])
+    );
+}
+
+/// A key gone between the listing and its read that no collection could
+/// have deleted (no listed snapshot with its segment above it) stays a
+/// gap: `--require-continuous` (the default) refuses the run and its
+/// verification; `--require-continuous false` completes with the gap.
+#[tokio::test]
+async fn a_miss_no_collection_explains_stays_a_gap() {
+    for continuous in [None, Some(false)] {
+        let mut f = Fixture::new().await;
+        f.increment().await;
+        let prefix = "state/acme/shop/actors/counter/alice/";
+        // Generation 2 takes over at txid 3; a late segment of generation
+        // 1 at txid 3 is off the chain. No snapshot has its segment listed.
+        f.db.exec("UPDATE counts SET n=3", &[]).unwrap();
+        let bytes =
+            f.db.take_changes()
+                .unwrap()
+                .unwrap()
+                .to_ltx(3, 3, 300)
+                .unwrap();
+        let at = |generation, parent_generation| Segment {
+            id: SegmentId {
+                generation,
+                txid: 3,
+            },
+            parent_generation,
+        };
+        put(
+            &f.source,
+            &format!("{prefix}{}", segment_key(&at(2, 1))),
+            bytes.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        let late = Key::from(format!("{prefix}{}", segment_key(&at(1, 1))));
+        put(&f.source, late.as_ref(), bytes.clone(), false)
+            .await
+            .unwrap();
+        let source: Store = Arc::new(ReadOnly {
+            inner: f.source.clone(),
+            gets: Default::default(),
+            collect: std::sync::Mutex::new(Some((late, Key::from("elsewhere/unrelated"), bytes))),
+            collect_after: 0,
+            fail_collect: false,
+        });
+        let mut args = f.args();
+        args.require_continuous = continuous;
+        let raced = create(&args, &source, "", &f.dest, "").await;
+        let refused = continuous.is_none();
+        assert_eq!(raced.is_err(), refused, "{continuous:?}");
+        let run_id = latest(&f.dest, "").await.unwrap().unwrap();
+        let run = load(&f.dest, "", &run_id).await.unwrap();
+        let actor = disk_actor(&run.actors[0]).unwrap();
+        assert_eq!(actor["status"], if refused { "failed" } else { "copied" });
+        assert_eq!(actor["gaps"], json!([segment_key(&at(1, 1))]), "{actor}");
+        assert_eq!(actor["collected"], json!([]), "{actor}");
+        assert_eq!(verify(&f.dest, "", &run_id, None).await.is_err(), refused);
+    }
 }
 
 /// ADR 0042, Tests, "Readers": `backup create` racing an idle pass. The
@@ -678,11 +878,12 @@ async fn history_all_reports_listed_get_miss() {
 /// snapshot) after the backup listed and before its first read, as any
 /// collection may:
 /// - `--history head` completes and verifies at the head;
-/// - `--history all` with `--require-continuous false` completes with the
-///   deleted position recorded as a gap;
-/// - `--history all` by default (continuous) is refused as partial, as
-///   after an ordinary collection between its listing and its reads, and
-///   the next run, which lists after the pass, completes.
+/// - `--history all`, continuous (the default) or not, lists again after
+///   the miss, finds the first snapshot gone from below the idle snapshot
+///   and its segment, as the rule deletes it, and completes in the same
+///   run: the key recorded as collected, no gap, and the backup verifies.
+///   (Before 0.8.1 the continuous run was refused as partial, and the
+///   next one completed.)
 #[tokio::test]
 async fn backup_create_during_an_idle_pass() {
     for (history, continuous) in [
@@ -718,7 +919,7 @@ async fn backup_create_during_an_idle_pass() {
         );
         // At the first read: the pass's delete. The hook also writes an
         // object; one outside the app, so no listed object changes.
-        let source: Store = Arc::new(ReadOnly {
+        let racing = Arc::new(ReadOnly {
             inner: f.source.clone(),
             gets: Default::default(),
             collect: std::sync::Mutex::new(Some((
@@ -729,23 +930,26 @@ async fn backup_create_during_an_idle_pass() {
             collect_after: 0,
             fail_collect: false,
         });
+        let source: Store = racing.clone();
         let mut args = f.args();
         args.history = history;
         args.require_continuous = continuous;
-        let raced = create(&args, &source, "", &f.dest, "").await;
-        let refused = history == History::All && continuous.is_none();
-        assert_eq!(raced.is_err(), refused, "{history:?} {continuous:?}");
-        if refused {
-            // The next run lists after the pass.
-            create(&args, &source, "", &f.dest, "").await.unwrap();
-        }
-        let run_id = latest(&f.dest, "").await.unwrap().unwrap();
+        let run_id = create(&args, &source, "", &f.dest, "")
+            .await
+            .unwrap_or_else(|e| panic!("{history:?} {continuous:?}: {e:#}"));
+        assert!(
+            racing.collect.lock().unwrap().is_none(),
+            "the pass's delete ran"
+        );
+        assert_eq!(latest(&f.dest, "").await.unwrap().unwrap(), run_id);
         verify(&f.dest, "", &run_id, None).await.unwrap();
         let run = load(&f.dest, "", &run_id).await.unwrap();
         let actor = disk_actor(&run.actors[0]).unwrap();
+        assert_eq!(actor["status"], "copied");
         assert_eq!(actor["txid"], 2, "{history:?} {continuous:?}");
-        if continuous == Some(false) {
-            assert_eq!(array(&actor, "gaps").unwrap().len(), 1);
+        assert_eq!(array(&actor, "gaps").unwrap().len(), 0);
+        if history == History::All {
+            assert_eq!(actor["collected"], json!([gone[0]]));
         }
     }
 }
@@ -865,7 +1069,7 @@ async fn latest_digest_and_protected_app_membership_are_checked() {
 }
 
 #[tokio::test]
-async fn historical_get_gap_splits_ranges_and_requires_opt_out() {
+async fn a_collected_historical_segment_splits_ranges_without_a_gap() {
     for continuous in [true, false] {
         let mut f = Fixture::new().await;
         f.increment().await;
@@ -925,8 +1129,11 @@ async fn historical_get_gap_splits_ranges_and_requires_opt_out() {
         });
         let mut args = f.args();
         args.require_continuous = Some(continuous);
-        let result = create(&args, &source, "", &f.dest, "").await;
-        assert_eq!(result.is_err(), continuous);
+        // Segment 2 went from below the snapshot at 4 and its segment: a
+        // collection (cut short, or its deletes landing one at a time) may
+        // leave exactly this. Not a gap, so the continuous run completes;
+        // the ranges still record what was archived.
+        create(&args, &source, "", &f.dest, "").await.unwrap();
         let id = latest(&f.dest, "").await.unwrap().unwrap();
         let run = load(&f.dest, "", &id).await.unwrap();
         let actor = disk_actor(&run.actors[0]).unwrap();
@@ -934,8 +1141,9 @@ async fn historical_get_gap_splits_ranges_and_requires_opt_out() {
             actor["ranges"],
             json!([{"generation":1,"start":1,"end":1},{"generation":1,"start":4,"end":4}])
         );
-        assert_eq!(array(&actor, "gaps").unwrap().len(), 1);
-        assert_eq!(verify(&f.dest, "", &id, None).await.is_err(), continuous);
+        assert_eq!(array(&actor, "gaps").unwrap().len(), 0);
+        assert_eq!(array(&actor, "collected").unwrap().len(), 1);
+        verify(&f.dest, "", &id, None).await.unwrap();
     }
 }
 
@@ -1192,14 +1400,17 @@ async fn rereview_retry_observations_include_vanished_non_head() {
         all: true,
     };
     let actor = copier.actor(prefix, initial, None).await.unwrap();
-    assert!(
-        array(&actor, "gaps")
-            .unwrap()
-            .contains(&json!(snapshot_key(SegmentId {
-                generation: 1,
-                txid: 1
-            })))
+    // Every key observed by any attempt is accounted for: the first
+    // snapshot, gone from below the second and its segment, as collected;
+    // the head the first listing named, which nothing explains, as a gap.
+    assert_eq!(
+        actor["collected"],
+        json!([snapshot_key(SegmentId {
+            generation: 1,
+            txid: 1
+        })])
     );
+    assert_eq!(actor["gaps"], json!([missing]));
 }
 
 #[tokio::test]
