@@ -9,6 +9,13 @@ use wasmkeep_sdk::{
 thread_local! {static ROUND:std::cell::RefCell<Round>=std::cell::RefCell::new(Round::default());}
 /// The quiet room's idle alarm (room_cluster).
 const QUIET_IDLE_MS: u64 = 3000;
+/// room_scaling: the pusher's hysteresis as the test set it (`/test-hysteresis`), so a
+/// test holds a merge for as long as it needs and then releases it, rather than
+/// racing a timer.
+fn hysteresis_override() -> Option<u64> {
+    let rows = wasmkeep_sdk::storage::query("SELECT CAST(ms AS TEXT) FROM test_hysteresis", &[]).ok()?;
+    rows.values.first()?[0].as_str()?.parse().ok()
+}
 struct Guest;
 impl Actor for Guest {
     fn on_init() -> Result<(), String> {
@@ -56,11 +63,13 @@ impl Actor for Guest {
         // capacity a second later), and the sockets miss a node. R6 is about
         // spreading and failover, not merging: the default minute. R4/R5
         // (room_scaling) prove merges with 1 s.
-        .with_hysteresis(if matches!(a.name.as_str(), "big" | "small") {
-            60_000
-        } else {
-            1000
-        });
+        .with_hysteresis(hysteresis_override().unwrap_or(
+            if matches!(a.name.as_str(), "big" | "small") {
+                60_000
+            } else {
+                1000
+            },
+        ));
         // room_cluster: a quiet room whose idle alarm is short enough to test.
         if a.name == "quiet" {
             pusher::handler::idle_period(QUIET_IDLE_MS);
@@ -88,6 +97,18 @@ impl http::Guest for Guest {
         let path = req.path_with_query().unwrap_or_default();
         // The pusher tests (room_cluster): a room event that traps, a slow
         // edge, and the pusher's children by name.
+        if let Some(ms) = path.strip_prefix("/test-hysteresis?ms=") {
+            let ms: u64 = ms.parse().unwrap_or(1000);
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS test_hysteresis (ms INTEGER NOT NULL)".to_owned(),
+                "DELETE FROM test_hysteresis".to_owned(),
+                format!("INSERT INTO test_hysteresis VALUES ({ms})"),
+            ] {
+                wasmkeep_sdk::storage::query(&sql, &[]).unwrap();
+            }
+            http::respond(out, 200, "text/plain", b"ok");
+            return;
+        }
         if path == "/test-trap" {
             panic!("a room event that traps");
         }

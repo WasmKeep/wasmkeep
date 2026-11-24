@@ -317,6 +317,12 @@ pub fn fetch_all(
         // Wait for any of them, and for a moment when one is to be retried
         // (then something is always waited for: polling nothing traps).
         let mut pollables: Vec<Pollable> = states.iter().filter_map(State::pollable).collect();
+        // Every request that was open is done, and others are still to
+        // start: there is nothing to wait for, so start them.
+        if pollables.is_empty() && !retrying {
+            waited = false;
+            continue;
+        }
         let clock = retrying.then(|| {
             pollables.push(monotonic_clock::subscribe_duration(RETRY_WAIT));
             pollables.len() - 1

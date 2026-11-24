@@ -460,6 +460,23 @@ async fn check_batches(lang: &str, wasm: &[u8]) {
         "{lang}: the host's limit per actor"
     );
     eprintln!("{lang}: 20 x /slow at once: {} ms", took.as_millis());
+    // Twenty failures, which come at once (a refused connection): when the
+    // batch next looks, the sixteen open requests are done and four are
+    // still to start. It must start them, not wait for requests that are gone
+    // (waiting on nothing traps the guest).
+    refused_batch(lang, addr, closed, 0).await;
+}
+
+/// `fetch_all` of twenty requests to `closed`, each sending `send` bytes:
+/// twenty `error: ` answers.
+async fn refused_batch(lang: &str, addr: SocketAddr, closed: SocketAddr, send: usize) {
+    let twenty = vec![(send, format!("http://{closed}/ok")); 20];
+    let (got, _) = fetch_all_from_guest(addr, &twenty, false).await;
+    assert_eq!(got.len(), 20, "{lang}: {got:?}");
+    assert!(
+        got.iter().all(|a| a.starts_with("error: ")),
+        "{lang}: {got:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -484,6 +501,12 @@ async fn rust_batches() {
         "rust: 4 x /slow one after the other: {} ms",
         took.as_millis()
     );
+    // The same twenty refusals with 200 kB bodies: writing the bodies takes
+    // longer than the refusals, so all sixteen open requests are done at the
+    // batch's first look (every time, where the 20 x /slow above and the
+    // bodiless twenty only end together on a loaded machine). Left to the
+    // Rust guest, whose bodies are cheap to build.
+    refused_batch("rust", addr, REFUSING, 200_000).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

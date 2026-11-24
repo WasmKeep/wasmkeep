@@ -176,6 +176,12 @@ export function fetchAll(requests: FetchRequest[]): FetchResult[] {
       else if (it.phase === "body") pollables.push(it.stream!.subscribe());
       else if (it.phase === "trailers") pollables.push(it.trailers!.subscribe());
     }
+    // Every request that was open is done, and others are still to start:
+    // there is nothing to wait for, so start them.
+    if (pollables.length === 0 && !retrying) {
+      waited = false;
+      continue;
+    }
     const clock = retrying ? pollables.push(subscribeDuration(RETRY_WAIT)) - 1 : -1;
     const ready = poll(pollables);
     waited = clock >= 0 && Array.from(ready).includes(clock);
