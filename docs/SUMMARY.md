@@ -45,7 +45,7 @@
 - [Upgrade a cluster to 0.5.0](deploy/upgrading-to-0.5.md)
 - [Upgrade a cluster to 0.6.0](deploy/upgrading-to-0.6.md)
 - [Upgrade a cluster to 0.7.0](deploy/upgrading-to-0.7.md)
-- [Upgrade a cluster to 0.8.0 (unreleased)](deploy/upgrading-to-0.8.md)
+- [Upgrade a cluster to 0.8.0](deploy/upgrading-to-0.8.md)
 - [Monitoring](monitoring.md)
 - [Troubleshooting](troubleshooting.md)
 - [Resuming destructive operations](operations.md)
@@ -112,5 +112,5 @@ are designs, not available capabilities. -->
 - [0039 The change feed (accepted, as built)](adr/0039-the-change-feed.md)
 - [0040 Directory, broadcast groups and the reconnecting room (accepted, as built)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
 - [0041 Placement at wake-up](adr/0041-placement-at-wake-up.md)
-- [0042 Compacting an idle actor's history (proposed)](adr/0042-compacting-an-idle-actors-history.md)
+- [0042 Compacting an idle actor's history](adr/0042-compacting-an-idle-actors-history.md)
 

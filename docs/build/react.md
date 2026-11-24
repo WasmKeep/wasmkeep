@@ -15,7 +15,7 @@ Applies to: WasmKeep `0.6.0` and later (static assets are new in `0.6.0`;
 its background, and the variables you set stay set. The finished app is
 [`examples/react-todos`](https://github.com/wasmkeep/wasmkeep/tree/main/examples/react-todos),
 and `scripts/tutorials/react.sh` runs this page's commands as written.
-Until `0.7.0` is on npm, install the SDK from a clone in step 2 instead
+Until `0.8.0` is on npm, install the SDK from a clone in step 2 instead
 (`npm install --save-exact <clone>/sdks/typescript`, after `npm ci` in the
 clone's `sdks/typescript`), as in
 [starting a project](../tutorials/first-actor.md#starting-a-project-with-wasmkeep-new).
@@ -70,7 +70,7 @@ types TypeScript needs for React; there is no UI library:
 
 <!-- test: install -->
 ```bash
-npm install --save-exact @wasmkeep/sdk@0.7.0 react@19.3.1 react-dom@19.3.1
+npm install --save-exact @wasmkeep/sdk@0.8.0 react@19.3.1 react-dom@19.3.1
 npm install --save-dev --save-exact typescript@5.9.3 vite@8.3.8 \
   @vitejs/plugin-react@6.3.0 @types/react@19.3.0 @types/react-dom@19.3.0
 ```

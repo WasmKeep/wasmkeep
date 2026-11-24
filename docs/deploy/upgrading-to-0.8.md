@@ -1,8 +1,5 @@
 # Upgrade a cluster to 0.8.0
 
-> **For the next release, 0.8.0 (unreleased).** This page describes what
-> `main` does now; it will be final when 0.8.0 is cut.
-
 0.8.0 hardens what a node accepts and writes: private env files, data and
 cache directories, bounded request heads, upload budgets, tighter SQLite
 limits, and a metrics listener that checks its `Host`. Ports, routes, exit
@@ -98,5 +95,5 @@ node refuses an env file, a secrets key or a cache it should not trust.
   retries, and is not ready until it can, instead of dropping the app.
   A rollback racing `wasmkeep app delete` is refused. Nothing to do.
 - **Placement.** A room and its pusher wake on different nodes by default,
-  and a big room's edges spread over the nodes; see the Unreleased notes in
+  and a big room's edges spread over the nodes; see the 0.8.0 notes in
   the [changelog](../../CHANGELOG.md). Nothing to deploy.

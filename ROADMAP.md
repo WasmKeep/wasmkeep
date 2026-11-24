@@ -6,57 +6,59 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0` and `0.7.0`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0` and `0.8.0`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.8.0`: **a big room that needs no hand placement.** 0.7.0 released big
-rooms (what each brings is under [Built](#built); the limits known at
-release are in the [changelog](CHANGELOG.md)), but keeping a room and its
-pusher on different nodes is still the operator's. In this order:
+`0.8.1`: **0.8 settled.** No new feature. `0.8.0` made a big room need
+no hand placement (what it brings is under [Built](#built); the limits
+known at release are in the [changelog](CHANGELOG.md)). This release
+closes what it left open:
 
-1. **A room and its pusher kept apart at wake-up** (S/M): built, by
-   default for the SDKs' class names, with moving the pusher by hand as
-   the fallback ([how](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node));
-   its fleet measure, with default placement and after a rolling
-   restart, is still to run.
-2. **A room's edges on several nodes** (M): built, by default for the
-   SDKs' class names: each edge wakes on the rendezvous choice over the
-   live nodes ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22));
-   its fleet measure (`actor where` showing edges on two nodes or more,
-   20 s into a 4,500-client hold and after one rolling restart) is still
-   to run.
-3. **The upload tail** (M): a large room's delivery tail depends on
-   segment-upload latency from the room's node.
-4. **Compacting idle actors' histories** (M), last, the other half of a
-   faster change feed: listing is parallel in 0.7.0, but a poll still
-   lists every object of a long history. Designed in
-   [ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md)
-   (proposed): a snapshot at the head when an actor hibernates, and one
-   retention window later the existing collection under a fresh hold,
-   without moving the head. The rule and its simulation are in; the
-   server's snapshot and pass are next.
+1. **Availability follow-ups** (M): reads of other nodes' leases that
+   never trust an older copy, and the remaining follow-ups of the slow
+   bucket work in `0.7.0`.
+2. **Limits a guest can reach** (S/M): a configurable SQLite memory cap,
+   `LIKE` and `GLOB` under the statement's budgets, caps on open file
+   reads.
+3. **Idle history compaction, observed** (S): built and tested in
+   `0.8.0` ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md));
+   still to be watched on a cluster left running longer than its
+   retention window, and simulated against a backup that reads meanwhile.
+4. **The mixed-version check as a gate** (M): three nodes moved one at a
+   time from the previous release to this one, and back
+   ([releasing](docs/releasing.md#the-mixed-version-check)). Whether this
+   release can be installed one node at a time is stated on its upgrading
+   page, from that check's result.
 
 ## Next
 
-After 0.8.0, the items below, not before it.
+`0.9.0`: **operating without the author.** Not before the release above.
+
+1. **Rolling upgrades of WasmKeep** (L): one node at a time from the
+   previous minor version, with no stop of the whole cluster and no
+   offline migration. Two consecutive versions work in one cluster, and
+   a new bucket format is written only once every node reads it. Today
+   every node is upgraded together unless a release's page says
+   otherwise ([how](docs/cluster.md#upgrading-wasmkeep)).
+2. **Verify a bucket** (M/L): a read-only command that checks every
+   actor can be restored from what the bucket holds.
+3. **Traces** (M/L): one request followed through the front, its actor,
+   the calls it makes, the hop between nodes and the bucket write.
+4. **Old upgrade paths removed** (M), each with a documented last
+   version that carries it.
 
 ## After that
 
 Not before the releases above.
 
-- **Operating without the author**: mixed versions during an upgrade
-  (today every node is upgraded together, `0.4.0` to `0.4.1`,
-  `0.4.1` to `0.4.2` and `0.5.x` to `0.6.0` aside, [how](docs/cluster.md#upgrading-wasmkeep));
-  verify a bucket; traces; a write acknowledged once another node holds
-  it, if measuring shows it is worth its design; asynchronous handlers once WebAssembly's
-  next system interface (WASI 0.3) is ready in Wasmtime and the SDK tools,
-  keeping one event at a time per actor by default. Required before a stable `1.0`: within `1.x`,
-  every upgrade is rolling, one node at a time, with no stop of the whole
-  cluster and no offline migration. Two consecutive versions work in one
-  cluster, and a new bucket format is written only once every node reads
-  it.
+- **Operating without the author, continued**: a write acknowledged once
+  another node holds it, if measuring shows it is worth its design;
+  asynchronous handlers once WebAssembly's next system interface (WASI
+  0.3) is ready in Wasmtime and the SDK tools, keeping one event at a
+  time per actor by default. Required before a stable `1.0`: within
+  `1.x`, every upgrade is rolling, one node at a time.
 - **Faster, and compared.** Performance targets on dedicated hardware
   with a stated scale envelope; the comparison with celld on a cloud bucket
   with a node per machine
@@ -336,6 +338,26 @@ Started alongside M3; what is left of it is under [Now](#now) and
   room and its pusher on different nodes: 4,500 clients at 10 messages/s
   with delivery p99 under 1 s, 6,000 the measured edge
   ([measured](bench/results/2026-11-22-43119bd-room-group-ovh-bhs-3vps-r07-room-apart.json)).
+- In `0.8.0`, a big room that needs no hand placement: a room and its
+  pusher wake on different nodes by default
+  ([ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)),
+  and a room's edges wake spread over the nodes
+  ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
+  Measured on three nodes and a real bucket with default placement:
+  4,500 clients at 10 messages/s with delivery p99 under 1 s, the layout
+  kept through a rolling restart; 6,000 missed narrowly
+  ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-080)).
+- In `0.8.0`, an idle actor's history compacted: a snapshot at the head
+  when it hibernates, and the history below it collected a retention
+  window later
+  ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md)).
+- In `0.8.0`, a quiet room's first publish after a full hibernation is
+  pushed, not fetched by every client
+  ([ADR 0040, section 13](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#13-the-pusher-amended-2026-11-20)).
+- In `0.8.0`, hardening from an internal audit of the guest boundary,
+  the cluster's signatures, uploads and local files
+  ([security](docs/security.md),
+  [upgrading](docs/deploy/upgrading-to-0.8.md)).
 
 ## Stretch goal: the benchmark showdown
 
