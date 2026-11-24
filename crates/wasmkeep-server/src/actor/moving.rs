@@ -226,7 +226,7 @@ impl ActorState {
             return MoveOut::Busy;
         }
         if !self.held.as_ref().is_some_and(Held::is_valid) {
-            self.drop_hold(Dropped::Lapse);
+            self.drop_hold(self.invalid_hold_reason());
             return MoveOut::NotHeld;
         }
         // A batched hold flushes first, within 20 s, and the move is
