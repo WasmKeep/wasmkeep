@@ -520,11 +520,7 @@ fn pattern_compare(
             if c == c2 {
                 continue;
             }
-            if w.no_case
-                && c < 0x80
-                && c2 < 0x80
-                && (c as u8).to_ascii_lowercase() == (c2 as u8).to_ascii_lowercase()
-            {
+            if w.no_case && c < 0x80 && c2 < 0x80 && (c as u8).eq_ignore_ascii_case(&(c2 as u8)) {
                 continue;
             }
             if c == w.one && escaped != Some(pi) && c2 != 0 {
