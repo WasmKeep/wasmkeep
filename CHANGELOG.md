@@ -9,6 +9,19 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+- Calls between nodes: a node call's signature (`x-wasmkeep-internal`)
+  is checked once on arrival, by the runtime that serves the request, and
+  every later check of that request reads the result (a hop refused there
+  stays refused); one code path signs every hop, and one function sends a
+  client's request forwarded to its actor's owner. What is signed and
+  sent is unchanged byte for byte (pinned by tests), so 0.8.0 and later
+  nodes verify each other. `wasmkeep_signatures_bad_total` counts a bad
+  signature once per request: on the cluster port now too, and, when
+  plain HTTP between nodes is accepted, junk in that header on the public
+  port. A request to a front path carrying the header is now judged on
+  arrival like any other: in refuse mode a valid signature there is
+  spent on the public port (never honoured on the cluster port), and in
+  accept mode a bad one is counted and logged.
 - Cluster availability: a request kept for a dead node's actors is no
   longer kept for a peer that only could not be read, or for a body
   older than one already read; a round has at most 32 heartbeat reads in

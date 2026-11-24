@@ -1003,16 +1003,11 @@ impl ActorService {
         self.inner.cluster.as_ref()?.tls().cloned()
     }
 
-    /// Why a signed hop in `req` must answer 503 rather than run as a
-    /// client's request (see `Cluster::hop_refused`).
-    pub(crate) fn hop_refused<B>(&self, req: &hyper::Request<B>) -> Option<&'static str> {
-        let cluster = self.inner.cluster.as_ref()?;
-        let on_cluster_port = req
-            .extensions()
-            .get::<crate::http::ArrivedOnClusterPort>()
-            .is_some();
-        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
-        cluster.hop_refused(req.method(), path, req.headers(), on_cluster_port)
+    /// Judges the signature of `req` once, for every handler after the
+    /// router (`Cluster::judge_hop`): why it must answer 503 rather than
+    /// run as a client's request, if it must.
+    pub(crate) fn judge_hop<B>(&self, req: &mut hyper::Request<B>) -> Option<&'static str> {
+        self.inner.cluster.as_ref()?.judge_hop(req)
     }
 
     /// Whether every actor has ended, its resources closed, within `limit`.

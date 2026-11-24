@@ -305,8 +305,7 @@ impl Cluster {
                 std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))
             }
         };
-        let secret = format!("wasmkeep-ingress-identity-v2:{secret}");
-        let ts = now_ms();
+        let key = format!("wasmkeep-ingress-identity-v2:{secret}");
         let charged = u8::from(req.extensions().get::<IngressCharged>().is_some());
         let mut nonce = format!("{charged}{:032x}", u128::from(ip));
         if charged != 0 {
@@ -316,24 +315,18 @@ impl Cluster {
             nonce.push_str(&body_sha256(self.nonce().as_bytes())[..31]);
         }
         let body = identity_headers(req.headers());
-        let mac = signature(
-            &secret,
-            ts,
-            &nonce,
-            owner,
-            req.method(),
+        let method = req.method().clone();
+        // The proof's MAC is under the derived key; its sender's, as every
+        // sender's, under the cluster secret itself.
+        let v4 = V4 {
+            key: &key,
+            nonce: &nonce,
+            to: owner,
+            method: &method,
             path,
-            &body,
-            req.headers(),
-        );
-        req.headers_mut().insert(
-            ADMITTED,
-            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body} {mac}"))
-                .map_err(|e| e.to_string())?,
-        );
-        let cluster_secret = self.secret.get().map(String::as_str).unwrap_or_default();
-        self.add_sender(req.headers_mut(), cluster_secret, "admitted", &mac);
-        Ok(())
+            body: &body,
+        };
+        self.sign_hop(req.headers_mut(), HopKind::Admitted, secret, &v4)
     }
 
     /// A forward's proof ([`ADMITTED`]) that checks: its signature over
@@ -372,7 +365,7 @@ impl Cluster {
         match self.sender_checked(
             req.headers(),
             self.secret.get()?,
-            "admitted",
+            HopKind::Admitted,
             given,
             path,
             on_cluster_port,

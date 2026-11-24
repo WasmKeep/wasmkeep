@@ -372,6 +372,10 @@ pub(crate) fn rendezvous<'a>(
 /// This node's cluster membership and lease client.
 pub(crate) struct Cluster {
     pub(crate) node_id: String,
+    /// This runtime's random instance (as in its heartbeat): every app of a
+    /// process shares the node id, never this. Tags the router's verdicts
+    /// ([`CheckedHop`]).
+    instance: String,
     /// What this node serves (see `NodeInfo::app`).
     serves: String,
     /// Node signatures already accepted (replay protection).
@@ -700,13 +704,40 @@ impl Peer {
 }
 
 /// The three clients a node uses to reach its peers.
-struct Clients {
+pub(crate) struct Clients {
     /// Forwarded requests.
     request: Client<ClusterConnector, Incoming>,
     /// WebSocket upgrades sent to another node.
     upgrade: Client<ClusterConnector, http_body_util::Empty<bytes::Bytes>>,
     /// `actors.call` to another node.
     call: Client<ClusterConnector, http_body_util::Full<bytes::Bytes>>,
+}
+
+/// A body a forward sends ([`Cluster::forward`]), each on the peer
+/// client built for it.
+pub(crate) trait ForwardBody:
+    hyper::body::Body<Data = bytes::Bytes, Error: Into<Box<dyn std::error::Error + Send + Sync>>>
+    + Send
+    + Unpin
+    + 'static
+    + Sized
+{
+    /// The client that sends it.
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self>;
+}
+
+/// A client's request, its body streaming through.
+impl ForwardBody for Incoming {
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self> {
+        clients.request.clone()
+    }
+}
+
+/// A request whose body was read into memory.
+impl ForwardBody for http_body_util::Full<bytes::Bytes> {
+    fn client(clients: &Clients) -> Client<ClusterConnector, Self> {
+        clients.call.clone()
+    }
 }
 
 /// How long a connection to a peer may wait idle in a client's pool. Below
@@ -843,6 +874,7 @@ impl Cluster {
             seen_public: SeenSignatures::public().started_now(skew),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
+            instance: instance.clone(),
             owners: Owners::new(
                 bucket,
                 SystemClock,
@@ -1497,16 +1529,15 @@ impl Cluster {
         path: &str,
         body_hash: &str,
     ) -> Result<(), String> {
-        let ts = now_ms();
-        let nonce = self.nonce();
-        let mac = signature(secret, ts, &nonce, to, method, path, body_hash, headers);
-        headers.insert(
-            INTERNAL,
-            hyper::header::HeaderValue::from_str(&format!("v4 {ts} {nonce} {body_hash} {mac}"))
-                .map_err(|e| e.to_string())?,
-        );
-        self.add_sender(headers, secret, "internal", &mac);
-        Ok(())
+        let v4 = V4 {
+            key: secret,
+            nonce: &self.nonce(),
+            to,
+            method,
+            path,
+            body: body_hash,
+        };
+        self.sign_hop(headers, HopKind::Call, secret, &v4)
     }
 
     /// The cluster secret: created by the first node that needs it
@@ -1572,13 +1603,17 @@ impl Cluster {
         }
     }
 
-    /// Whether a request comes from another node of this cluster: its
-    /// signature matches `method`, `path` (as sent, `/actor/...`), its
-    /// caller and chain headers, and a timestamp within a minute. Uses the
-    /// secret only if already loaded (never fetches it for a stranger).
+    /// What a request's [`INTERNAL`] signature makes of it, checked once
+    /// for the hop (ADR 0038, section 5): a node's call, a hop refused
+    /// with 503, or a client's request. The signature matches `method`,
+    /// `path` (as sent, `/actor/...`), the signed headers, this node's id
+    /// and a timestamp within a minute, and the sender it names checks
+    /// ([`Self::sender_checked`]). Uses the secret only if already loaded
+    /// (never fetches it for a stranger).
     ///
-    /// Returns the signature: the request is a node's only if its body
-    /// matches [`Signed::body`] and [`Cluster::first_use`] accepts it.
+    /// [`HopCheck::Signed`] holds the signature: the request is a node's only if
+    /// its body matches [`Signed::body`] and [`Cluster::first_use`] accepts
+    /// it.
     ///
     /// In refuse mode, only a request that arrived on the cluster port
     /// (`on_cluster_port`) can be a node's: on the public port the request
@@ -1588,20 +1623,31 @@ impl Cluster {
     /// the cluster port later. That record is bounded and, full, drops new
     /// ones rather than refusing anything: the cluster port's mutual TLS
     /// remains what keeps such a copy out then.
-    pub(crate) fn is_internal(
+    ///
+    /// Refused ([`HopCheck::Refused`]), rather than served as a client's: a
+    /// signature that does not hold on the cluster port, or with no secret
+    /// loaded yet there, and on any port a sender that is forged, named
+    /// twice, of another app or (on the cluster port) not live. The caller
+    /// logs a refusal; this logs and counts the rest.
+    pub(crate) fn check_hop(
         &self,
         method: &hyper::Method,
         path: &str,
         headers: &hyper::HeaderMap,
         on_cluster_port: bool,
-    ) -> Option<Signed> {
-        let given = headers.get(INTERNAL).and_then(|v| v.to_str().ok())?;
+    ) -> HopCheck {
+        let Some(given) = headers.get(INTERNAL).and_then(|v| v.to_str().ok()) else {
+            return HopCheck::Outside;
+        };
         let public_port = self.refuse_plaintext && !on_cluster_port;
         let Some(secret) = self.secret.get() else {
-            if !public_port {
-                self.note_refused("cluster secret not loaded yet");
+            if on_cluster_port {
+                return HopCheck::Refused(SECRET_NOT_LOADED);
             }
-            return None;
+            if !public_port {
+                self.note_refused(SECRET_NOT_LOADED);
+            }
+            return HopCheck::Outside;
         };
         let now = now_ms();
         match verify(secret, given, now, &self.node_id, method, path, headers) {
@@ -1612,40 +1658,119 @@ impl Cluster {
                 // this record is full.
                 self.seen_public.spend(signed.mac, signed.ts, now);
                 self.note_refused("signed call on the public port, treated as from outside (--cluster-plaintext refuse)");
-                None
+                HopCheck::Outside
             }
             Some(signed) => {
-                match self.sender_checked(headers, secret, "internal", given, path, on_cluster_port)
-                {
-                    Ok(sender) => Some(Signed { sender, ..signed }),
-                    Err(why) => {
-                        self.note_refused(why);
-                        None
-                    }
+                match self.sender_checked(
+                    headers,
+                    secret,
+                    HopKind::Call,
+                    given,
+                    path,
+                    on_cluster_port,
+                ) {
+                    Ok(sender) => HopCheck::Signed(Signed { sender, ..signed }),
+                    Err(why) => HopCheck::Refused(why),
                 }
             }
             // Junk on the public port is an outside request like any other.
-            None if public_port => None,
+            None if public_port => HopCheck::Outside,
             None => {
                 crate::metrics::inc(&crate::metrics::METRICS.signatures_bad);
-                self.note_refused("bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)");
-                None
+                if on_cluster_port {
+                    return HopCheck::Refused(BAD_SIGNATURE);
+                }
+                self.note_refused(BAD_SIGNATURE_WHY);
+                HopCheck::Outside
             }
         }
     }
 
-    /// Whether the connection a signed hop came on (`peer`, on the cluster
-    /// port) is the one its [`SENDER`] names: that node's own live
-    /// heartbeat publishes the pin presented. A hop without a sender (a
-    /// node of an older version) or over plain HTTP passes here.
-    /// Names this node as the sender of a hop it signed (ADR 0038,
-    /// section 5), bound to the hop's own signature `mac`.
-    fn add_sender(&self, headers: &mut hyper::HeaderMap, secret: &str, kind: &str, mac: &str) {
-        if let Ok(v) =
-            hyper::header::HeaderValue::from_str(&sender_value(secret, kind, mac, &self.node_id))
-        {
-            headers.insert(SENDER, v);
+    /// The signature of a node's call in `headers` ([`Self::check_hop`]),
+    /// for a request no router judged first (a hello): a refusal is logged
+    /// here.
+    pub(crate) fn is_internal(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<Signed> {
+        match self.check_hop(method, path, headers, on_cluster_port) {
+            HopCheck::Signed(signed) => Some(signed),
+            HopCheck::Refused(why) => {
+                self.note_refused(if why == BAD_SIGNATURE {
+                    BAD_SIGNATURE_WHY
+                } else {
+                    why
+                });
+                None
+            }
+            HopCheck::Outside => None,
         }
+    }
+
+    /// The signature of a node's call in `req`, as this runtime's router
+    /// judged it on arrival ([`CheckedHop`]); judged now if it was not, or
+    /// by another runtime (another app of the process, under the same node
+    /// id). `Ok(None)`: a client's request. `Err`: a hop refused, answered
+    /// with [`hop_refusal`], never served as a client's.
+    pub(crate) fn signed_hop<B>(&self, req: &Request<B>) -> Result<Option<Signed>, &'static str> {
+        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
+            && *by == self.instance
+        {
+            return match hop {
+                HopCheck::Signed(signed) => Ok(Some(signed.clone())),
+                HopCheck::Refused(why) => Err(why),
+                HopCheck::Outside => Ok(None),
+            };
+        }
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        match self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port) {
+            HopCheck::Signed(signed) => Ok(Some(signed)),
+            HopCheck::Refused(why) => {
+                self.note_refused(if why == BAD_SIGNATURE {
+                    BAD_SIGNATURE_WHY
+                } else {
+                    why
+                });
+                Err(why)
+            }
+            HopCheck::Outside => Ok(None),
+        }
+    }
+
+    /// Why [`Self::check_hop`] refuses a hop with 503, if it does.
+    #[cfg(test)]
+    pub(super) fn hop_refused(
+        &self,
+        method: &hyper::Method,
+        path: &str,
+        headers: &hyper::HeaderMap,
+        on_cluster_port: bool,
+    ) -> Option<&'static str> {
+        match self.check_hop(method, path, headers, on_cluster_port) {
+            HopCheck::Refused(why) => Some(why),
+            HopCheck::Signed(_) | HopCheck::Outside => None,
+        }
+    }
+
+    /// Judges `req`'s signature once ([`Self::check_hop`]) and keeps the
+    /// verdict on it ([`CheckedHop`]) for the handlers after the router:
+    /// why it must be refused with 503 rather than served as a client's
+    /// request, if it must.
+    pub(crate) fn judge_hop<B>(&self, req: &mut Request<B>) -> Option<&'static str> {
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        let hop = self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port);
+        let refused = match &hop {
+            HopCheck::Refused(why) => Some(*why),
+            HopCheck::Signed(_) | HopCheck::Outside => None,
+        };
+        req.extensions_mut().insert(CheckedHop {
+            by: self.instance.clone(),
+            hop,
+        });
+        refused
     }
 
     /// The sender a signed hop names, checked (ADR 0038, section 5): bound
@@ -1659,7 +1784,7 @@ impl Cluster {
         &self,
         headers: &hyper::HeaderMap,
         secret: &str,
-        kind: &str,
+        kind: HopKind,
         given: &str,
         path: &str,
         on_cluster_port: bool,
@@ -1680,7 +1805,7 @@ impl Cluster {
         let sender = first
             .to_str()
             .ok()
-            .and_then(|v| verify_sender(secret, kind, primary, v))
+            .and_then(|v| verify_sender(secret, kind.sender_kind(), primary, v))
             .ok_or("hop's sender is not bound to its signature")?;
         if path == HELLO_PATH {
             return Ok(Some(sender));
@@ -1704,43 +1829,6 @@ impl Cluster {
                 Err("hop's sender is not a live node")
             }
             None => Ok(Some(sender)),
-        }
-    }
-
-    /// Why a signed hop must be refused with 503 rather than served as a
-    /// client's request (ADR 0038, section 5): its sender is forged, of
-    /// another app or not live, or, on the cluster port, its signature does
-    /// not hold. `None` for a hop accepted, or for a request that is no
-    /// node's (no signature, or junk on the public port).
-    pub(crate) fn hop_refused(
-        &self,
-        method: &hyper::Method,
-        path: &str,
-        headers: &hyper::HeaderMap,
-        on_cluster_port: bool,
-    ) -> Option<&'static str> {
-        let given = headers.get(INTERNAL)?.to_str().ok()?;
-        if self.refuse_plaintext && !on_cluster_port {
-            // The public port in refuse mode: never a node's call.
-            return None;
-        }
-        let Some(secret) = self.secret.get() else {
-            return on_cluster_port.then_some("cluster secret not loaded yet");
-        };
-        match verify(
-            secret,
-            given,
-            now_ms(),
-            &self.node_id,
-            method,
-            path,
-            headers,
-        ) {
-            Some(_) => self
-                .sender_checked(headers, secret, "internal", given, path, on_cluster_port)
-                .err(),
-            None if on_cluster_port => Some("bad, expired or misaddressed signature"),
-            None => None,
         }
     }
 
@@ -2764,47 +2852,20 @@ impl Cluster {
         Ok(base)
     }
 
-    /// [`Self::forward`] for a request whose body was read into memory (a
-    /// placed request that ran here after all, ADR 0041, section 6, whose
-    /// actor another node took meanwhile). Answered as a forward is.
-    pub(crate) async fn forward_buffered(
+    /// Forwards a request for an actor to the node that owns it: a
+    /// client's, its body streaming through ([`Incoming`]), or one whose
+    /// body was read into memory (a placed request that ran here after
+    /// all, ADR 0041, section 6, whose actor another node took meanwhile).
+    pub(crate) async fn forward<B: ForwardBody>(
         &self,
         owner: &str,
-        mut req: Request<http_body_util::Full<bytes::Bytes>>,
+        mut req: Request<B>,
     ) -> Response<HyperOutgoingBody> {
         let base = match self.prepare_forward(owner, &mut req).await {
             Ok(base) => base,
             Err(response) => return *response,
         };
-        let client = self.clients().call.clone();
-        match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
-            // The owner answered, so it read the request: it may have run.
-            Ok(Ok(response)) => self
-                .trusted_response(&base, owner, response)
-                .unwrap_or_else(|| outcome_unknown("the actor's node is no longer trusted")),
-            Ok(Err(e)) => {
-                self.failover.connect_failed(owner, &e);
-                tracing::warn!(owner, error = %e, "forwarding failed");
-                failed_forward(&base, &e)
-            }
-            Err(_) => mark_unknown(text_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "the actor's node did not answer in time\n",
-            )),
-        }
-    }
-
-    /// Forwards a request for an actor to the node that owns it.
-    pub(crate) async fn forward(
-        &self,
-        owner: &str,
-        mut req: Request<Incoming>,
-    ) -> Response<HyperOutgoingBody> {
-        let base = match self.prepare_forward(owner, &mut req).await {
-            Ok(base) => base,
-            Err(response) => return *response,
-        };
-        let client = self.clients().request.clone();
+        let client = B::client(&self.clients());
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
             // The owner answered, so it read the request: it may have run.
             Ok(Ok(response)) => self
@@ -2934,11 +2995,15 @@ fn random_hex(n: usize) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
+mod hop_check_tests;
+#[cfg(test)]
 mod placing_tests;
 #[cfg(test)]
 mod sender_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
 
 #[cfg(test)]
 mod state_keys_tests;

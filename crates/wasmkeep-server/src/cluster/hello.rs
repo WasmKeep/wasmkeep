@@ -87,7 +87,7 @@ impl Cluster {
     }
 
     /// One hello to `peer`: the status it answered.
-    async fn hello(&self, peer: &str) -> Result<StatusCode, String> {
+    pub(super) async fn hello(&self, peer: &str) -> Result<StatusCode, String> {
         let base = self
             .address_of(peer)
             .ok_or_else(|| format!("node {peer} is not reachable"))?;
