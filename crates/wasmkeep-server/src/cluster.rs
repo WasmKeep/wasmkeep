@@ -2934,6 +2934,8 @@ fn random_hex(n: usize) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
+mod hop_check_tests;
+#[cfg(test)]
 mod placing_tests;
 #[cfg(test)]
 mod sender_tests;
