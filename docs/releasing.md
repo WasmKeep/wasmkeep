@@ -68,8 +68,11 @@ deliveries), and never in pull request CI or in `check.sh`:
 
 ```bash
 ./scripts/mixed-version.sh            # from the previous release, v0.8.0 by default
-./scripts/mixed-version.sh v0.7.0     # or OLD_VERSION=v0.7.0
+./scripts/mixed-version.sh v0.8.0     # or OLD_VERSION=v0.8.0
 ```
+
+The old version must be 0.8.0 or later: the checks of rooms and pushers
+kept apart need it on both sides.
 
 It starts three nodes of the old release (downloaded with `gh` and checked
 against its `SHA256SUMS` and a SHA-256 pinned in the script) on a local
