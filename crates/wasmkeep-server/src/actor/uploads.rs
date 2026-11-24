@@ -818,12 +818,14 @@ impl ActorState {
 
     /// A clean stop's deadline passed with the hold not flushed: it ends
     /// given up, counted `stop` with the commits after its last boundary
-    /// (ADR 0034, section 10).
+    /// (ADR 0034, section 10), or `lost_lease` when the stop follows a lost
+    /// node lease.
     pub(super) fn give_up_at_stop(&mut self) {
         let unmarked = self.unmarked_commits();
+        let reason = self.lost_lease_or(Dropped::Stop);
         if let Some(hold) = self.held.take() {
             self.cancel_periodic_upload();
-            hold.drop_now_with(Dropped::Stop, u64::from(unmarked != Some(false)));
+            hold.drop_now_with(reason, u64::from(unmarked != Some(false)));
         }
     }
 

@@ -512,10 +512,17 @@ impl ActorState {
     /// `LostLease` once another writer replaced this node's lease (a fence,
     /// a twin, a deletion: the node stops), `Lapse` when it only ran out.
     pub(super) fn invalid_hold_reason(&self) -> Dropped {
+        self.lost_lease_or(Dropped::Lapse)
+    }
+
+    /// `LostLease` once another writer replaced this node's lease, else
+    /// `reason`: the stop that follows a lost lease counts what it gives up
+    /// as lost, not as the stop's.
+    pub(super) fn lost_lease_or(&self, reason: Dropped) -> Dropped {
         if self.cluster.as_ref().is_some_and(|c| c.identity_taken()) {
             Dropped::LostLease
         } else {
-            Dropped::Lapse
+            reason
         }
     }
 
@@ -1782,7 +1789,7 @@ impl ActorState {
                     // treating an incomplete activation as a flushed event.
                     self.drop_hold(match cut {
                         Cut::Lease => self.invalid_hold_reason(),
-                        Cut::Stop => Dropped::Stop,
+                        Cut::Stop => self.lost_lease_or(Dropped::Stop),
                         Cut::Wall(_) | Cut::Replica => Dropped::Failure,
                     });
                     self.activation_interrupted = true;

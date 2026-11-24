@@ -58,9 +58,10 @@ The text under a version's heading is its GitHub release text
   bucket key and Grafana password come from `WASMKEEP_DEMO_*` variables
   (a `.env` file), and their public defaults are marked insecure. A release
   tag must be a signed tag GitHub verifies. A batched write dropped because
-  another writer replaced the node's lease (a fence, a twin) now counts as
-  `lost_lease` in `wasmkeep_plain_events_dropped_total`, where it counted as
-  `lapse`; the label set is unchanged. An actor that traps on its full
+  another writer replaced the node's lease (a fence, a twin), or by the
+  stop that follows, now counts as `lost_lease` in
+  `wasmkeep_plain_events_dropped_total`, where it counted as `lapse` or
+  `stop`; the label set is unchanged. An actor that traps on its full
   resource table logs a line of its own, as the front does.
 
 ## 0.8.0

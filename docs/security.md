@@ -566,7 +566,7 @@ in ten parts (front door, guest boundary, cluster); each fix came with a
 test that fails without it. Later hardening: plain HTTP between nodes
 refused by default, outbound HTTP refusing the ports browsers block, and
 limits on what actors print reaching the node's log (all described above).
-In November 2026, before 0.8.0, a second internal review covered the
+In November 2026, before 0.8.0, another internal review covered the
 guest boundary, the cluster's signatures, uploads and local files; its
 fixes are in 0.8.0 and 0.8.1 (their release notes list what changed for
 operators). No independent third-party audit has been done yet.
