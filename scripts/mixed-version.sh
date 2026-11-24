@@ -104,13 +104,23 @@ label() { if [ "$1" = "$old_bin" ]; then echo "0.7.0"; else echo "main"; fi; }
 # v0.7.0 tree (the 0.7.0 SDK); test-actor from this checkout (the WIT is
 # unchanged since 0.7.0, and its probes are newer). The pusher is later
 # redeployed from this checkout's SDK alone, against the 0.7.0 room (#274).
-old_src=$mv_dir/src-$OLD_VERSION
+# Outside this checkout: inside it, the old crates would inherit this
+# workspace's version (version.workspace) instead of their own.
+old_src=${MIXED_VERSION_OLD_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/wasmkeep-mixed-version/src-$OLD_VERSION}
 if [ ! -f "$old_src/.complete" ]; then
   rm -rf "$old_src"; mkdir -p "$old_src"
   git archive "$OLD_VERSION" crates/wasmkeep-sdk crates/wasmkeep-wit \
     crates/wasmkeep-server/tests/guests/room-scaling \
     crates/wasmkeep-server/tests/guests/room-scaling-front rust-toolchain.toml \
     | tar -x -C "$old_src"
+  # The old crates inherit their version and settings from the old
+  # workspace root: keep it, with only the members extracted here.
+  git show "$OLD_VERSION:Cargo.toml" | python3 -c '
+import re, sys
+s = sys.stdin.read()
+s = re.sub(r"(?ms)^members\s*=\s*\[.*?\]", "members = [\"crates/wasmkeep-sdk\", \"crates/wasmkeep-wit\"]", s, count=1)
+s = re.sub(r"(?ms)^default-members\s*=\s*\[.*?\]\n?", "", s)
+sys.stdout.write(s)' > "$old_src/Cargo.toml"
   touch "$old_src/.complete"
 fi
 guest() { (cd "$1" && cargo build -j 4 --release --locked --target wasm32-wasip2 -q); }
