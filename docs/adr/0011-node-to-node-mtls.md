@@ -314,7 +314,10 @@ its readiness waits a period and a half for them to have listed it.
   late.
 - **An unknown pin** knocking still makes the node list sooner, as
   before; with the scheduled listing every ten periods it also covers a
-  node whose hello was lost.
+  node whose hello was lost. Since [ADR 0020](0020-one-lease-per-node.md)'s
+  amendment of 2026-11-24 (availability), the node also reads by key the
+  node its certificate names, a few names a period: the name is a hint
+  of what to read, never trusted itself.
 
 ### What got slower, worst cases at the defaults
 

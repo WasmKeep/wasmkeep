@@ -56,6 +56,14 @@
   the record. Also defines the app's upgrade floor record, read at start.
   See "Amendment of 2026-11-24: lease reads, and the upgrade floor" at the
   end.
+- Amended 2026-11-24 (0.8.1): availability. The failover wait ignores a
+  body kept after a failed read or older than one the process read; a
+  round has at most 32 reads in flight; a node found gone leaves the live
+  senders at once and is forgotten once no earlier read can land; a
+  runtime joining a process that holds heartbeats reads them by key
+  first; over TLS, the name on an unknown certificate is read by key; the
+  hellos wait for a live peer of this app. No lease rule changes. See
+  "Amendment of 2026-11-24: availability" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -852,7 +860,8 @@ listing's reads after its LIST were sequential too.
 - **At once, each within an attempt.** A round reads the objects of every
   node it knows at once, each within one read attempt
   (`heartbeat_read_attempt`: the lease attempt, 2.67 s at the defaults, at
-  most a heartbeat period but never under 1 s). A listing reads what it
+  most a heartbeat period but never under 1 s), up to 32 in flight
+  (amendment of 2026-11-24, availability). A listing reads what it
   lists at once too (up to 16 reads in flight), the listing and its reads
   within two attempts. One slow read costs one read's time, not one more
   per node.
@@ -861,9 +870,11 @@ listing's reads after its LIST were sequential too.
   or times out leaves that node as last read. Such a node keeps the trust
   its last heartbeat gave, until that heartbeat's own horizon and never
   past it, and nothing about it changes: its pins stay, no connection
-  pool is dropped, the failover wait sees the same body, and the fence
-  watch neither counts it as seen again nor forgets it (only heartbeats
-  just read are watched). The round reports a failure (the hellos and the
+  pool is dropped, the failover wait keeps what it knew of it (since the
+  amendment of 2026-11-24, availability: before, it judged the same body
+  again and could take a node that still writes for a stale one), and the
+  fence watch neither counts it as seen again nor forgets it (only
+  heartbeats just read are watched). The round reports a failure (the hellos and the
   scheduled listing go on as before) and the next round reads it again.
 - **Early reads.** After a round, a peer whose trust would end before the
   next round could land (before `next + lead`, `lead` twice the slowest
@@ -1030,8 +1041,9 @@ key, beside the few live nodes.
 - **Listing is discovery only, on a task of its own** (`listing_loop`):
   new node ids, nodes whose object is gone, and the objects of stopped
   nodes. The first period's round still lists (within two attempts), to
-  find the peers before saying hello; from then on every round reads the
-  known nodes by key. The listing task lists every ten periods and when
+  find the peers before saying hello, unless the process already holds
+  heartbeats (amendment of 2026-11-24, availability); from then on every
+  round reads the known nodes by key. The listing task lists every ten periods and when
   asked (a hello, a record naming an unknown node, an unknown pin, a first
   listing that failed), at once but at most once a period; an ask that
   arrives while it lists is kept for its next listing (an ask is no
@@ -1062,7 +1074,8 @@ key, beside the few live nodes.
   which asks for a listing as before: such a join waits for that listing,
   which now lands however slow the LIST, where a listing given two
   attempts never did. Reading the certificate's name at the handshake
-  would avoid that wait; not done (it would need a certificate parser).
+  would avoid that wait; done in the amendment of 2026-11-24,
+  availability.
 - **The dead-peer bound is unchanged**: rounds by key renew a peer's
   trust, so a slow LIST changes nothing about when a dead one lapses.
 
@@ -1363,3 +1376,91 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
   - a 7 s blip of the floor's reads: the node stays checking with its lease renewed, then starts;
   - a first write whose answer was lost: still read, still refused;
   - a stop during the read: the lease is released.
+
+## Amendment of 2026-11-24: availability
+
+Follow-ups of the slow-bucket amendment (2026-11-20). Each changes what
+a node reads or when, or what it does with a body it already has. None
+changes a lease rule: what frees an ownership record, the fence, the
+start check, the trust horizon and the newest-reads table stay as they
+are.
+
+### The rule
+
+- **The failover wait judges only what was read just now.** The heartbeat
+  rounds pass every node as last read to the failover wait
+  (`failover::OwnerWatch`). A node that a round kept as last read (its read
+  failed) or whose body is older than one this process already read
+  (`node_lease::older_than` against the newest-reads table, without
+  touching that table) is not news: its entry stays as the last real read
+  left it, and this node's own fence of it still holds. Before, a kept
+  body was judged again with a later clock. A node that still wrote but
+  could not be read for a horizon looked stale, and a request for its
+  actors was kept until the deadline waiting for a fence that no read
+  could bring. An earlier instance's body read late looked like a restart
+  to a kept request. An earlier `live` body of a fenced node undid the
+  fence. Now the request is answered as it would be without the wait.
+  A peer whose clock stepped back writes bodies older than the newest held:
+  the watch keeps its last entry, in view, until a body not older is read
+  or a fence lands (the fence watch is unchanged, and sees every fresh read).
+- **At most 32 reads in flight in a round** (`HEARTBEAT_READ_CONCURRENCY`).
+  Each read's attempt starts when the read is sent, so past 32 known nodes
+  a round can take more than one attempt. Up to 32 nodes, nothing changes.
+- **A node found gone leaves the live senders at once.** The process's
+  table of live senders (the sender check of hops) drops a node that no
+  heartbeat as last read names any more (its object is gone), as the pins
+  already did, rather than at its last heartbeat's horizon. A stopped
+  (`released` or `fenced`) node is left as before, until its horizon.
+- **A node found gone is forgotten** once no read issued before could
+  still land: twice the longest listing limit of the process's apps (60 s
+  at the defaults). Before, the heartbeats as last read kept an entry for
+  every node id the prefix ever had. A listing that leaves out a node
+  already found gone no longer renews that mark. A read issued before the
+  mark and landing after it was dropped would show the body it read until
+  the next read: its trust still ends at that heartbeat's own horizon.
+- **A runtime joining a process that already holds heartbeats** (a second
+  app, or a runtime restarted in place) makes its first round by key: one
+  read of each node held that may still write, and of its own object. The
+  listing task lists at once. Before, that round listed inline, within two
+  attempts, and a slow LIST held up its view and its early reads. A process
+  that holds no heartbeat yet still lists first, to find its peers before
+  saying hello.
+- **Over TLS, the name on an unknown certificate is read by key.** When a
+  client presents a certificate whose pin is not live here, the node reads
+  the common name on it (the node id, or the process's name when it has
+  one, [ADR 0038](0038-several-apps-per-process.md)) and, if it is a valid
+  node id, reads `nodes/<name>` by key on the join-read task, as for a
+  hello. That name was not verified: it only chooses what to read, and
+  trust still comes from the heartbeat read. At most four such names a
+  period, each read at most once a period, so a stranger reaching the
+  cluster port cannot make the node read the bucket more than that. A
+  process with a name serving several apps finds nothing under its name
+  and waits for the listing, as before.
+- **The hellos wait for a live peer of this app.** The first round of
+  hellos is sent once a round finds a live node of this app in the view,
+  the nodes a hello goes to. Before, any other node id as last read
+  counted, `released` and other apps' nodes included: the round was then
+  spent on nobody, and no hello was sent when a peer showed up later.
+
+### Tests
+
+- `failover::tests`:
+  `a_body_kept_as_last_read_neither_starts_nor_ends_a_wait` and
+  `an_older_body_read_late_neither_restarts_nor_stales_a_node`.
+- `cluster::tests`:
+  `a_peer_kept_as_last_read_is_not_stale_to_the_failover_wait` and
+  `an_older_lease_body_read_later_misleads_no_kept_request` (before: `Stale`
+  and `Restarted`), `a_round_caps_its_reads_in_flight` (before: 80 at
+  once), `a_gone_node_leaves_the_live_senders_at_once`,
+  `gone_nodes_are_forgotten_once_no_earlier_read_can_land`,
+  `a_runtime_joining_a_process_does_not_wait_for_a_slow_listing` (LIST 3 s
+  late; before, the first round waited two attempts) and
+  `only_live_peers_of_this_app_count_as_found_for_the_hellos`.
+- `cluster_tls::tests::the_name_on_an_unknown_certificate_is_kept_to_read_by_key`.
+- `tests/cluster/slow_bucket.rs`:
+  `a_joining_node_is_seen_from_its_first_call_while_listing_is_slow` (LIST
+  3 s late, the joining node never looked for: in the view within 2 s,
+  plain and over TLS; before, over TLS, only the listing showed it).
+- `sim/tests/madsim_node_lease.rs`: the waiters' reads are per node, and a
+  node whose read fails is passed to the watch as kept, as the server's
+  rounds do. Before, any failed read left the whole round unlearnt.

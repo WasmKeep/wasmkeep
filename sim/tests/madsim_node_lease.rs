@@ -23,8 +23,10 @@
 //! With waiters (`a_waiter_follows_the_owner_watch`), a process refused
 //! because another node holds the actor may keep asking as the server
 //! keeps a request for a dead node's actor: it feeds an
-//! `OwnerWatch` (`wasmkeep_cluster::failover`) from its own listings of
-//! the node leases and asks again only when its `Waiter` says so, until a
+//! `OwnerWatch` (`wasmkeep_cluster::failover`) from its own reads of the
+//! node leases (one per node; a node whose read fails is kept as last read
+//! and passed as not read just now, as the server's rounds do) and asks
+//! again only when its `Waiter` says so, until a
 //! deadline. The same checks hold with those acquisitions; a waiter never
 //! asks while the holder is only stale, nor more often than its retry
 //! period; and after a crash with one request per survivor and no retry
@@ -549,36 +551,38 @@ async fn run_node(
         // wait if it has one, and (the crash scenario) whether it asked
         // since the holder was killed.
         let mut watch = OwnerWatch::new(id.clone(), &cfg, HORIZON_MS);
+        // Each other node's lease as last read (`None`: unreadable).
+        let mut last_read: HashMap<String, Option<NodeLeaseObject>> = HashMap::new();
         let mut listed_ms = 0;
         let mut wait: Option<Wait> = None;
         let mut asked_since_kill = false;
         let ask_after_kill_ms = rng.below(1_500);
         loop {
             if variant.waiters() && clock.now_ms() >= listed_ms + LISTING_MS {
-                // One listing: every other node's lease, or nothing learnt.
-                let mut bodies = Vec::new();
-                let mut failed = false;
+                // One round of reads, one per other node, as the server's:
+                // a read that fails keeps that node as last read, and the
+                // watch is told it was not read just now.
+                let mut kept = Vec::new();
                 for p in (1..=3u32).filter(|&p| p != i) {
-                    match bucket.get(&format!("{NODES}n{p}")).await {
-                        Ok(Some((body, _))) => bodies.push((format!("n{p}"), body)),
-                        Ok(None) => {}
-                        Err(_) => failed = true,
+                    let id = format!("n{p}");
+                    match bucket.get(&format!("{NODES}{id}")).await {
+                        Ok(Some((body, _))) => {
+                            last_read.insert(id, NodeLeaseObject::decode(&body));
+                        }
+                        Ok(None) => {
+                            last_read.remove(&id);
+                        }
+                        Err(_) => kept.push(id),
                     }
                 }
-                if !failed {
-                    let objects: Vec<(String, Option<NodeLeaseObject>)> = bodies
-                        .into_iter()
-                        .map(|(id, body)| (id, NodeLeaseObject::decode(&body)))
-                        .collect();
-                    let seen = objects.iter().map(|(id, o)| Seen {
-                        id,
-                        state: o.as_ref().map(|o| o.state),
-                        instance: o.as_ref().and_then(|o| o.instance.as_deref()),
-                        written_at_ms: o.as_ref().map_or(0, |o| o.written_at_ms),
-                    });
-                    listed_ms = clock.now_ms();
-                    watch.observe(seen, listed_ms);
-                }
+                let seen = last_read.iter().map(|(id, o)| Seen {
+                    id,
+                    state: o.as_ref().map(|o| o.state),
+                    instance: o.as_ref().and_then(|o| o.instance.as_deref()),
+                    written_at_ms: o.as_ref().map_or(0, |o| o.written_at_ms),
+                });
+                listed_ms = clock.now_ms();
+                watch.observe_kept(seen, |id| kept.iter().any(|k| k == id), listed_ms);
             }
             if node.lost() {
                 // Exit at once: no releases. The claims end now.
