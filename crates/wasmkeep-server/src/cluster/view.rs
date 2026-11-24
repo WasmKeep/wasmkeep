@@ -110,25 +110,31 @@ pub(super) async fn heartbeat_loop(cluster: std::sync::Weak<Cluster>, every: Dur
         }
         let ok = if first {
             first = false;
-            // The first period lists, to find the peers; one that fails or
-            // runs out leaves it to the listing task, asked at once.
-            let listed = c.refresh_view(true).await;
-            if !listed {
+            let held = c.transport.heard_writers();
+            if held.iter().any(|id| *id != c.node_id) {
+                // The process already read the nodes (another app, or a
+                // runtime restarted in place): they are read by key at
+                // once, and the listing task lists. A slow LIST then holds
+                // up neither this view nor the early reads.
                 c.want_listing();
+                c.refresh_first(held).await
+            } else {
+                // The first period lists, to find the peers; one that
+                // fails or runs out leaves it to the listing task, asked
+                // at once.
+                let listed = c.refresh_view(true).await;
+                if !listed {
+                    c.want_listing();
+                }
+                listed || c.refresh_view(false).await
             }
-            listed || c.refresh_view(false).await
         } else {
             c.refresh_view(false).await
         };
         if c.identity_taken() {
             return;
         }
-        let found_peers = c
-            .known_nodes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|n| *n != c.node_id);
+        let found_peers = c.found_peers();
         let retry = hellos_left < HELLO_ROUNDS
             && hello_failed.swap(false, std::sync::atomic::Ordering::AcqRel);
         if ((hellos_left == HELLO_ROUNDS && found_peers) || retry)
@@ -789,6 +795,22 @@ impl Cluster {
         self.read_heartbeats(&ids).await
     }
 
+    /// The first round of a runtime whose process already holds
+    /// heartbeats: one read by key of each node in `held` (as
+    /// [`super::process::Transport::heard_writers`] gives them) and of this
+    /// node's own object, timed as a refresh.
+    async fn refresh_first(&self, mut held: Vec<String>) -> bool {
+        let started = std::time::Instant::now();
+        if !held.contains(&self.node_id) {
+            held.push(self.node_id.clone());
+        }
+        let ok = self.read_heartbeats(&held).await;
+        crate::metrics::METRICS
+            .listing_seconds
+            .observe(started.elapsed());
+        ok
+    }
+
     /// How long a listing of the listing task may take: it is off the
     /// read path, so a slow LIST still finds new nodes, late. Two read
     /// attempts, the scheduled interval, or 30 s, whichever is longest.
@@ -1095,6 +1117,19 @@ impl Cluster {
             return;
         }
         let _ = self.reads_wanted.send(id.to_owned());
+    }
+
+    /// Whether the last refresh found a peer to say hello to: a live node
+    /// of this app in the view, as [`Self::say_hello`] chooses them. A
+    /// stopped node, or a node of another app, gets no hello, so it must
+    /// not use up the first round of hellos, which is then kept for the
+    /// first peer that shows up.
+    pub(super) fn found_peers(&self) -> bool {
+        self.peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|(id, peer)| *id != self.node_id && peer.app == self.serves)
     }
 
     /// Asks for a listing of `nodes/` at once (at most one early listing a

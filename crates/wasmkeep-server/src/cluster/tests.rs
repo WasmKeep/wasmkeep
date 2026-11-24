@@ -5141,6 +5141,8 @@ struct SlowNodeReads {
     /// the most at once.
     node_gets_in_flight: std::sync::atomic::AtomicU64,
     node_gets_peak: std::sync::atomic::AtomicU64,
+    /// Every listing of `nodes/` waits this long first (ms).
+    list_nodes_delay_ms: std::sync::atomic::AtomicU64,
     /// The next write of this key lands, and its answer is lost (once).
     lose_put_reply: std::sync::Mutex<Option<String>>,
 }
@@ -5240,7 +5242,14 @@ impl ObjectStore for SlowNodeReads {
             .others_delay_ms
             .load(std::sync::atomic::Ordering::SeqCst);
         let listing = self.inner.list(prefix);
-        if delay == 0 || prefix.is_some_and(|p| p.as_ref() == "nodes") {
+        let nodes = prefix.is_some_and(|p| p.as_ref() == "nodes");
+        let delay = if nodes {
+            self.list_nodes_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            delay
+        };
+        if delay == 0 {
             return listing;
         }
         futures_util::stream::once(async move {
@@ -6045,4 +6054,86 @@ async fn gone_nodes_are_forgotten_once_no_earlier_read_can_land() {
         "{:?}",
         a.transport.heard_ids()
     );
+}
+
+/// A node that starts on a prefix holding only stopped nodes (or nodes of
+/// other apps) has no peer to say hello to: its first round of hellos is
+/// kept for the first peer of its app that shows up live, rather than
+/// spent on nobody (`say_hello` sends to those peers only).
+#[tokio::test]
+async fn only_live_peers_of_this_app_count_as_found_for_the_hellos() {
+    let store = Arc::new(SlowNodeReads::default());
+    let a = quiet_tls_node(&store, 3_000);
+    let b = |state: &str, instance: &str| {
+        format!(
+            "wasmkeep-node 3\n{state} {instance}\n{}\nb\nhttp://b\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            now_ms()
+        )
+    };
+    put_b(&store, b("released", "beef")).await;
+    let other = format!(
+        "wasmkeep-node 3\nlive f00d\n{}\nc\nhttp://c\n0.0.0\nt/other\n\n\nserving\n\ntake\n",
+        now_ms()
+    );
+    store
+        .inner
+        .put(&StorePath::from("nodes/c"), other.into_bytes().into())
+        .await
+        .unwrap();
+    assert!(a.refresh_view(true).await);
+    assert!(!a.found_peers(), "a stopped node or another app's counted");
+    put_b(&store, b("live", "cafe")).await;
+    assert!(a.refresh_view(true).await);
+    assert!(a.found_peers());
+}
+
+/// A runtime that starts in a process that already read the nodes (a
+/// second app, or a runtime restarted in place) reads them by key in its
+/// first round, and leaves the listing to the listing task: a slow LIST
+/// holds up neither its view nor, so, its early reads. A process that read
+/// nothing yet still lists first, to find its peers.
+#[tokio::test]
+async fn a_runtime_joining_a_process_does_not_wait_for_a_slow_listing() {
+    let store = Arc::new(SlowNodeReads::default());
+    let process = super::process::NodeProcess::new();
+    let shared = || Arc::clone(&store) as Arc<dyn ObjectStore>;
+    // Shop, which never gets past its start check, read b already.
+    let mut config = ClusterConfig::new("shop-1", "http://shop-1", shared());
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 100).unwrap();
+    config.process = Some(Arc::clone(&process));
+    let shop = Cluster::new(&config, &StateRoot::new("", "t", "shop")).unwrap();
+    put_b(&store, node_lease_body("b", "live", "beef", now_ms())).await;
+    assert!(shop.read_heartbeats(&["b".to_owned()]).await);
+    // Every LIST of `nodes/` 3 s late: past the two attempts (2 s) an
+    // inline listing gets.
+    store
+        .list_nodes_delay_ms
+        .store(3_000, std::sync::atomic::Ordering::SeqCst);
+    // Blog joins with a short lease: its start check ends in about 1.2 s.
+    let mut config = ClusterConfig::new("blog-1", "http://blog-1", shared());
+    config.heartbeat = Duration::from_millis(100);
+    config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+    config.process = Some(Arc::clone(&process));
+    let blog = Cluster::new(&config, &StateRoot::new("", "t", "blog")).unwrap();
+    let mut identity = blog.identity.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        identity.wait_for(|s| *s == super::identity::Identity::Unique),
+    )
+    .await
+    .expect("blog never started")
+    .unwrap();
+    let unique = std::time::Instant::now();
+    let attempt = blog.heartbeat_read_attempt;
+    loop {
+        if blog.known_nodes.lock().unwrap().iter().any(|n| n == "b") {
+            break;
+        }
+        assert!(
+            unique.elapsed() < attempt,
+            "blog's first round waited for the slow listing"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

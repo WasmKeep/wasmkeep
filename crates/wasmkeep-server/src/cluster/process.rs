@@ -548,6 +548,33 @@ impl Transport {
         );
     }
 
+    /// The nodes whose heartbeat as last read may still be written to: not
+    /// gone, and not `released` or `fenced` (that instance never writes
+    /// again). What a round reads by key.
+    pub(super) fn heard_writers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .heard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bodies
+            .iter()
+            .filter(|(_, (_, body))| {
+                body.as_ref().is_some_and(|b| {
+                    !matches!(
+                        b.lease,
+                        Some(
+                            wasmkeep_cluster::node_lease::NodeState::Released
+                                | wasmkeep_cluster::node_lease::NodeState::Fenced
+                        )
+                    )
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The node ids in the heartbeats as last read, gone ones included.
     #[cfg(test)]
     pub(super) fn heard_ids(&self) -> Vec<String> {
