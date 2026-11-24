@@ -414,14 +414,13 @@ mod tests {
     fn a_fifo_is_refused_without_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hub.env");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        // mkfifo(1), not rustix: rustix has no mknodat or mkfifoat on macOS.
+        let made = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo: {made}");
         let (done, result) = std::sync::mpsc::channel();
         let read = path.clone();
         std::thread::spawn(move || {

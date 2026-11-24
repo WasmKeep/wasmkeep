@@ -80,13 +80,17 @@ filter = 'binary(=room_cluster)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
-# This single-client test cold-compiles five StarlingMonkey components,
-# each embedding the JS engine, before serving requests. The languages job
-# exceeded the default two minutes; allow startup on slower CI runners,
-# but still terminate a hung test after five minutes. The separate
-# room_cluster_300_clients proof keeps its existing coverage.
+# This single-client test cold-compiles six StarlingMonkey components
+# (about 13 MB each, the JS engine embedded) before serving requests: about
+# 127 CPU-seconds of compiling, 39 s on four otherwise idle cores and under
+# 5 s once cached. Serving the requests takes under a second. In the
+# languages job the compiling shares four vCPUs with three other tests, so
+# its time follows the runner: 141 to 187 s in most runs, and 171 and 277 s
+# on the same commit in two runs. It then went past five minutes on a
+# slower runner with no change to its compile cost (the same CPU time before
+# and after the 0.8.0 changes). Ended after ten minutes if it hangs.
 filter = 'binary(=big_room) & test(=typescript_big_room_starlingmonkey)'
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
 # `wasmkeep new`: each test builds a generated project from cold (a fresh

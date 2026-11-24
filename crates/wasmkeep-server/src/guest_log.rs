@@ -178,12 +178,12 @@ impl Bucket {
         Self {
             rate,
             tokens: rate * 2.0,
-            at: Instant::now(),
+            at: now(),
         }
     }
 
     fn take(&mut self) -> bool {
-        let now = Instant::now();
+        let now = now();
         let refill = now.duration_since(self.at).as_secs_f64() * self.rate;
         self.tokens = (self.tokens + refill).min(self.rate * 2.0);
         self.at = now;
@@ -194,6 +194,28 @@ impl Bucket {
             false
         }
     }
+}
+
+/// The buckets' clock.
+#[cfg(not(test))]
+fn now() -> Instant {
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stopped clock ([`tests::stop_clock`]): the buckets refill
+    /// only when the test moves it, however long its loops take. Unset,
+    /// the real clock.
+    static CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The buckets' clock: in tests, the stopped one if the test set it.
+#[cfg(test)]
+fn now() -> Instant {
+    CLOCK
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(Instant::now)
 }
 
 /// One instance's output: what is waiting for a newline, on each stream.
@@ -369,6 +391,18 @@ impl AsyncWrite for Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Stops this thread's bucket clock: a slow runner's loop no longer
+    /// refills a bucket while the test counts what it gives.
+    fn stop_clock() {
+        CLOCK.with(|c| c.set(Some(Instant::now())));
+    }
+
+    /// Moves the stopped clock on by `by`.
+    fn advance(by: Duration) {
+        CLOCK.with(|c| c.set(c.get().map(|at| at + by)));
+    }
 
     #[test]
     fn control_characters_are_escaped_and_lines_cut() {
@@ -421,6 +455,7 @@ mod tests {
 
     #[test]
     fn each_app_has_its_own_budget() {
+        stop_clock();
         let log = GuestLog::new(1);
         let (a, b) = (log.for_app("t/a"), log.for_app("t/b"));
         let first = a.budget("t/a");
@@ -429,11 +464,19 @@ mod tests {
         // A later instance of the app, or its front, shares that budget.
         assert!(!a.budget("t/a").take());
         assert!(!log.budget("t/a").take());
-        assert!(b.budget("t/b").take());
+        let other = b.budget("t/b");
+        let taken = (0..10_000).filter(|_| other.take()).count();
+        assert_eq!(taken, APP_RATE as usize * 2);
+        // A second later, the app has a second's worth again.
+        advance(Duration::from_secs(1));
+        let again = a.budget("t/a");
+        let taken = (0..10_000).filter(|_| again.take()).count();
+        assert_eq!(taken, APP_RATE as usize);
     }
 
     #[test]
     fn the_node_caps_every_app_together() {
+        stop_clock();
         let log = GuestLog::new(1);
         let apps: Vec<_> = (0..10).map(|i| log.for_app(&format!("t/a{i}"))).collect();
         let taken: usize = apps
@@ -444,10 +487,8 @@ mod tests {
                 (0..10_000).filter(|_| budget.take()).count()
             })
             .sum();
-        // The node's burst, and what it refilled while the loop ran: far
-        // under the ten apps' own budgets together.
-        let burst = NODE_RATE as usize * 2;
-        assert!((burst..burst + 500).contains(&taken), "{taken}");
+        // The node's burst: far under the ten apps' own budgets together.
+        assert_eq!(taken, NODE_RATE as usize * 2);
     }
 
     #[test]
@@ -462,10 +503,11 @@ mod tests {
 
     #[test]
     fn the_bucket_allows_a_burst_then_the_rate() {
+        stop_clock();
         let mut bucket = Bucket::new(5);
         let burst = (0..100).filter(|_| bucket.take()).count();
         assert_eq!(burst, 10);
-        bucket.at -= std::time::Duration::from_secs(1);
+        advance(Duration::from_secs(1));
         let after = (0..100).filter(|_| bucket.take()).count();
         assert_eq!(after, 5);
     }
