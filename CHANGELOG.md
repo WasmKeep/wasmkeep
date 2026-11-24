@@ -9,6 +9,118 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+## 0.8.0
+
+**A big room that needs no hand placement, idle histories compacted, and
+a hardened node.** A room and its pusher wake on different nodes by
+default, and a big room's edges wake spread over the nodes, so the
+operator no longer moves the pusher by hand. An actor that stops writing
+has its history compacted to a snapshot and the write at its head, a
+retention window after it rests, so the change feed's listing stops
+growing with it. A quiet room's first publish after a full hibernation is
+pushed instead of fetched by every client. An internal audit of the guest
+boundary, the cluster's signatures, uploads and local files led to
+tighter limits and stricter checks, several of which you must act on when
+you upgrade (below). Still a **pre-alpha pre-release**.
+
+**Big rooms with default placement.** On three 4-vCPU nodes and a real
+bucket, with default placement and no `actor move`, 4,500 clients at 10
+messages/s got delivery p99 under 1 s (894-978 ms across the generators),
+every message acknowledged and none lost or repeated, and the layout
+(the room and its pusher apart, edges on all three nodes) was kept
+through a rolling restart of the nodes. 6,000 clients missed narrowly
+(p99 0.99-1.04 s)
+([measured](docs/benchmarks.md#a-big-room-on-three-nodes-080),
+[results](bench/results/2026-11-23-28f83b9-room-group-ovh-bhs-3vps-r08-default-placement.json)).
+The margin at 4,500 is smaller than with 0.7.0's hand layout (see the
+known limitations).
+
+### Act on these when you upgrade
+
+These change what a node accepts or does at start, or what an actor or a
+client sees. The steps are in
+[upgrading to 0.8.0](docs/deploy/upgrading-to-0.8.md).
+
+- **`--env` files must be private.** On Unix, `--env` and `--front-env`
+  files, and `wasmkeep dev`'s `.env.local`, are refused at start if other
+  users can open them, if their group can write them, or if their group can
+  read them while the server's user owns them (before, a world-readable file
+  only logged a warning). Use `chmod 600 FILE` for a file the service owns,
+  or `chown root:wasmkeep FILE && chmod 640 FILE`. `--config` files are not
+  affected.
+- **Guest output is logged in a new format.** What guests print is the last
+  field of its line, `line="..."`, quoted, after a fixed `guest output`
+  message (before, it was the event message). Update log filters that match
+  it. Escapes follow logfmt and now cover format characters and line
+  separators; actor names, event errors and traps are quoted the same way.
+  The 4 KB limit applies after escaping, and output is limited to 1,000
+  lines a second per app and 5,000 per process, beyond each instance's
+  `--guest-log-rate`.
+- **`actors.call` carries less.** At most 96 headers and 62 KiB of path and
+  headers (was 256 headers and 64 KiB), and a call chain of at most 16
+  actors; past them a call fails (`too-large`, `failed`). Check actors that
+  forward many headers or call deeply.
+- **A request head over 64 KiB or 100 header fields gets `431`.** Node
+  headers are not counted; both ports leave 24 KiB and 32 fields for them.
+  Check a proxy that adds large cookies or many headers.
+- **The metrics listener checks `Host`.** It answers `421` unless the host is
+  an IP address, `localhost` or a name under it, a name given with the new
+  `--metrics-host` (`[listen] metrics-hosts`), or, when not bound to
+  loopback, a single-label name. A scraper that names a node by a dotted
+  host name needs `--metrics-host`. A stalled scraper is let go after 10 s.
+- **A stalled client's socket is closed.** A response write that waits 60 s
+  with no byte taken by the client closes the connection; a WebSocket closed
+  this way ends with `1006`. Kept-alive connections and idle WebSockets are
+  not affected. Clients that stop reading must reconnect.
+- **The component cache directory is checked.** `--cache-dir` loads an
+  artefact only if the directory and the file belong to the server's user,
+  are not group- or world-writable, and are not reached through a symlink;
+  otherwise the component is compiled again and the command that fixes the
+  directory is logged at start. New cache directories are created 0700 and
+  artefacts 0600; existing artefacts others can read are made 0600 when
+  loaded. Run `chmod 700` on the cache and data directories of an existing
+  install.
+- **Data directories are owner-only.** `serve` and `dev` create a missing
+  data directory 0700 and warn when an existing one is readable by others;
+  CLI scratch directories that hold actor data (backup, restore, actor read
+  and sql, inspect, the feed) are created 0700. The single-node guide sets
+  `UMask=0077`.
+- **Changing the secrets key has a second step.** After a key change,
+  `wasmkeep secrets rotate-key --finish` deletes the sealed objects another
+  key sealed (keeping the one before `current` for 30 s after it moved, and
+  objects above `current` for the one-hour retention window), and fails
+  while any are left. Changing the key does not change the values: rotate
+  values the old key could open at their source.
+- **File uploads are budgeted.** Files being written by streamed writes and
+  upload links are spooled within 1 GiB per app (at least one file of
+  `--max-blob-bytes`, at most half the process's) and 4 GiB per process (at
+  least two such files). An upload link holds its whole size before it reads
+  its body and answers `503` past a budget; a streamed write fails with
+  `unavailable`. An upload body that sends nothing for 60 s, or averages
+  under 16 KiB/s after its first 30 s, is aborted with `408`; the same link
+  sent again while its first body is arriving answers `409`. An instance has
+  at most 16 streamed writes open, and one left open goes when its event
+  ends. Clients must retry `503`, and uploaders must keep a steady rate.
+- **Tighter SQLite limits.** A statement may compile to at most 2,000,000
+  instructions (`quota-exceeded` past it), SQLite's heap is capped at 4 GiB
+  per process (temporary data included, as it now stays in memory), and
+  `instr`, `replace` and `trim` stop at the statement's budgets. Guest schema
+  changes may not name the reserved `_wasmkeep_` prefix. Check actors with
+  very large sorts or temporary data.
+- **Rebuild StarlingMonkey actors.** A guest now holds at most 4,096 host
+  resources (handles) at once; past that its event fails and the actor's
+  instance is replaced. The TypeScript SDK now releases each request's handles
+  once it is answered, and the TypeScript, Go, C, Zig and MoonBit SDKs release
+  a broken stream's error. A StarlingMonkey actor built with an earlier SDK
+  leaks handles and fails one request about every 2,000: rebuild it with
+  this version's SDK and deploy it.
+- **Manual releases are restricted.** The release workflow run by hand starts
+  only on a `vX.Y.Z` tag or on `main`; any other ref is refused. Tag pushes
+  and pull requests are unchanged. This concerns whoever cuts releases, not
+  operators of a node.
+
+### What is new
+
 **A snapshot at the head when an actor hibernates.** In a cluster, an
 actor that leaves memory because it was idle or evicted first uploads a
 snapshot at its last write, if its node wrote that write and at least 8
@@ -104,91 +216,6 @@ Upgrading: nothing changes on the wire, for clients, edges or the
 room's `pull`; deploy the classes together as usual. A 0.7 pusher keeps
 no position, so its first round stays header-only.
 
-### Act on these when you upgrade
-
-These change what a node accepts or does at start, or what an actor or a
-client sees. The steps are in
-[upgrading to 0.8.0](docs/deploy/upgrading-to-0.8.md) (for the next
-release, unreleased).
-
-- **`--env` files must be private.** On Unix, `--env` and `--front-env`
-  files, and `wasmkeep dev`'s `.env.local`, are refused at start if other
-  users can open them, if their group can write them, or if their group can
-  read them while the server's user owns them (before, a world-readable file
-  only logged a warning). Use `chmod 600 FILE` for a file the service owns,
-  or `chown root:wasmkeep FILE && chmod 640 FILE`. `--config` files are not
-  affected.
-- **Guest output is logged in a new format.** What guests print is the last
-  field of its line, `line="..."`, quoted, after a fixed `guest output`
-  message (before, it was the event message). Update log filters that match
-  it. Escapes follow logfmt and now cover format characters and line
-  separators; actor names, event errors and traps are quoted the same way.
-  The 4 KB limit applies after escaping, and output is limited to 1,000
-  lines a second per app and 5,000 per process, beyond each instance's
-  `--guest-log-rate`.
-- **`actors.call` carries less.** At most 96 headers and 62 KiB of path and
-  headers (was 256 headers and 64 KiB), and a call chain of at most 16
-  actors; past them a call fails (`too-large`, `failed`). Check actors that
-  forward many headers or call deeply.
-- **A request head over 64 KiB or 100 header fields gets `431`.** Node
-  headers are not counted; both ports leave 24 KiB and 32 fields for them.
-  Check a proxy that adds large cookies or many headers.
-- **The metrics listener checks `Host`.** It answers `421` unless the host is
-  an IP address, `localhost` or a name under it, a name given with the new
-  `--metrics-host` (`[listen] metrics-hosts`), or, when not bound to
-  loopback, a single-label name. A scraper that names a node by a dotted
-  host name needs `--metrics-host`. A stalled scraper is let go after 10 s.
-- **A stalled client's socket is closed.** A response write that waits 60 s
-  with no byte taken by the client closes the connection; a WebSocket closed
-  this way ends with `1006`. Kept-alive connections and idle WebSockets are
-  not affected. Clients that stop reading must reconnect.
-- **The component cache directory is checked.** `--cache-dir` loads an
-  artefact only if the directory and the file belong to the server's user,
-  are not group- or world-writable, and are not reached through a symlink;
-  otherwise the component is compiled again and the command that fixes the
-  directory is logged at start. New cache directories are created 0700 and
-  artefacts 0600; existing artefacts others can read are made 0600 when
-  loaded. Run `chmod 700` on the cache and data directories of an existing
-  install.
-- **Data directories are owner-only.** `serve` and `dev` create a missing
-  data directory 0700 and warn when an existing one is readable by others;
-  CLI scratch directories that hold actor data (backup, restore, actor read
-  and sql, inspect, the feed) are created 0700. The single-node guide sets
-  `UMask=0077`.
-- **Changing the secrets key has a second step.** After a key change,
-  `wasmkeep secrets rotate-key --finish` deletes the sealed objects another
-  key sealed (keeping the one before `current` for 30 s after it moved, and
-  objects above `current` for the one-hour retention window), and fails
-  while any are left. Changing the key does not change the values: rotate
-  values the old key could open at their source.
-- **File uploads are budgeted.** Files being written by streamed writes and
-  upload links are spooled within 1 GiB per app (at least one file of
-  `--max-blob-bytes`, at most half the process's) and 4 GiB per process (at
-  least two such files). An upload link holds its whole size before it reads
-  its body and answers `503` past a budget; a streamed write fails with
-  `unavailable`. An upload body that sends nothing for 60 s, or averages
-  under 16 KiB/s after its first 30 s, is aborted with `408`; the same link
-  sent again while its first body is arriving answers `409`. An instance has
-  at most 16 streamed writes open, and one left open goes when its event
-  ends. Clients must retry `503`, and uploaders must keep a steady rate.
-- **Tighter SQLite limits.** A statement may compile to at most 2,000,000
-  instructions (`quota-exceeded` past it), SQLite's heap is capped at 4 GiB
-  per process (temporary data included, as it now stays in memory), and
-  `instr`, `replace` and `trim` stop at the statement's budgets. Guest schema
-  changes may not name the reserved `_wasmkeep_` prefix. Check actors with
-  very large sorts or temporary data.
-- **Rebuild StarlingMonkey actors.** A guest now holds at most 4,096 host
-  resources (handles) at once; past that its event fails and the actor's
-  instance is replaced. The TypeScript SDK now releases each request's handles
-  once it is answered, and the TypeScript, Go, C, Zig and MoonBit SDKs release
-  a broken stream's error. A StarlingMonkey actor built with an earlier SDK
-  leaks handles and fails one request about every 2,000: rebuild it with
-  this version's SDK and deploy it.
-- **Manual releases are restricted.** The release workflow run by hand starts
-  only on a `vX.Y.Z` tag or on `main`; any other ref is refused. Tag pushes
-  and pull requests are unchanged. This concerns whoever cuts releases, not
-  operators of a node.
-
 ### Security and hardening
 
 - **Wasm and wasi-http field limits.** A `wasi:http` `fields` a guest builds
@@ -258,6 +285,27 @@ release, unreleased).
   `wasmkeep_signatures_bad_total`.
 - CI: CodeQL also runs on push to `main`, and a speed-sensitive StarlingMonkey
   test moves to the full suite.
+
+### Known limitations
+
+- **Two nodes always co-locate the room and the pusher after a rolling
+  restart.** Moving the pusher by hand is still the fallback
+  ([designing for hot actors](docs/designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)).
+- **The idle pass's queue is lost on restart.** Actors that rested within
+  the last retention window before a restart keep their leftover history
+  until they next write and rest.
+- **A `--history all` backup that races an idle pass is refused once.**
+  Run it again.
+- **The margin at 4,500 clients is smaller than 0.7.0's hand layout.**
+  Delivery p99 was 894-978 ms, against 644-763 ms with the pusher placed by
+  hand, because the room's node now also runs about a third of the edges.
+  6,000 clients is still the edge, just over the 1 s target.
+- **Delivery is disturbed while nodes restart.** In the 4,500-client
+  rolling-restart run, delivery p99 rose to 18.8-33.5 s during the
+  restarts and 271 publishes failed; no client saw a gap or a repeat, and
+  all 4,500 were back before the leave.
+- **Not measured:** a killed node, and the apart and spread rules on two
+  nodes.
 
 ## 0.7.0
 

@@ -1,14 +1,18 @@
 # 0042. Compacting an idle actor's history
 
-- Status: proposed (2026-11-23). Slices 1 to 3 done: this record, the
-  rule (`idle_collectable`) and the simulation. Slice 4, the idle
-  snapshot, built (see "As built: the idle snapshot"). Slice 5, the idle
-  pass, built (see "As built: the idle pass"), with its own adversarial
-  review to come; slice 6 (ADR 0012's and ADR 0033's sentences, the feed
-  measured again) is next.
-- Milestone: `0.8.0`, item 4 under Now in [ROADMAP.md](../../ROADMAP.md)
+- Status: accepted (2026-11-24), shipped in 0.8.0. Slices 1 to 3 (this
+  record, the rule `idle_collectable` and the simulation), slice 4 (the
+  idle snapshot, "As built: the idle snapshot") and slice 5 (the idle
+  pass, "As built: the idle pass") are in 0.8.0, with
+  `--no-idle-compaction` to turn both off. From slice 6, the
+  documentation in `docs/cluster.md` and `docs/actor-data-access.md` is
+  in; the amended sentences of ADR 0012 and ADR 0033 and the change
+  feed measured again after bursts are not, and follow. The pass has
+  been tested, and not yet watched on a cluster left running longer than
+  its retention window.
+- Milestone: `0.8.0` (see [Built](../../ROADMAP.md#built) in ROADMAP.md)
 - Follows: ADR 0007 (chained segments), ADR 0012 (collection), ADR 0020 (holds and generations), ADR 0028 (idle expiry's acquisition), ADR 0033 (offline readers, the retention window), ADR 0034 (barriers, snapshots only at the acknowledged head), ADR 0035 (recorded head), ADR 0039 (the change feed)
-- Amends, once accepted: ADR 0012, decision 3 on idle actors ("acceptable for now")
+- Amends: ADR 0012, decision 3 on idle actors ("acceptable for now"); its sentence is still to be updated
 
 ## Context
 
