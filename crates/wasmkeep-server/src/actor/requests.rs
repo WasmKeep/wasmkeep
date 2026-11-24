@@ -65,12 +65,16 @@ impl ActorService {
         // another node of the cluster proving it with the cluster secret
         // (in refuse mode, only on the cluster port: ADR 0011, phase B).
         // A client claiming either is not believed.
-        // Judged once, by the router (`Cluster::signed_hop`).
-        let signed_body = self
-            .inner
-            .cluster
-            .as_ref()
-            .and_then(|cluster| cluster.signed_hop(&req));
+        // Judged once, by the router (`Cluster::signed_hop`); a hop it
+        // refused stays refused.
+        let signed_body = match self.inner.cluster.as_ref().map(|c| c.signed_hop(&req)) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(signed))) => Some(signed),
+            Some(Err(why)) => {
+                tracing::warn!(reason = why, "a signed hop refused");
+                return crate::cluster::hop_refusal(req.headers());
+            }
+        };
         // A node's signed request with the hand-off's upgrade mark is a
         // relayed upgrade whose `Upgrade` header went missing (ADR 0027):
         // never a call, whatever it signs.

@@ -113,10 +113,7 @@ impl App {
         {
             tracing::warn!(reason = why, "a signed hop refused");
             // A placed call refused so never ran: its sender runs it.
-            return crate::cluster::refuse_if_placed(
-                req.headers(),
-                crate::cluster::unavailable("this hop is refused; retry\n"),
-            );
+            return crate::cluster::hop_refusal(req.headers());
         }
         if (req.extensions().get::<ArrivedOnClusterPort>().is_none()
             || req.headers().contains_key(crate::cluster::FORWARDED))

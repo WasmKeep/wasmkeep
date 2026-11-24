@@ -104,13 +104,22 @@ pub(crate) enum HopCheck {
 }
 
 /// The router's verdict on a request's signature, made once when it
-/// arrived ([`Cluster::judge_hop`]) by the runtime of node `node`, for
-/// the handlers after it ([`Cluster::signed_hop`]). Set by the host only:
-/// a request's extensions never come from the wire.
+/// arrived ([`Cluster::judge_hop`]) by the runtime whose instance is `by`
+/// (unique to each runtime, where the node id is shared by every app of a
+/// process), for that runtime's handlers after it
+/// ([`Cluster::signed_hop`]). Set by the host only: a request's extensions
+/// never come from the wire.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedHop {
-    pub(super) node: String,
+    pub(super) by: String,
     pub(super) hop: HopCheck,
+}
+
+/// The answer to a signed hop refused (ADR 0038, section 5): 503, never
+/// a client's request; a placed call marked refused, so its sender runs
+/// it.
+pub(crate) fn hop_refusal(headers: &hyper::HeaderMap) -> Response<HyperOutgoingBody> {
+    refuse_if_placed(headers, unavailable("this hop is refused; retry\n"))
 }
 
 /// The path a hop's signature covers: as the request arrived, query

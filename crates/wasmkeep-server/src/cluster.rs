@@ -372,6 +372,10 @@ pub(crate) fn rendezvous<'a>(
 /// This node's cluster membership and lease client.
 pub(crate) struct Cluster {
     pub(crate) node_id: String,
+    /// This runtime's random instance (as in its heartbeat): every app of a
+    /// process shares the node id, never this. Tags the router's verdicts
+    /// ([`CheckedHop`]).
+    instance: String,
     /// What this node serves (see `NodeInfo::app`).
     serves: String,
     /// Node signatures already accepted (replay protection).
@@ -870,6 +874,7 @@ impl Cluster {
             seen_public: SeenSignatures::public().started_now(skew),
             refusal_logged: Mutex::new(HashMap::new()),
             node_id: config.node_id.clone(),
+            instance: instance.clone(),
             owners: Owners::new(
                 bucket,
                 SystemClock,
@@ -1705,20 +1710,34 @@ impl Cluster {
         }
     }
 
-    /// The signature of a node's call in `req`, as the router judged it on
-    /// arrival ([`CheckedHop`]); judged now if it was not, or by another
-    /// node id's runtime. A hop the router refused never reaches here.
-    pub(crate) fn signed_hop<B>(&self, req: &Request<B>) -> Option<Signed> {
-        if let Some(CheckedHop { node, hop }) = req.extensions().get::<CheckedHop>()
-            && *node == self.node_id
+    /// The signature of a node's call in `req`, as this runtime's router
+    /// judged it on arrival ([`CheckedHop`]); judged now if it was not, or
+    /// by another runtime (another app of the process, under the same node
+    /// id). `Ok(None)`: a client's request. `Err`: a hop refused, answered
+    /// with [`hop_refusal`], never served as a client's.
+    pub(crate) fn signed_hop<B>(&self, req: &Request<B>) -> Result<Option<Signed>, &'static str> {
+        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
+            && *by == self.instance
         {
             return match hop {
-                HopCheck::Signed(signed) => Some(signed.clone()),
-                HopCheck::Refused(_) | HopCheck::Outside => None,
+                HopCheck::Signed(signed) => Ok(Some(signed.clone())),
+                HopCheck::Refused(why) => Err(why),
+                HopCheck::Outside => Ok(None),
             };
         }
         let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
-        self.is_internal(req.method(), hop_path(req), req.headers(), on_cluster_port)
+        match self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port) {
+            HopCheck::Signed(signed) => Ok(Some(signed)),
+            HopCheck::Refused(why) => {
+                self.note_refused(if why == BAD_SIGNATURE {
+                    BAD_SIGNATURE_WHY
+                } else {
+                    why
+                });
+                Err(why)
+            }
+            HopCheck::Outside => Ok(None),
+        }
     }
 
     /// Why [`Self::check_hop`] refuses a hop with 503, if it does.
@@ -1748,7 +1767,7 @@ impl Cluster {
             HopCheck::Signed(_) | HopCheck::Outside => None,
         };
         req.extensions_mut().insert(CheckedHop {
-            node: self.node_id.clone(),
+            by: self.instance.clone(),
             hop,
         });
         refused
