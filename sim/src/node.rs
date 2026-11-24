@@ -881,16 +881,16 @@ async fn start_check<B: Bucket, C: Clock>(
             .and_then(|(b, _)| NodeLeaseObject::decode(b))
             .filter(|o| o.state == NodeState::Live)
             .and_then(|o| o.instance);
-        // Over a fenced or released object (an operator's created fence
-        // included), the first write lands no earlier than its `written_at`
-        // plus ttl and grace on this clock, as the server's check.
-        let first_ended = first
+        // Over an operator's created fence, the first write lands no earlier
+        // than its `written_at` plus ttl and grace on this clock, as the
+        // server's check (ADR 0020, amendment on lease reads).
+        let first_created = first
             .as_ref()
             .and_then(|(b, _)| NodeLeaseObject::decode(b))
-            .filter(|o| o.state != NodeState::Live)
+            .filter(wasmkeep_cluster::node_lease::created_fence)
             .map(|o| o.written_at_ms);
         env.sleep_ms(wait).await;
-        if let Some(at) = first_ended {
+        if let Some(at) = first_created {
             env.sleep_ms(at.saturating_add(wait).saturating_sub(clock.now_ms()))
                 .await;
         }
