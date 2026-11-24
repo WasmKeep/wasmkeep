@@ -320,8 +320,13 @@ async fn a_pusher_whose_record_names_a_dead_node_is_taken_over_not_sent_apart() 
 
 /// An alarm due on a node that holds the companion and is not draining:
 /// handed to a peer, which fires it there and never sends it on. The pair
-/// woke together on a while it was alone; peers joined; the pusher set its
-/// alarm and hibernated; the room stays busy on a.
+/// woke together on a while it was alone and stays resident there, kept
+/// busy, while peers join; the pusher sets its alarm and hibernates; the
+/// room stays busy on a.
+///
+/// Kept busy from the start: idle, either would hibernate while the peers
+/// start, and the wake-ups that brought them back would race (a pusher
+/// woken while the room's wake-up is under way goes to a peer, apart).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_alarm_due_beside_its_room_is_handed_to_a_peer_once() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -334,34 +339,53 @@ async fn an_alarm_due_beside_its_room_is_handed_to_a_peer_once() {
     wait_drain_line(&store, "a", "serving").await;
     assert_eq!(wake(&a, "room", "lobby").await, "a");
     assert_eq!(wake(&a, "pusher", "lobby").await, "a");
+    // Each of the pair kept busy on a: an event every 50 ms, far inside
+    // the 500 ms idle timeout.
+    let busy = |class: &'static str| {
+        let addr = a.addr;
+        tokio::spawn(async move {
+            loop {
+                send(addr, "GET", &format!("/actor/{class}/lobby/fired"), "").await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+    let room_busy = busy("room");
+    let pusher_busy = busy("pusher");
     let _b = pair_node("b", dirs[1].path(), &store, roomy).await;
     let _c = pair_node("c", dirs[2].path(), &store, roomy).await;
     for id in ["b", "c"] {
         wait_drain_line(&store, id, "serving").await;
     }
     settle().await;
-    // The room kept busy on a; the pusher, its alarm set, hibernates.
-    let room = a.addr;
-    let busy = tokio::spawn(async move {
-        loop {
-            send(room, "GET", "/actor/room/lobby/fired", "").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
+    // The pusher, still resident on a, sets its alarm there; left alone,
+    // it hibernates while the room stays busy.
     let r = send_reachable(a.addr, "POST", "/actor/pusher/lobby/alarm?in=3000", "").await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while holder(&store, "pusher", "lobby").await.is_some() {
+    let due = std::time::Instant::now() + Duration::from_secs(3);
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("a")),
+        "{}",
+        r.body
+    );
+    pusher_busy.abort();
+    let _ = pusher_busy.await;
+    assert_eq!(holder(&store, "room", "lobby").await.as_deref(), Some("a"));
+    // Off a before the alarm is due: hibernated (no holder), or already
+    // fired on the peer it was handed to.
+    let mut now_on = holder(&store, "pusher", "lobby").await;
+    while now_on.as_deref() == Some("a") {
         assert!(
-            std::time::Instant::now() < deadline,
-            "the pusher never hibernated"
+            std::time::Instant::now() < due,
+            "the pusher was still resident on a when its alarm came due"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        now_on = holder(&store, "pusher", "lobby").await;
     }
     // Due: handed to b or c, fired there.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = due + Duration::from_secs(10);
     let fired_on = loop {
-        if let Some(node) = holder(&store, "pusher", "lobby").await {
+        if let Some(node) = now_on {
             break node;
         }
         assert!(
@@ -369,9 +393,10 @@ async fn an_alarm_due_beside_its_room_is_handed_to_a_peer_once() {
             "the alarm never fired"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+        now_on = holder(&store, "pusher", "lobby").await;
     };
     assert_ne!(fired_on, "a");
-    busy.abort();
+    room_busy.abort();
     assert_eq!(holder(&store, "room", "lobby").await.as_deref(), Some("a"));
     let r = send_reachable(a.addr, "GET", "/actor/pusher/lobby/fired", "").await;
     assert_eq!((r.status, r.body.trim()), (200, "1"), "{}", r.head);
