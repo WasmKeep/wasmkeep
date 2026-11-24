@@ -27,6 +27,19 @@ docker compose up -d --build
 podman compose up -d --build
 ```
 
+The bucket key and Grafana's admin password default to insecure values
+written in the compose files, the same for everyone. To use your own, put
+generated ones in a `.env` file in this directory before the first start
+(Compose reads it; Git ignores it):
+
+```bash
+printf 'WASMKEEP_DEMO_S3_SECRET=%s\nWASMKEEP_DEMO_GRAFANA_PASSWORD=%s\n' \
+  "$(openssl rand -hex 24)" "$(openssl rand -hex 16)" > .env && chmod 600 .env
+```
+
+To change the key after the first start, start over with
+`docker compose down -v`.
+
 The first build compiles the server and the counter (a few minutes). Then
 MinIO starts, `bucket` creates the bucket, `deploy` runs `wasmkeep deploy
 --app demo/counter` with the counter component, and the three nodes serve
@@ -69,7 +82,9 @@ bucket).
 `docker compose logs -f a b c` (each node logs `cluster enabled` with its
 cluster address at start).
 
-The MinIO console is at <http://127.0.0.1:9001> (user `wasmkeep-demo`).
+The MinIO console is at <http://127.0.0.1:9001> (user `wasmkeep-demo`, the
+password `WASMKEEP_DEMO_S3_SECRET`, or the insecure default in
+`compose.yaml`).
 
 To deploy a new version, rebuild the demo image and rerun the one-shot
 service; the nodes switch within a few seconds (rerunning it unchanged is a
@@ -98,7 +113,9 @@ podman compose -f compose.yaml -f monitoring.yaml up -d --build
 ```
 
 Grafana is at <http://127.0.0.1:3000> (the dashboard is its home page;
-anonymous viewing, `admin`/`admin` to edit), Prometheus at
+anonymous viewing; user `admin` to edit, with
+`WASMKEEP_DEMO_GRAFANA_PASSWORD` or the insecure default in
+`monitoring.yaml`), Prometheus at
 <http://127.0.0.1:9090>; both listen on 127.0.0.1 only. Send some traffic
 (the counter from "Try it", in a loop over a few names and the three
 ports), then kill a node: within about 15 s "Nodes ready" drops to 2,
@@ -129,10 +146,11 @@ example runs no Alertmanager, so nothing is sent anywhere.
   Compose's default of 10 s would turn it into a crash.
 - Each node and MinIO keep their data in a named volume. Start over with
   `docker compose down -v`.
-- The credentials in `compose.yaml` are demo credentials, readable by
-  anyone with the repository. Whoever can write the bucket can run code on
-  the cluster: replace them, and keep MinIO's ports on localhost, before
-  storing anything that matters.
+- Without a `.env` (see "Start it"), the credentials are the insecure
+  defaults in the compose files, readable by anyone with the repository.
+  Whoever can write the bucket can run code on the cluster: generate your
+  own, and keep MinIO's ports on localhost, before storing anything that
+  matters.
 
 ## The image on its own
 

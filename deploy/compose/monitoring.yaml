@@ -6,8 +6,10 @@
 #   docker compose -f compose.yaml -f monitoring.yaml up -d --build
 #   (or: podman compose -f compose.yaml -f monitoring.yaml up -d --build)
 #
-# Grafana: http://127.0.0.1:3000 (anonymous viewer access; admin/admin to
-# edit). Prometheus: http://127.0.0.1:9090. Both bound to 127.0.0.1 only.
+# Grafana: http://127.0.0.1:3000 (anonymous viewer access; user admin to
+# edit, with WASMKEEP_DEMO_GRAFANA_PASSWORD or else the insecure public
+# default below). Prometheus: http://127.0.0.1:9090. Both bound to
+# 127.0.0.1 only.
 
 services:
   a:
@@ -76,7 +78,8 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # INSECURE DEMO PASSWORD unless WASMKEEP_DEMO_GRAFANA_PASSWORD is set.
+      GF_SECURITY_ADMIN_PASSWORD: ${WASMKEEP_DEMO_GRAFANA_PASSWORD:-INSECURE-public-demo}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/wasmkeep.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"

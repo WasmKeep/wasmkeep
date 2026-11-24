@@ -34,7 +34,10 @@ registry.
    runs the fast jobs only. On a workstation, run the
    [mixed-version check](#the-mixed-version-check) on that commit too.
 2. **Tag.** Two signed tags on that commit: `v<version>`, and
-   `sdks/go/v<version>` for the Go module. `release.yml` waits for a full CI
+   `sdks/go/v<version>` for the Go module (`git tag -s`, with a signing key
+   added to your GitHub account). `release.yml` first checks that
+   `v<version>` is an annotated tag on the commit whose signature GitHub
+   verifies, and stops otherwise. It then waits for a full CI
    run on the commit (by hand or nightly), builds and signs everything,
    pushes the image and opens a **draft** release. A tag on a commit the
    full suite did not pass on fails here: run it on the commit, then the

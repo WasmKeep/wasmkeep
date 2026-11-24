@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// A line of its own when a guest trapped on its resource table's cap, so
+/// an operator tells it apart from a bug in the guest (the front logs the
+/// same). `event` names what trapped.
+pub(super) fn log_table_full(app: &str, address: &ActorAddress, event: &str, e: &wasmtime::Error) {
+    if crate::guest_tables::is_table_full(e) {
+        tracing::warn!(app = %crate::logging::named(app), actor = %crate::logging::actor(address), event, cap = crate::MAX_GUEST_RESOURCES, "guest trapped: it held as many host resources as a store allows");
+    }
+}
+
 /// How an actor event answered a request.
 pub(super) enum Outcome<B> {
     /// The guest's response.
@@ -499,6 +508,24 @@ impl ActorState {
         }
     }
 
+    /// Why a hold that may no longer act ended (ADR 0034, section 6):
+    /// `LostLease` once another writer replaced this node's lease (a fence,
+    /// a twin, a deletion: the node stops), `Lapse` when it only ran out.
+    pub(super) fn invalid_hold_reason(&self) -> Dropped {
+        self.lost_lease_or(Dropped::Lapse)
+    }
+
+    /// `LostLease` once another writer replaced this node's lease, else
+    /// `reason`: the stop that follows a lost lease counts what it gives up
+    /// as lost, not as the stop's.
+    pub(super) fn lost_lease_or(&self, reason: Dropped) -> Dropped {
+        if self.cluster.as_ref().is_some_and(|c| c.identity_taken()) {
+            Dropped::LostLease
+        } else {
+            reason
+        }
+    }
+
     /// The hold ends without its barrier: a periodic snapshot it left
     /// uploading sends no request it has not started, and the next hold's
     /// resets still wait for it (ADR 0034, section 7).
@@ -757,7 +784,7 @@ impl ActorState {
         let _timed = self.timing.work(super::timing::Work::Restore);
         // Whatever ran before may be stale now: close it all. The database
         // is rebuilt from the bucket unless it is already current.
-        self.drop_hold(Dropped::Lapse);
+        self.drop_hold(self.invalid_hold_reason());
         self.live = None;
         self.db = None;
         // A move under way (ADR 0017): as a drain of this one actor, with the
@@ -988,7 +1015,10 @@ impl ActorState {
             }
         };
         let result = match limit(self.limits.wall, self.held.as_ref(), outcome).await {
-            Ok(r) => r.map_err(|e| format!("{e:#}")),
+            Ok(r) => r.map_err(|e| {
+                log_table_full(&self.app_name, &self.address, "fetch", &e);
+                format!("{e:#}")
+            }),
             Err(cut) => Err(format!("event {cut}")),
         };
         if let Err(e) = &result {
@@ -1744,6 +1774,7 @@ impl ActorState {
                     i
                 }
                 Ok(Err(e)) => {
+                    log_table_full(&self.app_name, &self.address, "instantiate", &e);
                     self.db = store.data_mut().db.take();
                     return Err(format!("instantiate: {e:#}"));
                 }
@@ -1757,8 +1788,8 @@ impl ActorState {
                     // Start functions may have written, so give up rather than
                     // treating an incomplete activation as a flushed event.
                     self.drop_hold(match cut {
-                        Cut::Lease => Dropped::Lapse,
-                        Cut::Stop => Dropped::Stop,
+                        Cut::Lease => self.invalid_hold_reason(),
+                        Cut::Stop => self.lost_lease_or(Dropped::Stop),
                         Cut::Wall(_) | Cut::Replica => Dropped::Failure,
                     });
                     self.activation_interrupted = true;
@@ -1827,7 +1858,10 @@ impl ActorState {
         let outcome = match init {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(format!("on-init failed: {msg}")),
-            Ok(Err(trap)) => Err(format!("on-init trapped: {trap:#}")),
+            Ok(Err(trap)) => {
+                log_table_full(&self.app_name, &self.address, "init", &trap);
+                Err(format!("on-init trapped: {trap:#}"))
+            }
             Err(cut) => Err(format!("on-init {cut}")),
         };
         if outcome.is_ok() {

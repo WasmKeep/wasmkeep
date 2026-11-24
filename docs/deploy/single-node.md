@@ -132,10 +132,29 @@ LimitNOFILE=65536
 # executable) or a LimitAS (the instance pool reserves a lot of virtual
 # address space up front; it is not resident memory).
 NoNewPrivileges=yes
+# No capabilities: listen on a port above 1024 (behind the proxy below).
+CapabilityBoundingSet=
+# The file system read-only but for the data and cache directories.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/wasmkeep
+PrivateDevices=yes
+ReadWritePaths=/var/lib/wasmkeep/data /var/lib/wasmkeep/cache
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# IPv4 and IPv6 for clients, peers and the bucket; Unix sockets for the
+# journal and name resolution.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target
@@ -156,6 +175,16 @@ there runs as native code, so the server loads it only while the directory
 and the file belong to its user and no one else can write to them;
 otherwise it compiles again, and logs at start the command that fixes the
 directory.
+
+The hardening lines leave the service able to write its data and cache
+directories only, with no capabilities and the system calls of an
+ordinary service. Both directories must exist before the start (as
+created above). If you move `--data-dir` or `--cache-dir`, change
+`ReadWritePaths` with it; to listen on port 80 or 443 yourself, without
+the proxy, add `AmbientCapabilities=CAP_NET_BIND_SERVICE` and the same
+capability to `CapabilityBoundingSet`. `systemd-analyze security wasmkeep`
+shows what the unit still allows. Units written from an earlier version
+of this page can take these lines as they are.
 
 ## 3. Put a reverse proxy in front
 
