@@ -155,6 +155,12 @@ func FetchAll(requests []FetchRequest) []FetchResult {
 				pollables = append(pollables, p)
 			}
 		}
+		// Every request that was open is done, and others are still to
+		// start: there is nothing to wait for, so start them.
+		if len(pollables) == 0 && !retrying {
+			waited = false
+			continue
+		}
 		clock := -1
 		if retrying {
 			pollables = append(pollables, monotonicclock.SubscribeDuration(retryWait))

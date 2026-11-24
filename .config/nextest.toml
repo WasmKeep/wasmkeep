@@ -62,15 +62,6 @@ filter = 'binary(open_files)'
 slow-timeout = { period = "120s", terminate-after = 4 }
 
 [[profile.default.overrides]]
-# Known flake: room_scaling_split_reconnect_and_merge occasionally misses a
-# step on a loaded machine (the split and merge run on real second-scale
-# timers over four sockets, and no single race in the test explains it).
-# Run again, up to twice, and reported as FLAKY in the summary and
-# junit.xml, so it stays visible; three failures in a row still fail.
-filter = 'binary(=room_scaling) & test(=room_scaling_split_reconnect_and_merge)'
-retries = { backoff = "fixed", count = 2, delay = "2s" }
-
-[[profile.default.overrides]]
 # Each room_cluster test builds its front guest, starts three nodes, joins
 # 30 or 300 clients, kills a node and runs 450 publish rounds of at least
 # 100 ms: about 70 s on a quiet workstation, more than the default two

@@ -136,6 +136,11 @@ async fn room_scaling_split_reconnect_and_merge() {
         },
         ServeLimits::default(),
     ));
+    // The fixture merges after one second of hysteresis. Hold the merge for
+    // as long as the test needs instead, and let it go when the test asks:
+    // no assertion below races that second (the hysteresis rule itself is
+    // `r4_hysteresis_and_pair_thresholds` in the SDK).
+    assert_eq!(get(addr, "/hysteresis?ms=3600000").await.0, 200);
     let mut low = vec![];
     let mut high = vec![];
     for i in 0..100 {
@@ -172,7 +177,6 @@ async fn room_scaling_split_reconnect_and_merge() {
     last[3] = 1;
     assert_eq!(get(addr, "/map").await.1, "1");
     assert_eq!(get(addr, "/publish").await.0, 200);
-    let split_at = Instant::now();
     for i in [0, 2] {
         while last[i] < 2 {
             assert!(!consume(frame(&mut sockets[i]).await, &mut last[i]));
@@ -219,8 +223,7 @@ async fn room_scaling_split_reconnect_and_merge() {
             assert!(!consume(frame(&mut sockets[i]).await, &mut last[i]));
         }
     }
-    // The fixture overrides the default minute with one second.
-    tokio::time::sleep(Duration::from_millis(500).saturating_sub(split_at.elapsed())).await;
+    // The merge is held: still two edges after a publish, and the sockets are served.
     for i in [0, 1, 3] {
         sockets[i]
             .send(Message::Text(r#"{"t":"ping"}"#.into()))
@@ -235,20 +238,20 @@ async fn room_scaling_split_reconnect_and_merge() {
             }
         }
     }
-    // The split's last step (which starts the minute, here a second) runs
-    // a few events after the test saw it: one durable step per event. The
-    // publish's round must come after that second for the merge to start.
-    tokio::time::sleep(Duration::from_millis(1300).saturating_sub(split_at.elapsed())).await;
+    // Let the merge go. Its round comes with the next publish, and the split's
+    // own steps are done by then or finished first: the test waits below for
+    // the map and the state, not for a time.
+    assert_eq!(get(addr, "/hysteresis?ms=0").await.0, 200);
     assert_eq!(get(addr, "/publish").await.0, 200);
     while !consume(frame(&mut sockets[0]).await, &mut last[0]) {}
-    for _ in 0..100 {
+    for _ in 0..500 {
         if get(addr, "/map").await.1 == "1" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(get(addr, "/map").await.1, "1");
-    for _ in 0..200 {
+    for _ in 0..500 {
         if get(addr, "/state").await.1 == "1,0" {
             break;
         }

@@ -57,6 +57,21 @@ impl http::Guest for Front {
             http::respond_with(out, &r);
             return;
         }
+        // room_scaling: how long a split holds off a merge (the pusher's hysteresis).
+        if path.starts_with("/hysteresis?") {
+            let r = wasmkeep_sdk::actors::call(
+                "pusher/r",
+                &wasmkeep_sdk::actors::Request {
+                    method: "POST".into(),
+                    path: format!("/test-hysteresis?ms={}", query(&path, "ms").unwrap_or("1000")),
+                    headers: vec![],
+                    body: vec![],
+                },
+            )
+            .unwrap();
+            http::respond_with(out, &r);
+            return;
+        }
         let result: Result<String, String> = match path.as_str() {
             "/publish" => room
                 .publish(&[Publish {
