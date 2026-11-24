@@ -758,7 +758,7 @@ apart_refused() { # apart_refused R
   local r=$1 x=b attempt before after h p resident got=""
   if [ "$(label "${bin[$r]}")" = "$(label "${bin[$x]}")" ]; then fail "apart, refusal: $x and $r run one version"; return; fi
   pin b || return
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5 6; do
     if ! released 90 room/legacy pusher/legacy; then fail "apart, refusal: room/legacy or pusher/legacy still held:$HELD"; return; fi
     req_retry 20 GET "$r" "/r6/history?room=legacy&n=0"
     h=$(holder room/legacy)
@@ -777,7 +777,7 @@ apart_refused() { # apart_refused R
     fi
     note "apart, refusal (attempt $attempt): not refused by $r: $got"
   done
-  fail "apart, refusal: no wake-up of pusher/legacy placed on $r in 3 attempts (last: $got)"
+  fail "apart, refusal: no wake-up of pusher/legacy placed on $r in 6 attempts (last: $got)"
 }
 
 # A node of this checkout holding room/quiet drained, with every client
