@@ -5,7 +5,7 @@ alert on and how to read the page, see [Monitoring](../monitoring.md); this page
 catalogue behind it. For what to do when a status code or a readiness reason shows up, see
 [Troubleshooting](../troubleshooting.md).
 
-The list follows `crates/wasmkeep-server/src/metrics.rs`. A script,
+The list follows `crates/wasmkeep-server/src/metrics.rs` and `metrics/render.rs`. A script,
 `scripts/check-metrics-reference.py`, fails when a metric name is in the code and not on this page,
 or the other way round. It checks names only; types, labels and meanings are kept by hand.
 
