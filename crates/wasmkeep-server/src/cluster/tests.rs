@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// The default lease's ttl plus grace, for the heartbeat rounds the tests
+/// feed by hand ([`super::process::Transport::note_heartbeats`]).
+const LEASE_TTL_GRACE_MS: u64 = 15_000;
+
 #[test]
 fn the_pool_drops_a_peer_connection_before_the_peer_closes_it() {
     assert!(PEER_POOL_IDLE < crate::http::ServeLimits::default().header_read_timeout);
@@ -3070,6 +3074,51 @@ async fn an_operator_fence_over_no_object_is_not_a_twin() {
     a.identity().await.unwrap();
 }
 
+/// ADR 0020, amendment on lease reads: a process starting over an
+/// operator's created fence (no instance) writes its first `live` body no
+/// earlier than the fence's `written_at` plus ttl and grace (1.2 s) on its
+/// clock, whether the fence was there at the first read or appeared over
+/// no object during the check, so its bodies are dated after the fence as
+/// `older_than` orders them. Here the fence is dated 400 ms ahead (an
+/// operator's clock), and, created late in the check, after the check's own
+/// wait would have ended.
+#[tokio::test]
+async fn a_start_over_a_created_fence_dates_its_body_after_it() {
+    let key = StorePath::from("nodes/a");
+    let first_body = async |store: &Arc<dyn ObjectStore>| {
+        let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+        wasmkeep_cluster::node_lease::NodeLeaseObject::decode(&body).unwrap()
+    };
+    // There at the first read.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let fenced_at = now_ms() + 400;
+    let fence = format!("wasmkeep-node 3\nfenced -\n{fenced_at}\n");
+    store.put(&key, fence.into_bytes().into()).await.unwrap();
+    fast_node("a", &store).identity().await.unwrap();
+    let live = first_body(&store).await;
+    assert_eq!(live.state, wasmkeep_cluster::node_lease::NodeState::Live);
+    assert!(
+        live.written_at_ms >= fenced_at + 1_200,
+        "{} < {fenced_at} + 1200",
+        live.written_at_ms
+    );
+    // Created over no object 1 s into the check.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = fast_node("a", &store);
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let fenced_at = now_ms();
+    let fence = format!("wasmkeep-node 3\nfenced -\n{fenced_at}\n");
+    store.put(&key, fence.into_bytes().into()).await.unwrap();
+    a.identity().await.unwrap();
+    let live = first_body(&store).await;
+    assert_eq!(live.state, wasmkeep_cluster::node_lease::NodeState::Live);
+    assert!(
+        live.written_at_ms >= fenced_at + 1_200,
+        "{} < {fenced_at} + 1200",
+        live.written_at_ms
+    );
+}
+
 /// Review finding B5: an acquisition asks, right before its write, whether
 /// a hold of the epoch it read may act, not whether the lease is valid by
 /// the clock. Here the epoch moves while its read of the record is in
@@ -5458,23 +5507,29 @@ async fn an_older_read_landing_late_never_undoes_a_newer_one() {
     );
     let found =
         |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
-    let fresh = a
-        .transport
-        .note_heartbeats(found(body("fenced")), newer, |_, _, f| f.to_vec());
+    let fresh = a.transport.note_heartbeats(
+        found(body("fenced")),
+        newer,
+        LEASE_TTL_GRACE_MS,
+        |_, _, f| f.to_vec(),
+    );
     assert_eq!(fresh, ["b"]);
-    let (all, fresh) = a
-        .transport
-        .note_heartbeats(found(body("live")), older, |a, _, f| {
-            (a.to_vec(), f.to_vec())
-        });
+    let (all, fresh) =
+        a.transport
+            .note_heartbeats(found(body("live")), older, LEASE_TTL_GRACE_MS, |a, _, f| {
+                (a.to_vec(), f.to_vec())
+            });
     assert!(fresh.is_empty(), "an older read replaced a newer one");
     assert_eq!(
         all[0].lease,
         Some(wasmkeep_cluster::node_lease::NodeState::Fenced)
     );
-    let all = a
-        .transport
-        .note_heartbeats(Heartbeats::Listed(Vec::new()), older, |a, _, _| a.to_vec());
+    let all = a.transport.note_heartbeats(
+        Heartbeats::Listed(Vec::new()),
+        older,
+        LEASE_TTL_GRACE_MS,
+        |a, _, _| a.to_vec(),
+    );
     assert_eq!(all.len(), 1, "an older listing dropped a node read since");
     let all = a.transport.note_heartbeats(
         Heartbeats::Read(vec![(
@@ -5482,6 +5537,7 @@ async fn an_older_read_landing_late_never_undoes_a_newer_one() {
             HeartbeatRead::Failed("down".to_owned()),
         )]),
         newer + Duration::from_millis(1),
+        LEASE_TTL_GRACE_MS,
         |a, _, _| a.to_vec(),
     );
     assert_eq!(all.len(), 1, "a failed read keeps the node as last read");
@@ -5508,12 +5564,17 @@ async fn heartbeat_reads_raise_the_newest_lease_bodies() {
     let found =
         |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
     let t0 = std::time::Instant::now();
-    a.transport
-        .note_heartbeats(found(body("live", "cafe", 2_000)), t0, |_, _, _| ());
+    a.transport.note_heartbeats(
+        found(body("live", "cafe", 2_000)),
+        t0,
+        LEASE_TTL_GRACE_MS,
+        |_, _, _| (),
+    );
     // Issued later, dated earlier (a stale read): the newest stays.
     a.transport.note_heartbeats(
         found(body("released", "beef", 1_000)),
         t0 + Duration::from_millis(1),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     let newest = a.transport.lease_reads.newest("b").unwrap();
@@ -5529,6 +5590,7 @@ async fn heartbeat_reads_raise_the_newest_lease_bodies() {
     a.transport.note_heartbeats(
         Heartbeats::Listed(vec![body("fenced", "cafe", 2_000)]),
         t0 + Duration::from_millis(2),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert_eq!(
@@ -5572,6 +5634,7 @@ async fn a_runtime_restarted_in_place_is_not_its_own_predecessors_twin() {
             HeartbeatRead::Found(Box::new(body(&old))),
         )]),
         std::time::Instant::now(),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     first.leave_process();
@@ -5593,6 +5656,7 @@ async fn a_runtime_restarted_in_place_is_not_its_own_predecessors_twin() {
             HeartbeatRead::Found(Box::new(body("beef"))),
         )]),
         std::time::Instant::now(),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert!(second.read_heartbeats(&["b".to_owned()]).await);
@@ -5702,11 +5766,16 @@ async fn a_live_body_read_late_never_undoes_a_fence_of_its_instance() {
     let found =
         |n: NodeInfo| Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(n)))]);
     let t0 = std::time::Instant::now();
-    a.transport
-        .note_heartbeats(found(body("fenced", "beef")), t0, |_, _, _| ());
+    a.transport.note_heartbeats(
+        found(body("fenced", "beef")),
+        t0,
+        LEASE_TTL_GRACE_MS,
+        |_, _, _| (),
+    );
     let fresh = a.transport.note_heartbeats(
         found(body("live", "beef")),
         t0 + Duration::from_millis(1),
+        LEASE_TTL_GRACE_MS,
         |_, _, f| f.to_vec(),
     );
     assert!(fresh.is_empty(), "a stale live body undid the fence");
@@ -5718,6 +5787,7 @@ async fn a_live_body_read_late_never_undoes_a_fence_of_its_instance() {
     let fresh = a.transport.note_heartbeats(
         found(body("live", "cafe")),
         t0 + Duration::from_millis(2),
+        LEASE_TTL_GRACE_MS,
         |_, _, f| f.to_vec(),
     );
     assert_eq!(fresh, ["b"]);
@@ -5827,6 +5897,7 @@ async fn a_siblings_read_of_this_nodes_predecessor_is_not_a_twin() {
     sibling.transport.note_heartbeats(
         Heartbeats::Listed(vec![decoded(&released), decoded(&peer(now_ms()))]),
         std::time::Instant::now(),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert!(a.read_heartbeats(&["b".to_owned()]).await);
@@ -5841,6 +5912,7 @@ async fn a_siblings_read_of_this_nodes_predecessor_is_not_a_twin() {
             decoded(&peer(now_ms())),
         ]),
         std::time::Instant::now(),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert!(a.read_heartbeats(&["b".to_owned()]).await);
@@ -6034,22 +6106,29 @@ async fn gone_nodes_are_forgotten_once_no_earlier_read_can_land() {
     a.transport.note_heartbeats(
         Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(Box::new(body)))]),
         t0,
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     a.transport.note_heartbeats(
         Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Gone)]),
         t0 + Duration::from_millis(1),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert_eq!(a.transport.heard_ids(), ["b"], "gone, and remembered");
     // Within the longest a read may take: still remembered.
-    a.transport
-        .note_heartbeats(Heartbeats::Listed(Vec::new()), t0 + limit, |_, _, _| ());
+    a.transport.note_heartbeats(
+        Heartbeats::Listed(Vec::new()),
+        t0 + limit,
+        LEASE_TTL_GRACE_MS,
+        |_, _, _| (),
+    );
     assert_eq!(a.transport.heard_ids(), ["b"]);
     // Past it: forgotten.
     a.transport.note_heartbeats(
         Heartbeats::Listed(Vec::new()),
         t0 + limit * 2 + Duration::from_millis(2),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     assert!(
@@ -6340,16 +6419,19 @@ async fn a_late_read_does_not_bring_a_gone_node_back() {
     a.transport.note_heartbeats(
         Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(body()))]),
         t0,
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     a.transport.note_heartbeats(
         Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Gone)]),
         t0 + Duration::from_millis(10),
+        LEASE_TTL_GRACE_MS,
         |_, _, _| (),
     );
     let all = a.transport.note_heartbeats(
         Heartbeats::Read(vec![("b".to_owned(), HeartbeatRead::Found(body()))]),
         t0 + Duration::from_millis(5),
+        LEASE_TTL_GRACE_MS,
         |all, _, _| all.to_vec(),
     );
     assert!(all.is_empty(), "a late read brought a gone node back");

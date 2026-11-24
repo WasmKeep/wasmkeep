@@ -718,7 +718,9 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             // As the server's heartbeat rounds do: every lease body read
             // raises the process's newest reads.
             if let Some(o) = &seen {
-                self.owners.reads().observe(&peer, o);
+                self.owners
+                    .reads()
+                    .observe(&peer, o, cfg.ttl_ms() + cfg.grace_ms());
             }
             match seen.filter(|o| o.state == NodeState::Live) {
                 Some(o) => {
@@ -879,7 +881,19 @@ async fn start_check<B: Bucket, C: Clock>(
             .and_then(|(b, _)| NodeLeaseObject::decode(b))
             .filter(|o| o.state == NodeState::Live)
             .and_then(|o| o.instance);
+        // Over a fenced or released object (an operator's created fence
+        // included), the first write lands no earlier than its `written_at`
+        // plus ttl and grace on this clock, as the server's check.
+        let first_ended = first
+            .as_ref()
+            .and_then(|(b, _)| NodeLeaseObject::decode(b))
+            .filter(|o| o.state != NodeState::Live)
+            .map(|o| o.written_at_ms);
         env.sleep_ms(wait).await;
+        if let Some(at) = first_ended {
+            env.sleep_ms(at.saturating_add(wait).saturating_sub(clock.now_ms()))
+                .await;
+        }
         match (first, bucket.get(key).await) {
             (None, Ok(None)) => return None,
             (Some((was, _)), Ok(Some((now, version)))) if now == was => return Some(version),

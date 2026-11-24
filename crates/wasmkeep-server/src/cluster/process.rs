@@ -410,11 +410,14 @@ impl Transport {
     ///   starts it again).
     ///
     /// `apply` gets every node as last read (by id), the same judged, and
-    /// the nodes this call replaced.
+    /// the nodes this call replaced. `ttl_grace_ms` is the app's lease ttl
+    /// plus grace, which orders a created fence in the newest lease bodies
+    /// read ([`wasmkeep_cluster::node_lease::older_than`]).
     pub(super) fn note_heartbeats<R>(
         &self,
         read: Heartbeats,
         issued: std::time::Instant,
+        ttl_grace_ms: u64,
         apply: impl FnOnce(&[NodeInfo], &[NodeInfo], &[String]) -> R,
     ) -> R {
         let now = crate::cluster_tls::now_ms();
@@ -429,6 +432,7 @@ impl Transport {
                         instance: n.instance.clone(),
                         written_at_ms: n.written_at_ms,
                     },
+                    ttl_grace_ms,
                 );
             }
         };

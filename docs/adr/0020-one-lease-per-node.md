@@ -53,9 +53,11 @@
 - Amended 2026-11-24: lease reads. A node lease read to judge an
   ownership record free is never older than a body of that lease the
   process has already read; an older one is read again, and never frees
-  the record. Also defines the app's upgrade floor record, read at start.
-  See "Amendment of 2026-11-24: lease reads, and the upgrade floor" at the
-  end.
+  the record. A fence an operator created over a deleted object is newer
+  than every named body dated less than ttl plus grace after it, and a
+  start over one writes no earlier than that. Also defines the app's
+  upgrade floor record, read at start. See "Amendment of 2026-11-24: lease
+  reads, and the upgrade floor" at the end.
 - Amended 2026-11-24 (0.8.1): availability. The failover wait ignores a
   body kept after a failed read or older than one the process read; a
   round has at most 32 reads in flight; a node found gone leaves the live
@@ -1257,9 +1259,12 @@ would leave the actors of a restarted node unfreeable.
   `fenced` or `released` one is newer than any `live` one, whatever their
   dates: that instance never writes `live` after its end, and its clock
   may have stepped back before it (a fence or a release keeps the
-  `written_at` of the last `live` write). Otherwise the body dated earlier
-  is older; two bodies of different instances dated the same are not
-  ordered.
+  `written_at` of the last `live` write). A fence an operator created
+  over a deleted object (`fenced`, no instance) is newer than a body of a
+  named instance dated less than ttl plus grace after it, and older than
+  one dated that much after it or more (see "A fence created over a
+  deleted object" below). Otherwise the body dated earlier is older; two
+  bodies of different instances dated the same are not ordered.
 - A read made to judge a record (the acquisition's, and the read back after
   an acquisition's failed write) that returns a body older than the newest
   held for that node is read again, up to three reads in all. If every read
@@ -1284,6 +1289,42 @@ would leave the actors of a restarted node unfreeable.
 - Nothing changes in the stored records or leases, so nodes of the
   previous patch run beside this one: each judges by its own reads.
 
+### A fence created over a deleted object
+
+`cluster fence` over an absent `nodes/<id>` creates a fence dated by the
+operator's clock (raised to the bucket's time), naming no instance. It is
+written after every body of the processes before it, yet it may be dated
+before the last of them: that process's clock may run ahead and the
+operator's behind, each within the skew allowed, so by less than twice the
+skew. Ordered by date alone, a process that read the predecessor's last
+`live` body and then the fence takes the current fence for a stale read
+(refused, not judged) and keeps the predecessor's body as its newest. When
+the node id runs again as another instance and takes the actor, a stale
+read of that predecessor's body is not behind, names another instance than
+the record's, and frees it at once: two owners. The simulation found it
+(`stale_lease_reads_never_free_a_held_record`, seed 5367 of 20,000).
+
+- Ordering: a created fence is newer than every body of a named instance
+  (`live`, `fenced` or `released`) dated less than ttl plus grace after
+  it, and older than one dated at least that much after it. Twice the
+  skew is below ttl plus grace (`grace + safety >= 2 * max_skew`, `safety <
+  ttl`), so every body before the fence is older. Two created fences (one
+  raised to a later date) are ordered by date.
+- Starting over one: the start check writes the first `live` body no
+  earlier than the created fence's `written_at` plus ttl plus grace on its
+  own clock, whether the fence was there at its first read or appeared
+  over no object during the check (before, that check could end at its
+  own wait, ttl plus grace from its first read). The same clock dates
+  that body, so it is at least ttl plus grace after the fence, whatever
+  the skew. This adds at most the fence's lead over this clock (twice the
+  skew allowed) to such a start, only after an operator's fence over a
+  deleted object.
+- Nodes of the previous patch may start over a created fence earlier: a
+  body of theirs dated less than ttl plus grace after the fence is then
+  read as older than it, refused until the unpin window passes, and under
+  stale reads such a node gets no more than the rule before this
+  amendment.
+
 ### What it does not close
 
 - A first read that is stale: a process that has never read a body of
@@ -1296,7 +1337,9 @@ would leave the actors of a restarted node unfreeable.
   object for ttl plus grace and, over a `fenced` or `released` body, until
   that body's `written_at` is ttl plus grace old on its own clock (section
   1), which is more than twice the skew allowed. So a successor's
-  bodies are dated after its predecessor's. Twins (two processes started
+  bodies are dated after its predecessor's. A fence created over a deleted
+  object has no start check: it is ordered by the rule above, not by date
+  alone. Twins (two processes started
   with one id by mistake) write in turn and may be dated within the skew
   of each other: their bodies can be ordered wrongly, and the rule then
   gives no more than the rule before. A body dated ahead holds the newest
@@ -1354,13 +1397,15 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
 ### Tests
 
 - `node_lease::tests`:
-  - `which_body_of_a_lease_is_older`: an instance's end is newer than any of its `live` bodies, whatever the dates.
+  - `which_body_of_a_lease_is_older`: an instance's end is newer than any of its `live` bodies, whatever the dates; a created fence is newer than every named body dated less than ttl plus grace after it, and older than one dated that much after it or more.
+  - `a_created_fence_is_newer_than_the_bodies_before_it`: a predecessor's `live` body dated after an operator's created fence, served again once the node runs as another instance that holds the actor, is read again and frees nothing (judged by date alone it took the record).
   - `the_newest_reads_only_move_forward`.
   - `a_body_dated_ahead_holds_the_newest_for_a_window_only`: an older body replaces the held one once older bodies have been read for ttl plus grace with no confirming read. A gap with no reads does not shorten the window, a confirming read ends it, and a clock stepping back counts it from the step.
   - `a_stale_read_of_a_predecessor_frees_nothing`: the bucket serves a predecessor's `released` body after the process read its successor's `live` one. The acquisition is refused as a stale read while every read is stale, and the record is held by the successor once a read is current. Judging the exhausted read anyway, or switching the table off, frees the record.
   - `a_fence_after_a_clock_step_back_frees_after_ttl_and_grace`.
   - `the_read_back_never_judges_a_stale_body`.
 - `cluster::tests::heartbeat_reads_raise_the_newest_lease_bodies`: the server's heartbeat reads feed the table that its ownership records use, and a later-issued stale read does not lower it.
+- `cluster::tests::a_start_over_a_created_fence_dates_its_body_after_it`: over a created fence dated ahead at the first read, or created over no object late in the check, the first `live` body is dated at least ttl plus grace after the fence.
 - `sim/tests/madsim_node_lease.rs`:
   - `stale_lease_reads_never_free_a_held_record`: the record clients' reads of node leases return the body served before the newest one served, one read in three. There are never two owners and never one generation for two holds, and reads behind the newest are met and read again.
   - In `each_broken_variant_is_caught`, `StaleReadsTrusted` (the same reads judged as read) and `StaleExhaustedJudged` (an exhausted read judged anyway) both give two owners.

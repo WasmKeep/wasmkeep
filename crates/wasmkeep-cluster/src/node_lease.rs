@@ -168,12 +168,29 @@ pub fn frees(
 ///   `live` one, whatever their dates (that instance never writes `live`
 ///   after its fence or release, and its own clock may have stepped back
 ///   before them); otherwise the earlier date is older.
-/// - Different instances: the earlier date is older (a successor's start
-///   check dates its bodies after its predecessor's); dated the same, they
-///   are not ordered.
+/// - A fence an operator created over a deleted object (`fenced`, no
+///   instance) and a body of a named instance: the body is older if dated
+///   less than `ttl_grace_ms` (the lease's ttl plus grace) after the fence,
+///   newer otherwise. The fence is dated by the operator's clock, so a
+///   predecessor's bodies may be dated after it, by less than twice the
+///   skew allowed (below ttl plus grace); a successor's start check dates
+///   its first body at least ttl plus grace after the fence on its own
+///   clock.
+/// - Other different instances: the earlier date is older (a successor's
+///   start check dates its bodies after its predecessor's); dated the
+///   same, they are not ordered.
 ///
 /// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
-pub fn older_than(body: &NodeLeaseObject, seen: &NodeLeaseObject) -> bool {
+pub fn older_than(body: &NodeLeaseObject, seen: &NodeLeaseObject, ttl_grace_ms: u64) -> bool {
+    match (created_fence(body), created_fence(seen)) {
+        (false, true) if body.instance.is_some() => {
+            return body.written_at_ms < seen.written_at_ms.saturating_add(ttl_grace_ms);
+        }
+        (true, false) if seen.instance.is_some() => {
+            return body.written_at_ms.saturating_add(ttl_grace_ms) <= seen.written_at_ms;
+        }
+        _ => {}
+    }
     if body.instance == seen.instance {
         let ended = |o: &NodeLeaseObject| o.state != NodeState::Live;
         if ended(body) != ended(seen) {
@@ -181,6 +198,12 @@ pub fn older_than(body: &NodeLeaseObject, seen: &NodeLeaseObject) -> bool {
         }
     }
     body.written_at_ms < seen.written_at_ms
+}
+
+/// Whether `o` is a fence an operator created over an absent object
+/// ([`operator_fence`]): `fenced`, naming no instance.
+pub fn created_fence(o: &NodeLeaseObject) -> bool {
+    o.state == NodeState::Fenced && o.instance.is_none()
 }
 
 /// How many times a node lease read after a record is made before its
@@ -333,18 +356,18 @@ impl NewestReads {
 
     /// Notes `body`, just read for node `node`: it becomes the newest held
     /// if the one held is older than it, and confirms the one held unless it
-    /// is older.
-    pub fn observe(&self, node: &str, body: &NodeLeaseObject) {
+    /// is older ([`older_than`], given the lease's ttl plus grace).
+    pub fn observe(&self, node: &str, body: &NodeLeaseObject, ttl_grace_ms: u64) {
         if self.fault == ReadFault::Off {
             return;
         }
         let mut newest = self.lock();
         match newest.get_mut(node) {
             Some(held) => {
-                if older_than(&held.body, body) {
+                if older_than(&held.body, body, ttl_grace_ms) {
                     held.body = body.clone();
                 }
-                if !older_than(body, &held.body) {
+                if !older_than(body, &held.body, ttl_grace_ms) {
                     held.behind_since_ms = None;
                 }
             }
@@ -365,6 +388,8 @@ impl NewestReads {
     /// reported when it is). If not, it is noted ([`Self::observe`]). An
     /// older body replaces the newest held (and is not behind) once older
     /// bodies have been read for `unpin_ms` with no read confirming it.
+    /// `unpin_ms` is the lease's ttl plus grace, which also orders a
+    /// created fence ([`older_than`]).
     pub fn behind(&self, node: &str, body: &NodeLeaseObject, now_ms: u64, unpin_ms: u64) -> bool {
         if self.fault == ReadFault::Off {
             return false;
@@ -380,8 +405,8 @@ impl NewestReads {
             );
             return false;
         };
-        if !older_than(body, &held.body) {
-            if older_than(&held.body, body) {
+        if !older_than(body, &held.body, unpin_ms) {
+            if older_than(&held.body, body, unpin_ms) {
                 held.body = body.clone();
             }
             held.behind_since_ms = None;
@@ -2783,37 +2808,53 @@ mod tests {
             written_at_ms: at,
         };
         let live = |i, at| body(NodeState::Live, Some(i), at);
+        // ttl plus grace.
+        let tg = 15_000;
+        let older = |a: &NodeLeaseObject, b: &NodeLeaseObject| older_than(a, b, tg);
         // Dated earlier, across instances or between two live bodies.
-        assert!(older_than(&live("i1", 1_000), &live("i1", 1_001)));
-        assert!(older_than(
+        assert!(older(&live("i1", 1_000), &live("i1", 1_001)));
+        assert!(older(
             &body(NodeState::Released, Some("i1"), 1_000),
             &live("i2", 1_001)
         ));
-        assert!(!older_than(&live("i1", 1_001), &live("i1", 1_000)));
+        assert!(!older(&live("i1", 1_001), &live("i1", 1_000)));
         for end in [NodeState::Fenced, NodeState::Released] {
             // The same instance: its fence or release is newer than any of
             // its live bodies, whatever the dates (its clock stepped back).
             for at in [999, 1_000, 1_001] {
-                assert!(older_than(&live("i1", at), &body(end, Some("i1"), 1_000)));
-                assert!(!older_than(&body(end, Some("i1"), 1_000), &live("i1", at)));
+                assert!(older(&live("i1", at), &body(end, Some("i1"), 1_000)));
+                assert!(!older(&body(end, Some("i1"), 1_000), &live("i1", at)));
             }
             // Another instance's, dated the same: not ordered either way.
-            assert!(!older_than(
-                &live("i2", 1_000),
-                &body(end, Some("i1"), 1_000)
-            ));
-            assert!(!older_than(
-                &body(end, Some("i1"), 1_000),
-                &live("i2", 1_000)
-            ));
+            assert!(!older(&live("i2", 1_000), &body(end, Some("i1"), 1_000)));
+            assert!(!older(&body(end, Some("i1"), 1_000), &live("i2", 1_000)));
         }
         // Two ends of one instance: by date.
-        assert!(older_than(
+        assert!(older(
             &body(NodeState::Released, Some("i1"), 1_000),
             &body(NodeState::Fenced, Some("i1"), 1_001)
         ));
         // The same body is not older than itself.
-        assert!(!older_than(&live("i1", 1_000), &live("i1", 1_000)));
+        assert!(!older(&live("i1", 1_000), &live("i1", 1_000)));
+        // A fence an operator created over a deleted object (no instance):
+        // newer than every named body, live or ended, dated less than ttl
+        // plus grace after it (a predecessor on a clock ahead), older than
+        // one dated that much after it or more (a successor), whatever the
+        // instance.
+        let created = body(NodeState::Fenced, None, 100_000);
+        for state in [NodeState::Live, NodeState::Fenced, NodeState::Released] {
+            for at in [99_000, 100_000, 101_000, 100_000 + tg - 1] {
+                assert!(older(&body(state, Some("i1"), at), &created));
+                assert!(!older(&created, &body(state, Some("i1"), at)));
+            }
+            for at in [100_000 + tg, 100_000 + tg + 1] {
+                assert!(older(&created, &body(state, Some("i2"), at)));
+                assert!(!older(&body(state, Some("i2"), at), &created));
+            }
+        }
+        // Two created fences (one raised to a later date): by date.
+        assert!(older(&created, &body(NodeState::Fenced, None, 100_001)));
+        assert!(!older(&body(NodeState::Fenced, None, 100_001), &created));
     }
 
     #[test]
@@ -2829,14 +2870,14 @@ mod tests {
         assert!(!reads.behind("b", &live("i2", 2_000), 0, w));
         // An earlier body is behind, and leaves the newest as it was.
         assert!(reads.behind("b", &live("i1", 1_000), 10, w));
-        reads.observe("b", &live("i1", 1_500));
+        reads.observe("b", &live("i1", 1_500), w);
         assert_eq!(reads.newest("b"), Some(live("i2", 2_000)));
         assert_eq!(reads.behind_count(), 1);
         // Per node.
         assert!(!reads.behind("c", &live("i1", 1_000), 10, w));
         // Off: nothing held, nothing behind.
         let off = NewestReads::off();
-        off.observe("b", &live("i2", 2_000));
+        off.observe("b", &live("i2", 2_000), w);
         assert!(!off.behind("b", &live("i1", 1_000), 0, w));
         assert_eq!(off.newest("b"), None);
     }
@@ -2860,11 +2901,11 @@ mod tests {
         let seen = std::sync::Arc::clone(&events);
         let reads = NewestReads::new().with_report(move |e| seen.lock().unwrap().push(e.clone()));
         // k, on a clock an hour ahead, then dead; m, its successor.
-        reads.observe("b", &live("k", 3_600_000));
+        reads.observe("b", &live("k", 3_600_000), w);
         // A minute with no read, then a behind read: the window starts now.
         assert!(reads.behind("b", &live("m", 61_000), 61_000, w));
         // A read confirming k ends it.
-        reads.observe("b", &live("k", 3_600_000));
+        reads.observe("b", &live("k", 3_600_000), w);
         assert!(reads.behind("b", &live("m", 80_000), 80_000, w));
         assert!(reads.behind("b", &live("m", 94_000), 94_999, w));
         // Behind for 15 s with no confirming read: m's body replaces it.
@@ -2876,7 +2917,7 @@ mod tests {
             read_ms: 95_000
         }));
         // The reader's clock steps back: the window counts from the step.
-        reads.observe("b", &live("x", 9_000_000));
+        reads.observe("b", &live("x", 9_000_000), w);
         assert!(reads.behind("b", &live("m", 99_000), 99_000, w));
         assert!(reads.behind("b", &live("m", 50_000), 50_000, w));
         assert!(reads.behind("b", &live("m", 64_000), 64_999, w));
@@ -2913,7 +2954,7 @@ mod tests {
         // a's heartbeat reads saw b live as i2.
         let current =
             NodeLeaseObject::decode(&run((&mem).get("nodes/b")).unwrap().unwrap().0).unwrap();
-        reads.observe("b", &current);
+        reads.observe("b", &current, cfg().ttl_ms() + cfg().grace_ms());
         // Stale on every read: refused, nothing written.
         *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), BEHIND_READS as u32));
         assert_eq!(
@@ -2934,7 +2975,9 @@ mod tests {
         let judging = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(
             std::sync::Arc::new(NewestReads::with_fault(ReadFault::ExhaustedJudged)),
         );
-        judging.reads().observe("b", &current);
+        judging
+            .reads()
+            .observe("b", &current, cfg().ttl_ms() + cfg().grace_ms());
         *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), old.clone(), BEHIND_READS as u32));
         assert_eq!(
             run(judging.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
@@ -2950,6 +2993,80 @@ mod tests {
             Ok(3),
             "the unfixed rule takes the record a holds"
         );
+    }
+
+    /// An operator deleted b's lease while b ran as i1 on a clock ahead,
+    /// and `cluster fence` created a fence dated by a clock behind it, so
+    /// before i1's last `live` body. b then runs as i2 and holds the actor,
+    /// and the bucket serves i1's `live` body to a once more. The created
+    /// fence is newer than every body of a named instance dated less than
+    /// ttl plus grace after it, so i1's body is behind and frees nothing
+    /// (judged by date alone, the fence was behind and i1's body the
+    /// newest, and that stale read took the record i2 held).
+    #[test]
+    fn a_created_fence_is_newer_than_the_bodies_before_it() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_500);
+        let i1 = NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some("i1".into()),
+            written_at_ms: 101_000,
+        };
+        let fence = NodeLeaseObject {
+            state: NodeState::Fenced,
+            instance: None,
+            written_at_ms: 100_000,
+        };
+        mem.overwrite("nodes/b", Some(&i1.encode()));
+        mem.overwrite(
+            "owners/x",
+            Some(
+                &OwnerRecord {
+                    holder: Some(("b".into(), "i1".into())),
+                    generation: 1,
+                    recorded: None,
+                }
+                .encode(),
+            ),
+        );
+        let reads = std::sync::Arc::new(NewestReads::new());
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+        // a's heartbeat reads saw i1 live.
+        reads.observe("b", &i1, cfg().ttl_ms() + cfg().grace_ms());
+        // Deleted, and the fence created: current, so judged (not yet free).
+        mem.overwrite("nodes/b", Some(&fence.encode()));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held {
+                node: "b".into(),
+                instance: "i1".into()
+            })
+        );
+        assert_eq!(reads.newest("b"), Some(fence.clone()));
+        assert_eq!(reads.behind_count(), 0);
+        // b starts as i2 once the fence is ttl plus grace old on its clock,
+        // and takes the actor.
+        t.set(115_000);
+        let v = run((&mem).get("nodes/b")).unwrap().unwrap().1;
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        run(lb.start(Some(&v))).unwrap();
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(hold.generation, 2);
+        // i1's body served once more: behind the fence, read again, and the
+        // current body says i2 holds the actor.
+        t.set(115_100);
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), i1.encode(), 1));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))),
+            Err(AcquireError::Held {
+                node: "b".into(),
+                instance: "i2".into()
+            })
+        );
+        assert_eq!(reads.behind_count(), 1);
     }
 
     /// b's clock steps back while it runs as i2, then b is fenced: the
@@ -2982,7 +3099,11 @@ mod tests {
         let reads = std::sync::Arc::new(NewestReads::new());
         let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
         // a read b live as i2 at 50 s; b's clock then went back 20 s.
-        reads.observe("b", &body(NodeState::Live, 50_000));
+        reads.observe(
+            "b",
+            &body(NodeState::Live, 50_000),
+            cfg().ttl_ms() + cfg().grace_ms(),
+        );
         mem.overwrite("nodes/b", Some(&body(NodeState::Live, 30_000).encode()));
         t.set(52_000);
         assert_eq!(
@@ -3055,7 +3176,11 @@ mod tests {
         ] {
             let reads = std::sync::Arc::new(NewestReads::with_fault(fault));
             let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
-            reads.observe("b", &NodeLeaseObject::decode(&live("i3", 99_000)).unwrap());
+            reads.observe(
+                "b",
+                &NodeLeaseObject::decode(&live("i3", 99_000)).unwrap(),
+                cfg().ttl_ms() + cfg().grace_ms(),
+            );
             mem.overwrite("owners/r", Some(&record(None, 4)));
             *mem.steal_next.borrow_mut() = Some(("owners/r".into(), record(Some(("b", "i3")), 5)));
             *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), live("i2", 90_000), 1));

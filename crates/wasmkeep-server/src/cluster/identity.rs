@@ -456,6 +456,16 @@ impl Cluster {
         // The process the first read names, if live.
         let mut first_instance = None;
         if let Some((body, _)) = &last {
+            // A fence an operator created over a deleted object (no
+            // instance, no payload): the first write lands no earlier than
+            // its `written_at` plus ttl and grace on this clock, so this
+            // process's bodies are dated after it as `older_than` orders
+            // them (ADR 0020, amendment on lease reads).
+            if let Some(o) =
+                NodeLeaseObject::decode(body).filter(wasmkeep_cluster::node_lease::created_fence)
+            {
+                deadline = deadline.max(lapsed_at(o.written_at_ms));
+            }
             match decode(body) {
                 // A node lease (ADR 0020): its process acts only until its
                 // last write's `written_at + ttl - safety`, and any write of
@@ -519,9 +529,16 @@ impl Cluster {
                 if let Some(o) = ended {
                     // It lapsed once its kept `written_at` is ttl plus grace
                     // old: the check goes on then, without the rest of its
-                    // wait (ADR 0020, section 1). Any later change is
-                    // another writer.
-                    deadline = deadline.min(lapsed_at(o.written_at_ms));
+                    // wait (ADR 0020, section 1). An operator's fence over no
+                    // object ends nothing, and the first write lands no
+                    // earlier than its `written_at` plus ttl and grace, as
+                    // for one read first. Any later change is another
+                    // writer.
+                    deadline = if last.is_none() {
+                        deadline.max(lapsed_at(o.written_at_ms))
+                    } else {
+                        deadline.min(lapsed_at(o.written_at_ms))
+                    };
                     first_instance = None;
                 } else {
                     // Classified as a lease write's re-read classifies it.

@@ -1055,6 +1055,13 @@ fn seeds() -> u64 {
         .unwrap_or(200)
 }
 
+/// `WASMKEEP_SIM_SEED`: one seed to run alone, as other simulations take it.
+fn only_seed() -> Option<u64> {
+    std::env::var("WASMKEEP_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
 #[test]
 fn one_owner_and_one_generation_per_hold() {
     let (mut acquired, mut fences, mut clean_stops, mut deletions) = (0, 0, 0, 0);
@@ -1150,7 +1157,9 @@ fn each_broken_variant_is_caught() {
 fn stale_lease_reads_never_free_a_held_record() {
     let (mut acquired, mut behind) = (0, 0);
     let mut reasons: HashMap<&'static str, u64> = HashMap::new();
-    for seed in 0..seeds() {
+    // `WASMKEEP_SIM_SEED` runs that one seed's checks alone (no floors).
+    let only = only_seed();
+    for seed in only.map_or(0..seeds(), |s| s..s + 1) {
         let o = simulate(seed, Variant::StaleReads, Duration::from_secs(30));
         if let Some(d) = double_ownership(&o.claims) {
             panic!("seed {seed}: two owners under stale reads: {d:?}");
@@ -1163,6 +1172,9 @@ fn stale_lease_reads_never_free_a_held_record() {
         for (r, n) in o.reasons {
             *reasons.entry(r).or_default() += n;
         }
+    }
+    if only.is_some() {
+        return;
     }
     eprintln!(
         "{} seeds with stale lease reads: {acquired} acquisitions {reasons:?}, \

@@ -1013,7 +1013,11 @@ impl Cluster {
     /// last read, the view, the trust and the watches.
     fn apply_heartbeats(&self, read: Heartbeats, issued: std::time::Instant) {
         let transport = Arc::clone(&self.transport);
-        transport.note_heartbeats(read, issued, |all, judged, fresh| {
+        let ttl_grace = self
+            .lease_config
+            .ttl_ms()
+            .saturating_add(self.lease_config.grace_ms());
+        transport.note_heartbeats(read, issued, ttl_grace, |all, judged, fresh| {
             self.apply_view(all, judged, fresh);
         });
     }
@@ -1108,7 +1112,13 @@ impl Cluster {
                         written_at_ms: n.written_at_ms,
                     };
                     self.transport.lease_reads.newest(id).is_some_and(|newest| {
-                        wasmkeep_cluster::node_lease::older_than(&body, &newest)
+                        wasmkeep_cluster::node_lease::older_than(
+                            &body,
+                            &newest,
+                            self.lease_config
+                                .ttl_ms()
+                                .saturating_add(self.lease_config.grace_ms()),
+                        )
                     })
                 })
             });
