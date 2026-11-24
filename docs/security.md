@@ -176,14 +176,16 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   once, and conservative result/row/cell, allocation and vector-capacity
   overhead, including empty values ([details](concepts.md#storage)). A statement
   is stopped at the event's wall clock and SQL CPU budget, checked between
-  steps of SQLite's virtual machine and inside `instr`, `replace` and
-  `trim`. A stop inside one of these functions fails the statement only;
-  it does not roll back the guest's open transaction (a stop between steps
-  of a statement that writes does). A single step over a large value is
-  not interrupted, so a statement can overrun the budgets; `LIKE` and
-  `GLOB` are the costliest, their time growing with the value's length
-  times the pattern's (up to SQLite's 50,000-byte patterns). Host
-  statements have the same wall-clock limit.
+  steps of SQLite's virtual machine and inside `instr`, `replace`, `trim`,
+  `LIKE` and `GLOB`. These are the host's, with SQLite's answers, and match
+  without recursion; unlike SQLite's own `LIKE` and `GLOB`, they do not
+  narrow a search on an index to a prefix (`path GLOB 'a/*'` scans the
+  table; `path >= 'a/' AND path < 'a0'` uses the index). A stop inside one
+  of these functions fails the statement only; it does not roll back the
+  guest's open transaction (a stop between steps of a statement that writes
+  does). Another single step over a large value is not interrupted, so a
+  statement can still overrun the budgets by as long as such a step takes.
+  Host statements have the same wall-clock limit.
 - At most 2,000,000 instructions per compiled statement (past it,
   `quota-exceeded`). SQLite's own limits on columns, function arguments,
   expression depth and compound `SELECT` terms are kept, set explicitly:

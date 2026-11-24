@@ -715,8 +715,13 @@ impl ActorDb {
             deadline: Arc::clone(&deadline),
             cpu_deadline: Arc::clone(&cpu_deadline),
         };
-        crate::guest_functions::register(&conn, &budget, config.max_value_bytes)
-            .map_err(open_err)?;
+        crate::guest_functions::register(
+            &conn,
+            &budget,
+            config.max_value_bytes,
+            GUEST_MAX_LIKE_PATTERN as usize,
+        )
+        .map_err(open_err)?;
         // While a writing guest statement runs during capture, the WAL is
         // checked too: one statement must not grow it far past its cap.
         let wal_cap = Arc::new(AtomicU64::new(0));
@@ -1754,8 +1759,9 @@ const GUEST_MAX_COMPOUND_SELECT: i32 = 500;
 /// SQLite answers "out of memory".
 const GUEST_MAX_VDBE_OPS: i32 = 2_000_000;
 /// Bytes in a `LIKE` or `GLOB` pattern: SQLite's default (50,000), as set
-/// explicitly. A match costs up to the value's length times the pattern's,
-/// in one step the progress handler cannot interrupt.
+/// explicitly. The host's `like` and `glob` check it as SQLite's do; a
+/// match costs up to the value's length times the pattern's, under the
+/// statement's budgets ([`crate::guest_functions`]).
 const GUEST_MAX_LIKE_PATTERN: i32 = 50_000;
 /// rusqlite's busy timeout, which a checkpoint that does not wait for
 /// readers sets aside for a moment.
