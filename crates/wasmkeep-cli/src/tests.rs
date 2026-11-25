@@ -1687,9 +1687,38 @@ fn actor_where_shows_the_owner_and_writes_nothing() {
     else {
         unreachable!()
     };
-    let report =
-        super::actor_where::report_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into())))
-            .unwrap();
+    let read = |this: (u32, u32)| {
+        let this = wasmkeep_cluster::app_format::floor::Minor {
+            major: this.0,
+            minor: this.1,
+        };
+        super::actor_where::report_on(&args, Some(this), || {
+            Ok((std::sync::Arc::clone(&store), "wk".into()))
+        })
+        .unwrap()
+    };
+    // ADR 0043, section 5: a read-only command warns about a live node
+    // outside this `wasmkeep`'s range and goes on, with the same rows. The
+    // stale node-b is not one; beside 0.0 and 0.1 there is no warning.
+    let far = read((0, 9));
+    assert_eq!(far.warnings.len(), 1, "{:?}", far.warnings);
+    assert!(
+        far.warnings[0].contains("this `wasmkeep` (0.9) runs only beside")
+            && far.warnings[0].contains("acme/shop has live nodes outside that: node-a (0.0.0)"),
+        "{:?}",
+        far.warnings
+    );
+    let report = read((0, 1));
+    assert_eq!(report.warnings, Vec::<String>::new());
+    // A `wasmkeep` whose own version cannot be read still answers.
+    let unread = super::actor_where::report_on(&args, None, || {
+        Ok((std::sync::Arc::clone(&store), "wk".into()))
+    })
+    .unwrap();
+    assert!(unread.warnings.is_empty());
+    assert_eq!(unread.to_json(), report.to_json());
+    assert_eq!(far.to_text(now), report.to_text(now));
+    assert_eq!(far.to_json(), report.to_json());
     let text = report.to_text(now);
     let line = |actor: &str| {
         text.lines()

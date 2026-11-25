@@ -114,6 +114,105 @@ fn a_floor_below_the_previous_version_stops_a_start() {
     assert!(floor_from_below(Some(v(0, 12)), v(1, 0), true).is_err());
 }
 
+/// Section 5, "A skipped minor version": with no floor record, the
+/// registered leases say what last ran the app. A node of N starts when
+/// one of them names N-1 or later, and its own earlier lease does not
+/// name less; a stopped node's stale lease beside those is no skip.
+#[test]
+fn a_skipped_minor_version_is_refused_by_the_leases_left() {
+    let stopped = |id: &str, version: &str| node(id, version, "released", "take");
+    let check = |this: Minor, id: &str, nodes: &[NodeInfo]| skipped_minor(None, this, id, nodes);
+    let nine = v(0, 9);
+
+    // Every node stopped on 0.7, one fenced: refused, naming the newest.
+    let old = [
+        stopped("a", "0.7.4"),
+        node("b", "0.7.5", "fenced", "take"),
+        stopped("c", "0.6.0"),
+    ];
+    let why = check(nine, "d", &old).unwrap_err();
+    assert!(
+        why.contains("node `b` last ran `0.7.5`")
+            && why.contains("no registered node of this app ran 0.8")
+            && why.contains("this binary is 0.9")
+            && why.contains("install the last release of 0.8 on every node")
+            && !why.contains("cluster forget"),
+        "{why}"
+    );
+    // Restarted in place under one of their ids: refused too.
+    assert!(check(nine, "a", &old).is_err());
+    assert!(check(nine, "b", &old).is_err());
+
+    // Stopped on 0.8, any patch, or already on 0.9 or later: allowed.
+    for version in ["0.8.0", "0.8.1", "0.9.0", "0.10.0"] {
+        let nodes = [stopped("a", version), stopped("b", version)];
+        assert!(check(nine, "a", &nodes).is_ok(), "{version}");
+        assert!(check(nine, "c", &nodes).is_ok(), "{version}");
+    }
+    // A fresh app, and one whose leases were all forgotten.
+    assert!(check(nine, "a", &[]).is_ok());
+
+    // A lease a retired node left on 0.7 beside nodes that ran 0.8.
+    let mixed = [stopped("gone", "0.7.4"), stopped("b", "0.8.1")];
+    assert!(check(nine, "a", &mixed).is_ok());
+    assert!(check(nine, "b", &mixed).is_ok());
+    // This node's own earlier lease, released on 0.7: stopped, and
+    // restarted over a minor. The ways out are this node's, not "every
+    // node", and `cluster forget` removes a released lease.
+    let why = check(nine, "gone", &mixed).unwrap_err();
+    assert!(
+        why.contains("node `gone` last ran `0.7.4`")
+            && why.contains("this node did not run 0.8")
+            && why.contains("Install the last release of 0.8 on this node and start it once")
+            && why.contains("under a new node id")
+            && why.contains("`wasmkeep cluster forget gone`")
+            && !why.contains("every node"),
+        "{why}"
+    );
+    // Fenced on 0.7 (it crashed; no command removes a fenced lease) and
+    // replaced under its id once the others ran 0.8: it starts. With no
+    // node that ran 0.8, the app is what is refused.
+    let crashed = [
+        node("gone", "0.7.4", "fenced", "take"),
+        stopped("b", "0.9.0"),
+    ];
+    assert!(check(nine, "gone", &crashed).is_ok());
+    assert_eq!(
+        ran_below_previous(nine, &crashed)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect::<Vec<_>>(),
+        ["gone"]
+    );
+    assert!(ran_below_previous(nine, &crashed[1..]).is_empty());
+    let why = check(nine, "gone", &crashed[..1]).unwrap_err();
+    assert!(
+        why.contains("no registered node of this app ran 0.8"),
+        "{why}"
+    );
+
+    // A version line that does not parse is older than any version. A
+    // heartbeat from before node leases is the start guard's: not counted,
+    // for or against.
+    let why = check(nine, "a", &[stopped("x", "nine")]).unwrap_err();
+    assert!(why.contains("cannot read (`nine`"), "{why}");
+    let before = NodeInfo::decode(b"wasmkeep-node 2\nx\nhttp://x\n0.8.1\n5\nacme/shop\n").unwrap();
+    assert_eq!(before.lease, None);
+    assert!(check(nine, "a", std::slice::from_ref(&before)).is_ok());
+    assert!(check(nine, "a", &[before.clone(), stopped("b", "0.8.1")]).is_ok());
+    assert!(check(nine, "a", &[before, stopped("b", "0.7.4")]).is_err());
+
+    // With a floor record, the floor answers; and so it does above 0.9,
+    // where no record already refuses (`floor_from_below`).
+    assert!(skipped_minor(Some(nine), nine, "d", &old).is_ok());
+    assert!(skipped_minor(Some(v(0, 8)), nine, "d", &old).is_ok());
+    assert!(floor_from_below(None, v(0, 10), true).is_err());
+    // The first minor of a major version has none before it here.
+    assert!(check(v(1, 0), "d", &old).is_ok());
+    // Another major version below.
+    assert!(check(v(1, 1), "d", &[stopped("a", "0.12.0")]).is_err());
+}
+
 /// Section 2: a gated format needs both halves, the floor and every live
 /// node's words. Every pair, a live node without the word above the
 /// floor included.

@@ -334,6 +334,10 @@ pub(crate) struct Report {
     /// deletes its mark at once, so one that old was left by a run that
     /// did not finish, and keeps a node from starting under that id.
     pub(crate) unfinished_forgets: Vec<String>,
+    /// This `wasmkeep`'s minor version, for the warning of a read-only
+    /// command about live nodes outside its range (ADR 0043, section 5);
+    /// `None`: not judged (the reader says its version, a test need not).
+    pub(crate) wasmkeep: Option<wasmkeep_cluster::app_format::floor::Minor>,
 }
 
 pub(crate) use wasmkeep_cli::verify::FORGET_UNFINISHED_MS;
@@ -438,6 +442,7 @@ async fn read_with_limit(
         apps: read_apps(&store, prefix, bucket, max).await?,
         upgrades,
         unfinished_forgets,
+        wasmkeep: None,
     })
 }
 
@@ -670,6 +675,15 @@ impl Report {
             if upgrade.state.exit_code() == 1 {
                 out.push(format!("upgrade of {}", upgrade.line()));
             }
+        }
+        // And what this `wasmkeep` itself does not run beside: it reads
+        // and goes on, as `cluster upgrade status` does.
+        if let Some(this) = self.wasmkeep {
+            out.extend(
+                self.upgrades
+                    .iter()
+                    .filter_map(|u| crate::upgrade_cmd::reader_warning(u, this)),
+            );
         }
         let versions = self.versions();
         if versions.len() > 1 {
@@ -1330,6 +1344,66 @@ mod tests {
             assert!(why.contains("never deleted"), "{state}: {why}");
             assert!(exists(&store));
         }
+    }
+
+    /// ADR 0043, section 5: `cluster status` is read-only, so beside a
+    /// live node outside this `wasmkeep`'s range, or under a floor above
+    /// it, it warns as `cluster upgrade status` does, in the text and the
+    /// JSON, and goes on. A stopped node outside the range is not one.
+    #[test]
+    fn a_reader_outside_the_live_nodes_range_warns_and_goes_on() {
+        let lease = |id: &str, state: &str, version: &str| {
+            format!(
+                "wasmkeep-node 3\n{state} beef\n{NOW}\n{id}\nhttp://{id}\n{version}\nacme/shop\n\n\nserving\n\ntake\n"
+            )
+            .into_bytes()
+        };
+        let v = |minor: u32| wasmkeep_cluster::app_format::floor::Minor { major: 0, minor };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let put = |key: &str, body: Vec<u8>| {
+            block_on(store.put(&StorePath::from(key), body.into())).unwrap();
+        };
+        put("demo/nodes/a", lease("a", "live", "0.11.0"));
+        put("demo/nodes/b", lease("b", "released", "0.7.4"));
+        let mut r = report(Arc::clone(&store));
+        let before = r.warnings();
+        for this in [10, 11, 12] {
+            r.wasmkeep = Some(v(this));
+            assert_eq!(r.warnings(), before, "0.{this}");
+        }
+        r.wasmkeep = Some(v(9));
+        let warnings = r.warnings();
+        let own = "this `wasmkeep` (0.9) runs only beside the version before and the one after, \
+                   and acme/shop has live nodes outside that: a (0.11.0); commands that write \
+                   are refused";
+        assert_eq!(warnings.len(), before.len() + 1, "{warnings:?}");
+        assert!(warnings.contains(&own.to_owned()), "{warnings:?}");
+        assert!(r.to_text().contains(&format!("warning: {own}")));
+        assert!(
+            r.to_json()["warnings"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::from(own))
+        );
+        // The same sentence as `cluster upgrade status`.
+        assert!(
+            crate::upgrade_cmd::status_text("s3://b/demo", &r.upgrades, v(9))
+                .contains(&format!("warning: {own}"))
+        );
+        // A floor above the reader.
+        put(
+            "demo/formats/acme/shop/floor",
+            b"wasmkeep-floor 1\n0.11\n".to_vec(),
+        );
+        let mut r = report(Arc::clone(&store));
+        r.wasmkeep = Some(v(10));
+        assert!(
+            r.warnings()
+                .iter()
+                .any(|w| w.contains("this `wasmkeep` (0.10) is older than the cluster")),
+            "{:?}",
+            r.warnings()
+        );
     }
 
     /// ADR 0043: once the app's upgrade to 0.9 is finalized, `cluster

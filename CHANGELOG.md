@@ -42,7 +42,10 @@ a **pre-alpha pre-release**.
 - **A node refuses to start beside a version it cannot run with.** A
   node of minor version N starts only while every live node of its app
   runs N-1, N or N+1, and names the node that stops it. It also refuses
-  an app whose previous upgrade was never finalized.
+  an app whose previous upgrade was never finalized, and, with every
+  node stopped, an app whose node leases say it last ran a version
+  below N-1 (a cluster stopped on 0.7 does not start on 0.9: install
+  the last 0.8 release first).
 - **A new app is born finalized.** The first deploy of an app that
   never ran, or the first node of an app served without a deploy,
   creates its upgrade floor at its own version. An app that already has
@@ -103,6 +106,9 @@ a **pre-alpha pre-release**.
   node, and not older than the floor. One check now answers "does every
   live node announce this word" for every writer, the CLI included; the
   messages are unchanged.
+- **Read-only commands warn about a live node outside their range and
+  go on**: `cluster status` and `actor where` now print the line that
+  `cluster upgrade status` prints (`actor where` on standard error).
 - **A whole-app restore is checked like a deploy** (ADR 0043). Every
   version it installs goes through the deploy's gate, on the floor the
   restore leaves, before anything is written. It is refused from a

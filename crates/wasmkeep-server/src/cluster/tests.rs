@@ -1819,9 +1819,12 @@ async fn the_start_check_names_what_changed_the_object() {
 /// during the check is still a deletion, and the start stops.
 #[tokio::test]
 async fn a_forget_that_ends_between_two_reads_of_the_start_check_lets_the_start_go_on() {
+    // Its own earlier lease, of this version: an older one is a skipped
+    // minor version, another refusal.
+    let version = wasmkeep_cluster::VERSION;
     let lease = |state: &str| {
         format!(
-            "wasmkeep-node 3\n{state} beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            "wasmkeep-node 3\n{state} beef\n{}\na\nhttp://old\n{version}\nt/default\n\n\nserving\n\ntake\n",
             now_ms()
         )
     };
@@ -1921,8 +1924,9 @@ async fn a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let key = StorePath::from("nodes/a");
         let mark = wasmkeep_cluster::node_lease::encode_forgotten(now_ms());
+        let version = wasmkeep_cluster::VERSION;
         let released = format!(
-            "wasmkeep-node 3\nreleased beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            "wasmkeep-node 3\nreleased beef\n{}\na\nhttp://old\n{version}\nt/default\n\n\nserving\n\ntake\n",
             now_ms()
         );
         let first = if during_the_check {

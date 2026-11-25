@@ -489,7 +489,10 @@ impl Cluster {
     /// its app runs a version outside N-1 to N+1, or names one that does
     /// not parse, and names that node. It also refuses when the app has
     /// registered nodes and `floor` (as read before) is below N-1: the
-    /// upgrade before this one was never finalized (section 3).
+    /// upgrade before this one was never finalized (section 3). And it
+    /// refuses when the app has no floor and its registered nodes, all
+    /// stopped, last ran a version below N-1
+    /// ([`wasmkeep_cluster::upgrade::skipped_minor`]).
     pub(super) async fn version_guard(
         &self,
         floor: Option<wasmkeep_cluster::app_format::floor::Minor>,
@@ -512,7 +515,71 @@ impl Cluster {
         let served = format!("{}/{}", self.root.tenant(), self.root.app());
         let registered = first.registered_at_start(&served, &self.node_id, this);
         wasmkeep_cluster::upgrade::floor_from_below(floor, this, registered)?;
+        // With no floor record, the leases say what last ran the app: a
+        // stopped node is not seen by the skew check above.
+        let mut of_app: Vec<&NodeInfo> = first
+            .nodes
+            .iter()
+            .filter(|n| wasmkeep_cluster::membership::serves(n, &served))
+            .collect();
+        let judge = |nodes: &[&NodeInfo]| {
+            wasmkeep_cluster::upgrade::skipped_minor(
+                floor,
+                this,
+                &self.node_id,
+                nodes.iter().copied(),
+            )
+        };
+        if let Err(why) = judge(&of_app) {
+            // Leases from before the app was deleted and created again
+            // are another app's: read only when they would refuse.
+            let Some(since) = self.recreated_at().await else {
+                return Err(why);
+            };
+            of_app.retain(|n| n.written_at_ms > since);
+            judge(&of_app)?;
+        }
+        if floor.is_none() {
+            let behind = wasmkeep_cluster::upgrade::ran_below_previous(this, of_app);
+            if !behind.is_empty() {
+                tracing::warn!(
+                    nodes = %behind
+                        .iter()
+                        .map(|n| format!("{} ({})", n.id, n.version))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "node leases of this app name a version more than one minor version below \
+                     this one: taken for nodes retired before the app's last upgrade, as others \
+                     ran the version between (ADR 0043, section 5)"
+                );
+            }
+        }
         Ok((first, tokio::time::Instant::now()))
+    }
+
+    /// When this app was created again after an `app delete` (`deploy
+    /// --recreate`, ADR 0028): the last-modified time of its `recreated`
+    /// marker, by the bucket's clock; `None` if it never was. Every lease
+    /// of the incarnation before was last written earlier: `--recreate` is
+    /// refused until well after the app's nodes last wrote. Listed again
+    /// every half period until the bucket answers.
+    async fn recreated_at(&self) -> Option<u64> {
+        use wasmkeep_cluster::control::Keys as _;
+        let folder = format!("apps/{}/{}/", self.root.tenant(), self.root.app());
+        let marker = format!("{folder}recreated");
+        loop {
+            match self.control_keys.list_keys(&folder).await {
+                Ok(keys) => {
+                    return keys
+                        .into_iter()
+                        .find_map(|(k, at)| (k == marker).then_some(at));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "listing the app's markers failed; retrying before starting");
+                    tokio::time::sleep(self.heartbeat_every / 2).await;
+                }
+            }
+        }
     }
 
     /// The skew check's second half, once the node id check passed and

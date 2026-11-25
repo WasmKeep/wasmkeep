@@ -9,6 +9,8 @@
 //!
 //! - [`skew`]: a node or a CLI of minor version N runs beside N-1 to N+1
 //!   and nothing else (section 5).
+//! - [`skipped_minor`]: a stopped app that last ran a version below N-1
+//!   is not started on N (section 5).
 //! - [`FORMATS`] and [`gate`]: the gate table as data, and the one answer
 //!   to "may this writer write this format now" (section 2).
 //! - [`assess`], [`finalize_write`] and [`finalize_confirm`]: what
@@ -91,6 +93,105 @@ pub fn floor_from_below(floor: Option<Minor>, this: Minor, registered: bool) -> 
          {step}, run `wasmkeep cluster upgrade finalize` with that version's `wasmkeep`, then \
          install {this}"
     ))
+}
+
+/// Whether a node `id` of minor version `this` may start over an app
+/// with no floor record whose registered nodes are `registered` (section
+/// 5, "A skipped minor version"): the heartbeats of this app under
+/// `nodes/`, live, released or fenced, this node's own earlier one
+/// included. Refused, naming the node and the path, when
+///
+/// - none of them names the version before this one or a later one: the
+///   app last ran a version this one does not run beside, and every node
+///   being stopped, the skew check saw none of them; or
+/// - this node's own earlier lease is `released` and names a version
+///   below the one before: it was stopped and is restarted in place over
+///   a minor version. A fenced one is not judged alone: its process did
+///   not stop cleanly, no command removes it, and a replacement under its
+///   id is how it goes.
+///
+/// A lease whose version line does not parse counts as older than any
+/// version. A heartbeat from before node leases is not counted: the
+/// start guard judges it, and it will stop decoding (section 6). The
+/// caller leaves out the leases of an earlier incarnation of the app
+/// (deleted, then created again): they say nothing of this one.
+///
+/// With a floor record the floor answers ([`floor_from_below`]), and so
+/// it does when the version before this one is above what no record
+/// means: this rule decides only where no floor could have been written.
+/// An app with no registered node passes, as there: nothing says what ran
+/// it.
+pub fn skipped_minor<'a>(
+    floor: Option<Minor>,
+    this: Minor,
+    id: &str,
+    registered: impl IntoIterator<Item = &'a NodeInfo>,
+) -> Result<(), String> {
+    use crate::node_lease::NodeState;
+    let (None, Some(step)) = (floor, this.previous()) else {
+        return Ok(());
+    };
+    // `None`: older than any version.
+    let ran = |n: &NodeInfo| Minor::of_node_version(&n.version);
+    let nodes: Vec<&NodeInfo> = registered
+        .into_iter()
+        .filter(|n| n.lease.is_some())
+        .collect();
+    let last = |node: &NodeInfo| match ran(node) {
+        None => format!(
+            "node `{}` last ran a version this one cannot read (`{}`, in its lease \
+             `{NODES_PREFIX}{}`)",
+            node.id, node.version, node.id
+        ),
+        Some(_) => format!(
+            "node `{}` last ran `{}` (its lease `{NODES_PREFIX}{}` says so)",
+            node.id, node.version, node.id
+        ),
+    };
+    if !nodes.iter().any(|n| ran(n).is_some_and(|v| v >= step)) {
+        // The newest of them, to name.
+        let Some(node) = nodes.iter().max_by_key(|n| ran(n)) else {
+            return Ok(());
+        };
+        return Err(format!(
+            "{}, and no registered node of this app ran {step}: this binary is {this}, and a \
+             minor version is not skipped. Upgrade one minor version at a time: install the \
+             last release of {step} on every node and start them, then install {this}",
+            last(node)
+        ));
+    }
+    let own = nodes.iter().find(|n| {
+        n.id == id && n.lease == Some(NodeState::Released) && ran(n).is_none_or(|v| v < step)
+    });
+    match own {
+        None => Ok(()),
+        Some(own) => Err(format!(
+            "{}, and this node did not run {step}: this binary is {this}, and a minor version \
+             is not skipped. Install the last release of {step} on this node and start it \
+             once, then install {this}; or start this node under a new node id. If `{id}` was \
+             the id of a node retired before the app ran {step}, remove its lease with \
+             `wasmkeep cluster forget {id}`",
+            last(own)
+        )),
+    }
+}
+
+/// The registered nodes of an app, among `registered`, whose lease names
+/// a version below the one before `this` (or one that does not parse):
+/// what [`skipped_minor`] took for retired nodes when it let a start
+/// through, for the node to say so.
+pub fn ran_below_previous<'a>(
+    this: Minor,
+    registered: impl IntoIterator<Item = &'a NodeInfo>,
+) -> Vec<&'a NodeInfo> {
+    let Some(step) = this.previous() else {
+        return Vec::new();
+    };
+    registered
+        .into_iter()
+        .filter(|n| n.lease.is_some())
+        .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < step))
+        .collect()
 }
 
 /// What the gate table says of one format (section 2).
