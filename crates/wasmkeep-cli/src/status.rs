@@ -336,9 +336,7 @@ pub(crate) struct Report {
     pub(crate) unfinished_forgets: Vec<String>,
 }
 
-/// How old the mark of a `cluster forget` is before `cluster status`
-/// says its command did not finish.
-pub(crate) const FORGET_UNFINISHED_MS: u64 = 5_000;
+pub(crate) use wasmkeep_cli::verify::FORGET_UNFINISHED_MS;
 
 /// Reads the cluster under `prefix` of `store`, at `now_ms`, counting a
 /// heartbeat live for `horizon_ms`.

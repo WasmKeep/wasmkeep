@@ -104,7 +104,9 @@ The text under a version's heading is its GitHub release text
   reads the mark writes nothing over it and waits for it to be gone. If
   the command stopped between its two steps, the node does not start
   after 60 s and says to run the command again; `cluster status` names
-  such a mark. A node whose start check was watching a released lease
+  such a mark, and so does `cluster verify`, as a `note:` line (`notes`
+  in `--json`) that changes neither its verdict nor its exit code; it
+  reported the mark as a problem. A node whose start check was watching a released lease
   that is removed now checks its node id again and starts, where it
   stopped with `this node's lease object was deleted`. Before the
   finalize the command deletes as it did, and says so

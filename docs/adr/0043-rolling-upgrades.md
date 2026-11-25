@@ -1191,6 +1191,10 @@ The bucket adapter still has no conditional delete (`object_store`
    than 5 s ago was left by a command that did not finish. `cluster
    status` warns with one line, "forget did not finish; run `wasmkeep
    cluster forget <id>`": until then no node starts under that id.
+   `cluster verify` says the same as a note (`note:`, and `notes` in
+   `--json`): the mark is not a node and not a problem with what the
+   bucket holds, so it changes neither the verdict nor the exit code. A
+   younger mark is passed over in silence.
 
 Limits, kept as documented:
 
