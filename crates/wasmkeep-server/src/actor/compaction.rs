@@ -35,15 +35,33 @@
 //!    older than the window, in batches, the new hold's lease checked
 //!    before each ([`Collector::collect_idle`](crate::replica::Collector::collect_idle)),
 //!    and the pass's stop too: past [`PASS_DEADLINE`], an event waiting in
-//!    the mailbox behind the job, or a drain begun, it deletes no more (what
-//!    is left waits for the actor's next write);
+//!    the mailbox behind the job, or a drain begun, it deletes no more;
 //! 5. the release, which keeps the requirement the hold inherited (it is
 //!    never verified) and the idle origin. Then the job's empty state is
 //!    let go, unless an event that came after it holds the actor.
 //!
-//! Nothing is restored, activated or uploaded. The entry is only a hint of
-//! when to try: what the pass deletes rests on the record and the listing
-//! it reads itself.
+//! Nothing is restored, activated or uploaded.
+//!
+//! **A pass stopped at its deadline continues.** What it did not delete
+//! is queued again ([`CONTINUE_AFTER`] later) as a continuation: the
+//! entry the pass's own release leaves, with the version that release
+//! wrote and its generation, and the writer's generation `g` the first
+//! pass compacted for. The continuation acquires that record unchanged
+//! (any acquisition since, a write above all, changed it: `changed`,
+//! dropped), so every hold after `g` was one of this node's passes, which
+//! upload nothing, and the snapshot of `g` still has no other uploader.
+//! It deletes for `g` with the same rule, window and bounds. A chain ends
+//! when a pass finishes (`done`), after [`FRUITLESS_MAX`] passes in a row
+//! that deleted nothing, or after [`CONTINUATIONS_MAX`] passes (`stopped`).
+//! A pass stopped by a waiting event, a drain or its hold's end is not
+//! continued (`stopped`): the event's hold or the drain decides what comes
+//! next. One entry per actor and the spacing keep a giant history to one
+//! of the node's slots at a time, behind every entry due before it.
+//!
+//! For a first pass the entry is only a hint of when to try: what it
+//! deletes rests on the record and the listing it reads itself. A
+//! continuation's `g` comes from this node's memory of its own pass; the
+//! record it acquires unchanged is what proves no other hold came since.
 //!
 //! **The incarnation.** After `app delete` and `deploy --recreate`,
 //! generations start again at 1, and on S3 a version 1 released record at
@@ -81,8 +99,21 @@ pub(crate) const PASSES_AT_ONCE: usize = 4;
 const PASS_WAIT: Duration = Duration::from_secs(60);
 
 /// How long a pass deletes, from its acquisition: then it stops, and what
-/// is left waits for the actor's next write.
+/// is left is continued by another pass ([`CONTINUE_AFTER`] later).
 const PASS_DEADLINE: Duration = Duration::from_secs(5);
+
+/// When a pass stopped at its deadline is continued: the same spacing
+/// for every continuation, so a history of any length keeps one slot
+/// at most about half the time, behind the entries due before it.
+pub(crate) const CONTINUE_AFTER: Duration = Duration::from_secs(5);
+
+/// Passes of a chain in a row that deleted nothing (a listing that alone
+/// takes the deadline, say) after which it is given up.
+pub(crate) const FRUITLESS_MAX: u32 = 3;
+
+/// Passes of one chain at most (about 100,000 objects at one batch a
+/// pass); then what is left waits for the actor's next write and rest.
+pub(crate) const CONTINUATIONS_MAX: u32 = 1_000;
 
 /// Attempts at a pass's listing and deletes inside its hold, with doubling
 /// waits from one second, while the hold is valid and the pass not stopped.
@@ -102,8 +133,12 @@ const TICK_MAX: Duration = Duration::from_secs(5);
 pub(crate) struct Entry {
     /// The ownership record's key.
     pub(crate) key: String,
-    /// The generation the release kept.
+    /// The generation the release kept: the writer's, or for a
+    /// continuation the previous pass's hold.
     pub(crate) generation: u64,
+    /// The generation whose snapshot the pass compacts from: the writer's
+    /// (`generation` itself, except for a continuation).
+    pub(crate) snapshot_generation: u64,
     /// The version the release wrote.
     pub(crate) version: Version,
     /// When the release landed (Unix ms): the idle origin the pass's
@@ -113,6 +148,22 @@ pub(crate) struct Entry {
     pub(crate) due_ms: u64,
     /// Times it was put back for a passing obstacle.
     pub(crate) attempts: u32,
+    /// Passes of this chain before this one (0: the first pass).
+    pub(crate) continued: u32,
+    /// Passes of this chain in a row, before this one, that stopped at
+    /// the deadline having deleted nothing.
+    pub(crate) fruitless: u32,
+}
+
+/// A continuation armed by a pass for its own release
+/// ([`Queue::arm`], [`Queue::continue_from`]).
+#[derive(Debug)]
+enum Continuing {
+    /// The pass's hold's generation, and its next entry (version,
+    /// generation and due time filled in when the release lands).
+    Armed { hold_generation: u64, next: Entry },
+    /// The release landed: whether the queue took the next entry.
+    Queued(bool),
 }
 
 /// The idle passes due on this node, by record key.
@@ -123,6 +174,11 @@ pub(crate) struct Queue {
     paused: std::sync::atomic::AtomicBool,
     /// Wakes the loop: an entry added, a pass's slot given back.
     changed: tokio::sync::Notify,
+    /// The continuations armed by passes now releasing, by record key.
+    continuing: std::sync::Mutex<HashMap<String, Continuing>>,
+    /// Tests: a pass's deletes in batches of `.0`, and its deadline after
+    /// `.1` batches.
+    limit: std::sync::Mutex<Option<(usize, usize)>>,
 }
 
 #[derive(Debug, Default)]
@@ -229,12 +285,74 @@ impl Queue {
     fn is_paused(&self) -> bool {
         self.paused.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// A pass of `next.key` under a hold of `hold_generation` stopped at
+    /// its deadline: its release, if it lands with its version, queues
+    /// `next`.
+    fn arm(&self, hold_generation: u64, next: Entry) {
+        self.continuing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                next.key.clone(),
+                Continuing::Armed {
+                    hold_generation,
+                    next,
+                },
+            );
+    }
+
+    /// A release of `hold` that wrote nothing landed, with `version`: if
+    /// it is the hold of a pass that armed a continuation, that entry is
+    /// queued, on this version and generation.
+    fn continue_from(&self, hold: &Hold, version: Version, now_ms: u64) {
+        let mut continuing = self.continuing.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(Continuing::Armed {
+            hold_generation,
+            next,
+        }) = continuing.get(&hold.key)
+        else {
+            return;
+        };
+        if *hold_generation != hold.generation {
+            return;
+        }
+        let mut next = next.clone();
+        next.generation = hold.generation;
+        next.version = version;
+        next.due_ms = now_ms.saturating_add(u64::try_from(CONTINUE_AFTER.as_millis()).unwrap_or(0));
+        let queued = self.push(next);
+        continuing.insert(hold.key.clone(), Continuing::Queued(queued));
+    }
+
+    /// Ends `key`'s continuation once its pass released: whether the next
+    /// pass is queued.
+    fn disarm(&self, key: &str) -> bool {
+        matches!(
+            self.continuing
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(key),
+            Some(Continuing::Queued(true))
+        )
+    }
+
+    /// Tests: deletes in batches of `.0`, and each pass's deadline after
+    /// `.1` batches (`None`: as built).
+    pub(crate) fn limit(&self, limit: Option<(usize, usize)>) {
+        *self.limit.lock().unwrap_or_else(|p| p.into_inner()) = limit;
+    }
+
+    fn limits(&self) -> Option<(usize, usize)> {
+        *self.limit.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Whether a hold that ended wrote history: its acknowledged head is a
 /// position of its own generation (only a segment it uploaded puts one
 /// there). A hold that only read, and the idle pass's own hold, did not:
-/// their release queues nothing, so a pass never queues another.
+/// their release queues nothing, except the continuation a pass stopped
+/// at its deadline arms for its own release ([`Queue::arm`]).
 pub(crate) fn wrote(hold: &Hold) -> bool {
     matches!(
         hold.head.acknowledged,
@@ -256,13 +374,17 @@ impl Cluster {
     /// idle pass; one that did not write makes this node forget any entry
     /// of the actor (the version it remembered is gone). A release whose
     /// answer was lost (it comes back `Superseded`) never reaches here:
-    /// that actor is not queued.
+    /// that actor is not queued. A pass's own release (it wrote nothing)
+    /// queues the continuation that pass armed, if any.
     pub(crate) fn note_idle_release(&self, hold: &Hold, written: Option<Version>) {
         let Some(version) = written else {
             return;
         };
         if !wrote(hold) {
             self.idle_passes.remove(&hold.key);
+            if self.idle_compaction && self.app_refusal().is_none() {
+                self.idle_passes.continue_from(hold, version, now_ms());
+            }
             return;
         }
         if !self.idle_compaction || self.app_refusal().is_some() {
@@ -275,10 +397,13 @@ impl Cluster {
         self.idle_passes.push(Entry {
             key: hold.key.clone(),
             generation: hold.generation,
+            snapshot_generation: hold.generation,
             version,
             released_ms: now,
             due_ms: now.saturating_add(wait),
             attempts: 0,
+            continued: 0,
+            fruitless: 0,
         });
     }
 
@@ -379,12 +504,48 @@ impl Drop for PassHold<'_> {
     }
 }
 
+/// Why a pass stopped before deleting all it could.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Its deadline ([`PASS_DEADLINE`]): continued, within the bounds.
+    Deadline,
+    /// An event waits behind its job: that event's hold comes next.
+    Waiting,
+    /// The node drains.
+    Drain,
+    /// Its hold's lease ended.
+    Lease,
+}
+
+impl Stop {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Deadline => "its deadline",
+            Self::Waiting => "an event waiting",
+            Self::Drain => "a drain",
+            Self::Lease => "its hold ending",
+        }
+    }
+}
+
 /// What an idle pass did, a label of `wasmkeep_idle_compactions_total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Compacted {
     /// Compacted: `deleted` objects gone (0 if the history was already
-    /// as compact as the window allows, or the pass was stopped first).
+    /// as compact as the window allows), nothing old enough left.
     Done { deleted: usize },
+    /// Stopped at its deadline with `left` objects old enough still to
+    /// delete, and the next pass queued (on its own release's record,
+    /// [`CONTINUE_AFTER`] later).
+    Continued { deleted: usize, left: usize },
+    /// Stopped with `left` objects old enough still to delete, and not
+    /// continued: stopped by an event, a drain or its hold's end, the
+    /// chain's bounds reached, or the continuation not queued.
+    Stopped {
+        deleted: usize,
+        left: usize,
+        why: String,
+    },
     /// The record is not the one the release wrote: dropped.
     Changed,
     /// No snapshot of the released generation with its segment.
@@ -402,6 +563,8 @@ impl Compacted {
     fn label(&self) -> &'static str {
         match self {
             Self::Done { .. } => "done",
+            Self::Continued { .. } => "continued",
+            Self::Stopped { .. } => "stopped",
             Self::Changed => "changed",
             Self::Nothing => "nothing",
             Self::Refused(_) | Self::Retry(_) => "refused",
@@ -469,13 +632,60 @@ impl ActorState {
             }
         };
         let registered = PassHold::new(&cluster, cluster.owner_key(&self.address));
-        let outcome =
+        let (outcome, stop) =
             compact_under(&cluster, &self.address, &hold, &entry, &app_epoch, waiting).await;
         drop(registered);
+        // Stopped at its deadline: the rest is for a continuation, which
+        // this hold's release queues if it lands with its version.
+        let mut bound = None;
+        if let (Compacted::Stopped { deleted, .. }, Some(Stop::Deadline), Some(generation)) =
+            (&outcome, stop, hold.generation())
+        {
+            let fruitless = if *deleted == 0 {
+                entry.fruitless + 1
+            } else {
+                0
+            };
+            if fruitless >= FRUITLESS_MAX {
+                bound = Some("passes in a row deleted nothing");
+            } else if entry.continued + 1 >= CONTINUATIONS_MAX {
+                bound = Some("the chain's last pass");
+            } else {
+                cluster.idle_passes.arm(
+                    generation,
+                    Entry {
+                        continued: entry.continued + 1,
+                        fruitless,
+                        attempts: 0,
+                        ..entry.clone()
+                    },
+                );
+            }
+        }
         // Unverified: it releases with the requirement it inherited, and
         // with the idle origin its acquisition carried.
         hold.release().await;
-        outcome
+        let queued = cluster
+            .idle_passes
+            .disarm(&cluster.owner_key(&self.address));
+        match outcome {
+            Compacted::Stopped { deleted, left, .. } if queued => {
+                Compacted::Continued { deleted, left }
+            }
+            Compacted::Stopped { deleted, left, why } => Compacted::Stopped {
+                deleted,
+                left,
+                why: match (stop, bound) {
+                    (_, Some(bound)) => format!("{why}; not continued: {bound}"),
+                    (Some(Stop::Deadline), None) => format!(
+                        "{why}; not continued: the release did not land with its version, \
+                         or the queue is full"
+                    ),
+                    _ => why,
+                },
+            },
+            outcome => outcome,
+        }
     }
 }
 
@@ -494,7 +704,8 @@ async fn other_incarnation(cluster: &Cluster, app_epoch: &str) -> Option<Compact
     }
 }
 
-/// The pass's work under its own hold `hold` of `address`.
+/// The pass's work under its own hold `hold` of `address`, and why a
+/// pass that stopped did.
 async fn compact_under(
     cluster: &Arc<Cluster>,
     address: &ActorAddress,
@@ -502,48 +713,111 @@ async fn compact_under(
     entry: &Entry,
     app_epoch: &str,
     waiting: Waiting,
-) -> Compacted {
+) -> (Compacted, Option<Stop>) {
     // The released generation, from the record this hold replaced
     // (every acquisition writes generation + 1). The entry's own must
     // agree: an equal version with another generation is another
     // record (another incarnation's, whose `ETag` is the same).
     let Some(generation) = hold.generation().and_then(|g| g.checked_sub(1)) else {
-        return Compacted::Refused("the hold ended before the pass began".into());
+        return (
+            Compacted::Refused("the hold ended before the pass began".into()),
+            None,
+        );
     };
     if generation != entry.generation {
-        return Compacted::Changed;
+        return (Compacted::Changed, None);
     }
     // The incarnation: this runtime's epoch, read again now that the
     // pass holds the actor. A recreated or restored app compacts
     // nothing of what this node remembered.
     if let Some(refused) = other_incarnation(cluster, app_epoch).await {
-        return refused;
+        return (refused, None);
     }
     let deadline = std::time::Instant::now() + PASS_DEADLINE;
+    let limits = cluster.idle_passes.limits();
+    let batch = limits.map_or(crate::replica::COLLECT_BATCH, |(batch, _)| batch);
     let stopping = Arc::clone(cluster);
-    let stop = move || std::time::Instant::now() >= deadline || waiting() || stopping.draining();
-    let collector = Collector::idle(cluster, address, generation, hold.view());
+    let reason = Arc::new(std::sync::Mutex::new(None::<Stop>));
+    let said = Arc::clone(&reason);
+    let batches = std::sync::atomic::AtomicUsize::new(0);
+    // Asked before each batch: an event or a drain first (neither is
+    // continued), then the deadline (or the tests' batch budget).
+    let stop = move || {
+        let why = if waiting() {
+            Some(Stop::Waiting)
+        } else if stopping.draining() {
+            Some(Stop::Drain)
+        } else if std::time::Instant::now() >= deadline
+            || limits
+                .is_some_and(|(_, most)| batches.load(std::sync::atomic::Ordering::SeqCst) >= most)
+        {
+            Some(Stop::Deadline)
+        } else {
+            batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        if why.is_some() {
+            *said.lock().unwrap_or_else(|p| p.into_inner()) = why;
+        }
+        why.is_some()
+    };
+    // The writer's generation: the released one for a first pass, the one
+    // the chain began with for a continuation.
+    let collector = Collector::idle(cluster, address, entry.snapshot_generation, hold.view());
     let mut wait = Duration::from_secs(1);
     for attempt in 1..=PASS_ATTEMPTS {
         match collector
-            .collect_idle(cluster.history_retention, &stop)
+            .collect_idle(cluster.history_retention, batch, &stop)
             .await
         {
-            Ok(IdleCollected::NoSnapshot) => return Compacted::Nothing,
-            Ok(IdleCollected::Collected { deleted, .. }) => {
-                return Compacted::Done { deleted };
+            Ok(IdleCollected::NoSnapshot) => return (Compacted::Nothing, None),
+            Ok(IdleCollected::Collected {
+                deleted, left: 0, ..
+            }) => {
+                return (Compacted::Done { deleted }, None);
+            }
+            Ok(IdleCollected::Collected {
+                deleted,
+                left,
+                stopped,
+                ..
+            }) => {
+                let said = *reason.lock().unwrap_or_else(|p| p.into_inner());
+                // Not stopped, and some left: the lease ended first.
+                let why = said.filter(|_| stopped).unwrap_or(Stop::Lease);
+                return (
+                    Compacted::Stopped {
+                        deleted,
+                        left,
+                        why: format!("stopped by {}", why.text()),
+                    },
+                    Some(why),
+                );
             }
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
+                // Failed at or past the deadline under a valid hold: the
+                // chain goes on, as for a stop there (its deletes so far
+                // are counted in `wasmkeep_history_collected_total`).
+                if collector.lease_valid() && std::time::Instant::now() >= deadline {
+                    return (
+                        Compacted::Stopped {
+                            deleted: 0,
+                            left: 0,
+                            why: format!("a bucket error at its deadline: {e}"),
+                        },
+                        Some(Stop::Deadline),
+                    );
+                }
                 if attempt == PASS_ATTEMPTS || !collector.lease_valid() || stop() {
-                    return Compacted::Refused(e.to_string());
+                    return (Compacted::Refused(e.to_string()), None);
                 }
                 tokio::time::sleep(wait).await;
                 wait *= 2;
             }
         }
     }
-    Compacted::Refused("no attempt left".into())
+    (Compacted::Refused("no attempt left".into()), None)
 }
 
 /// The actor an ownership record key names, if it can be told (a name
@@ -727,6 +1001,12 @@ async fn pass_one(
         Compacted::Done { deleted } => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, "idle history compacted");
         }
+        Compacted::Continued { deleted, left } => {
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, left, "idle pass stopped at its deadline: continued later");
+        }
+        Compacted::Stopped { deleted, left, why } => {
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, left, %why, "idle pass stopped: not continued");
+        }
         Compacted::Refused(why) | Compacted::Retry(why) => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), %why, "idle pass: not compacted");
         }
@@ -777,10 +1057,13 @@ mod tests {
         Entry {
             key: key.into(),
             generation: 1,
+            snapshot_generation: 1,
             version: Version(format!("v-{key}")),
             released_ms: due_ms,
             due_ms,
             attempts: 0,
+            continued: 0,
+            fruitless: 0,
         }
     }
 
@@ -800,6 +1083,66 @@ mod tests {
         q.remove("c");
         assert!(q.take_due(30, 2).is_empty());
         assert_eq!(q.len(), 0);
+    }
+
+    fn hold(key: &str, generation: u64) -> Hold {
+        Hold {
+            key: key.into(),
+            generation,
+            version: Version(format!("held-{generation}")),
+            previous: None,
+            head: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_armed_continuation_is_queued_only_by_its_own_holds_release() {
+        let q = Queue::default();
+        let next = Entry {
+            continued: 1,
+            ..entry("k", 0)
+        };
+        // Another hold's release (another generation): nothing queued, and
+        // the pass that armed it learns it was not.
+        q.arm(7, next.clone());
+        q.continue_from(&hold("k", 8), Version("v8".into()), 1_000);
+        assert_eq!(q.len(), 0);
+        assert!(!q.disarm("k"));
+        // Its own release: queued on the version and generation it wrote,
+        // for the writer's generation, `CONTINUE_AFTER` later.
+        q.arm(7, next.clone());
+        q.continue_from(&hold("k", 7), Version("v7".into()), 1_000);
+        assert!(q.disarm("k"));
+        let queued = q.entries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (
+                queued[0].generation,
+                queued[0].snapshot_generation,
+                queued[0].version.0.as_str(),
+                queued[0].due_ms,
+                queued[0].continued
+            ),
+            (7, 1, "v7", 1_000 + CONTINUE_AFTER.as_millis() as u64, 1)
+        );
+        // Disarmed: a release landing later (in the background) queues
+        // nothing more, and a release with nothing armed neither.
+        q.clear();
+        q.continue_from(&hold("k", 7), Version("v7".into()), 2_000);
+        assert_eq!(q.len(), 0);
+        assert!(!q.disarm("k"));
+    }
+
+    #[test]
+    fn a_continuation_the_full_queue_refuses_is_said_not_queued() {
+        let q = Queue::default();
+        for i in 0..QUEUE_MAX as u64 {
+            assert!(q.push(entry(&format!("k{i}"), 1_000 + i)));
+        }
+        q.arm(2, entry("new", 0));
+        q.continue_from(&hold("new", 2), Version("v2".into()), 1_000);
+        assert!(!q.disarm("new"), "refused, so not continued");
+        assert_eq!(q.len(), QUEUE_MAX);
     }
 
     #[test]

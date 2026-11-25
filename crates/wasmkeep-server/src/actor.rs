@@ -874,6 +874,16 @@ impl ActorService {
         }
     }
 
+    /// Tests: this node's idle passes delete in batches of `batch` and
+    /// stop as at their deadline after `batches` batches (`None`: as
+    /// built), so a short history spans several passes.
+    #[doc(hidden)]
+    pub fn limit_idle_passes(&self, limit: Option<(usize, usize)>) {
+        if let Some(c) = &self.inner.cluster {
+            c.idle_passes.limit(limit);
+        }
+    }
+
     /// Tests: makes every remembered idle pass due now.
     #[doc(hidden)]
     pub fn idle_passes_due_now(&self) {

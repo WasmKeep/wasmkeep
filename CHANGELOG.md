@@ -148,6 +148,18 @@ Still a **pre-alpha pre-release**.
   an acquirer proving the recorded head after a pass
   ([backup and restore](docs/deploy/backup-and-restore.md),
   [ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md#as-built-the-backup-retry-and-the-last-simulations-081)).
+- **Idle compaction finishes large histories.** An idle pass stopped at
+  its 5 s deadline is now continued by further passes, 5 s apart, until
+  the actor's history is compact (an actor with thousands of objects
+  used to lose one batch of 100 and keep the rest until it next wrote,
+  and the pass counted `done`). `wasmkeep_idle_compactions_total{outcome}`
+  gains `continued` and `stopped`, and `done` now means nothing old
+  enough was left. Each pass raises the record's generation, so on a
+  version 2 app an actor compacted over several passes is refused by
+  `--require-owner-match` until it next writes, as after two wakes that
+  only read
+  ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md), "As
+  built: continuing a stopped pass").
 - **`lost_lease` is counted.** A batched write dropped because another
   writer replaced the node's lease (a fence, a twin), or by the stop that
   follows, now counts as `lost_lease` in

@@ -72,6 +72,14 @@
 //! segments alone give), and the plan after it is a snapshot with every
 //! segment after it. Then the final checks above.
 //!
+//! Some passes stop before deleting all they could, as the server's stops
+//! at its deadline (`IDLE_PASS_CAPPED_PERCENT`, a few deletes each): such
+//! a pass, once its release landed, queues a continuation on the record
+//! that release wrote, for the writer's generation, a little later. The
+//! continuation runs as a pass does (the version check, the rule for the
+//! writer's generation), and a wake in between makes it find the record
+//! changed.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -298,6 +306,17 @@ const SAFE_IDLE: Rules = Rules {
 /// How long after a hibernation the pass runs (the retention window
 /// plus the skew bound in the server), at least and up to.
 const IDLE_PASS_AFTER_MS: (u64, u64) = (300, 3_000);
+/// The share of passes (in percent) that stop after a few deletes, as
+/// the server's at its deadline, and are continued.
+const IDLE_PASS_CAPPED_PERCENT: u64 = 50;
+/// How many deletes such a pass sends at most: 1 up to this.
+const IDLE_PASS_CAP: u64 = 3;
+/// How long after a stopped pass its continuation runs, at least and up
+/// to (the server's `CONTINUE_AFTER` is fixed; drawn here, so a wake
+/// comes before some and after others).
+const IDLE_CONTINUE_AFTER_MS: (u64, u64) = (100, 1_500);
+/// Passes of one chain at most, in the model.
+const IDLE_CHAIN_MAX: u32 = 30;
 /// How often nobody wakes the actor until its pass is done (in percent);
 /// otherwise a wake may come first, at a random time before the pass.
 const IDLE_PAST_PASS_PERCENT: u64 = 80;
@@ -335,6 +354,15 @@ struct IdleCounts {
     /// Passes whose listing without its snapshot still planned, so the
     /// restore was compared against the segments' own history.
     compared_without_snapshot: u64,
+    /// Passes stopped before deleting all they could.
+    stopped: u64,
+    /// Continuations started (acquisitions tried), of a stopped pass.
+    continuations: u64,
+    /// Continuations that sent at least one delete.
+    continuations_deleted: u64,
+    /// Continuations dropped because the record changed since the
+    /// previous pass's release (a wake in between).
+    continuations_changed: u64,
 }
 
 fn count_idle(f: impl FnOnce(&mut IdleCounts)) {
@@ -967,7 +995,11 @@ async fn hibernate(
     madsim::task::spawn_local(idle_pass(
         Rc::clone(node),
         rules,
-        generation,
+        Chain {
+            generation,
+            snapshot_generation: generation,
+            passes: 0,
+        },
         version.0,
         delay_ms,
         Rc::clone(mailbox),
@@ -975,20 +1007,40 @@ async fn hibernate(
     ));
 }
 
+/// Which pass of a chain runs: the released record's generation, the
+/// writer's generation it compacts for (the same for a first pass), and
+/// the passes before it.
+#[derive(Debug, Clone, Copy)]
+struct Chain {
+    generation: u64,
+    snapshot_generation: u64,
+    passes: u32,
+}
+
 /// The idle pass (ADR 0042, section 3), `delay_ms` after the release of
-/// generation `generation` wrote `version`: in the actor's mailbox, a
-/// fresh hold taken only if the record is unchanged, the rule, the
-/// deletes, the release. Then it watches for its deletes landing after
-/// the hold ended.
+/// generation `chain.generation` wrote `version`: in the actor's mailbox,
+/// a fresh hold taken only if the record is unchanged, the rule for the
+/// writer's generation, the deletes, the release. Then it watches for its
+/// deletes landing after the hold ended. A pass stopped early queues its
+/// continuation once its release landed, on the record it wrote.
 async fn idle_pass(
     node: Rc<Node>,
     rules: Rules,
-    generation: u64,
+    chain: Chain,
     version: String,
     delay_ms: u64,
     mailbox: Rc<Mailbox>,
     store: Store,
 ) {
+    let generation = chain.generation;
+    let continuation = chain.passes > 0;
+    // Not drawn from the run's `rng`: existing seeds keep their faults.
+    let mut rng = Rng::new(
+        generation.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(chain.passes) ^ 0x0042_c0de,
+    );
+    let cap = rng
+        .chance(IDLE_PASS_CAPPED_PERCENT)
+        .then(|| usize::try_from(1 + rng.below(IDLE_PASS_CAP)).unwrap());
     let bucket = EpBucket::connect_with_timeout(WAIT).await;
     let deletes = EpBucket::connect_with_timeout(DELETE_WAIT).await;
     sleep(Duration::from_millis(delay_ms)).await;
@@ -999,6 +1051,9 @@ async fn idle_pass(
     }
     mailbox.pass.set(true);
     count_idle(|c| c.passes += 1);
+    if continuation {
+        count_idle(|c| c.continuations += 1);
+    }
     // Step 2: the record, only if unchanged since the release.
     let taken = if rules.idle == Idle::ChangedRecord {
         node.acquire(RECORD, 1).await
@@ -1010,6 +1065,9 @@ async fn idle_pass(
         Err(e) => {
             if e == AcquireError::Changed {
                 count_idle(|c| c.changed += 1);
+                if continuation {
+                    count_idle(|c| c.continuations_changed += 1);
+                }
             }
             trace(&format!(
                 "{} idle pass of gen {generation}: {e:?}",
@@ -1019,14 +1077,48 @@ async fn idle_pass(
             return;
         }
     };
-    let sent = compact(&node, &bucket, &deletes, rules, generation, &hold).await;
+    let (sent, left) = compact(&node, &bucket, &deletes, rules, chain, &hold, cap).await;
+    if continuation && !sent.is_empty() {
+        count_idle(|c| c.continuations_deleted += 1);
+    }
     // Step 6: the release. Deletes still in flight land after it.
     let mut in_flight: Vec<String> = {
         let s = store.lock().unwrap();
         sent.into_iter().filter(|k| s.contains_key(k)).collect()
     };
-    let _ = node.release(&hold).await;
+    let released = node.release(&hold).await;
     mailbox.pass.set(false);
+    // Stopped early: the continuation, on the version this release wrote
+    // (read back, as at hibernation: a record naming nobody at the pass's
+    // generation is that write).
+    if left > 0 && released && chain.passes + 1 < IDLE_CHAIN_MAX && !node.lost() {
+        count_idle(|c| c.stopped += 1);
+        if let Ok(Some((body, version))) = bucket.get(RECORD).await
+            && OwnerRecord::decode(&body)
+                .is_some_and(|r| r.holder.is_none() && r.generation == hold.generation)
+        {
+            let after = IDLE_CONTINUE_AFTER_MS.0
+                + rng.below(IDLE_CONTINUE_AFTER_MS.1 - IDLE_CONTINUE_AFTER_MS.0);
+            trace(&format!(
+                "{} idle pass of gen {generation} stopped ({left} left): continued as gen {}",
+                node.id(),
+                hold.generation
+            ));
+            madsim::task::spawn_local(Box::pin(idle_pass(
+                Rc::clone(&node),
+                rules,
+                Chain {
+                    generation: hold.generation,
+                    snapshot_generation: chain.snapshot_generation,
+                    passes: chain.passes + 1,
+                },
+                version.0,
+                after,
+                Rc::clone(&mailbox),
+                Arc::clone(&store),
+            )));
+        }
+    }
     for _ in 0..40 {
         if in_flight.is_empty() {
             break;
@@ -1041,18 +1133,22 @@ async fn idle_pass(
 }
 
 /// Steps 3 to 5 of the pass under `hold`: list, choose by the rule (or a
-/// broken variant), check the pass's oracles on its listing, delete while
-/// the hold may act. Returns the keys it sent deletes for.
+/// broken variant) for the chain's writer, check the pass's oracles on
+/// its listing, delete while the hold may act, at most `cap` keys (the
+/// last ones chosen). Returns the keys it sent deletes for, and how many
+/// chosen keys the cap left.
 async fn compact(
     node: &Node,
     bucket: &EpBucket,
     deletes: &EpBucket,
     rules: Rules,
-    generation: u64,
+    chain: Chain,
     hold: &Held,
-) -> Vec<String> {
+    cap: Option<usize>,
+) -> (Vec<String>, usize) {
+    let generation = chain.snapshot_generation;
     let Ok(objects) = bucket.list(PREFIX).await else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let listing = read_listing(objects.iter().map(|(k, _)| k.as_str()));
     let chosen = if rules.idle == Idle::AnySnapshotAtHead {
@@ -1072,7 +1168,7 @@ async fn compact(
     ));
     let Some((s, mut gone)) = chosen else {
         count_idle(|c| c.nothing += 1);
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     match rules.idle {
         Idle::DropSegmentAtP => {
@@ -1087,7 +1183,7 @@ async fn compact(
             // a listing with times (one more LIST, as the server's
             // `Collector::list` reads `last_modified` from its listing).
             let Ok(timed) = bucket.list_versions(PREFIX).await else {
-                return Vec::new();
+                return (Vec::new(), 0);
             };
             let now = wasmkeep_cluster::lease::Clock::now_ms(node.clock()).saturating_sub(EPOCH_MS);
             let old: BTreeSet<String> = timed
@@ -1099,9 +1195,13 @@ async fn compact(
         }
         _ => {}
     }
+    // Stopped early: the first keys chosen are left for a continuation
+    // (the last ones, where a mutation's extra key is, are sent).
+    let left = cap.map_or(0, |cap| gone.len().saturating_sub(cap));
+    gone.drain(..left);
     let violations = pass_violations(&objects, &gone, s);
     IDLE_PROBLEMS.with(|p| p.borrow_mut().extend(violations));
-    if hold.generation != generation + 1 && !gone.is_empty() {
+    if hold.generation != chain.generation + 1 && !gone.is_empty() {
         count_idle(|c| c.took_changed += 1);
     }
     if s.generation != generation && !gone.is_empty() {
@@ -1120,7 +1220,7 @@ async fn compact(
     if !sent.is_empty() {
         count_idle(|c| c.deleted += 1);
     }
-    sent
+    (sent, left)
 }
 
 /// One process's life on node leases: until its lease is lost (fenced, or
@@ -1462,6 +1562,8 @@ pub(crate) fn backup_simulation(seed: u64, observer: Observer) {
 pub(crate) struct IdleObserved {
     /// Passes that sent at least one delete.
     pub(crate) passes_deleted: u64,
+    /// Of those, continuations of a pass stopped early.
+    pub(crate) continuations_deleted: u64,
     /// The first violation of the replication checks, per pass or final.
     pub(crate) problem: Option<String>,
 }
@@ -1483,6 +1585,7 @@ pub(crate) fn idle_backup_simulation(
     let outcome = simulate_observed(seed, rules, duration, false, Some(observer));
     IdleObserved {
         passes_deleted: outcome.idle.deleted,
+        continuations_deleted: outcome.idle.continuations_deleted,
         problem: check(&outcome).err(),
     }
 }
@@ -2314,12 +2417,17 @@ fn idle_holds(rules: Rules, what: &str) -> IdleCounts {
         t.took_changed += c.took_changed;
         t.late_deletes += c.late_deletes;
         t.compared_without_snapshot += c.compared_without_snapshot;
+        t.stopped += c.stopped;
+        t.continuations += c.continuations;
+        t.continuations_deleted += c.continuations_deleted;
+        t.continuations_changed += c.continuations_changed;
     }
     eprintln!(
         "replication {what}: {} seeds x 30 s: {acked} acknowledged writes, all restored; \
          {generations} generations; {} idle snapshots; {} passes ({} more skipped): {} deleted, {} dropped for a \
          changed record, {} found nothing, {} took a changed record and deleted; {} deletes \
-         landed after their hold ended; {} restores compared without the snapshot",
+         landed after their hold ended; {} restores compared without the snapshot; {} passes \
+         stopped early: {} continuations, {} deleted, {} dropped for a changed record",
         seeds(),
         t.snapshots,
         t.passes,
@@ -2329,7 +2437,11 @@ fn idle_holds(rules: Rules, what: &str) -> IdleCounts {
         t.nothing,
         t.took_changed,
         t.late_deletes,
-        t.compared_without_snapshot
+        t.compared_without_snapshot,
+        t.stopped,
+        t.continuations,
+        t.continuations_deleted,
+        t.continuations_changed
     );
     assert!(acked > seeds() * 10, "too few writes ({acked})");
     assert!(
@@ -2356,6 +2468,16 @@ fn idle_compaction_keeps_every_acknowledged_write() {
     assert!(
         c.compared_without_snapshot > 0,
         "the restore was never compared without the snapshot: {c:?}"
+    );
+    // Passes stopped early and continued: some continuations deleted,
+    // some found the record changed by a wake in between.
+    assert!(
+        c.continuations_deleted > 0,
+        "no continuation deleted: {c:?}"
+    );
+    assert!(
+        c.continuations_changed > 0,
+        "no continuation found the record changed: {c:?}"
     );
 }
 

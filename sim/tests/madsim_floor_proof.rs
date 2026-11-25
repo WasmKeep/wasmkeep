@@ -575,11 +575,15 @@ fn cancellation_drops_queued_hung_and_backing_off_discovery() {
 // the released record (one generation up), inherits its requirement
 // (`combine` of its node's local evidence and the record), lists, applies
 // `idle_collectable` with the released generation, deletes, and releases
-// unverified: it freezes what it inherited. Sometimes a late segment of an
-// earlier generation lands after the pass (a slow upload of an older
-// owner, ADR 0012's reason for keeping the segment at P).
+// unverified: it freezes what it inherited. On some seeds the pass stops
+// early, as the server's at its deadline, and is continued: up to three
+// more passes, each acquiring the record the previous one released (one
+// generation up again), inheriting from it, and deleting for the
+// writer's generation, the last one finishing. Sometimes a late segment
+// of an earlier generation lands after the passes (a slow upload of an
+// older owner, ADR 0012's reason for keeping the segment at P).
 //
-// An acquirer on another node then reads the pass's record
+// An acquirer on another node then reads the last pass's record
 // (`Requirement::of_record`), lists, plans with the real planner and
 // judges with the real `prove`. Checked: the record still requires H,
 // complete, stamped by H's writer; the plan's head is H; and the proof is
@@ -600,8 +604,9 @@ enum PassBreak {
 }
 
 /// One seed: `Err(why)` if the acquirer did not prove H exactly; `Ok` with
-/// whether the pass deleted anything and whether `S` was below H.
-fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool), String> {
+/// whether the passes deleted anything, whether `S` was below H, and how
+/// many passes ran.
+fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool, u64), String> {
     use std::sync::Mutex;
     use wasmkeep_cluster::hold_cell::{self, HoldHead};
     use wasmkeep_cluster::lease::Version;
@@ -693,60 +698,103 @@ fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool), Stri
         };
         keys.insert(snapshot_key(head), body);
     }
-    // The pass: one generation up, unchanged record, its requirement
-    // inherited from its node's local evidence (the writer's frozen head)
-    // and the record.
-    let inherited = combine(
-        Some((writer_floor, gens)),
-        Requirement::of_record(&released).map(|r| (r, released.generation)),
-    );
-    let pass = Hold {
-        key: "owners/t/c/a".into(),
-        generation: released.generation + 1,
-        version: Version("v2".into()),
-        previous: None,
-        head: HoldHead {
-            inherited,
-            recorded: true,
-            ..HoldHead::default()
-        },
-    };
-    let listing = Listing::from_keys(keys.keys().map(String::as_str));
-    let Some((s, mut gone)) = idle_collectable(&listing, released.generation) else {
-        return Err("no snapshot of the released generation".into());
-    };
-    let boundary = |id: SegmentId| {
-        listing
-            .segments
-            .iter()
-            .find(|seg| seg.id == id)
-            .map(segment_key)
-    };
-    match breaks {
-        PassBreak::DropSegmentAtP => gone.extend(boundary(s)),
-        PassBreak::DropSnapshot => gone.push(snapshot_key(s)),
-        PassBreak::DropBetween if s.txid < head.txid => gone.extend(boundary(SegmentId {
-            generation: gens,
-            txid: s.txid + 1,
-        })),
-        _ => {}
-    }
-    let deleted = !gone.is_empty();
-    for key in &gone {
-        keys.remove(key);
-    }
-    // Released unverified: it freezes what it inherited.
-    let frozen = if breaks == PassBreak::ForgetInherited {
-        None
+    // The passes: one, or on some seeds a chain stopped early and
+    // continued (drawn apart from `rng`, so the seeds keep their
+    // histories).
+    let mut chain_rng = Rng::new(seed ^ 0x0042_c0de);
+    let passes = if chain_rng.chance(50) {
+        2 + chain_rng.below(3)
     } else {
-        Requirement::frozen(&pass)
+        1
     };
-    let after = OwnerRecord {
-        holder: None,
-        generation: pass.generation,
-        recorded: Some(Requirement::stored(frozen, false, None)),
-    };
-    let after = OwnerRecord::decode(&after.encode()).expect("a valid record");
+    let (mut record, mut local) = (released.clone(), Some((writer_floor, gens)));
+    let (mut deleted, mut chosen, mut ran) = (false, None, 0);
+    for n in 1..=passes {
+        // One generation up, unchanged record, its requirement inherited
+        // from its node's local evidence (the previous hold's frozen head)
+        // and the record.
+        let inherited = combine(
+            local,
+            Requirement::of_record(&record).map(|r| (r, record.generation)),
+        );
+        let pass = Hold {
+            key: "owners/t/c/a".into(),
+            generation: record.generation + 1,
+            version: Version(format!("v{}", n + 1)),
+            previous: None,
+            head: HoldHead {
+                inherited,
+                recorded: true,
+                ..HoldHead::default()
+            },
+        };
+        // For the writer's generation, whichever pass of the chain.
+        let listing = Listing::from_keys(keys.keys().map(String::as_str));
+        let Some((s, mut gone)) = idle_collectable(&listing, gens) else {
+            if n == 1 {
+                return Err("no snapshot of the writer's generation".into());
+            }
+            // A continuation finding nothing (a mutation deleted `S`)
+            // releases nothing new, as the server's `nothing`: the
+            // acquirer judges what is left.
+            break;
+        };
+        if chosen.is_some_and(|c| c != s) {
+            return Err(format!("pass {n} chose {s:?}, not {chosen:?}"));
+        }
+        chosen = Some(s);
+        let boundary = |id: SegmentId| {
+            listing
+                .segments
+                .iter()
+                .find(|seg| seg.id == id)
+                .map(segment_key)
+        };
+        // A mutation in the last pass: a continuation, on a chain.
+        if n == passes {
+            match breaks {
+                PassBreak::DropSegmentAtP => gone.extend(boundary(s)),
+                PassBreak::DropSnapshot => gone.push(snapshot_key(s)),
+                PassBreak::DropBetween if s.txid < head.txid => {
+                    gone.extend(boundary(SegmentId {
+                        generation: gens,
+                        txid: s.txid + 1,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        // Stopped early but for the last: half, from the end (where a
+        // mutation's extra key is).
+        let take = if n < passes {
+            gone.len().div_ceil(2)
+        } else {
+            gone.len()
+        };
+        for key in gone.iter().rev().take(take) {
+            deleted = true;
+            keys.remove(key);
+        }
+        // Released unverified: it freezes what it inherited.
+        let frozen = if breaks == PassBreak::ForgetInherited {
+            None
+        } else {
+            Requirement::frozen(&pass)
+        };
+        let after = OwnerRecord {
+            holder: None,
+            generation: pass.generation,
+            recorded: Some(Requirement::stored(frozen, false, None)),
+        };
+        record = OwnerRecord::decode(&after.encode()).expect("a valid record");
+        local = frozen.map(|f| (f, pass.generation));
+        ran += 1;
+    }
+    let s = chosen.expect("one pass ran");
+    let after = record;
+    if after.generation != gens + ran {
+        return Err(format!("the last pass's record at {}", after.generation));
+    }
     // A late segment of an earlier generation, landing after the pass.
     if gens > 1 && rng.chance(40) {
         let late = SegmentId {
@@ -801,26 +849,27 @@ fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool), Stri
     if !chain.contains(&(head, Some(sum(head, 0)))) {
         return Err(format!("H not on the chain with its checksum: {chain:?}"));
     }
-    Ok((deleted, s.txid < head.txid))
+    Ok((deleted, s.txid < head.txid, ran))
 }
 
 #[test]
 fn after_an_idle_pass_an_acquirer_proves_the_recorded_head_exactly() {
-    let (mut deleted, mut below) = (0, 0);
+    let (mut deleted, mut below, mut chains) = (0, 0, 0);
     for seed in 0..seeds() {
-        let (d, b) = proof_after_a_pass(seed, PassBreak::None)
+        let (d, b, passes) = proof_after_a_pass(seed, PassBreak::None)
             .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
         deleted += u64::from(d);
         below += u64::from(b);
+        chains += u64::from(passes > 1 && d);
     }
     eprintln!(
         "{} seeds: an exact proof after every pass; {deleted} passes deleted, {below} from a \
-         snapshot below the head",
+         snapshot below the head, {chains} over a chain of 2 to 4 passes",
         seeds()
     );
     assert!(
-        deleted >= seeds() / 2 && below >= seeds() / 10,
-        "deleted {deleted}, below {below}"
+        deleted >= seeds() / 2 && below >= seeds() / 10 && chains >= seeds() / 4,
+        "deleted {deleted}, below {below}, chains {chains}"
     );
 }
 

@@ -3,7 +3,7 @@
 use super::*;
 
 /// Deletes per batch in a collection pass; the lease is checked before each.
-pub(super) const COLLECT_BATCH: usize = 100;
+pub(crate) const COLLECT_BATCH: usize = 100;
 
 /// Garbage collection of one actor's history by its owner (ADR 0012),
 /// detached from the replica: the owner's generation, and a view of its
@@ -45,9 +45,9 @@ impl Collector {
         let listing = Listing::from_keys(listed.iter().map(|(k, _)| k.as_str()));
         let gone = collectable(&listing, self.generation, snapshot);
         Ok(self
-            .delete_older(&listed, gone, retention, &|| false)
+            .delete_older(&listed, gone, retention, COLLECT_BATCH, &|| false)
             .await?
-            .0)
+            .deleted)
     }
 
     /// The collector of an idle pass (ADR 0042, section 3): `generation`
@@ -74,11 +74,14 @@ impl Collector {
     /// those older than `retention` by `last_modified`, in batches, the
     /// lease checked before each, and `stop` too: the pass stops deleting
     /// once it says so (its deadline, an event waiting behind it, a drain),
-    /// and what is left waits for the actor's next write. A lease already
-    /// invalid is [`ReplicaError::Late`], nothing listed.
+    /// and what is left is counted in `left`, for the caller to continue in
+    /// a later pass. Deletes go `batch` objects at a time
+    /// ([`COLLECT_BATCH`], except in tests). A lease already invalid is
+    /// [`ReplicaError::Late`], nothing listed.
     pub(crate) async fn collect_idle(
         &self,
         retention: std::time::Duration,
+        batch: usize,
         stop: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<IdleCollected, ReplicaError> {
         if !self.lease.is_valid() {
@@ -89,12 +92,15 @@ impl Collector {
         let Some((snapshot, gone)) = idle_collectable(&listing, self.generation) else {
             return Ok(IdleCollected::NoSnapshot);
         };
-        let (deleted, kept, stopped) = self.delete_older(&listed, gone, retention, stop).await?;
+        let d = self
+            .delete_older(&listed, gone, retention, batch, stop)
+            .await?;
         Ok(IdleCollected::Collected {
             snapshot,
-            deleted,
-            kept,
-            stopped,
+            deleted: d.deleted,
+            kept: d.kept,
+            left: d.left,
+            stopped: d.stopped,
         })
     }
 
@@ -126,17 +132,16 @@ impl Collector {
     }
 
     /// Deletes the listed objects `gone` names that are older than
-    /// `retention`, in batches, while the lease is valid and `stop` says
-    /// nothing. Returns how many were deleted (already gone counts), how
-    /// many were kept for being younger than the window, and whether
-    /// `stop` cut the deletes short.
+    /// `retention`, in batches of `batch`, while the lease is valid and
+    /// `stop` says nothing.
     async fn delete_older(
         &self,
         listed: &[(String, object_store::ObjectMeta)],
         gone: Vec<String>,
         retention: std::time::Duration,
+        batch: usize,
         stop: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<(usize, usize, bool), ReplicaError> {
+    ) -> Result<Deleted, ReplicaError> {
         use futures_util::StreamExt;
         let gone: std::collections::HashSet<String> = gone.into_iter().collect();
         let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
@@ -153,7 +158,7 @@ impl Collector {
             }
         }
         let (mut deleted, mut stopped) = (0, false);
-        for batch in doomed.chunks(COLLECT_BATCH) {
+        for batch in doomed.chunks(batch.max(1)) {
             // ADR 0012, condition 3.
             if !self.lease.is_valid() {
                 break;
@@ -179,8 +184,26 @@ impl Collector {
                 }
             }
         }
-        Ok((deleted, kept, stopped))
+        Ok(Deleted {
+            deleted,
+            kept,
+            left: doomed.len().saturating_sub(deleted),
+            stopped,
+        })
     }
+}
+
+/// What [`Collector::delete_older`] did.
+struct Deleted {
+    /// Deleted (already gone counts).
+    deleted: usize,
+    /// Kept for being younger than the retention window.
+    kept: usize,
+    /// Old enough and not deleted: the lease ended or `stop` said so
+    /// before their batch.
+    left: usize,
+    /// `stop` cut the deletes short.
+    stopped: bool,
 }
 
 /// What an idle pass's collection did ([`Collector::collect_idle`]).
@@ -196,6 +219,10 @@ pub(crate) enum IdleCollected {
         snapshot: SegmentId,
         deleted: usize,
         kept: usize,
+        /// Collectable, old enough, and not deleted: the lease ended or
+        /// the pass's stop came before their batch. 0 when the pass
+        /// finished.
+        left: usize,
         /// The pass's stop condition cut the deletes short.
         stopped: bool,
     },

@@ -727,6 +727,7 @@ impl IdleReader {
 struct IdleRun {
     reader: IdleReader,
     passes_deleted: u64,
+    continuations_deleted: u64,
     problem: Option<String>,
 }
 
@@ -744,6 +745,7 @@ fn idle_run(seed: u64, broken: IdleBreak) -> IdleRun {
     IdleRun {
         reader: Arc::try_unwrap(reader).ok().unwrap().into_inner().unwrap(),
         passes_deleted: observed.passes_deleted,
+        continuations_deleted: observed.continuations_deleted,
         problem: observed.problem,
     }
 }
@@ -751,7 +753,7 @@ fn idle_run(seed: u64, broken: IdleBreak) -> IdleRun {
 #[test]
 fn a_backup_reader_racing_idle_passes_finishes_within_two_attempts() {
     let (mut completed, mut second, mut misses, mut deleted, mut longest) = (0, 0, 0, 0, 0);
-    let mut empty = 0;
+    let (mut empty, mut continued) = (0, 0);
     for seed in 0..seeds() {
         let run = idle_run(seed, IdleBreak::None);
         assert_eq!(run.problem, None, "seed {seed}: replication");
@@ -772,12 +774,13 @@ fn a_backup_reader_racing_idle_passes_finishes_within_two_attempts() {
         second += r.second_attempts;
         misses += r.misses;
         deleted += run.passes_deleted;
+        continued += run.continuations_deleted;
         longest = longest.max(r.longest_ms);
     }
     eprintln!(
         "backup racing idle passes: {} seeds x 60 s: {completed} backups, {second} on a second \
          attempt after {misses} reads found a pass's delete, none gave up; {deleted} passes \
-         deleted; longest attempt {longest} ms (deadline {IDLE_READER_DEADLINE_MS} ms, window \
+         deleted ({continued} continuing a stopped pass); longest attempt {longest} ms (deadline {IDLE_READER_DEADLINE_MS} ms, window \
          {IDLE_WINDOW_MS} ms)",
         seeds()
     );
@@ -823,7 +826,10 @@ fn a_reader_skipping_an_object_a_pass_deleted_is_caught() {
 // actor woke first (its record changed), with `idle_collectable` of the
 // released generation, deleting what is older than the window on its
 // clock (skewed by up to the bound), each delete landing up to 400 ms
-// after it was sent. The pass's delay is not the window here, which is
+// after it was sent. Half the passes stop after 1 to 3 deletes, as the
+// server's at its deadline, and are continued 100 ms to 1.5 s later
+// (unless the actor woke first), each continuation judging the window on
+// its own clock again. The pass's delay is not the window here, which is
 // more adversarial than the server (whose pass waits a window after the
 // release): the bound rests on the objects' age alone. The reader is the
 // one above, paced to its deadline and reading the plan's oldest object
@@ -836,6 +842,8 @@ struct Focused {
     exhausted: usize,
     longest_ms: u64,
     passes_deleted: usize,
+    /// Continuations of a stopped pass that sent deletes.
+    continuations_deleted: usize,
     failure: Option<String>,
 }
 
@@ -873,8 +881,12 @@ fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
         exhausted: 0,
         longest_ms: 0,
         passes_deleted: 0,
+        continuations_deleted: 0,
         failure: None,
     };
+    // Where a pass stops: not drawn from `rng`, so the seeds keep their
+    // writes and wakes.
+    let mut stops = wasmkeep_sim::rng::Rng::new(seed ^ 0x0042_0c0d);
     // The bucket: key -> (last modified, body).
     let mut store: BTreeMap<String, (u64, Vec<u8>)> = BTreeMap::new();
     let mut written: Vec<SegmentId> = Vec::new();
@@ -882,8 +894,9 @@ fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
     // The writer: awake with writes left (and when the next is due), or
     // resting until a wake.
     let (mut writes_left, mut next_write, mut wake_at) = (0u64, 0u64, 0u64);
-    // A pass due: when, and the released generation.
-    let mut pass: Option<(u64, u64)> = None;
+    // A pass due: when, the released generation, and whether it continues
+    // a stopped one.
+    let mut pass: Option<(u64, u64, bool)> = None;
     let mut landing: Vec<(u64, String)> = Vec::new();
     // The reader.
     let mut attempt = 0usize;
@@ -943,7 +956,7 @@ fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
                     store.insert(snapshot_key(id), (now, snapshot_body(&written)));
                     since_snapshot = 0;
                 }
-                pass = Some((now + rng.below(3_000), generation));
+                pass = Some((now + rng.below(3_000), generation, false));
                 wake_at = now
                     + if rng.chance(50) {
                         100 + rng.below(1_500)
@@ -952,23 +965,35 @@ fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
                     };
             }
         }
-        if let Some((at, released)) = pass
+        if let Some((at, released, continued)) = pass
             && now >= at
         {
             pass = None;
             let listing = Listing::from_keys(store.keys().map(String::as_str));
             if let Some((_, gone)) = idle_collectable(&listing, released) {
                 let clock = now.saturating_add_signed(skew);
-                let mut sent = 0;
-                for key in gone {
-                    let old = window.is_none_or(|w| store[&key].0.saturating_add(w) <= clock);
-                    if old {
-                        landing.push((now + rng.below(400), key));
-                        sent += 1;
-                    }
+                let old: Vec<String> = gone
+                    .into_iter()
+                    .filter(|key| window.is_none_or(|w| store[key].0.saturating_add(w) <= clock))
+                    .collect();
+                // Stopped early: the rest for a continuation.
+                let cap = if stops.chance(50) {
+                    usize::try_from(1 + stops.below(3)).unwrap()
+                } else {
+                    usize::MAX
+                };
+                let sent = old.len().min(cap);
+                for key in old.iter().take(sent) {
+                    landing.push((now + rng.below(400), key.clone()));
                 }
                 if sent > 0 {
                     out.passes_deleted += 1;
+                    if continued {
+                        out.continuations_deleted += 1;
+                    }
+                }
+                if old.len() > sent {
+                    pass = Some((now + 100 + stops.below(1_400), released, true));
                 }
             }
         }
@@ -1055,6 +1080,7 @@ fn focused(seed: u64, window: Option<u64>, skip_missing: bool) -> Focused {
 #[test]
 fn a_reader_racing_idle_passes_in_the_focused_model_needs_two_attempts_at_most() {
     let (mut completed, mut second, mut misses, mut deleted, mut raced) = (0, 0, 0, 0, 0);
+    let mut continued = 0;
     for seed in 0..seeds() {
         let r = focused(seed, Some(IDLE_WINDOW_MS), false);
         assert_eq!(r.failure, None, "seed {seed}");
@@ -1068,15 +1094,17 @@ fn a_reader_racing_idle_passes_in_the_focused_model_needs_two_attempts_at_most()
         second += r.second_attempts;
         misses += r.misses;
         deleted += r.passes_deleted;
+        continued += r.continuations_deleted;
         raced += usize::from(r.second_attempts > 0);
     }
     eprintln!(
         "focused backup racing idle passes: {} seeds x 60 s: {completed} backups, {second} on a \
          second attempt (on {raced} seeds) after {misses} reads found a pass's delete, none gave \
-         up; {deleted} passes deleted",
+         up; {deleted} passes deleted, {continued} of them continuing a stopped pass",
         seeds()
     );
     assert!(deleted > 0 && second > 0, "no race reached");
+    assert!(continued > 0, "no continuation deleted");
     assert!(
         raced as u64 >= seeds() / 4,
         "the race on only {raced} seeds"
@@ -1086,7 +1114,7 @@ fn a_reader_racing_idle_passes_in_the_focused_model_needs_two_attempts_at_most()
 #[test]
 fn the_focused_reader_oracles_catch_their_mutations() {
     // Pure computation: at least 400 seeds, so the rarest mutation (a
-    // window below the bound, first caught at seed 166) is reached at any
+    // window below the bound, first caught at seed 250) is reached at any
     // seed count.
     let seeds = seeds().max(400);
     let count = |window, skip| {
