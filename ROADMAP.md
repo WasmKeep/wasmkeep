@@ -301,7 +301,7 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - In `0.6.0`, a room past one actor: a directory, a broadcast group,
   edges and relays
   ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md),
-  [measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). A
+  [measured](docs/benchmarks-archive.md#a-big-room-on-three-nodes-preview)). A
   preview then; no longer one since `0.7.0`
   ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-070)).
 - In `0.6.0`, placement at wake-up, on by default

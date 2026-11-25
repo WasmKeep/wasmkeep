@@ -363,7 +363,7 @@ The [reconnecting-room harness](benchmarks.md#reconnecting-room-harness)
 records delivery and reconnect latency, recovery and topology on a deployed
 cluster. Its small smoke check is correctness evidence only. The real-bucket
 growth and slow-client benchmark at 3,000 to 10,000 clients is
-[measured on 0.6.0](benchmarks.md#a-big-room-on-three-nodes-preview), where
+[measured on 0.6.0](benchmarks-archive.md#a-big-room-on-three-nodes-preview), where
 the pattern was a preview: delivery p99 of 5 to 15 s, held by the room's
 publish path. 0.7.0 moves delivery off that path, to the pusher: with the
 pusher on another node, 4,500 clients got delivery p99 under 1 s
