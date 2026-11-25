@@ -1370,6 +1370,8 @@ async fn open_one(
 #[tokio::test]
 async fn a_guest_opens_at_most_16_read_streams_and_the_event_closes_them() {
     for (i, f) in both().into_iter().enumerate() {
+        // Only Linux counts the descriptors.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let on_disk = i == 1;
         let mut c = caller(&f, Namespace::actor("c", "n", "0"));
         let mut table = ResourceTable::new();
