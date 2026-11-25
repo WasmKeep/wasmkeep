@@ -58,6 +58,18 @@
 //! next. One entry per actor and the spacing keep a giant history to one
 //! of the node's slots at a time, behind every entry due before it.
 //!
+//! A pass whose release does not land within a second leaves its
+//! continuation armed ([`Queue::detach`]): the release, retried in the
+//! background, queues it when it lands with its version, and the pass is
+//! counted then (`continued`). A release that comes back `Superseded`, in
+//! the pass or in the background, reads the record back once: naming
+//! nobody at the hold's generation, it is that release, landed with its
+//! answer lost, and the chain continues on the version read
+//! ([`Cluster::idle_release_superseded`]). Any other record, a read with
+//! no answer, a lapse of this node's lease, or any acquisition of the
+//! actor here clears it (`stopped`), so no armed entry outlives the
+//! record its release would have written.
+//!
 //! For a first pass the entry is only a hint of when to try: what it
 //! deletes rests on the record and the listing it reads itself. A
 //! continuation's `g` comes from this node's memory of its own pass; the
@@ -79,7 +91,7 @@ use std::collections::{BTreeSet, HashMap};
 use object_store::ObjectStoreExt as _;
 
 use super::*;
-use crate::cluster::RECORD_CHANGED;
+use crate::cluster::{LeaseReturn, RECORD_CHANGED};
 use crate::replica::{Collector, IdleCollected};
 use wasmkeep_cluster::lease::Version;
 use wasmkeep_cluster::node_lease::Hold;
@@ -161,9 +173,27 @@ pub(crate) struct Entry {
 enum Continuing {
     /// The pass's hold's generation, and its next entry (version,
     /// generation and due time filled in when the release lands).
-    Armed { hold_generation: u64, next: Entry },
+    /// `detached`: the pass's release came back pending and the pass
+    /// ended without counting itself; whatever ends this entry (its
+    /// release landing in the background, or its clearing) counts it.
+    Armed {
+        hold_generation: u64,
+        next: Entry,
+        detached: bool,
+    },
     /// The release landed: whether the queue took the next entry.
     Queued(bool),
+}
+
+/// Counts a pass whose release was retried in the background, once its
+/// continuation was queued (`continued`) or could not be (`stopped`).
+fn count_detached(key: &str, continued: bool) {
+    if continued {
+        tracing::debug!(key = %crate::logging::text(key), "idle pass: its release landed in the background, continued later");
+    } else {
+        tracing::debug!(key = %crate::logging::text(key), "idle pass: its release, retried in the background, did not land with its version: not continued");
+    }
+    crate::metrics::idle_compaction(if continued { "continued" } else { "stopped" });
 }
 
 /// The idle passes due on this node, by record key.
@@ -255,9 +285,22 @@ impl Queue {
     /// Forgets every entry (the app's tombstone was seen, or compaction is
     /// off).
     pub(crate) fn clear(&self) {
-        let mut q = self.lock();
-        q.by_key.clear();
-        q.by_due.clear();
+        {
+            let mut q = self.lock();
+            q.by_key.clear();
+            q.by_due.clear();
+        }
+        self.end_all_armed();
+    }
+
+    /// An acquisition of `key` here: the version any entry of it
+    /// remembered is gone, and so is the record any pass's release still
+    /// retried in the background would have written (ADR 0042).
+    pub(crate) fn acquired(&self, key: &str) {
+        // Cleared first: a background release landing in between then
+        // finds nothing armed, or has queued an entry `remove` forgets.
+        self.end_armed(key, None);
+        self.remove(key);
     }
 
     /// How many entries wait (tests).
@@ -289,7 +332,7 @@ impl Queue {
     /// A pass of `next.key` under a hold of `hold_generation` stopped at
     /// its deadline: its release, if it lands with its version, queues
     /// `next`.
-    fn arm(&self, hold_generation: u64, next: Entry) {
+    pub(crate) fn arm(&self, hold_generation: u64, next: Entry) {
         self.continuing
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -298,43 +341,163 @@ impl Queue {
                 Continuing::Armed {
                     hold_generation,
                     next,
+                    detached: false,
                 },
             );
     }
 
-    /// A release of `hold` that wrote nothing landed, with `version`: if
-    /// it is the hold of a pass that armed a continuation, that entry is
-    /// queued, on this version and generation.
-    fn continue_from(&self, hold: &Hold, version: Version, now_ms: u64) {
-        let mut continuing = self.continuing.lock().unwrap_or_else(|p| p.into_inner());
+    fn continuing(&self) -> std::sync::MutexGuard<'_, HashMap<String, Continuing>> {
+        self.continuing.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A release of `hold` that wrote nothing landed, with `version` (its
+    /// own conditional write's answer): if it is the hold of a pass that
+    /// armed a continuation, that entry is queued, on this version and
+    /// generation. A pass whose release was retried in the background is
+    /// counted here: `Some(queued)`.
+    fn continue_from(&self, hold: &Hold, version: Version, now_ms: u64) -> Option<bool> {
+        self.continue_at(&hold.key, hold.generation, version, now_ms, false)
+    }
+
+    /// [`Self::continue_from`] for the hold of `key` at `generation`; with
+    /// `forget`, the actor's queued entry is first forgotten, only if the
+    /// continuation is armed for that hold (checked under the same lock).
+    fn continue_at(
+        &self,
+        key: &str,
+        generation: u64,
+        version: Version,
+        now_ms: u64,
+        forget: bool,
+    ) -> Option<bool> {
+        let mut continuing = self.continuing();
         let Some(Continuing::Armed {
             hold_generation,
             next,
-        }) = continuing.get(&hold.key)
+            detached,
+        }) = continuing.get(key)
         else {
-            return;
+            return None;
         };
-        if *hold_generation != hold.generation {
-            return;
+        if *hold_generation != generation {
+            return None;
         }
+        if forget {
+            self.remove(key);
+        }
+        let detached = *detached;
         let mut next = next.clone();
-        next.generation = hold.generation;
+        next.generation = generation;
         next.version = version;
         next.due_ms = now_ms.saturating_add(u64::try_from(CONTINUE_AFTER.as_millis()).unwrap_or(0));
         let queued = self.push(next);
-        continuing.insert(hold.key.clone(), Continuing::Queued(queued));
+        if detached {
+            continuing.remove(key);
+            drop(continuing);
+            count_detached(key, queued);
+            return Some(queued);
+        }
+        continuing.insert(key.to_owned(), Continuing::Queued(queued));
+        None
     }
 
-    /// Ends `key`'s continuation once its pass released: whether the next
-    /// pass is queued.
+    /// Whether a continuation is armed for the hold of `key` at
+    /// `generation`.
+    pub(crate) fn armed_for(&self, key: &str, generation: u64) -> bool {
+        matches!(
+            self.continuing().get(key),
+            Some(Continuing::Armed { hold_generation, .. }) if *hold_generation == generation
+        )
+    }
+
+    /// Ends `key`'s continuation once its pass released (or its release
+    /// was superseded): whether the next pass is queued.
     fn disarm(&self, key: &str) -> bool {
         matches!(
-            self.continuing
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(key),
+            self.continuing().remove(key),
             Some(Continuing::Queued(true))
         )
+    }
+
+    /// The release of the pass under a hold of `hold_generation` came back
+    /// pending: retried in the background. If its release already landed
+    /// there (or the entry was cleared), whether the next pass is queued,
+    /// as [`Self::disarm`]. Otherwise `None`: the entry stays armed, for
+    /// the background release to queue when it lands with its version
+    /// ([`Self::continue_from`]), or for a superseded release, a lapse or
+    /// an acquisition of the key to clear ([`Self::end_armed`]); either
+    /// counts the pass.
+    pub(crate) fn detach(&self, key: &str, hold_generation: u64) -> Option<bool> {
+        let mut continuing = self.continuing();
+        match continuing.get_mut(key) {
+            Some(Continuing::Armed {
+                hold_generation: armed,
+                detached,
+                ..
+            }) if *armed == hold_generation => {
+                *detached = true;
+                None
+            }
+            Some(Continuing::Queued(queued)) => {
+                let queued = *queued;
+                continuing.remove(key);
+                Some(queued)
+            }
+            Some(Continuing::Armed { .. }) | None => Some(false),
+        }
+    }
+
+    /// Clears `key`'s armed continuation (of the hold of `generation`, or
+    /// any): its release was superseded, the release wrote no version, or
+    /// the key was acquired here. A continuation already queued is left
+    /// to the queue. Whether a pass detached from it was counted
+    /// (`stopped`).
+    pub(crate) fn end_armed(&self, key: &str, generation: Option<u64>) -> bool {
+        let mut continuing = self.continuing();
+        let Some(Continuing::Armed {
+            hold_generation,
+            detached,
+            ..
+        }) = continuing.get(key)
+        else {
+            return false;
+        };
+        if generation.is_some_and(|g| g != *hold_generation) {
+            return false;
+        }
+        let detached = *detached;
+        continuing.remove(key);
+        drop(continuing);
+        if detached {
+            count_detached(key, false);
+        }
+        detached
+    }
+
+    /// Clears every armed continuation: this node's lease lapsed or ended,
+    /// or the queue was cleared. How many passes detached from them were
+    /// counted (`stopped`).
+    pub(crate) fn end_all_armed(&self) -> usize {
+        let mut ended = Vec::new();
+        self.continuing().retain(|key, c| match c {
+            Continuing::Armed { detached, .. } => {
+                if *detached {
+                    ended.push(key.clone());
+                }
+                false
+            }
+            Continuing::Queued(_) => true,
+        });
+        for key in &ended {
+            count_detached(key, false);
+        }
+        ended.len()
+    }
+
+    /// Whether `key` has an armed continuation (tests).
+    #[cfg(test)]
+    pub(crate) fn armed(&self, key: &str) -> bool {
+        matches!(self.continuing().get(key), Some(Continuing::Armed { .. }))
     }
 
     /// Tests: deletes in batches of `.0`, and each pass's deadline after
@@ -375,15 +538,20 @@ impl Cluster {
     /// of the actor (the version it remembered is gone). A release whose
     /// answer was lost (it comes back `Superseded`) never reaches here:
     /// that actor is not queued. A pass's own release (it wrote nothing)
-    /// queues the continuation that pass armed, if any.
+    /// queues the continuation that pass armed, if any, whether the
+    /// release landed in the pass or later in the background; one that
+    /// cannot (no version, compaction off, the app refused) clears it.
     pub(crate) fn note_idle_release(&self, hold: &Hold, written: Option<Version>) {
         let Some(version) = written else {
+            self.idle_passes.end_armed(&hold.key, Some(hold.generation));
             return;
         };
         if !wrote(hold) {
             self.idle_passes.remove(&hold.key);
             if self.idle_compaction && self.app_refusal().is_none() {
                 self.idle_passes.continue_from(hold, version, now_ms());
+            } else {
+                self.idle_passes.end_armed(&hold.key, Some(hold.generation));
             }
             return;
         }
@@ -405,6 +573,38 @@ impl Cluster {
             continued: 0,
             fruitless: 0,
         });
+    }
+
+    /// A release of the hold of `key` at `generation` came back
+    /// `Superseded` (in the pass, or retried in the background) while an
+    /// idle pass's continuation is armed for that hold: the record is read
+    /// back once. Naming nobody at `generation`, it is that release, landed
+    /// with its answer lost (ADR 0042, "As built: a release retried in the
+    /// background"): the continuation is queued on the version read, as a
+    /// release that landed would have. Anything else, or no answer, clears
+    /// it. Nothing armed for that hold: nothing read.
+    pub(crate) async fn idle_release_superseded(&self, key: &str, generation: u64) {
+        if !self.idle_passes.armed_for(key, generation) {
+            return;
+        }
+        let read =
+            tokio::time::timeout(self.lease_attempt, self.owners.released_at(key, generation))
+                .await;
+        match read {
+            Ok(Ok(Some(version))) if self.idle_compaction && self.app_refusal().is_none() => {
+                tracing::debug!(key = %crate::logging::text(key), generation, "idle pass: its release landed with its answer lost; continued on the record read back");
+                // As `note_idle_release` for a release that did not write,
+                // the actor's entry forgotten only while this hold's
+                // continuation is still armed, under the same lock: an
+                // acquisition here since (a writer's entry queued after
+                // it) cleared it, and that entry stays.
+                self.idle_passes
+                    .continue_at(key, generation, version, now_ms(), true);
+            }
+            _ => {
+                self.idle_passes.end_armed(key, Some(generation));
+            }
+        }
     }
 
     /// The app's epoch as its markers give it now, read again from the
@@ -538,6 +738,13 @@ pub(crate) enum Compacted {
     /// delete, and the next pass queued (on its own release's record,
     /// [`CONTINUE_AFTER`] later).
     Continued { deleted: usize, left: usize },
+    /// Stopped at its deadline with `left` objects old enough still to
+    /// delete, its continuation armed, and its release left to the
+    /// background: not counted here. When that release lands with its
+    /// version it queues the next pass and counts this one `continued`;
+    /// superseded, or cleared first by a lapse or an acquisition of the
+    /// key here, it counts `stopped` ([`Queue::detach`]).
+    Deferred { deleted: usize, left: usize },
     /// Stopped with `left` objects old enough still to delete, and not
     /// continued: stopped by an event, a drain or its hold's end, the
     /// chain's bounds reached, or the continuation not queued.
@@ -560,8 +767,10 @@ pub(crate) enum Compacted {
 }
 
 impl Compacted {
-    fn label(&self) -> &'static str {
-        match self {
+    /// Its label, `None` for a pass counted later ([`Self::Deferred`]).
+    fn label(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Deferred { .. } => return None,
             Self::Done { .. } => "done",
             Self::Continued { .. } => "continued",
             Self::Stopped { .. } => "stopped",
@@ -569,7 +778,7 @@ impl Compacted {
             Self::Nothing => "nothing",
             Self::Refused(_) | Self::Retry(_) => "refused",
             Self::Busy => "busy",
-        }
+        })
     }
 }
 
@@ -638,6 +847,7 @@ impl ActorState {
         // Stopped at its deadline: the rest is for a continuation, which
         // this hold's release queues if it lands with its version.
         let mut bound = None;
+        let mut armed = None;
         if let (Compacted::Stopped { deleted, .. }, Some(Stop::Deadline), Some(generation)) =
             (&outcome, stop, hold.generation())
         {
@@ -660,16 +870,32 @@ impl ActorState {
                         ..entry.clone()
                     },
                 );
+                armed = Some(generation);
             }
         }
         // Unverified: it releases with the requirement it inherited, and
         // with the idle origin its acquisition carried.
-        hold.release().await;
-        let queued = cluster
-            .idle_passes
-            .disarm(&cluster.owner_key(&self.address));
+        let returned = hold.release().await;
+        let key = cluster.owner_key(&self.address);
+        // Superseded in the pass: a try cut off at its bound may have
+        // landed, its answer lost, and a later try conflicted with it.
+        if let (LeaseReturn::Superseded, Some(generation)) = (returned, armed) {
+            cluster.idle_release_superseded(&key, generation).await;
+        }
+        // Left to the background: the continuation stays armed for that
+        // release to queue when it lands with its version, which counts
+        // the pass then (unless it already landed, or was cleared).
+        let queued = match (returned, armed) {
+            (LeaseReturn::Pending, Some(generation)) => {
+                cluster.idle_passes.detach(&key, generation)
+            }
+            _ => Some(cluster.idle_passes.disarm(&key)),
+        };
         match outcome {
-            Compacted::Stopped { deleted, left, .. } if queued => {
+            Compacted::Stopped { deleted, left, .. } if queued.is_none() => {
+                Compacted::Deferred { deleted, left }
+            }
+            Compacted::Stopped { deleted, left, .. } if queued == Some(true) => {
                 Compacted::Continued { deleted, left }
             }
             Compacted::Stopped { deleted, left, why } => Compacted::Stopped {
@@ -678,8 +904,8 @@ impl ActorState {
                 why: match (stop, bound) {
                     (_, Some(bound)) => format!("{why}; not continued: {bound}"),
                     (Some(Stop::Deadline), None) => format!(
-                        "{why}; not continued: the release did not land with its version, \
-                         or the queue is full"
+                        "{why}; not continued: the release did not land with its version (superseded, \
+                         a lapse, the actor acquired here), or the queue is full"
                     ),
                     _ => why,
                 },
@@ -907,7 +1133,9 @@ fn settle(cluster: &Cluster, mut entry: Entry, outcome: Compacted) {
         cluster.idle_passes.push(entry);
         return;
     }
-    crate::metrics::idle_compaction(outcome.label());
+    if let Some(label) = outcome.label() {
+        crate::metrics::idle_compaction(label);
+    }
 }
 
 /// One entry: its job in the actor's mailbox, unless it is skipped first.
@@ -1003,6 +1231,9 @@ async fn pass_one(
         }
         Compacted::Continued { deleted, left } => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, left, "idle pass stopped at its deadline: continued later");
+        }
+        Compacted::Deferred { deleted, left } => {
+            tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, left, "idle pass stopped at its deadline: its release is retried in the background, continued once it lands");
         }
         Compacted::Stopped { deleted, left, why } => {
             tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), deleted, left, %why, "idle pass stopped: not continued");
@@ -1133,6 +1364,189 @@ mod tests {
         assert!(!q.disarm("k"));
     }
 
+    fn counted(outcome: &str) -> u64 {
+        crate::metrics::METRICS
+            .idle_compactions
+            .get(&[("outcome", outcome)])
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn continued_stopped() -> (u64, u64) {
+        (counted("continued"), counted("stopped"))
+    }
+
+    /// A pass whose release came back pending: its continuation stays
+    /// armed, and the background release landing queues it, on the
+    /// version it wrote and its hold's generation, counting the pass
+    /// `continued` there and only there.
+    #[test]
+    fn a_release_pending_then_landed_queues_the_continuation() {
+        let q = Queue::default();
+        let next = Entry {
+            continued: 1,
+            ..entry("k", 0)
+        };
+        q.arm(7, next);
+        let (continued, stopped) = continued_stopped();
+        assert_eq!(q.detach("k", 7), None, "deferred");
+        assert!(q.armed("k"));
+        assert_eq!(continued_stopped(), (continued, stopped));
+        // Another hold's release (another generation) queues nothing.
+        assert_eq!(
+            q.continue_from(&hold("k", 8), Version("v8".into()), 1_000),
+            None
+        );
+        assert_eq!(q.len(), 0);
+        assert!(q.armed("k"));
+        // Its own, landing in the background.
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 1_000),
+            Some(true)
+        );
+        assert!(!q.armed("k"), "nobody else ends it");
+        let queued = q.entries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (
+                queued[0].generation,
+                queued[0].snapshot_generation,
+                queued[0].version.0.as_str(),
+                queued[0].due_ms,
+                queued[0].continued
+            ),
+            (7, 1, "v7", 1_000 + CONTINUE_AFTER.as_millis() as u64, 1)
+        );
+        assert_eq!(continued_stopped(), (continued + 1, stopped));
+        // Landing again (it cannot, but) queues nothing more.
+        q.clear();
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 2_000),
+            None
+        );
+        assert_eq!(q.len(), 0);
+    }
+
+    /// A release that landed in the background before the pass learned it
+    /// was pending: the pass finds it queued, as for a release that
+    /// landed at once, and counts itself.
+    #[test]
+    fn a_release_landed_before_the_pass_detached_counts_in_the_pass() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        let counts = continued_stopped();
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 1_000),
+            None
+        );
+        assert_eq!(q.detach("k", 7), Some(true));
+        assert_eq!(q.len(), 1);
+        assert_eq!(continued_stopped(), counts, "the pass counts it");
+        // Cleared before the pass detached: not continued.
+        q.arm(9, entry("j", 0));
+        assert!(
+            !q.end_armed("j", Some(9)),
+            "not detached: the pass counts it"
+        );
+        assert_eq!(q.detach("j", 9), Some(false));
+        // Nothing armed at all.
+        assert_eq!(q.detach("i", 3), Some(false));
+        assert_eq!(continued_stopped(), counts);
+    }
+
+    /// A continuation queued from a record read back forgets the actor's
+    /// entry only while it is still armed for that hold: an acquisition
+    /// here in between (which cleared it) keeps the entry a writer's
+    /// release queued since.
+    #[test]
+    fn a_read_back_forgets_the_actor_entry_only_while_armed() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        assert_eq!(q.detach("k", 7), None);
+        q.acquired("k");
+        q.push(entry("k", 5));
+        assert_eq!(
+            q.continue_at("k", 7, Version("v7".into()), 1_000, true),
+            None
+        );
+        assert_eq!(q.entries(), [entry("k", 5)], "the writer's entry stays");
+        // Still armed: the stale entry is replaced by the continuation.
+        q.arm(7, entry("j", 0));
+        q.push(entry("j", 5));
+        assert_eq!(q.detach("j", 7), None);
+        assert_eq!(
+            q.continue_at("j", 7, Version("v7".into()), 1_000, true),
+            Some(true)
+        );
+        let j: Vec<Entry> = q.entries().into_iter().filter(|e| e.key == "j").collect();
+        assert_eq!(j.len(), 1);
+        assert_eq!((j[0].generation, j[0].version.0.as_str()), (7, "v7"));
+    }
+
+    /// Pending, then superseded: the armed entry is cleared (only for its
+    /// own hold's generation), nothing is queued, the pass counts
+    /// `stopped`.
+    #[test]
+    fn a_release_pending_then_superseded_clears_the_continuation() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        assert_eq!(q.detach("k", 7), None);
+        let (continued, stopped) = continued_stopped();
+        assert!(!q.end_armed("k", Some(8)), "another hold's");
+        assert!(q.armed("k"));
+        assert!(q.end_armed("k", Some(7)));
+        assert!(!q.armed("k"));
+        assert_eq!(continued_stopped(), (continued, stopped + 1));
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 1_000),
+            None
+        );
+        assert_eq!(q.len(), 0);
+        assert!(!q.end_armed("k", Some(7)), "counted once");
+        assert_eq!(continued_stopped(), (continued, stopped + 1));
+    }
+
+    /// Pending, then an acquisition of the key here: cleared, whatever
+    /// generation armed it, along with any entry of the key; a
+    /// continuation already queued and not yet collected by its pass is
+    /// the queue's (the acquisition removed its entry).
+    #[test]
+    fn a_release_pending_then_an_acquisition_clears_the_continuation() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        assert_eq!(q.detach("k", 7), None);
+        q.push(entry("k", 5));
+        let (continued, stopped) = continued_stopped();
+        q.acquired("k");
+        assert!(!q.armed("k"));
+        assert_eq!(q.len(), 0);
+        assert_eq!(continued_stopped(), (continued, stopped + 1));
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 1_000),
+            None
+        );
+        assert_eq!(q.len(), 0);
+    }
+
+    /// A lapse clears every armed continuation, counting only the passes
+    /// detached from theirs (the others count themselves, `stopped`).
+    #[test]
+    fn a_lapse_clears_every_armed_continuation() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        q.arm(3, entry("j", 0));
+        assert_eq!(q.detach("k", 7), None);
+        let (continued, stopped) = continued_stopped();
+        assert_eq!(q.end_all_armed(), 1);
+        assert!(!q.armed("k") && !q.armed("j"));
+        assert_eq!(continued_stopped(), (continued, stopped + 1));
+        assert_eq!(q.detach("j", 3), Some(false));
+        assert_eq!(
+            q.continue_from(&hold("k", 7), Version("v7".into()), 1_000),
+            None
+        );
+        assert_eq!(q.len(), 0);
+    }
+
     #[test]
     fn a_continuation_the_full_queue_refuses_is_said_not_queued() {
         let q = Queue::default();
@@ -1143,6 +1557,16 @@ mod tests {
         q.continue_from(&hold("new", 2), Version("v2".into()), 1_000);
         assert!(!q.disarm("new"), "refused, so not continued");
         assert_eq!(q.len(), QUEUE_MAX);
+        // Its release landing in the background: counted `stopped` there.
+        q.arm(2, entry("late", 0));
+        assert_eq!(q.detach("late", 2), None);
+        let (continued, stopped) = continued_stopped();
+        assert_eq!(
+            q.continue_from(&hold("late", 2), Version("v2".into()), 1_000),
+            Some(false)
+        );
+        assert!(!q.armed("late"));
+        assert_eq!(continued_stopped(), (continued, stopped + 1));
     }
 
     #[test]

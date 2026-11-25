@@ -334,6 +334,11 @@ impl Cluster {
             hook();
         }
         self.pending.end_all(true);
+        // No armed idle-pass continuation outlives a lapse (ADR 0042): a
+        // release retried in the background lands, if at all, under
+        // another epoch. One already queued stays; its pass's version
+        // check drops it if the record changed.
+        self.idle_passes.end_all_armed();
     }
 
     /// Makes this node's lease invalid here at once: every hold ends (as
@@ -343,6 +348,7 @@ impl Cluster {
     pub(super) fn invalidate_node_lease(&self, release: bool) {
         self.validity.invalidate();
         self.pending.end_all(release);
+        self.idle_passes.end_all_armed();
     }
 
     /// Another writer replaced this node's lease object: a twin, a peer's

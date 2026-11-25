@@ -1046,6 +1046,15 @@ struct Flaky {
     fail_gets_of: Arc<std::sync::Mutex<Option<String>>>,
     /// Writes of ownership records (`owners/...`) fail while set.
     fail_owner_puts: Arc<AtomicBool>,
+    /// Releases of ownership records (a record naming nobody) fail
+    /// while set; acquisitions go through.
+    fail_owner_releases: Arc<AtomicBool>,
+    /// The next this-many releases of ownership records land, and answer
+    /// an error at once: a reply lost.
+    lost_owner_release_replies: Arc<std::sync::atomic::AtomicU32>,
+    /// The next this-many releases of ownership records land, and answer
+    /// 1,500 ms later: after the sender's one-second try gave up.
+    slow_owner_release_replies: Arc<std::sync::atomic::AtomicU32>,
     /// The next this-many segment (`/wal/`) uploads never answer and are
     /// not applied: a PUT the bucket left hanging.
     hang_wal_puts: Arc<std::sync::atomic::AtomicU32>,
@@ -1110,6 +1119,9 @@ impl Flaky {
             delay_node_lists_ms: Arc::default(),
             fail_gets_of: Arc::default(),
             fail_owner_puts: Arc::default(),
+            fail_owner_releases: Arc::default(),
+            lost_owner_release_replies: Arc::default(),
+            slow_owner_release_replies: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
             fail_puts_of: Arc::default(),
@@ -1258,6 +1270,50 @@ impl ObjectStore for Flaky {
                 store: "flaky",
                 source: "write refused".into(),
             });
+        }
+        if location.as_ref().starts_with(&test_key(Family::Owners, ""))
+            && self.fail_owner_releases.load(Ordering::SeqCst)
+            && String::from_utf8_lossy(&bytes::Bytes::from(payload.clone()))
+                .lines()
+                .nth(1)
+                .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+        {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "ownership record release failed".into(),
+            });
+        }
+        if location.as_ref().starts_with(&test_key(Family::Owners, ""))
+            && String::from_utf8_lossy(&bytes::Bytes::from(payload.clone()))
+                .lines()
+                .nth(1)
+                .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+        {
+            let lost = self
+                .lost_owner_release_replies
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            let slow = !lost
+                && self
+                    .slow_owner_release_replies
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+            if lost || slow {
+                // Landed in the bucket, wherever the answer goes.
+                let (inner, location) = (Arc::clone(&self.inner), location.clone());
+                let landed =
+                    tokio::spawn(async move { inner.put_opts(&location, payload, opts).await })
+                        .await
+                        .expect("the release's write task");
+                landed?;
+                if slow {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                }
+                return Err(object_store::Error::Generic {
+                    store: "flaky",
+                    source: "ownership record release: reply lost".into(),
+                });
+            }
         }
         if location.as_ref().starts_with(&test_key(Family::Owners, ""))
             && self.fail_owner_puts.load(Ordering::SeqCst)

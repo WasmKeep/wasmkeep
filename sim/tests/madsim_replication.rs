@@ -315,6 +315,10 @@ const IDLE_PASS_CAP: u64 = 3;
 /// to (the server's `CONTINUE_AFTER` is fixed; drawn here, so a wake
 /// comes before some and after others).
 const IDLE_CONTINUE_AFTER_MS: (u64, u64) = (100, 1_500);
+/// The share of passes stopped early (in percent) whose release lands
+/// with its answer lost: left to the background, where its retry is
+/// superseded by the write that landed.
+const IDLE_RELEASE_ANSWER_LOST_PERCENT: u64 = 25;
 /// Passes of one chain at most, in the model.
 const IDLE_CHAIN_MAX: u32 = 30;
 /// How often nobody wakes the actor until its pass is done (in percent);
@@ -363,6 +367,12 @@ struct IdleCounts {
     /// Continuations dropped because the record changed since the
     /// previous pass's release (a wake in between).
     continuations_changed: u64,
+    /// Passes stopped early whose release did not land at once (left to
+    /// the background).
+    pending_releases: u64,
+    /// Of those, continued once that release's retry ended, on the record
+    /// read back.
+    continued_after_pending: u64,
 }
 
 fn count_idle(f: impl FnOnce(&mut IdleCounts)) {
@@ -1086,17 +1096,59 @@ async fn idle_pass(
         let s = store.lock().unwrap();
         sent.into_iter().filter(|k| s.contains_key(k)).collect()
     };
-    let released = node.release(&hold).await;
+    // A stopped pass's release loses its answer on some passes, drawn
+    // apart so the other draws of every seed stay as they were: from the
+    // pass's generation, its place in the chain and the simulated clock
+    // (which differs between seeds where generations do not).
+    let answer_lost = left > 0 && {
+        let now = madsim::time::TimeHandle::current()
+            .now_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        Rng::new(now ^ generation.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ u64::from(chain.passes))
+            .chance(IDLE_RELEASE_ANSWER_LOST_PERCENT)
+    };
+    let released = if answer_lost {
+        node.release_answer_lost(&hold).await
+    } else {
+        node.release(&hold).await
+    };
     mailbox.pass.set(false);
+    // Not landed now (no answer in time, or one lost): left to the
+    // background, as the server does, whose pass keeps its continuation
+    // armed until that retry ends, a lapse clearing it (ADR 0042, "As
+    // built: a release retried in the background"). Waited for here, then
+    // read back like a release that landed: a landed retry, or this
+    // release landed with its answer lost (the retry then superseded), is
+    // a record naming nobody at the pass's generation.
+    let mut retried = false;
+    if left > 0 && !released && chain.passes + 1 < IDLE_CHAIN_MAX && !node.lost() {
+        count_idle(|c| c.pending_releases += 1);
+        let epoch = node.epoch();
+        for _ in 0..100 {
+            if !node.release_pending(RECORD, hold.generation)
+                || node.lost()
+                || node.epoch() != epoch
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        retried =
+            !node.release_pending(RECORD, hold.generation) && !node.lost() && node.epoch() == epoch;
+    }
     // Stopped early: the continuation, on the version this release wrote
     // (read back, as at hibernation: a record naming nobody at the pass's
     // generation is that write).
-    if left > 0 && released && chain.passes + 1 < IDLE_CHAIN_MAX && !node.lost() {
+    if left > 0 && (released || retried) && chain.passes + 1 < IDLE_CHAIN_MAX && !node.lost() {
         count_idle(|c| c.stopped += 1);
         if let Ok(Some((body, version))) = bucket.get(RECORD).await
             && OwnerRecord::decode(&body)
                 .is_some_and(|r| r.holder.is_none() && r.generation == hold.generation)
         {
+            if retried {
+                count_idle(|c| c.continued_after_pending += 1);
+            }
             let after = IDLE_CONTINUE_AFTER_MS.0
                 + rng.below(IDLE_CONTINUE_AFTER_MS.1 - IDLE_CONTINUE_AFTER_MS.0);
             trace(&format!(
@@ -2421,13 +2473,16 @@ fn idle_holds(rules: Rules, what: &str) -> IdleCounts {
         t.continuations += c.continuations;
         t.continuations_deleted += c.continuations_deleted;
         t.continuations_changed += c.continuations_changed;
+        t.pending_releases += c.pending_releases;
+        t.continued_after_pending += c.continued_after_pending;
     }
     eprintln!(
         "replication {what}: {} seeds x 30 s: {acked} acknowledged writes, all restored; \
          {generations} generations; {} idle snapshots; {} passes ({} more skipped): {} deleted, {} dropped for a \
          changed record, {} found nothing, {} took a changed record and deleted; {} deletes \
          landed after their hold ended; {} restores compared without the snapshot; {} passes \
-         stopped early: {} continuations, {} deleted, {} dropped for a changed record",
+         stopped early: {} continuations, {} deleted, {} dropped for a changed record; {} \
+         releases of a stopped pass left to the background, {} continued after their retry",
         seeds(),
         t.snapshots,
         t.passes,
@@ -2441,7 +2496,9 @@ fn idle_holds(rules: Rules, what: &str) -> IdleCounts {
         t.stopped,
         t.continuations,
         t.continuations_deleted,
-        t.continuations_changed
+        t.continuations_changed,
+        t.pending_releases,
+        t.continued_after_pending
     );
     assert!(acked > seeds() * 10, "too few writes ({acked})");
     assert!(
@@ -2478,6 +2535,12 @@ fn idle_compaction_keeps_every_acknowledged_write() {
     assert!(
         c.continuations_changed > 0,
         "no continuation found the record changed: {c:?}"
+    );
+    // Releases whose answer was lost, retried in the background, and the
+    // chain continued from the record read back.
+    assert!(
+        c.continued_after_pending > 0,
+        "no chain continued after a release left to the background: {c:?}"
     );
 }
 

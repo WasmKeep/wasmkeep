@@ -607,6 +607,27 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         Some((released, written))
     }
 
+    /// [`Self::release`] whose answer is lost: the release is sent and may
+    /// land, but the node learns nothing, so the hold waits in the pending
+    /// set and its retry, if the write landed, conflicts with it and comes
+    /// back superseded (ADR 0042, a release whose answer was lost). `false`
+    /// (not landed, as far as the node knows) unless nothing was held.
+    pub async fn release_answer_lost(&self, held: &Held) -> bool {
+        let hold = {
+            let mut s = lock(&self.shared);
+            let Some(hold) = s.holds.remove(&held.key) else {
+                return true;
+            };
+            s.in_flight += 1;
+            hold
+        };
+        let _ = self.owners.release_written(&hold).await;
+        let mut s = lock(&self.shared);
+        s.in_flight -= 1;
+        s.pending.push(PendingEntry::Release(hold));
+        false
+    }
+
     /// A clean stop: every hold released, then the lease task makes the
     /// lease invalid here and writes it `released`, which frees whatever
     /// did not land. Waits for the lease task to end.
@@ -633,6 +654,17 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
     /// live here; the server asks its membership view.
     pub async fn other_owner(&self, key: &str) -> Result<Option<String>, AcquireError> {
         self.owners.other_owner(key, |_, _| true).await
+    }
+
+    /// Whether a release of the hold of `key` at `generation` may still be
+    /// retried in the background: in the pending set, or anything in
+    /// flight (a pass takes the entries out while it tries them).
+    pub fn release_pending(&self, key: &str, generation: u64) -> bool {
+        let s = lock(&self.shared);
+        s.in_flight > 0
+            || s.pending.iter().any(|e| {
+                matches!(e, PendingEntry::Release(hold) if hold.key == key && hold.generation == generation)
+            })
     }
 
     /// Whether nothing waits for its outcome and no record is parked (a

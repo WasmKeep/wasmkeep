@@ -682,8 +682,9 @@ impl LeaseHold {
                 }
                 let generation = hold.generation;
                 // Any acquisition here: the version an idle pass remembered
-                // is gone (ADR 0042).
-                cluster.idle_passes.remove(&key);
+                // is gone, and so is the record a pass's release still
+                // retried in the background would write (ADR 0042).
+                cluster.idle_passes.acquired(&key);
                 let cell = Arc::new(Mutex::new(Some(hold)));
                 cluster.pending.register(&key, &cell);
                 // The new hold carries the local evidence now.
@@ -1482,7 +1483,16 @@ impl Cluster {
                                 self.release_landed(&hold, written);
                                 Retried::Ended
                             }
-                            Released::Superseded => Retried::Ended,
+                            // Not this hold's record any more, unless it
+                            // is this release, landed with its answer lost:
+                            // a continuation an idle pass armed for it is
+                            // queued on the record read back, or cleared
+                            // (ADR 0042).
+                            Released::Superseded => {
+                                self.idle_release_superseded(&hold.key, hold.generation)
+                                    .await;
+                                Retried::Ended
+                            }
                             Released::Pending | Released::Unchanged => {
                                 Retried::Pending(PendingEntry::Release(hold))
                             }
