@@ -213,12 +213,12 @@ configurations; whichever you use, check:
 
 Keep secrets in the bucket, sealed with a key the nodes hold, rather
 than in each node's `--env` file
-([Secrets in the bucket](../cluster.md#secrets-in-the-bucket)):
+([Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)):
 
 - [ ] **One key**, made once (`wasmkeep secrets new-key --out
   secrets.key`, as in step 0), copied to every node (mode 0600) and kept
   with the bucket's credentials. Losing it means setting every secret
-  again ([losing the key](../cluster.md#secrets-in-the-bucket)).
+  again ([losing the key](../cluster-deploying.md#secrets-in-the-bucket)).
 - [ ] **Every node started with `--secrets-key`**. Once the app has
   secrets, a node without the key refuses to start.
 - [ ] **Each value set**, from a file or a pipe rather than the command
@@ -257,7 +257,7 @@ the values came from.
 
 Deploy your app with `wasmkeep deploy`, from one place (a CI job or one
 operator's machine), never by copying components to the nodes
-([Deploying](../cluster.md#deploying)). Each deploy is a new version that
+([Deploying](../cluster-deploying.md#deploying)). Each deploy is a new version that
 every node follows within a few seconds, switching each actor at its
 next event; `deploy` checks every component before it uploads anything.
 
@@ -385,7 +385,7 @@ Two kinds, with different rules:
   at a time) or stops the cluster. So far every upgrade stops it: stop
   every node, wait until `cluster status` exits with 1, install the new
   binary everywhere, start them all
-  ([Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)). `0.4.0` also
+  ([Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep)). `0.4.0` also
   migrates the bucket once, offline:
   [Upgrade a cluster to 0.4.0](../deploy/upgrading-to-0.4.md).
 
@@ -399,7 +399,7 @@ Two kinds, with different rules:
 
 To work on a machine (a kernel update, a resize, a replacement), drain
 its node first: it hands its actors to the others and keeps forwarding
-requests ([Draining a node](../cluster.md#draining-a-node)).
+requests ([Draining a node](../cluster-operations.md#draining-a-node)).
 
 <!-- test: drain -->
 ```bash

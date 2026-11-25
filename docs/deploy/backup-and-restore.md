@@ -37,7 +37,7 @@ it may include unacknowledged tips. **There is no consistent point across
 actors.** Reconcile cross-actor business invariants after restoring.
 
 A run also carries the app's
-[upgrade floor](../cluster.md#versions-the-upgrade-floor-and-finalize) (`formats/<tenant>/<app>/floor`), when the app
+[upgrade floor](../cluster-upgrades.md#versions-the-upgrade-floor-and-finalize) (`formats/<tenant>/<app>/floor`), when the app
 has one: the minor version below which no node may serve it. Such a run is
 backup format 2 (with `--all`, as soon as one app of the run has a floor). A
 run in which no app has a floor stays format 1, which 0.8.1 reads as before.
@@ -580,7 +580,7 @@ repaired, and the other actors are not affected.
 
 `wasmkeep cluster verify --bucket s3://BUCKET/PREFIX` checks exactly that
 for every actor, on the live bucket or on a copy, without writing:
-[Verifying a bucket](../cluster.md#verifying-a-bucket). With `--deep` it
+[Verifying a bucket](../cluster-operations.md#verifying-a-bucket). With `--deep` it
 also reads each of those objects and checks its checksums. It is not
 `backup verify`, which checks an online archive's own contents.
 
@@ -685,7 +685,7 @@ also delete it. Start the nodes again when the check has passed.
    and newer secrets in memory than the copy names. They keep running
    the newer deploy, and they refuse the older secrets: 503 for the app
    after 30 s, until they are restarted
-   ([Secrets in the bucket](../cluster.md#secrets-in-the-bucket)).
+   ([Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)).
 2. **Copy the backup into an empty prefix**, not over the damaged one.
    Objects written after the backup carry higher positions and
    generations than the copy's, and a restore takes the highest as the

@@ -9,7 +9,7 @@ binary: its ports, routes, exit codes and the package
 
 ## The binary
 
-Upgrade the binary as [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)
+Upgrade the binary as [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep)
 says: stop every node, upgrade them all, start them all. 0.7.0 documents no
 exception for one node at a time. No bucket or node-to-node format changes
 between 0.6.0 and 0.7.0 (the one new stored item, an actor's

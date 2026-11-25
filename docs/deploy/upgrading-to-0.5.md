@@ -7,7 +7,7 @@ uses none of them keeps its manifests and ownership records byte for byte,
 so upgrading the binaries alone changes nothing a 0.4.2 node reads.
 
 The rule for everything below is the one in
-[running a cluster](../cluster.md#rolling-upgrades-and-new-storage-functions):
+[running a cluster](../cluster-upgrades.md#rolling-upgrades-and-new-storage-functions):
 **upgrade every node first, then deploy.** Each new feature announces a
 word in the node's heartbeat, and the command that would depend on it
 checks the words of the app's nodes.
@@ -77,7 +77,7 @@ See [back up and restore](backup-and-restore.md) and
 switches one app to ownership
 records of version 2 (`wasmkeep-owner 2`), which carry the recorded head
 ([ADR 0035](../adr/0035-a-recorded-head-on-hand-over.md),
-[the operator guide](../cluster.md#the-recorded-head-ownership-format)).
+[the operator guide](../cluster-upgrades.md#the-recorded-head-ownership-format)).
 Until you run it, every record is version 1, as under 0.4.2.
 
 - **Per app, and one way.** There is no command to turn it off.

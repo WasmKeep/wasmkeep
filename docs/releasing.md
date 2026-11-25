@@ -111,7 +111,7 @@ mixed_version --run-ignored only --no-capture`.
 A passing run does not by itself make a rolling upgrade supported. A
 release's upgrading page says whether it can be installed one node at a
 time, from this check's result. Without that statement the rule stays the
-one in [Upgrading WasmKeep](cluster.md#upgrading-wasmkeep): stop every
+one in [Upgrading WasmKeep](cluster-upgrades.md#upgrading-wasmkeep): stop every
 node, upgrade them all, start them all. After a release, add its SHA-256
 to `PINNED_SHA256` at the top of the script and make it the default
 `OLD_VERSION`.

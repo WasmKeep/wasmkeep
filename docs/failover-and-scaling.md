@@ -41,14 +41,14 @@ node has rebuilt the database from the bucket (unless its local copy is
 already current). Clients whose socket closed with 1012 open it again and
 reach the new holder.
 
-With the [recorded-head format](cluster.md#the-recorded-head-ownership-format)
+With the [recorded-head format](cluster-upgrades.md#the-recorded-head-ownership-format)
 enabled, each release also records the position the node acknowledged,
 and the next node does not start the actor until its bucket listing
 shows that position: on a bucket whose listings lag, a request may get a
 503 for a few seconds instead of an older state. A release that does not
 land within the 3 s falls back to the crash path below.
 
-To empty a node before stopping it, [drain it](cluster.md#draining-a-node):
+To empty a node before stopping it, [drain it](cluster-operations.md#draining-a-node):
 it hands its actors over while it still forwards requests, and each
 actor's pending alarm moves to the new holder's timer.
 
@@ -198,8 +198,8 @@ process. The `wasmkeep_placement*` metrics count what it did
 - **No moving of running actors by load.** Placement acts only when an
   actor wakes. An actor in memory stays on its node until it hibernates,
   until it is moved with
-  [`wasmkeep actor move`](cluster.md#moving-one-actor), until its node is
-  drained with [`wasmkeep cluster drain`](cluster.md#draining-a-node), or
+  [`wasmkeep actor move`](cluster-operations.md#moving-one-actor), until its node is
+  drained with [`wasmkeep cluster drain`](cluster-operations.md#draining-a-node), or
   until its node stops or dies. A move is not a pin: once the actor
   hibernates, its next event starts it wherever that event lands, or is
   placed. A cluster whose actors never hibernate does not fill a new node.
@@ -240,7 +240,7 @@ traffic lands. Front requests have their own slots on each node
 With `serve --app`, it is part of the app's deploy (`wasmkeep deploy
 --front PATH`): every node switches to a new front with the classes, a few
 seconds apart, and `--rollback` brings the previous one back
-([how](cluster.md#deploying-the-front)). Without `--app`, it is a file
+([how](cluster-deploying.md#deploying-the-front)). Without `--app`, it is a file
 each node is started with, and updating it is a restart of each node in
 turn.
 

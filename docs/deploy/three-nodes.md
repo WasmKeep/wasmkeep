@@ -154,7 +154,7 @@ wasmkeep deploy --app acme/shop --bucket s3://acme-wasmkeep/prod \
 `deploy` compiles and checks every component before uploading anything.
 Later deploys work the same way: nodes pick the new version up within a few
 seconds and switch each actor at its next event; `--rollback` returns to the
-previous version. See [Deploying](../cluster.md#deploying).
+previous version. See [Deploying](../cluster-deploying.md#deploying).
 
 ## 4. The load balancer
 
@@ -189,7 +189,7 @@ From any machine with the bucket credentials, `wasmkeep cluster status
 --bucket s3://acme-wasmkeep/prod` lists the nodes from their heartbeats
 (live or not, version, addresses, TLS) and the deployed version of the app;
 it exits with 1 if no node is live. See
-[Checking a cluster](../cluster.md#checking-a-cluster).
+[Checking a cluster](../cluster-operations.md#checking-a-cluster).
 
 ## Operating it
 
@@ -215,7 +215,7 @@ it exits with 1 if no node is live. See
   live nodes, one version, no warning. Clients get errors between the last
   stop and the first start. Old and new nodes refuse each other's calls
   and handle alarms differently, so a rolling restart across versions is
-  not supported yet: see [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep).
+  not supported yet: see [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep).
 - **Restarting a node** on the same binary (a configuration change, a host
   reboot): one node at a time is fine. A stopping node finishes its
   in-flight requests, then hands its actors over: the other nodes serve
@@ -225,7 +225,7 @@ it exits with 1 if no node is live. See
   `/actor/` and `/_wasmkeep/`): with `--app` it is part of the deploy,
   `wasmkeep deploy --app acme/shop --bucket ... --front site.wasm`, and
   nodes switch to it without a restart (see
-  [Deploying the front](../cluster.md#deploying-the-front)).
+  [Deploying the front](../cluster-deploying.md#deploying-the-front)).
 - **Adding a node**: start it with a new id and add it to the load
   balancer. An actor in memory on another node stays there, and the new
   node forwards its requests; once it hibernates, its node gives it up,
@@ -236,7 +236,7 @@ it exits with 1 if no node is live. See
   files. Create a key once (`wasmkeep secrets new-key --out secrets.key`),
   give it to every node (`--secrets-key /etc/wasmkeep/secrets.key`, mode
   0600), and set values with `wasmkeep secrets set`; nodes pick them up
-  within a few seconds (see [Secrets in the bucket](../cluster.md#secrets-in-the-bucket)).
+  within a few seconds (see [Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)).
 - **Removing or replacing a node**: drain it first, then stop it once it
   is drained:
 
@@ -248,7 +248,7 @@ it exits with 1 if no node is live. See
 
   A drain moves its actors a few at a time while the node keeps
   forwarding, and moves their pending alarms with them, so they fire on
-  time (see [Draining a node](../cluster.md#draining-a-node)). Stopping
+  time (see [Draining a node](../cluster-operations.md#draining-a-node)). Stopping
   without draining also works (`SIGTERM`, as `systemctl stop` sends): its
   actors move at once, and alarms of idle actors wait for the sweep. A
   node that is killed or crashes cannot hand over: its actors move after
