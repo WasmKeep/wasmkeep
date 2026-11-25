@@ -356,16 +356,19 @@ impl Queue {
     /// generation. A pass whose release was retried in the background is
     /// counted here: `Some(queued)`.
     fn continue_from(&self, hold: &Hold, version: Version, now_ms: u64) -> Option<bool> {
-        self.continue_at(&hold.key, hold.generation, version, now_ms)
+        self.continue_at(&hold.key, hold.generation, version, now_ms, false)
     }
 
-    /// [`Self::continue_from`] for the hold of `key` at `generation`.
+    /// [`Self::continue_from`] for the hold of `key` at `generation`; with
+    /// `forget`, the actor's queued entry is first forgotten, only if the
+    /// continuation is armed for that hold (checked under the same lock).
     fn continue_at(
         &self,
         key: &str,
         generation: u64,
         version: Version,
         now_ms: u64,
+        forget: bool,
     ) -> Option<bool> {
         let mut continuing = self.continuing();
         let Some(Continuing::Armed {
@@ -378,6 +381,9 @@ impl Queue {
         };
         if *hold_generation != generation {
             return None;
+        }
+        if forget {
+            self.remove(key);
         }
         let detached = *detached;
         let mut next = next.clone();
@@ -587,10 +593,13 @@ impl Cluster {
         match read {
             Ok(Ok(Some(version))) if self.idle_compaction && self.app_refusal().is_none() => {
                 tracing::debug!(key = %crate::logging::text(key), generation, "idle pass: its release landed with its answer lost; continued on the record read back");
-                // As `note_idle_release` for a release that did not write.
-                self.idle_passes.remove(key);
+                // As `note_idle_release` for a release that did not write,
+                // the actor's entry forgotten only while this hold's
+                // continuation is still armed, under the same lock: an
+                // acquisition here since (a writer's entry queued after
+                // it) cleared it, and that entry stays.
                 self.idle_passes
-                    .continue_at(key, generation, version, now_ms());
+                    .continue_at(key, generation, version, now_ms(), true);
             }
             _ => {
                 self.idle_passes.end_armed(key, Some(generation));
@@ -1442,6 +1451,35 @@ mod tests {
         // Nothing armed at all.
         assert_eq!(q.detach("i", 3), Some(false));
         assert_eq!(continued_stopped(), counts);
+    }
+
+    /// A continuation queued from a record read back forgets the actor's
+    /// entry only while it is still armed for that hold: an acquisition
+    /// here in between (which cleared it) keeps the entry a writer's
+    /// release queued since.
+    #[test]
+    fn a_read_back_forgets_the_actor_entry_only_while_armed() {
+        let q = Queue::default();
+        q.arm(7, entry("k", 0));
+        assert_eq!(q.detach("k", 7), None);
+        q.acquired("k");
+        q.push(entry("k", 5));
+        assert_eq!(
+            q.continue_at("k", 7, Version("v7".into()), 1_000, true),
+            None
+        );
+        assert_eq!(q.entries(), [entry("k", 5)], "the writer's entry stays");
+        // Still armed: the stale entry is replaced by the continuation.
+        q.arm(7, entry("j", 0));
+        q.push(entry("j", 5));
+        assert_eq!(q.detach("j", 7), None);
+        assert_eq!(
+            q.continue_at("j", 7, Version("v7".into()), 1_000, true),
+            Some(true)
+        );
+        let j: Vec<Entry> = q.entries().into_iter().filter(|e| e.key == "j").collect();
+        assert_eq!(j.len(), 1);
+        assert_eq!((j[0].generation, j[0].version.0.as_str()), (7, "v7"));
     }
 
     /// Pending, then superseded: the armed entry is cleared (only for its

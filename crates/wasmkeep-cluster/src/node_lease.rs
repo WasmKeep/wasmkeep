@@ -1896,11 +1896,16 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
 
     /// The record at `key`, read once, if it names nobody at `generation`:
     /// its version (ADR 0042, a release whose answer was lost). Within one
-    /// incarnation of the app only the release of the hold at `generation`
-    /// writes that state: every acquisition writes a new generation naming
-    /// its holder, a release keeps its hold's generation, and a record's
-    /// generation never goes down. `Ok(None)` for any other record or none;
-    /// `Err` if the bucket did not answer or the record is unreadable.
+    /// incarnation of the app only a release of the record the hold at
+    /// `generation` acquired writes that state: every acquisition writes a
+    /// new generation naming its holder, a release keeps its hold's
+    /// generation, and a record's generation never goes down. Two writers
+    /// can release it, both of this instance from the same state with no
+    /// hold in between: that hold's own release, and the resolver of an
+    /// earlier attempt of this instance at `generation` still unresolved
+    /// (`holds::retry`), once the hold is out of its cell. `Ok(None)` for
+    /// any other record or none; `Err` if the bucket did not answer or the
+    /// record is unreadable.
     pub async fn released_at(
         &self,
         key: &str,
@@ -2558,6 +2563,47 @@ mod tests {
             Err(AcquireError::Changed),
             "the pass's own release changed the record"
         );
+    }
+
+    /// ADR 0042: the read-back after a superseded release. Only a record
+    /// naming nobody at the generation asked gives its version; a holder,
+    /// another generation or no record give none; a body that is not a
+    /// record (the migration's tombstone), or no answer, is an error.
+    #[test]
+    fn released_at_gives_the_version_only_of_a_record_naming_nobody_there() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Owners::new(&mem, At(&t), "a", "i1", "nodes/", cfg());
+        let key = "owners/x";
+        let put = |holder: Option<(&str, &str)>, generation| {
+            let record = OwnerRecord {
+                holder: holder.map(|(n, i)| (n.to_owned(), i.to_owned())),
+                generation,
+                recorded: None,
+            };
+            mem.overwrite(key, Some(&record.encode()));
+        };
+        assert_eq!(run(a.released_at(key, 5)), Ok(None), "no record");
+        put(Some(("a", "i1")), 5);
+        assert_eq!(run(a.released_at(key, 5)), Ok(None), "held at 5");
+        put(None, 5);
+        let version = run((&mem).get(key)).unwrap().unwrap().1;
+        assert_eq!(run(a.released_at(key, 5)), Ok(Some(version)));
+        assert_eq!(run(a.released_at(key, 6)), Ok(None), "asked at 6");
+        assert_eq!(run(a.released_at(key, 4)), Ok(None), "asked at 4");
+        put(None, 4);
+        assert_eq!(run(a.released_at(key, 5)), Ok(None), "nobody at 4");
+        put(None, 6);
+        assert_eq!(run(a.released_at(key, 5)), Ok(None), "nobody at 6");
+        mem.overwrite(
+            key,
+            Some(&crate::legacy_layout::tombstone("state/t/default/owners/x")),
+        );
+        assert_eq!(run(a.released_at(key, 5)), Err(AcquireError::Corrupt));
+        mem.fail_get_after.set(Some(0));
+        assert_eq!(run(a.released_at(key, 5)), Err(AcquireError::Unavailable));
     }
 
     /// A write that landed with a failure reported (its reply lost, or a
