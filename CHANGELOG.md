@@ -15,9 +15,12 @@ The text under a version's heading is its GitHub release text
   `--rollback` and `--remove-old`. A cluster older than 0.4.0 upgrades
   through 0.8.x first: pin the 0.8.1 binary, migrate with it, then
   upgrade ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md)). A
-  bucket migrated earlier needs nothing. Nodes and commands still read
-  its commits and tombstones. They still refuse a tenant left in the old
-  layout, or a prefix a 0.8.x migration holds, and now say to use 0.8.1.
+  bucket migrated earlier keeps working: nodes and commands still read
+  its commits and tombstones. If its old keys were never removed, run
+  `cluster migrate --remove-old --apply` with the 0.8.1 binary while the
+  cluster is still on 0.8.1, before upgrading: 0.9.0 cannot remove them.
+  Nodes and commands still refuse a tenant left in the old layout, or a
+  prefix a 0.8.x migration holds, and now say to use 0.8.1.
 
 ## 0.8.1
 

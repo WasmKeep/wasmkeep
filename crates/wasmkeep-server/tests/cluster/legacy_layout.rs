@@ -28,10 +28,12 @@ fn local_to_bare(data: &Path) {
     }
 }
 
-/// A bucket a 0.8.x `cluster migrate` committed: the tombstones it left
-/// at the bare ownership keys are read as tombstones, never as records,
-/// the start check lets the tenant start, and a node of this version
-/// serves every actor from its root (its old local databases go aside).
+/// A bucket a 0.8.x `cluster migrate` committed, before `--remove-old`
+/// (old history and lease markers beside their copies, a tombstone over
+/// each old record, one `unowned`): the tombstones are read as
+/// tombstones, never as records, the commit lets the tenant start over
+/// all of it, and a node of this version serves every actor from its
+/// root (its old local databases go aside).
 /// Bare keys without the commit refuse the tenant, naming 0.8.1, and
 /// refuse a deploy too.
 #[tokio::test(flavor = "multi_thread")]
@@ -89,11 +91,33 @@ async fn a_bucket_migrated_by_0_8_is_served_and_an_unmigrated_one_refused() {
         }
         b.put(&bare, body).await.unwrap();
     }
+    // An `unowned` tombstone, where an actor had history and no record.
+    let ghost = format!("{rooted}t/ghost");
+    let body = format!("{TOMBSTONE_HEADER}\n{ghost}\nnone\n").into_bytes();
+    match wasmkeep_cluster::node_lease::OwnerObject::decode(&body) {
+        Some(wasmkeep_cluster::node_lease::OwnerObject::Tombstone { to, unowned }) => {
+            assert_eq!((to.as_str(), unowned), (ghost.as_str(), true));
+        }
+        other => panic!("{other:?}"),
+    }
+    b.put("owners/default/t/ghost", body).await.unwrap();
+    // A bucket before `--remove-old`: the old history and lease markers
+    // are still there, beside their copies under the root.
+    let mut copies = 0;
+    for (family, bare) in [("actors", "actors"), ("leases", "leases")] {
+        let root = format!("state/default/default/{family}/");
+        for meta in b.list(&root).await.unwrap() {
+            let to = meta.key.replacen(&root, &format!("{bare}/default/"), 1);
+            b.copy(&meta.key, &to).await.unwrap();
+            copies += 1;
+        }
+    }
+    assert!(copies > names.len(), "{copies}");
     // Before the commit: refused, naming the version that migrates.
     match start_check(&b, "default").await {
         Err(StartRefusal::Unmigrated(tenant, found)) => {
             assert_eq!(tenant, "default");
-            assert!(found.starts_with("owners/default/"), "{found}");
+            assert!(found.starts_with("actors/default/"), "{found}");
         }
         other => panic!("{other:?}"),
     }
@@ -136,11 +160,13 @@ async fn a_bucket_migrated_by_0_8_is_served_and_an_unmigrated_one_refused() {
         let r = send_runnable(c.addr, "POST", &path, "").await;
         assert_eq!((r.status, r.body.trim()), (200, "3"), "{name}");
     }
-    // The tombstones stay for good.
+    // The tombstones and the old copies stay: nothing here removes them.
     assert_eq!(
         b.list("owners/default/t/").await.unwrap().len(),
-        names.len()
+        names.len() + 1
     );
+    assert!(!b.list("actors/default/t/").await.unwrap().is_empty());
+    assert!(!b.list("leases/default/t/").await.unwrap().is_empty());
     drop(c);
 }
 

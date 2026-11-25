@@ -408,11 +408,12 @@ mod tests {
         (At(Arc::clone(&cell)), cell)
     }
 
-    /// Keys the migration lists come back as written, so a copy, read or
-    /// delete of a listed key reaches the same object (an escaped or long
-    /// actor name, under a prefix that needs escaping too).
+    /// Keys a [`Store`](crate::store::Store) listing gives come back as
+    /// written, so a copy, read or delete of a listed key reaches the same
+    /// object (an escaped or long actor name, under a prefix that needs
+    /// escaping too).
     #[tokio::test]
-    async fn migration_keys_round_trip_through_the_store_escaping() {
+    async fn listed_keys_round_trip_through_the_store_escaping() {
         use crate::store::Store as _;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let b = ObjectStoreBucket::new(Arc::clone(&store), "p%x/q");

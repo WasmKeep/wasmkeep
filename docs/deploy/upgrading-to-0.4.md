@@ -17,9 +17,12 @@ refuses a tenant that was not migrated, and prints the command to run.
 > ask on the way. Then upgrade to 0.9.0.
 > A node, `deploy` or `actor move` of 0.9.0 refuses a tenant still in
 > the layout before 0.4.0, and a prefix a 0.8.x migration holds, and says
-> to migrate with 0.8.1. A prefix migrated earlier needs nothing: 0.9.0
+> to migrate with 0.8.1. A prefix migrated earlier keeps working: 0.9.0
 > still reads its commits and the tombstones over the old ownership
-> records.
+> records. If its old keys were never removed (steps 10 and 11), run
+> `cluster migrate --remove-old --apply` with the 0.8.1 binary while the
+> cluster is still on 0.8.1, before upgrading to 0.9.0: 0.9.0 cannot
+> remove them, and they stay in the bucket for good.
 
 This page is the whole procedure, from the backup to removing the old
 keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
@@ -117,18 +120,20 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    nothing is refused, and it ends with "Nothing to migrate". `wasmkeep
    cluster status` still shows no live node.
 
-8. **Start** every node of 0.4.0. At its first start a node puts its old
+8. **Start** every node of 0.4.0 (from 0.9.0 on: of 0.8.1, the binary
+   that migrated; upgrade to 0.9.0 only after step 11). At its first start a node puts its old
    local databases aside (`<data_dir>/actors.pre-0.4/`), and restores
    each actor from the bucket on its first wake; a node with no bucket
    (`dev`, `serve` alone) moves them into its app's folder instead.
    **From the first start, the migration is one-way.**
 
-9. **Check the app**: `wasmkeep cluster status` shows every node live,
+9. **Check the app**, with the 0.8.1 binary from 0.9.0 on:
+   `wasmkeep cluster status` shows every node live,
    and requests to a few known actors return their data. Then unfreeze
    deploys, secret changes, `actor move` and drains.
 
 10. **Remove the old keys, dry run**, once the app answers (the same day
-    is the intent):
+    is the intent). From 0.9.0 on, run it with the 0.8.1 binary:
 
     ```sh
     wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX --remove-old
@@ -162,7 +167,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
       each key: copy them aside if they matter, remove them from the
       prefix, and run it again.
 
-11. **Remove the old keys**: the same command with `--apply`:
+11. **Remove the old keys**: the same command with `--apply` (from 0.9.0
+    on, the 0.8.1 binary too, before the cluster moves to 0.9.0):
 
     ```sh
     wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX --remove-old --apply
@@ -185,7 +191,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
 ## Rolling back
 
 **Before the first start** (step 8), while no app was deployed and no
-`actor move` was requested:
+`actor move` was requested, with the binary that migrated (from 0.9.0
+on: 0.8.1, since 0.9.0 has no `cluster migrate`):
 
 ```sh
 wasmkeep cluster migrate --bucket s3://BUCKET/PREFIX --rollback
@@ -204,7 +211,8 @@ starting the older binary.
 
 **After the first start**, the rollback refuses: a node of any version
 ran, an app was deployed, or a key under a migrated root is newer than
-the tenant's commit. The state stays where 0.4.0 reads it. Going back to
+the tenant's commit. The state stays where 0.4.0 (and every later
+version, 0.9.0 included) reads it. Going back to
 the older version then means restoring the backup from step 3 into an
 empty prefix, which loses every write since the migration. After
 `--remove-old --apply` has started, the rollback refuses whatever else

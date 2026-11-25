@@ -86,8 +86,9 @@ pub enum StartRefusal {
         "tenant {0} has actor state in the layout of a version before 0.4.0 ({1} exists) and \
          this bucket prefix was not migrated: this version cannot migrate it (`cluster \
          migrate` was removed in 0.9.0). Stop every node, migrate with the 0.8.1 binary \
-         (`wasmkeep cluster migrate --bucket <this bucket>`, a dry run, then `--apply`), then \
-         start this version (docs/deploy/upgrading-to-0.4.md)"
+         (`wasmkeep cluster migrate --bucket <this bucket>`, a dry run, then `--apply`), bring \
+         the cluster to 0.8.1 as the upgrade pages say, then upgrade to 0.9.0 \
+         (docs/deploy/upgrading-to-0.4.md)"
     )]
     Unmigrated(String, String),
     /// The bucket could not be read.
