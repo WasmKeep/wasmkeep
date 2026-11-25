@@ -403,8 +403,8 @@ impl Cluster {
                 let why = format!(
                     "this node created its app's upgrade floor at {floor}, and the listing after \
                      it shows older nodes of the app that started meanwhile: {nodes}. The floor \
-                     stays: stop each of them (or `wasmkeep cluster fence` it), then start this \
-                     node again"
+                     stays, and such a node cannot come back on its old version: upgrade each of \
+                     them (or stop it, or `wasmkeep cluster fence` it), then start this node again"
                 );
                 *self.born_late.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
                 Ok(Some(floor))

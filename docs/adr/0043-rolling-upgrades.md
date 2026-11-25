@@ -453,8 +453,14 @@ the app's first deploy and so never sees an app without one:
   - otherwise F is the lower of the CLI's version and L. F at or below
     `0.8` (what no record means) writes nothing; above it, the floor is
     created at F.
-- **A starting node**, at its first read of the floor, at its own minor
-  version. For a node, a deploy does not make the app one that ran: the
+- **A starting node**, at its first read of the floor, by the same rule
+  as the deploy: the lower of its own version and the lowest version
+  live under the prefix, itself left out, and nothing when that is at
+  or below `0.8` or a live version does not parse. So the first `0.9`
+  node of a new app beside `0.8.1` nodes of other apps creates no floor
+  either, and those nodes can still start into the app. With no other
+  node live it creates the floor at its own version. For a node, a
+  deploy does not make the app one that ran: the
   deploy may have written no floor (the rule above), and an app with a
   deploy, no state and no other registered node has nothing a node of
   the version before could lose. So the first node of an app whose
@@ -469,8 +475,9 @@ the app's first deploy and so never sees an app without one:
 does after its write. A node of the app below the new floor that is live
 then (or whose lease is stale without a release or a fence) started
 between the listing and the create and never saw the floor. The floor
-stays. The deploy fails naming the node, having written nothing else;
-the starting node does not start, naming it. No wait is needed before
+stays, and such a node cannot come back on its old version. The deploy
+fails naming the node, having written nothing else; the starting node
+does not start, naming it; both say to upgrade it. No wait is needed before
 this listing: a node whose first lease write had not landed reads the
 floor again once it has, and stops itself.
 
@@ -527,7 +534,8 @@ one named):
    is on a newer one ("finalize with that version's `wasmkeep`").
 3. Refused while any live node of the app is on an older minor version,
    naming each. Refused too while an older node's lease is stale but
-   neither `released` nor `fenced`: a stale lease is not proof of a stop
+   neither `released` nor `fenced` for longer than a lease's ttl plus
+   grace after its last write: a stale lease is not proof of a stop
    (the node may be cut off or slow, and still act), so the message
    names `wasmkeep cluster fence <id>`. Refused with no live node: there
    is nothing to finalize.

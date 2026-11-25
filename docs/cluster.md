@@ -1629,8 +1629,15 @@ every live node, and not older than the floor.
 `finalize` counts an older node as stopped only when its lease is
 `released` or `fenced`. A lease that is merely stale (the machine
 vanished, or is cut off) is refused: run `wasmkeep cluster fence <id>`
-first. It also needs a live node: after an upgrade done with every node
-stopped, start the nodes, then finalize.
+first; a fence counts 15 s after the node's last write. It also needs a
+live node: after an upgrade done with every node stopped, start the
+nodes, then finalize.
+
+Finalize before you stop the last node of the previous version for the
+next upgrade. A node refuses to start two minor versions above an app's
+floor, even alone: restarted in place from 0.9 on 0.10 without a
+finalize at 0.9, it does not start. Put 0.9 back, finalize, then
+upgrade.
 
 `node below the floor` means a node of an older version is live under a
 floor above it. Either it started while the floor was being written, or

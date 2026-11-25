@@ -470,6 +470,30 @@ fn finalize_is_refused_for_each_precondition() {
             "{stopped}"
         );
     }
+    // A fence proves a stop only once it is a lease's ttl plus grace
+    // (15 s) past the node's last write: until then the fenced process
+    // may still act. A release is a clean stop at once.
+    let fenced_at = |ago: u64| {
+        let mut n = node("cut", "0.8.1", "fenced", "take");
+        n.written_at_ms = NOW - ago;
+        n
+    };
+    assert!(matches!(
+        check(v(0, 9), Ok(None), &[a9.clone(), fenced_at(14_999)]),
+        Err(FinalizeRefusal::OlderNotStopped { .. })
+    ));
+    assert_eq!(
+        check(v(0, 9), Ok(None), &[a9.clone(), fenced_at(15_000)]),
+        Ok(Finalize::Raise(None, v(0, 9)))
+    );
+    assert_eq!(
+        check(
+            v(0, 9),
+            Ok(None),
+            &[a9.clone(), node("gone", "0.8.1", "released", "take")]
+        ),
+        Ok(Finalize::Raise(None, v(0, 9)))
+    );
     // A stale heartbeat from before node leases cannot be fenced: it
     // blocks too, and the message says what to do.
     let mut old_format = NodeInfo::decode(
@@ -661,10 +685,11 @@ mod bucket {
     #[tokio::test]
     async fn a_fresh_app_is_born_finalized() {
         let b = bucket();
-        // Another app's node, deploy and state do not make this one old.
+        // Another app's node, deploy and state do not make this one old
+        // (a live older node of it would hold the floor down: below).
         b.put_body(
             "nodes/x",
-            node_body_of("acme/blog", "x", "0.8.1", "live", "take"),
+            node_body_of("acme/blog", "x", "0.8.1", "released", "take"),
         )
         .await
         .unwrap();
@@ -813,15 +838,55 @@ mod bucket {
         let (got, floor, b) = lower(v(0, 9), &["0.9.0", "0.8.1"]).await;
         assert!(matches!(got, Born::NotFresh(_)), "{got:?}");
         assert_eq!(floor, None);
-        // The deploy lands; the first node of the app, of 0.9, then
-        // creates the floor the deploy left out, whatever the deploy.
+        // The deploy lands. Once the 0.8.1 node is gone, the first node
+        // of the app, of 0.9, creates the floor the deploy left out,
+        // whatever the deploy.
         b.put_body("apps/acme/shop/current", b"x".to_vec())
             .await
             .unwrap();
+        b.put_body(
+            "nodes/n1",
+            node_body_of("acme/blog", "n1", "0.9.0", "live", "take"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             born(&b, FirstWriter::Node("s1"), v(0, 9)).await,
             Ok(Born::Created(v(0, 9)))
         );
+        // The scenario of the review, whole: nodes of 0.8.1 serve another
+        // app; a 0.9 `wasmkeep` deploys a new app (no floor, rightly);
+        // the first node restarted for it runs 0.9. It must not create a
+        // floor above the lowest live version, or the 0.8.1 nodes still
+        // to be moved to the new app would be shut out for good.
+        let (got, floor, b) = lower(v(0, 9), &["0.8.1", "0.8.1"]).await;
+        assert!(matches!(got, Born::NotFresh(_)), "{got:?}");
+        assert_eq!(floor, None);
+        b.put_body("apps/acme/shop/current", b"x".to_vec())
+            .await
+            .unwrap();
+        let first = born(&b, FirstWriter::Node("s1"), v(0, 9)).await.unwrap();
+        assert!(matches!(first, Born::NotFresh(_)), "{first:?}");
+        assert_eq!(floor_of(&b).await, None, "no floor above 0.8");
+        // Its own live lease (a restart within the horizon) is not
+        // another node; the 0.8.1 nodes still are.
+        put(&b, "s1", "0.9.0", "live").await;
+        let again = born(&b, FirstWriter::Node("s1"), v(0, 9)).await.unwrap();
+        assert!(matches!(again, Born::NotFresh(_)), "{again:?}");
+        // One version later, beside nodes of 0.9: the floor is 0.9, not
+        // the starting node's 0.10.
+        let (_, _, b) = lower(v(0, 10), &["0.8.1"]).await;
+        b.put_body(
+            "nodes/n0",
+            node_body_of("acme/blog", "n0", "0.9.0", "live", "take"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            born(&b, FirstWriter::Node("s1"), v(0, 10)).await,
+            Ok(Born::Created(v(0, 9)))
+        );
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
         // A live version that does not parse: nothing.
         let (got, floor, _) = lower(v(0, 10), &["0.9.0", "nine"]).await;
         assert!(matches!(got, Born::NotFresh(_)), "{got:?}");

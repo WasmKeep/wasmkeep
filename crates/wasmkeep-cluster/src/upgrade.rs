@@ -578,15 +578,19 @@ pub struct NodeVersion {
     /// Its node lease's state; `None` for a heartbeat from before node
     /// leases.
     pub lease: Option<crate::node_lease::NodeState>,
+    /// Whether its lease proves its process stopped ([`Self::stopped`]).
+    pub proven_stopped: bool,
 }
 
 impl NodeVersion {
-    /// Whether its lease says its process stopped: `released` (a clean
-    /// stop) or `fenced`. A lease still `live` but stale proves nothing:
-    /// its node may be partitioned or slow, and still act.
+    /// Whether its lease says its process stopped for sure: `released`
+    /// (a clean stop), or `fenced` for longer than a lease's ttl plus
+    /// grace after its last write (a fenced process stops at its next
+    /// write, and acts no later than that). A lease still `live` but
+    /// stale proves nothing: its node may be cut off or slow, and still
+    /// act.
     pub fn stopped(&self) -> bool {
-        use crate::node_lease::NodeState;
-        matches!(self.lease, Some(NodeState::Released | NodeState::Fenced))
+        self.proven_stopped
     }
 
     /// Whether it runs below `target`, or names a version that does not
@@ -669,6 +673,16 @@ pub fn assess(
             minor: Minor::of_node_version(&n.version),
             live: is_live(n, now_ms, horizon_ms),
             lease: n.lease,
+            proven_stopped: match n.lease {
+                Some(crate::node_lease::NodeState::Released) => true,
+                // The default timings: one read cannot know a cluster's.
+                Some(crate::node_lease::NodeState::Fenced) => {
+                    let lease = crate::lease::LeaseConfig::default_safe();
+                    now_ms.saturating_sub(n.written_at_ms)
+                        >= lease.ttl_ms().saturating_add(lease.grace_ms())
+                }
+                _ => false,
+            },
         })
         .collect();
     let floor = floor.map_err(|e| e.len);
@@ -815,8 +829,9 @@ pub enum FinalizeRefusal {
     /// An older node is not live, but its lease was neither released
     /// nor fenced: stale is not stopped.
     #[error(
-        "nodes older than {target} are not live, but their lease was never released or fenced: \
-         {nodes}. A stale lease is not proof of a stop (the node may be cut off or slow, and \
+        "nodes older than {target} are not live, but their lease was never released, nor \
+         fenced for longer than a lease's ttl plus grace: {nodes}. A stale lease is not proof \
+         of a stop (the node may be cut off or slow, and \
          still act): run `wasmkeep cluster fence <id>` for each ({ids}), then finalize. For a \
          heartbeat from before node leases, stop the node and use `wasmkeep cluster forget <id>`"
     )]
@@ -1217,14 +1232,16 @@ pub enum Born {
     NotFresh(&'static str),
 }
 
-/// The floor the first deploy of a fresh app creates (ADR 0043, section
-/// 3), from the minor version of the `wasmkeep` that deploys and the live
-/// nodes under the bucket prefix, of every app (a new app has no node of
-/// its own yet, and the nodes that will serve it are most likely those
-/// that serve the others). `None`: no floor is written, and the app
-/// stays on the floor that no record means until a `finalize`.
+/// The floor the first writer of a fresh app creates (ADR 0043, section
+/// 3): its first deploy, or its first node. From the writer's minor
+/// version (`cli`: the `wasmkeep` that deploys, or the node that starts)
+/// and the other live nodes under the bucket prefix, of every app (a new
+/// app has no node of its own yet, and the nodes that will serve it are
+/// most likely those that serve the others). `None`: no floor is
+/// written, and the app stays on the floor that no record means until a
+/// `finalize`.
 ///
-/// - No live node under the prefix: the CLI's own version.
+/// - No other live node under the prefix: the writer's own version.
 /// - A live node whose version does not parse: none.
 /// - Otherwise the lower of the CLI's version and the lowest live
 ///   version, so no live node is shut out of the new app; none when that
@@ -1270,9 +1287,11 @@ pub fn deploy_floor<'a>(
 /// - Secrets set before the first deploy, or the uploads of a deploy
 ///   that never finished, do not make an app one that ran.
 ///
-/// A starting node creates the floor at its own version. A deploy
-/// creates the one [`deploy_floor`] gives. After the create the nodes are
-/// listed again ([`Born::Late`]).
+/// Both writers create the floor [`deploy_floor`] gives for their own
+/// version and the other live nodes under the prefix: their own version
+/// when none is live, never above the lowest live one, and none when
+/// that is not above what no record means. After the create the nodes
+/// are listed again ([`Born::Late`]).
 ///
 /// # Errors
 /// The bucket did not answer: nothing is concluded, and the caller goes
@@ -1318,23 +1337,23 @@ pub async fn born_finalized(
     if bucket.any_key(&format!("state/{served}")).await? {
         return Ok(Born::NotFresh("it has state"));
     }
-    let target = match by {
-        FirstWriter::Node(_) => this,
-        FirstWriter::Deploy => {
-            let live = listed
-                .nodes
-                .iter()
-                .filter(|n| is_live(n, now_ms, horizon_ms));
-            match deploy_floor(this, live) {
-                Some(floor) => floor,
-                None => {
-                    return Ok(Born::NotFresh(
-                        "the live nodes under the prefix run a version at or below the floor \
-                         that no record means, or one that does not parse",
-                    ));
-                }
-            }
-        }
+    // One rule for both writers: never above the lowest version live
+    // under the prefix, the writer itself left out. A node that is the
+    // first of its app beside older nodes of other apps would otherwise
+    // shut them out of it, as a deploy would.
+    let own = match by {
+        FirstWriter::Node(id) => id,
+        FirstWriter::Deploy => "",
+    };
+    let live = listed
+        .nodes
+        .iter()
+        .filter(|n| n.id != own && is_live(n, now_ms, horizon_ms));
+    let Some(target) = deploy_floor(this, live) else {
+        return Ok(Born::NotFresh(
+            "the live nodes under the prefix run a version at or below the floor that no \
+             record means, or one that does not parse",
+        ));
     };
     match bucket.create(&key, floor::encode(target)).await {
         Ok(_) => {}
@@ -1344,10 +1363,6 @@ pub async fn born_finalized(
     // As `finalize` lists again after its write: a node of the app that
     // started between the listing above and the create never saw the
     // floor.
-    let own = match by {
-        FirstWriter::Node(id) => id,
-        FirstWriter::Deploy => "",
-    };
     let again = assess(
         &served,
         Ok(Some(target)),

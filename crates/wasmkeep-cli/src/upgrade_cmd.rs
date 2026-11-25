@@ -536,8 +536,10 @@ mod tests {
         let (out, code) = run(&c, None, v(0, 9), true).await;
         assert_eq!(code, 1, "{out}");
         assert!(
-            out.contains("their lease was never released or fenced: cut (0.8.1)")
-                && out.contains("`wasmkeep cluster fence <id>` for each (cut)"),
+            out.contains(
+                "their lease was never released, nor fenced for longer than a lease's ttl plus \
+                 grace: cut (0.8.1)"
+            ) && out.contains("`wasmkeep cluster fence <id>` for each (cut)"),
             "{out}"
         );
         assert_eq!(floor(&c, "acme/shop").await, None, "nothing written");

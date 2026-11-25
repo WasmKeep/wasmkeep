@@ -206,8 +206,9 @@ impl AppRef {
             upgrade::Born::Late { floor, nodes } => Err(DeployError::Refused(format!(
                 "{}: this deploy created the app's upgrade floor at {floor}, and the listing \
                  after it shows older nodes of the app that started meanwhile: {nodes}. The \
-                 floor stays and nothing else was written: stop each of them (or `wasmkeep \
-                 cluster fence` it), then deploy again",
+                 floor stays and nothing else was written. Such a node cannot come back on its old \
+                 version: upgrade each of them (or stop it, or `wasmkeep cluster fence` it), \
+                 then deploy again",
                 self.name()
             ))),
             _ => Ok(()),
