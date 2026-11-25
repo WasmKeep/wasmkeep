@@ -1232,6 +1232,118 @@ diagnose --bucket s3://wasmkeep-demo` runs WasmKeep's bucket conformance
 checks under a scratch prefix and prints a verdict: required behaviour
 observed by these checks (exit 0), not safe (1), or no verdict (2). See [Buckets](deploy/buckets.md).
 
+### Verifying a bucket
+
+`wasmkeep cluster verify` checks that what the bucket holds is whole:
+every actor can be restored from it, and the records around the actors
+read. It only reads. No write is ever sent, so read access is enough,
+and it is safe on a running cluster.
+
+```bash
+wasmkeep cluster verify --bucket s3://wasmkeep-demo
+wasmkeep cluster verify --bucket s3://wasmkeep-demo --deep           # read every history object too
+wasmkeep cluster verify --bucket s3://wasmkeep-demo --app acme/shop  # one app
+wasmkeep cluster verify --bucket s3://wasmkeep-demo --app acme/shop --actor room/lobby --deep
+wasmkeep cluster verify --bucket s3://wasmkeep-demo --sample 100 --deep
+wasmkeep cluster verify --bucket s3://wasmkeep-demo --json           # for scripts
+```
+
+With `--app acme/shop --deep`, on the small bucket of the test suite
+(in memory, hence the time):
+
+```text
+Verifying s3://wasmkeep-demo, bodies read
+app acme/shop: deployed 7d551a82e742945e (deploy 2), recorded-head format, floor 0.8
+  actors: 4 with history, 4 restorable (34 objects, 17 KiB); 4 ownership records, 4 read; 4 read whole
+  alarms: 2 entries; lease markers left: 4
+nodes: 3 leases
+Read 18 objects (400 KiB) and listed 47 keys in 38 requests, 0.0 s.
+The bucket is whole.
+```
+
+It is a third command beside two that sound alike:
+
+| Command | What it checks | Writes |
+| --- | --- | --- |
+| `cluster verify` | What the cluster's bucket holds now: deploys, histories, records | Never |
+| `cluster diagnose` | What the bucket's API does (conditional writes, listings, clocks), on scratch objects | Under `diagnose/`, deleted afterwards |
+| `backup verify` | A backup's own contents, in the backup's bucket ([online archives](deploy/backup-and-restore.md#online-archives)) | A verification mark in the backup |
+
+What it checks:
+
+- **Per app.** `current` parses, the current version's manifest parses,
+  and each component, front and configuration it names has the SHA-256
+  it names. A static assets index has its digest and every content it
+  names is listed with its size. The recorded-head setting and the
+  upgrade floor decode. An app with state and no deploy (served with
+  `--actor`) is `not deployed`, which is not a problem. A deleted app is
+  not checked. An unfinished `backup restore` is a problem.
+- **Per actor.** A restore plan exists: from the listing, the chain
+  from the head back to a snapshot (or to transaction 1) has every
+  segment, as a node's restore plans it. Each object on it is at least
+  as long as a history object's header and trailer. The ownership record
+  decodes. In an app that records heads
+  ([the recorded-head format](#the-recorded-head-ownership-format)), the
+  recorded head is reached by that chain, by the rule a restore uses: it
+  is on the chain, or the chain's snapshot links back to it, or the
+  chain holds an object of a later generation. A version 2 record in an
+  app that has not enabled the format is a problem.
+- **Alarms.** Each entry of the alarm index names an actor that has
+  history or an ownership record.
+- **Files.** The count of stored files and each sweep record of a deleted
+  actor's files decode, and a sweep record names the actor its key names.
+  Files are listed and counted by epoch. The count the cluster publishes
+  lags by up to an hour, so a difference is shown and is not a problem.
+- **Nodes.** Each node lease decodes. A heartbeat in a format from before
+  node leases is counted, not a problem.
+- **Lease markers.** The per-actor markers left under `leases/` from
+  before node leases are counted. They are never read or deleted.
+
+`--deep` also reads every object a restore would read (the snapshot and
+each segment after it). It checks each file's checksum, that it is the
+transaction its key names, and that each follows the one before it by
+its database checksum. In an app that records heads it compares the
+checksum at the recorded head. It also reads the previous versions a
+deploy keeps for rollbacks and every static asset. It does not replay
+the pages into a database: `wasmkeep actor export` and `backup verify`
+do that. **Without `--deep`, damage inside a history object is not
+found.** A missing or misnamed object, or one cut to almost nothing, is.
+
+`--sample N` reads the ownership record (and with `--deep` the history)
+of N actors of each app, chosen at random. The listing is still whole,
+so every actor's chain is still checked by its key names. `--actor`
+checks one actor's history and record, nothing else.
+
+On a running cluster, nodes collect old history and replace records
+while the command reads. What looks wrong is listed and read again, up
+to three times, before it is reported.
+
+Each problem is one line with the key it is about, and `check` and
+`detail` in `--json`. For a missing segment the key is the one it would
+have, with `*` for the one part its neighbours do not tell:
+
+```text
+problem: state/acme/shop/actors/room/lobby/wal/0000000000000005-0000000000000001-*.ltx: the segment of transaction 5 (generation 1) is missing from the chain to the head, and no snapshot stands in for it: state/acme/shop/actors/room/lobby/wal/0000000000000006-0000000000000001-0000000000000001.ltx is built on it (history)
+```
+
+The last lines say what the run cost: objects read and their bytes, keys
+listed, requests and time. A GET is one request; a listing is one, and
+one more for every 1,000 keys it returns. Without `--deep` it is about
+one small GET per actor plus the listings and the current components.
+`--deep` reads the restorable history of every actor once.
+
+The exit code is 0 when the bucket is whole, 1 when a problem was found,
+2 when the run could not finish: the bucket refused a listing, `--app`
+names an app the prefix holds nothing of, or the prefix holds no app
+and no node at all (a mistyped prefix is not a whole bucket). At most
+1,000 problems are printed; all are counted.
+
+Memory stays bounded: an app's history is listed as one stream, 16
+actors are checked at once, and `--deep` keeps at most 256 MiB of
+history objects in memory unless one object alone is larger. It
+remembers 16 bytes per actor with history, up to 4 million actors per
+app.
+
 ## Draining a node
 
 To take a node out of service without stopping it first (to replace the

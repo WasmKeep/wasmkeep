@@ -1,4 +1,5 @@
-//! Shared CLI backup executor, also exercised by cluster integration tests.
+//! Shared CLI backup executor, also exercised by cluster integration tests;
+//! and `cluster verify`, for the same reason.
 #![forbid(unsafe_code)]
 
 use anyhow::Context;
@@ -6,6 +7,7 @@ mod actor_groups;
 pub mod backup;
 pub mod blob_links;
 pub mod feed;
+pub mod verify;
 
 /// Parses `TENANT/APP`.
 pub fn parse_app(s: &str) -> Result<(String, String), String> {

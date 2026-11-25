@@ -26,7 +26,9 @@ fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
    `spread`); the proof is to come
    ([ADR 0043](docs/adr/0043-rolling-upgrades.md)).
 2. **Verify a bucket** (M/L): a read-only command that checks every
-   actor can be restored from what the bucket holds.
+   actor can be restored from what the bucket holds. Built:
+   `wasmkeep cluster verify`
+   ([how](docs/cluster.md#verifying-a-bucket)).
 3. **Traces** (M/L): one request followed through the front, its actor,
    the calls it makes, the hop between nodes and the bucket write.
    Designed, not built ([ADR 0044](docs/adr/0044-traces.md)).

@@ -501,6 +501,12 @@ head. Objects besides those do no harm. A segment missing in the middle
 is an error, not a rollback: the actor answers `500` until the history is
 repaired, and the other actors are not affected.
 
+`wasmkeep cluster verify --bucket s3://BUCKET/PREFIX` checks exactly that
+for every actor, on the live bucket or on a copy, without writing:
+[Verifying a bucket](../cluster.md#verifying-a-bucket). With `--deep` it
+also reads each of those objects and checks its checksums. It is not
+`backup verify`, which checks an online archive's own contents.
+
 ### With the cluster stopped: restorable
 
 Stop every node cleanly and wait until `wasmkeep cluster status` exits
@@ -667,7 +673,8 @@ A backup that has never been restored is a hope. Do this before you need
 it, and again after every WasmKeep upgrade:
 
 1. Copy last night's backup into an empty prefix of a scratch bucket,
-   with the same prefix name.
+   with the same prefix name. `wasmkeep cluster verify --deep` on that
+   prefix says whether the copy is whole before any node starts on it.
 2. Start one node on it, on a machine that is not part of the cluster,
    with an empty data directory, the same app and the secrets key:
    `wasmkeep serve --app acme/shop --bucket s3://scratch/prod --node-id drill ...`.

@@ -54,6 +54,17 @@ pub(crate) const MAX_OPEN_WRITES: usize = 16;
 /// every one (on disk, its descriptor; on a bucket, its response).
 pub(crate) const MAX_OPEN_READS: usize = 16;
 
+/// The key of an app's last count of stored files, under its state root
+/// (`state/<tenant>/<app>/`).
+pub const USAGE_KEY: &str = usage::USAGE_KEY;
+
+/// What an app's `blob-usage` holds: the epoch counted, its bytes and its
+/// files; `None` for a body this version does not read. For tools that
+/// only read the bucket (`wasmkeep cluster verify`).
+pub fn decode_usage(body: &[u8]) -> Option<(String, u64, u64)> {
+    usage::Count::decode(body).map(|c| (c.epoch, c.bytes, c.files))
+}
+
 /// The process's spool budget, shared by every app runtime.
 fn node_spool() -> Arc<streams::Budget> {
     static NODE: std::sync::OnceLock<Arc<streams::Budget>> = std::sync::OnceLock::new();
