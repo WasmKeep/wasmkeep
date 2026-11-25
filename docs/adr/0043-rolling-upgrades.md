@@ -995,8 +995,49 @@ asset, its SHA-256 pinned). Every phase counts in the exit status.
    is refused with a message that names the version; none writes a form
    the other side misreads.
 
-Where it runs: on a workstation before a tag, and as one nightly job on
-`main`. Never on a pull request.
+**As built** (2026-11-25, `scripts/mixed-version.sh`,
+[releasing](../releasing.md#the-mixed-version-check)). The script covers
+phases 1 to 4, 7 and 8. Two things are not as the list above words them,
+and neither lets an old node serve or a gated format be written early:
+
+- **Phase 3.** With a `0.8.1` node live, the deploy's refusal names the
+  floor, not the node: the gate reads the floor first (section 2), and
+  the floor is `0.8` for as long as that node is live. The node is named
+  by `cluster upgrade finalize`, which the refusal sends the operator to
+  (`live nodes are older than 0.9: c (0.8.1)`). The script checks both.
+  A deploy names an older node only when one is live above a raised
+  floor, which the binary of `0.8.1` cannot be; the cluster test of
+  phase 5 writes that lease directly.
+- **Phase 4.** A `0.8.1` node stops at its first read of the floor, with
+  the message of section 3, while the current manifest is one it reads:
+  the script starts it after the finalize and before the gated deploy.
+  Once manifest 8 is current, `serve --app` of `0.8.1` reads the manifest
+  before the floor and exits with `unreadable <version>/manifest`, as
+  `0.8.0` does. Each of the three starts answers no request and writes no
+  lease, and the counter continues on the others; only the first says
+  why. The upgrading page says what that message means.
+- **Phase 8.** The `0.8.1` CLI has no floor check (Not settled, 6). On
+  the finalized cluster its `cluster status`, `secrets set` and `cluster
+  drain` work and are read rightly; its `deploy` and `backup create` are
+  refused by what they cannot read (`unreadable <version>/manifest`,
+  `invalid deploy manifest`, and `unknown or inconsistent backup format`
+  for an archive with a run that carries a floor). A refused `backup
+  create` leaves the run it gave up without a `complete` record (in an
+  archive with a floor, its `started` record alone), touches nothing
+  that was there, and the `0.9` CLI adds a run to that archive after it.
+  No refusal names a version: `0.8.1` is published, so the upgrading
+  page says it instead.
+
+Covered elsewhere: phase 5's second outcome by the cluster test
+`an_older_node_holds_back_the_finalize_and_a_gated_deploy`
+(`tests/cluster/upgrade.rs`), which writes the old node's lease
+directly; its first outcome, a start racing the finalize with the real
+binary, is not covered by a test. Phase 6 by the skew rule's tests over
+a heartbeat of `0.7.0` (`wasmkeep-cluster`, `upgrade/tests.rs`), not
+with a started node.
+
+Where it runs: on a workstation before a tag. The nightly job on `main`
+is not built. Never on a pull request.
 
 The second half of the proof is a three-node cluster on a real bucket:
 `0.8.1` to `0.9.0` one node at a time under a held room load (the load

@@ -388,6 +388,14 @@ pub(super) fn warn_if_public(advertise: &str) {
 
 pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     huge_pages(args.transparent_huge_pages);
+    // The test-only version override (wasmkeep-cluster's `test-version`
+    // feature): no release is built with it.
+    if wasmkeep_cluster::VERSION.contains("+test") {
+        tracing::warn!(
+            version = wasmkeep_cluster::VERSION,
+            "this build reports a test version (the `test-version` feature): it is for scripts/mixed-version.sh, never for production"
+        );
+    }
     let mut trace_guard = None;
     // A node file (ADR 0038) says what its flags would: read and checked
     // before anything else, then served as those flags are. `--app` is a

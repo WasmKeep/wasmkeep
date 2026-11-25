@@ -62,19 +62,28 @@ registry.
 
 ## The mixed-version check
 
-A gate before tagging a patch release, and a step before any other. It runs
-on a workstation, alone (nothing heavy beside it: it times node starts and
-deliveries), and never in pull request CI or in `check.sh`:
+A gate before tagging any release. It runs on a workstation, alone
+(nothing heavy beside it: it times node starts and deliveries), and never
+in pull request CI or in `check.sh`:
 
 ```bash
 ./scripts/mixed-version.sh            # from the previous release, v0.8.1 by default
 ./scripts/mixed-version.sh v0.8.1     # or OLD_VERSION=v0.8.1
 ```
 
-The old version must be 0.8.1 or later, the last release of the minor
-version before the checkout's: it reads the upgrade floor, and the gate
-and the returning node are checked against it
-([ADR 0043, section 8](adr/0043-rolling-upgrades.md#8-how-the-mixed-version-check-becomes-the-proof)).
+The old version must be 0.8.1 or later. It runs in one of two modes, by
+the minor versions of the old release and of the checkout's build, and
+says which on its first line and in the report:
+
+- **The next minor version** (0.9.0 after v0.8.1): every phase below. It
+  is the proof of
+  [ADR 0043, section 8](adr/0043-rolling-upgrades.md#8-how-the-mixed-version-check-becomes-the-proof),
+  and the old release must be the last of its minor version.
+- **The same minor version** (a patch: 0.9.1 after v0.9.0): the upgrade
+  under load, one node back and up again, the four paths at the end of
+  this section and both CLIs on the mixed cluster. Nothing is gated
+  between two patches, so the gate, the returning old node, the tracing
+  phase and the old CLI on a finalized cluster are left out.
 
 It starts three nodes of the old release (downloaded with `gh` and checked
 against its `SHA256SUMS` and a SHA-256 pinned in the script) on a local
@@ -87,7 +96,7 @@ After each step it checks durable writes, `actors.call` between every pair
 of nodes, alarms, secrets, env files, WebSocket room delivery, and
 `cluster status` from both versions' CLIs. While the cluster is mixed, both
 CLIs run `deploy`, `secrets set`, `cluster drain` and `backup create`. Then,
-every phase counting in the exit status:
+for the next minor version, every phase counting in the exit status:
 
 - **Back and forward.** One node returns to the old release and goes up
   again, with the same checks, before anything is finalized.
@@ -101,8 +110,10 @@ every phase counting in the exit status:
   release is started: it stops itself on the app's upgrade floor, which it
   names. With the gated format written it is started again, and stops on
   the manifest it cannot read (a node of 0.8.1 reads the current manifest
-  before the floor). Neither time does it answer a request, and the
-  counter goes on through the others.
+  before the floor); so does a node of v0.8.0, which reads no floor
+  (`MIXED_VERSION_OLDER_VERSION`). Each must stop itself with that reason
+  in its log, answer no request and write no lease, and the counter goes
+  on through the others.
 - **Tracing.** Two new nodes export to a collector the script runs
   (`scripts/mixed-version/otlp-sink.mjs`), with `--trace-sample 0`. A
   client's sampled `traceparent` forwarded by the node of the old release
@@ -112,24 +123,35 @@ every phase counting in the exit status:
   ([ADR 0044, section 4](adr/0044-traces.md#4-sampling)).
 - **The old CLI on the finalized cluster.** `cluster status`, `secrets
   set`, `cluster drain`, `backup create` and `deploy`: each works, and what
-  it wrote is read by the new nodes, or it is refused with a message and
-  changes nothing. `backup create` into an archive that holds a run with
-  the app's floor (backup format 2) must be refused.
+  it wrote is read by the new nodes, or it is refused with the message it
+  is known by and changes nothing. `backup create` into an archive that
+  holds a run with the app's floor (backup format 2) must be refused and
+  add no run to it: nothing there is removed or rewritten, and at most
+  the `started` record of the run it gave up is left, which the new CLI
+  reads past.
 
 **The new side's version.** Only a `wasmkeep` of the next minor version
 writes a gated format or finalizes, and a build of the checkout reports
-the workspace version, which is bumped in the release's pull request.
-While the workspace version still has the old release's minor version, the
-script builds the new side as the next one (0.9.0 beside v0.8.1): the
-cargo feature `test-version` of `wasmkeep-cluster` with
-`WASMKEEP_TEST_VERSION` in the build's environment, read by its `build.rs`
-alone. That binary reports `0.9.0+test.<commit>` and is built into
-`target/mixed-version/build`, never `target/release`. No release build sets
-the feature, without it the variable is ignored, and nothing changes the
-version of a built binary. Once the workspace version is ahead of the old
-release, the script uses the plain release build and overrides nothing:
-that is the run a tag waits for. `NEW_VERSION=<x.y.z>` asks for the
-override whatever the workspace says.
+the workspace version, which is bumped in the release's pull request. The
+run a tag waits for is the plain one, on the commit to tag: the script
+uses the release build and overrides nothing.
+
+Before the bump, the next-minor phases can still be run:
+
+```bash
+MIXED_VERSION_NEW_VERSION=0.9.0 ./scripts/mixed-version.sh
+```
+
+That builds the new side with the cargo feature `test-version` of
+`wasmkeep-cluster` and `WASMKEEP_TEST_VERSION` in the build's environment,
+read by its `build.rs` alone. The binary reports `0.9.0+test.<commit>`,
+warns at every `serve`, and is built into `target/mixed-version/build`,
+never `target/release`. No release build sets the feature, without it the
+variable is ignored, and nothing changes the version of a built binary;
+`release.yml` stops if the binary or the image it built reports `+test`,
+or on a tag anything but the tag's version. Without the variable, a
+checkout whose version still has the old release's minor version runs the
+same-minor mode.
 
 Four paths of the upgrade have checks of their own, each failing when it
 could not be brought about:

@@ -399,6 +399,9 @@ jobs:
       - name: Build against glibc 2.28 (AlmaLinux 8 container)
         run: ./scripts/build-portable.sh glibc
       - name: The binary needs glibc 2.28 at most, and runs
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           bin=target/portable/glibc/release/wasmkeep
           newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
@@ -406,7 +409,15 @@ jobs:
           [ -n "$newest" ] || { echo "::error::no glibc symbol read from $bin"; exit 1; }
           [ "$(printf '%s\n' "$newest" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::$bin needs $newest, newer than GLIBC_2.28"; exit 1; }
-          "$bin" --version
+          # Never the test-only version override (wasmkeep-cluster's
+          # `test-version` feature, marked `+test`), and on a tag the tag's
+          # version exactly.
+          reported=$("$bin" --version)
+          echo "$reported"
+          case $reported in *+test*) echo "::error::$bin reports a test version: $reported"; exit 1 ;; esac
+          if [ "$REF_TYPE" = tag ] && [ "$reported" != "wasmkeep ${REF_NAME#v}" ]; then
+            echo "::error::$bin reports '$reported', the tag is $REF_NAME"; exit 1
+          fi
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-cyclonedx@0.5.9,cargo-about@0.9.3
@@ -576,7 +587,11 @@ jobs:
           docker buildx build -f deploy/Dockerfile --platform "$PLATFORM" \
             --build-context notices=target/notices --provenance=false --sbom=false \
             --load -t wasmkeep:test .
-          docker run --rm wasmkeep:test --version
+          # As for the archive's binary: never the test-only version
+          # override.
+          reported=$(docker run --rm wasmkeep:test --version)
+          echo "$reported"
+          case $reported in *+test*) echo "::error::the image reports a test version: $reported"; exit 1 ;; esac
       - name: The documented local build (no notices context) still works
         run: docker buildx build -f deploy/Dockerfile --platform "$PLATFORM" --provenance=false .
       - name: Push by digest
