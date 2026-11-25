@@ -5,7 +5,7 @@
 //! refused until `cluster upgrade finalize`), a node of the old release
 //! started after it, tracing across versions, and the old CLI on the
 //! finalized cluster. It downloads the release (gh), starts moto and takes
-//! about half an hour, so it runs only when asked twice: with
+//! about a quarter of an hour, so it runs only when asked twice: with
 //! `--run-ignored only` and `WASMKEEP_MIXED_VERSION=1`.
 //!
 //! While the workspace version has the old release's minor version, the
