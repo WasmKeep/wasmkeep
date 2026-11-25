@@ -76,6 +76,20 @@ impl Readers {
         }
     }
 
+    /// The same, for the first deploy of an app without a floor record
+    /// (ADR 0043, section 3): on the floor that deploy would create for a
+    /// fresh app ([`upgrade::deploy_floor`]), so a new app's first deploy
+    /// may be in a format behind the floor. The deploy creates the floor
+    /// only once it is accepted, and is checked again on the floor it
+    /// then finds: an app that is not fresh gets none.
+    #[must_use]
+    pub fn as_first_deploy(mut self, this: Minor) -> Self {
+        if matches!(self.floor, Ok(None)) {
+            self.floor = Ok(upgrade::deploy_floor(this, &self.nodes));
+        }
+        self
+    }
+
     /// The live nodes of the app.
     pub fn live(&self) -> impl Iterator<Item = &NodeInfo> + Clone {
         self.nodes.iter().filter(|n| n.app == self.served)
@@ -256,7 +270,43 @@ impl AppRef {
     /// the writer itself: refused under a floor above this build's
     /// version, or beside a live node outside its range.
     pub(super) async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        self.check_readers_of(manifest, false).await
+    }
+
+    /// [`Self::check_readers`] for an app's first deploy: without a floor
+    /// record, on the floor this deploy would create for a fresh app
+    /// ([`Readers::as_first_deploy`]). Whether the app is fresh is known
+    /// only once the deploy is accepted ([`Self::born_finalized`]), so a
+    /// format behind the floor is checked again after that
+    /// ([`Self::check_floor_after_first`]).
+    pub(super) async fn check_first_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        self.check_readers_of(manifest, true).await
+    }
+
+    /// After [`Self::born_finalized`], for a first deploy in a format
+    /// behind the floor: the gate again, on the floor the app now has.
+    /// An app that only looked new (state, or a registered node) got no
+    /// floor, and the deploy is refused before it writes anything of the
+    /// app. A format every floor allows is not read for again.
+    pub(super) async fn check_floor_after_first(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<(), DeployError> {
+        let behind = upgrade::manifest_format(manifest.format_number())
+            .is_some_and(|f| f.since > floor::ABSENT);
+        if behind {
+            self.check_readers_of(manifest, false).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn check_readers_of(&self, manifest: &Manifest, first: bool) -> Result<(), DeployError> {
         let readers = self.readers().await?;
+        let readers = match (first, self.this_minor()) {
+            (true, Ok(this)) => readers.as_first_deploy(this),
+            _ => readers,
+        };
         let number = manifest.format_number();
         let format = upgrade::manifest_format(number)
             .ok_or_else(|| DeployError::Refused(format!("manifest format {number} has no gate")))?;

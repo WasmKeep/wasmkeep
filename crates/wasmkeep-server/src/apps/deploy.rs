@@ -547,7 +547,11 @@ impl AppRef {
             manifest.previous = Some(current.version.clone());
         }
         if !unchanged {
-            self.check_readers(&manifest).await?;
+            if read.is_none() {
+                self.check_first_readers(&manifest).await?;
+            } else {
+                self.check_readers(&manifest).await?;
+            }
             self.check_imports(Some(runtime), &imports, &kept).await?;
         }
         if !unchanged && !plan(&diff) {
@@ -557,6 +561,7 @@ impl AppRef {
         // of the app: a fresh app is born finalized (ADR 0043, section 3).
         if read.is_none() {
             self.born_finalized().await?;
+            self.check_floor_after_first(&manifest).await?;
         }
         let supplied = match &changes.assets {
             crate::assets::Change::Set(b) => Some(b),

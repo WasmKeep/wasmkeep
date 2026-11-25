@@ -923,13 +923,23 @@ behind the floor and the word `apart`. What the keys mean is in
    without `apart`.
 4. **Only when asked.** A manifest is format 8 only when it has an
    `apart` or a `spread` line. Every other version keeps the number it
-   had, so `0.8.1` nodes read it during the upgrade and after a way
-   back. A version with the keys, once current, is what ends the way
-   back for that app, as section 4 says of formats an app opts into.
+   had, so `0.8.1` nodes read it for the whole upgrade, and nothing
+   new is in the bucket before the finalize (section 4, "Per-app
+   formats").
 5. **The word `apart` is announced by every node of `0.9`**, placement
    on or off: it says the node reads the format, not that it applies the
    rules.
-6. **The writer's version is a value.** `AppRef::as_version` lets a test
+6. **A fresh app's first deploy may be format 8.** The gate runs before
+   the deploy is accepted, and the floor of a fresh app is created only
+   after (section 3: a refused or cancelled deploy writes none). So a
+   first deploy of an app without a floor record is checked on the floor
+   it would create (`upgrade::deploy_floor`: its own version, or the
+   lowest live version under the prefix). Once accepted it creates the
+   floor, and a format behind the floor is checked again on the floor
+   the app then has. An app that only looked new (state, a registered
+   node) got none, and is refused there, before anything of it is
+   written.
+7. **The writer's version is a value.** `AppRef::as_version` lets a test
    deploy as a `wasmkeep` of `0.9` while the workspace version is still
    `0.8.1`, as `ClusterConfig::version` does for a node. No command sets
    it. With this build's own version (`0.8`), a deploy with the keys is
@@ -939,7 +949,9 @@ Tests: the gate's row and both halves (`upgrade::tests`,
 `apps::tests::format_8_needs_the_floor_and_apart_on_every_live_node`),
 and `tests/cluster/apart_from.rs`, the gated write section 8's proof
 needs (phase 3): refused under the floor, beside an older node and
-beside a node without the word, then accepted.
+beside a node without the word, then accepted; and the first deploy of
+a fresh app, of one with state, and of one beside older nodes of
+another app.
 
 ## Not settled
 

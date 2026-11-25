@@ -293,7 +293,9 @@ either makes the version manifest format 8, which nodes of 0.8 cannot
 read. The deploy is refused, saying why, until the app's upgrade to 0.9
 is finalized (`wasmkeep cluster upgrade finalize`), and while a live
 node of the app is older or does not announce `apart`
-([ADR 0043](adr/0043-rolling-upgrades.md#2-the-gate-table)). A file
+([ADR 0043](adr/0043-rolling-upgrades.md#2-the-gate-table)). A new
+app needs no `finalize`: its first deploy may carry the keys when no
+older node is live under the bucket prefix. A file
 without these keys deploys as before, in the format a node of 0.8
 reads, so an app that uses the class names `room`, `pusher` and `edge`
 needs neither. No flag sets them: a deploy with flags keeps what the

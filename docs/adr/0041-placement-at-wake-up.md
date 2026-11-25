@@ -907,4 +907,5 @@ alarm.
   beside a node of `0.9` without `apart`, each time leaving `current` as
   it was; accepted once every node announces the word; then `fan` and
   `feed` of one name end on different nodes, in both orders, and each
-  `leaf` called from a `feed` wakes on its own choice.
+  `leaf` called from a `feed` wakes on its own choice. A fresh app's
+  first deploy with the keys is accepted and creates its floor.

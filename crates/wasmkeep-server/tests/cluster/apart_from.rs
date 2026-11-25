@@ -294,3 +294,72 @@ async fn a_deploy_with_apart_from_waits_for_the_floor_and_the_word_then_places()
         );
     }
 }
+
+/// A fresh app is born finalized (ADR 0043, section 3), so its first
+/// deploy may carry the keys: it is checked on the floor it would create,
+/// creates it once accepted, and writes format 8. An app that only looks
+/// new, or one whose live neighbours under the prefix are older, gets no
+/// floor and is refused before anything of it is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_apps_first_deploy_may_carry_the_keys() {
+    let rt = deploy_runtime();
+    let new_store = || -> Arc<dyn ObjectStore> { Arc::new(InMemory::new()) };
+    let floor_of = async |store: &Arc<dyn ObjectStore>| match store
+        .get(&"formats/default/default/floor".into())
+        .await
+    {
+        Ok(got) => Some(got.bytes().await.unwrap().to_vec()),
+        Err(_) => None,
+    };
+    let app_of = |store: &Arc<dyn ObjectStore>| {
+        AppRef::new(Arc::clone(store), "", "default", "default").as_version(NINE)
+    };
+    let deploy = async |store: &Arc<dyn ObjectStore>, accept: bool| {
+        let both = Changes {
+            classes: classes().classes,
+            ..keys()
+        };
+        app_of(store)
+            .deploy_changes_with(&rt, both, |_| accept)
+            .await
+    };
+
+    let fresh = new_store();
+    assert!(matches!(
+        deploy(&fresh, false).await,
+        Err(DeployError::Stopped)
+    ));
+    assert_eq!(floor_of(&fresh).await, None, "cancelled: nothing written");
+    let done = deploy(&fresh, true).await.unwrap();
+    assert_eq!(floor_of(&fresh).await, Some(floor::encode(NINE)));
+    let text = manifest_text(&fresh, &done.current.version).await;
+    assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+
+    // State without a floor: not fresh. Let through on the floor it would
+    // create, refused on the floor it has, and nothing of it is written.
+    let with_state = new_store();
+    with_state
+        .put(&"state/default/default/owners/c/x".into(), "x".into())
+        .await
+        .unwrap();
+    let e = deploy(&with_state, true).await.unwrap_err().to_string();
+    assert!(e.contains("cluster upgrade finalize"), "{e}");
+    assert_eq!(floor_of(&with_state).await, None);
+    assert!(app_of(&with_state).current().await.unwrap().is_none());
+
+    // A live node of 0.8.1 of another app under the prefix: the new app's
+    // floor would not be above it, so the keys wait.
+    let beside = new_store();
+    let body = format!(
+        "wasmkeep-node 3\nlive beef\n{}\nn\nhttp://127.0.0.1:9\n0.8.1\ndefault/other\n\n\nserving\n\n{WORDS}\n",
+        now_ms() + 60_000
+    );
+    beside
+        .put(&"nodes/n".into(), body.into_bytes().into())
+        .await
+        .unwrap();
+    let e = deploy(&beside, true).await.unwrap_err().to_string();
+    assert!(e.contains("upgrade floor is 0.8"), "{e}");
+    assert_eq!(floor_of(&beside).await, None);
+    assert!(app_of(&beside).current().await.unwrap().is_none());
+}
