@@ -10,7 +10,7 @@ client can see.
 
 ## The binary
 
-Upgrade the binary as [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)
+Upgrade the binary as [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep)
 says: stop every node, upgrade them all, start them all. 0.8.0 documents no
 exception for one node at a time. Do the file and directory steps below
 while the nodes are stopped, before the first start of the new binary: a
@@ -37,7 +37,7 @@ node refuses an env file, a secrets key or a cache it should not trust.
    `wasmkeep secrets rotate-key --finish` once no node holds the old key: it
    deletes the objects the old key sealed and fails while any are left. A key
    change does not change the values; rotate values the old key could open
-   at their source ([Secrets in the bucket](../cluster.md#secrets-in-the-bucket)).
+   at their source ([Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)).
 4. **Log filters.** What guests print is now the last field of the line,
    `line="..."`, after a fixed `guest output` message; before it was the
    event message. Update filters and parsers that match it. Output is limited
@@ -150,7 +150,7 @@ What to check after the upgrade:
 
 ### The binary
 
-Upgrade the binary as [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep)
+Upgrade the binary as [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep)
 says: **stop every node, upgrade them all, start them all**. 0.8.1
 documents no exception for one node at a time, so plan a short window in
 which the cluster serves nothing.

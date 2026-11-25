@@ -128,14 +128,14 @@ wasmkeep actor move --app acme/chat pusher/lobby --to node-b --bucket s3://acme-
 ```
 
 The target must be a live node of the same app that is not draining
-([Moving one actor](cluster.md#moving-one-actor)). A move does not pin:
+([Moving one actor](cluster-operations.md#moving-one-actor)). A move does not pin:
 the pusher's next cold wake-up is placed again, by the rule above. A move
 can also land elsewhere: when an event reaches a third node between the
 owner's release and the target's take, that node acquires the actor, and
 the move counts as done (ADR 0017, "another node claimed first").
 
 **Check where each actor runs** with `wasmkeep actor where`, which only
-reads ([Seeing where an actor runs](cluster.md#seeing-where-an-actor-runs)):
+reads ([Seeing where an actor runs](cluster-operations.md#seeing-where-an-actor-runs)):
 
 ```bash
 wasmkeep actor where --app acme/chat room/lobby pusher/lobby --bucket s3://acme-wasmkeep/prod
@@ -143,7 +143,7 @@ wasmkeep actor where --app acme/chat room/lobby pusher/lobby --bucket s3://acme-
 
 The two `OWNER` columns should name different nodes, both live. `wasmkeep
 cluster status` confirms the target is live and serving, and shows the
-load beside it ([Checking a cluster](cluster.md#checking-a-cluster)).
+load beside it ([Checking a cluster](cluster-operations.md#checking-a-cluster)).
 
 **What to watch** ([Monitoring](monitoring.md)), on the room's node and on
 the pusher's node:
@@ -209,7 +209,7 @@ More actors can spread over nodes. Existing resident actors do not move
 just because a node joins, and a room with open sockets stays with its
 socket home through hibernation. A move or drain can change its node,
 but cannot split its workload. See [How it scales](failover-and-scaling.md#how-it-scales)
-and [Moving one actor](cluster.md#moving-one-actor).
+and [Moving one actor](cluster-operations.md#moving-one-actor).
 
 ## Batch application work today
 
@@ -363,7 +363,7 @@ The [reconnecting-room harness](benchmarks.md#reconnecting-room-harness)
 records delivery and reconnect latency, recovery and topology on a deployed
 cluster. Its small smoke check is correctness evidence only. The real-bucket
 growth and slow-client benchmark at 3,000 to 10,000 clients is
-[measured on 0.6.0](benchmarks.md#a-big-room-on-three-nodes-preview), where
+[measured on 0.6.0](benchmarks-archive.md#a-big-room-on-three-nodes-preview), where
 the pattern was a preview: delivery p99 of 5 to 15 s, held by the room's
 publish path. 0.7.0 moves delivery off that path, to the pusher: with the
 pusher on another node, 4,500 clients got delivery p99 under 1 s

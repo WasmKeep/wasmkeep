@@ -19,7 +19,7 @@ fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
    offline migration. Two consecutive versions work in one cluster, and
    a new bucket format is written only once every node reads it. Today
    every node is upgraded together unless a release's page says
-   otherwise ([how](docs/cluster.md#upgrading-wasmkeep)). Built so far:
+   otherwise ([how](docs/cluster-upgrades.md#upgrading-wasmkeep)). Built so far:
    the version check at a node's start, the upgrade floor, `wasmkeep
    cluster upgrade status|finalize`, and the first format held back
    until an upgrade is finalized (the class keys `apart-from` and
@@ -28,7 +28,7 @@ fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
 2. **Verify a bucket** (M/L): a read-only command that checks every
    actor can be restored from what the bucket holds. Built:
    `wasmkeep cluster verify`
-   ([how](docs/cluster.md#verifying-a-bucket)).
+   ([how](docs/cluster-operations.md#verifying-a-bucket)).
 3. **Traces** (M/L): one request followed through the front, its actor,
    the calls it makes, the hop between nodes and the bucket write.
    Designed, not built ([ADR 0044](docs/adr/0044-traces.md)).
@@ -301,7 +301,7 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - In `0.6.0`, a room past one actor: a directory, a broadcast group,
   edges and relays
   ([ADR 0040](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md),
-  [measured](docs/benchmarks.md#a-big-room-on-three-nodes-preview)). A
+  [measured](docs/benchmarks-archive.md#a-big-room-on-three-nodes-preview)). A
   preview then; no longer one since `0.7.0`
   ([measured](docs/benchmarks.md#a-big-room-on-three-nodes-070)).
 - In `0.6.0`, placement at wake-up, on by default

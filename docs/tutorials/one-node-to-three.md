@@ -220,7 +220,7 @@ demo/shop  469fcd8d39aa32f2  1    1       no     1
 
 The command exits with 1 when no node is live, so scripts can use it;
 `--json` prints the same for them
-([Checking a cluster](../cluster.md#checking-a-cluster)).
+([Checking a cluster](../cluster-operations.md#checking-a-cluster)).
 
 ## 8. Kill a node
 
@@ -365,7 +365,7 @@ wasmkeep cluster status --bucket s3://demo
 
 To keep a drained node instead, `wasmkeep cluster undrain a
 --bucket s3://demo` lets it take actors again
-([Draining a node](../cluster.md#draining-a-node)).
+([Draining a node](../cluster-operations.md#draining-a-node)).
 
 ## 11. Clean up
 

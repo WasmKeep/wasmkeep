@@ -53,7 +53,7 @@ outside requests altogether (403): only actors and alarms reach the class.
 See [ADR 0010](adr/0010-who-may-create-an-actor.md). An app deployed with
 `wasmkeep deploy` carries its rules in the deploy instead
 (`wasmkeep deploy --access CLASS=MODE`), so every node applies the same ones
-with the code they protect ([Running a cluster](cluster.md#access-rules-and-configuration)). Paths outside
+with the code they protect ([Running a cluster](cluster-deploying.md#access-rules-and-configuration)). Paths outside
 `/actor/` go to the optional front, a stateless component given to `serve`,
 except `/_wasmkeep/`, which the server keeps for itself (`/_wasmkeep/health`
 and `/_wasmkeep/ready` for load balancers, see [Monitoring](monitoring.md)).
@@ -132,7 +132,7 @@ With `serve --app`, a component on the command line is refused: the front
 comes with the app's deploy (`wasmkeep deploy --front PATH`), with its
 classes, so that a rollback reaches it too, and its values come from the
 same three layers as a class's (`--front-config`, the `_front` secrets,
-`serve --front-env`; see [Deploying the front](cluster.md#deploying-the-front)).
+`serve --front-env`; see [Deploying the front](cluster-deploying.md#deploying-the-front)).
 
 ## Events
 
@@ -212,20 +212,20 @@ first event ─▶ on-init ─▶ resident ──idle 30 s──▶ hibernated
   fsynced on one node): use it before telling someone "deleted". Later
   storage calls in that event are refused.
 - **An operator** can delete an actor too, with `wasmkeep actor delete`
-  ([cluster](cluster.md#deleting-one-actor)): the same delete, run by the
+  ([cluster](cluster-operations.md#deleting-one-actor)): the same delete, run by the
   node that holds it or by any node if nobody does.
 - **Idle expiry**: a class may say how long its actors may stay idle
   (`expire-after-idle = "7d"` in `wasmkeep.toml`, or `deploy
   --expire-after-idle`): in a cluster, an actor that ran no event for that
   long, with no pending alarm and no open WebSocket, is deleted the same
   way, for sessions, carts and temporary rooms
-  ([cluster](cluster.md#idle-expiry)). An event arriving as it expires
+  ([cluster](cluster-operations.md#idle-expiry)). An event arriving as it expires
   either keeps it (the expiry loses) or finds a new, empty actor. Only
   events count: a [file](files.md) downloaded through a link runs no
   code and keeps no actor alive, and the actor's files go with it.
 - **A whole app** is deleted with `wasmkeep app delete`: its nodes stop
   serving it, then every actor, version and secret of it goes from the
-  bucket ([cluster](cluster.md#deleting-an-app)).
+  bucket ([cluster](cluster-operations.md#deleting-an-app)).
 
 ## Storage
 
@@ -431,13 +431,13 @@ not set.
   with the version instead: `wasmkeep deploy --config hub=hub-config.env`.
   They are stored in the bucket in the clear, reach every node with the
   code, and change without a restart (the next event runs in a new
-  instance; `on-init` does not rerun) ([Running a cluster](cluster.md#access-rules-and-configuration)).
+  instance; `on-init` does not rerun) ([Running a cluster](cluster-deploying.md#access-rules-and-configuration)).
 - **Secrets can live in the bucket, sealed.** `wasmkeep secrets set --app
   TENANT/APP --key FILE --class CLASS NAME` (the value from stdin) seals a
   secret with a key the nodes hold (`wasmkeep serve --secrets-key FILE`).
   It reaches every node within a few seconds, with no deploy or restart,
   and a rollback of code never brings an old secret back. A bucket reader
-  sees neither names nor values ([Secrets in the bucket](cluster.md#secrets-in-the-bucket),
+  sees neither names nor values ([Secrets in the bucket](cluster-deploying.md#secrets-in-the-bucket),
   [ADR 0016](adr/0016-secrets-in-the-bucket.md)).
 - **Which value wins**, by name: the deployed configuration, then the
   app's secrets, then the node's `--env` (logged, never the value).

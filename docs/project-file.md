@@ -73,7 +73,7 @@ least one class.
 | `access` | classes only | `internal` (the default: the app's actors, alarms and front only), `existing`, `existing:NAME,...` or `open`, as `deploy --access` |
 | `config` | optional | a file of `NAME=value` lines, plain configuration (stored in the bucket in the clear: never secrets) |
 | `requires` | optional | names that must be set (by the configuration, the app's secrets or a node's `--env`) before the class or front runs |
-| `expire-after-idle` | classes only | how long an actor of the class may stay idle before it is deleted: a whole number and one unit, `s`, `m`, `h` or `d` (`"7d"`, `"36h"`), at least `"1h"`; none by default (actors are kept). In a cluster only ([idle expiry](cluster.md#idle-expiry)) |
+| `expire-after-idle` | classes only | how long an actor of the class may stay idle before it is deleted: a whole number and one unit, `s`, `m`, `h` or `d` (`"7d"`, `"36h"`), at least `"1h"`; none by default (actors are kept). In a cluster only ([idle expiry](cluster-operations.md#idle-expiry)) |
 | `writes` | classes only | how the class's plain writes reach the bucket: `"strict"` (the default, every release's behaviour: an event's writes are uploaded before the next event starts) or `"batched"` (uploaded behind the events, several to a segment, [ADR 0034](adr/0034-batched-plain-writes.md)). Every `wasmkeep` build deploys and runs `"batched"`; nodes of 0.4.2 and earlier cannot run it, and a deploy holds it back while a live node lacks `flush`. The same as `deploy --writes CLASS=MODE`. `"strict"` written or not makes the same version, byte for byte |
 | `apart-from` | classes only | another class of the file: an actor of this class and the actor of the same name in that class wake on different nodes when they can (`fan/lobby` and `feed/lobby`), as the classes named `room` and `pusher` do without it ([placement](designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)). One entry is enough for a pair, and a class is in one pair at most. `false`: kept apart from no class, which turns the default off for a class named `room` or `pusher`. Not on a class with `spread = true`, nor naming one. Needs every node on 0.9 (below) |
 | `spread` | classes only | `true`: an actor of this class that a call or an alarm wakes goes to the node chosen for its own name among the live nodes, as the class named `edge` does beside `room` and `pusher` without it. `false` turns that default off. Not `true` on a class that is kept apart from another: a class takes one of the two rules. Needs every node on 0.9 (below) |
@@ -236,7 +236,7 @@ for matching, headers, limits, the type table, repair and collection.
 
 There is no key for a value, a secret or a bucket. Configuration goes in
 the files `config` names; secrets go in the bucket with `wasmkeep secrets
-set` ([Secrets in the bucket](cluster.md#secrets-in-the-bucket)); local
+set` ([Secrets in the bucket](cluster-deploying.md#secrets-in-the-bucket)); local
 values go in `.env.local`, which belongs in `.gitignore` (a `config` that
 names the `[dev] env` file, by any path or link, is refused). The bucket is
 `deploy --bucket`, so one file deploys to staging and production alike.

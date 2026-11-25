@@ -86,7 +86,7 @@ sudoedit /etc/wasmkeep/chat.env       # NAME=value lines
 ```
 
 An app that keeps its secrets in the bucket (`--app`, see
-[Secrets in the bucket](../cluster.md#secrets-in-the-bucket)) also needs a
+[Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)) also needs a
 secrets key on the node. The key file has a stricter rule than an env file:
 `0600`, owned by the service's user, since the server refuses a key its group
 can read. Create it once and hand it over:
@@ -303,7 +303,7 @@ A plain `cp` of a live database can produce a corrupt copy.
   event, so migrations happen lazily, per actor.
 - **No-restart deploys** need a bucket: `wasmkeep deploy --app acme/shop ...`
   uploads a version, and nodes started with `--app acme/shop` switch to it
-  within seconds, actor by actor (see [Running a cluster](../cluster.md#deploying)).
+  within seconds, actor by actor (see [Running a cluster](../cluster-deploying.md#deploying)).
 - **New WasmKeep binary**: install it and restart. Open WebSockets are
   closed; clients reconnect.
 

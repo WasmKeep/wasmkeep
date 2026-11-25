@@ -154,7 +154,7 @@ wasmkeep deploy --app acme/shop --bucket s3://acme-wasmkeep/prod \
 `deploy` compiles and checks every component before uploading anything.
 Later deploys work the same way: nodes pick the new version up within a few
 seconds and switch each actor at its next event; `--rollback` returns to the
-previous version. See [Deploying](../cluster.md#deploying).
+previous version. See [Deploying](../cluster-deploying.md#deploying).
 
 ## 4. The load balancer
 
@@ -189,7 +189,7 @@ From any machine with the bucket credentials, `wasmkeep cluster status
 --bucket s3://acme-wasmkeep/prod` lists the nodes from their heartbeats
 (live or not, version, addresses, TLS) and the deployed version of the app;
 it exits with 1 if no node is live. See
-[Checking a cluster](../cluster.md#checking-a-cluster).
+[Checking a cluster](../cluster-operations.md#checking-a-cluster).
 
 ## Operating it
 
@@ -207,15 +207,19 @@ it exits with 1 if no node is live. See
   listener: a refusing node does not reach that node's actors (503), and
   that node's calls to it are treated as a client's. To roll back, add
   `accept` to every node before removing any listener.
-- **Upgrading WasmKeep** (the binary, not your app): upgrade every node
-  together, not one at a time. `systemctl stop wasmkeep` on all three, wait
+- **Upgrading WasmKeep** (the binary, not your app): read the release's
+  upgrading page first. From 0.8.1 to 0.9.0 the cluster is upgraded one
+  node at a time and then finalized
+  ([upgrading to 0.9.0](upgrading-to-0.9.md)). For any other pair of
+  versions, upgrade every node together, not one at a time.
+  `systemctl stop wasmkeep` on all three, wait
   until `wasmkeep cluster status --bucket s3://acme-wasmkeep/prod` exits
   with 1 (no live node, about 10 s after the last stop), install the new
   binary on all three, start them, and check `cluster status` again: three
   live nodes, one version, no warning. Clients get errors between the last
   stop and the first start. Old and new nodes refuse each other's calls
-  and handle alarms differently, so a rolling restart across versions is
-  not supported yet: see [Upgrading WasmKeep](../cluster.md#upgrading-wasmkeep).
+  and handle alarms differently, so a rolling restart across those
+  versions is not supported: see [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep).
 - **Restarting a node** on the same binary (a configuration change, a host
   reboot): one node at a time is fine. A stopping node finishes its
   in-flight requests, then hands its actors over: the other nodes serve
@@ -225,7 +229,7 @@ it exits with 1 if no node is live. See
   `/actor/` and `/_wasmkeep/`): with `--app` it is part of the deploy,
   `wasmkeep deploy --app acme/shop --bucket ... --front site.wasm`, and
   nodes switch to it without a restart (see
-  [Deploying the front](../cluster.md#deploying-the-front)).
+  [Deploying the front](../cluster-deploying.md#deploying-the-front)).
 - **Adding a node**: start it with a new id and add it to the load
   balancer. An actor in memory on another node stays there, and the new
   node forwards its requests; once it hibernates, its node gives it up,
@@ -236,7 +240,7 @@ it exits with 1 if no node is live. See
   files. Create a key once (`wasmkeep secrets new-key --out secrets.key`),
   give it to every node (`--secrets-key /etc/wasmkeep/secrets.key`, mode
   0600), and set values with `wasmkeep secrets set`; nodes pick them up
-  within a few seconds (see [Secrets in the bucket](../cluster.md#secrets-in-the-bucket)).
+  within a few seconds (see [Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket)).
 - **Removing or replacing a node**: drain it first, then stop it once it
   is drained:
 
@@ -248,7 +252,7 @@ it exits with 1 if no node is live. See
 
   A drain moves its actors a few at a time while the node keeps
   forwarding, and moves their pending alarms with them, so they fire on
-  time (see [Draining a node](../cluster.md#draining-a-node)). Stopping
+  time (see [Draining a node](../cluster-operations.md#draining-a-node)). Stopping
   without draining also works (`SIGTERM`, as `systemctl stop` sends): its
   actors move at once, and alarms of idle actors wait for the sweep. A
   node that is killed or crashes cannot hand over: its actors move after

@@ -525,6 +525,6 @@ moto kept the bucket in memory, so it is gone too.
 - [The example's README](../../examples/todo-front/README.md): what to
   copy from it (sign-in that fails closed, names checked before a call)
   and what not.
-- [Secrets in the bucket](../cluster.md#secrets-in-the-bucket) and
-  [Deploying the front](../cluster.md#deploying-the-front): keys, values
+- [Secrets in the bucket](../cluster-deploying.md#secrets-in-the-bucket) and
+  [Deploying the front](../cluster-deploying.md#deploying-the-front): keys, values
   and rollbacks in depth.

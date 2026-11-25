@@ -28,7 +28,7 @@ Parquet files, with `wasmkeep feed`. It contacts no node. [Querying the change f
 one class. [Concepts](concepts.md#addresses).
 
 **drain**: asking a node to stop taking actors and hand its own to other nodes, before a restart or
-an upgrade. [Draining a node](cluster.md#draining-a-node).
+an upgrade. [Draining a node](cluster-operations.md#draining-a-node).
 
 **edge**: in a broadcast room, the class that holds clients' sockets and sends them messages, up to
 a cap per edge. [ADR 0040](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#5-the-edge).
@@ -99,5 +99,5 @@ send loop. Counted by `wasmkeep_placement_spread_total`.
 is an actor name). [Concepts](concepts.md#addresses).
 
 **tombstone**: the record written first when an app is deleted. From then nodes refuse to take its
-actors and stop serving it. [Deleting an app](cluster.md#deleting-an-app),
+actors and stop serving it. [Deleting an app](cluster-operations.md#deleting-an-app),
 [ADR 0028](adr/0028-actors-that-end.md).

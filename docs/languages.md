@@ -440,7 +440,7 @@ announce the capability word `flush`, or one that imports
 `storage.delete-self-durable` while a live node does not announce `ends`
 (nodes of `0.4.1` and before), naming those nodes. Upgrade every node of
 the app, then deploy. What the check cannot see is in
-[cluster](cluster.md#rolling-upgrades-and-new-storage-functions).
+[cluster](cluster-upgrades.md#rolling-upgrades-and-new-storage-functions).
 
 `wasmkeep new` (from `0.4.2` on) writes Rust and TypeScript
 projects, pinned to its own version
