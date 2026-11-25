@@ -157,7 +157,10 @@ Still a **pre-alpha pre-release**.
   enough was left. Each pass raises the record's generation, so on a
   version 2 app an actor compacted over several passes is refused by
   `--require-owner-match` until it next writes, as after two wakes that
-  only read
+  only read. A chain also ends (`stopped`) when a pass's release does not
+  land within a second: the release is retried in the background, but the
+  continuation is not queued again, and what is left stays until the
+  actor next writes and rests for a window
   ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md), "As
   built: continuing a stopped pass").
 - **`lost_lease` is counted.** A batched write dropped because another

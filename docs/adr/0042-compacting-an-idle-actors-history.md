@@ -209,7 +209,7 @@ Known limits, stated rather than fixed here:
 - **A pass takes a resident slot** for its job's empty state while it runs, only while the node has room.
 - **An actor whose name the record key shortened with a hash** (an encoded name over 200 bytes) is not compacted: the key cannot be told back to its address, as for idle expiry.
 - **A pass found `busy`** (the actor in use on the node when due) is dropped; the actor is queued again only by its next release after a write.
-- **A pass stopped** by a waiting event, a drain or its hold's end leaves what it did not delete until the actor next writes and rests (`stopped`). One stopped by its deadline is continued (0.8.1), up to 1,000 passes, and given up after 3 in a row that deleted nothing, a history whose listing alone takes the deadline for one; then it is left the same way.
+- **A pass stopped** by a waiting event, a drain or its hold's end leaves what it did not delete until the actor next writes and rests (`stopped`). One stopped by its deadline is continued (0.8.1), up to 1,000 passes, and given up after 3 in a row that deleted nothing, a history whose listing alone takes the deadline for one; then it is left the same way. A chain also ends (`stopped`) when a pass's release does not land within a second: the release is retried in the background, but the continuation is not queued again. What is left stays until the actor next writes and rests for a window.
 - **A full queue** refuses new actors; they keep their leftovers until they next write and rest.
 - **A class with an idle limit is not compacted**, in either record format (see "As built: the idle pass").
 
