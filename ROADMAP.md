@@ -19,13 +19,16 @@ fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
    offline migration. Two consecutive versions work in one cluster, and
    a new bucket format is written only once every node reads it. Today
    every node is upgraded together unless a release's page says
-   otherwise ([how](docs/cluster.md#upgrading-wasmkeep)).
+   otherwise ([how](docs/cluster.md#upgrading-wasmkeep)). Designed, not
+   built ([ADR 0043](docs/adr/0043-rolling-upgrades.md)).
 2. **Verify a bucket** (M/L): a read-only command that checks every
    actor can be restored from what the bucket holds.
 3. **Traces** (M/L): one request followed through the front, its actor,
    the calls it makes, the hop between nodes and the bucket write.
+   Designed, not built ([ADR 0044](docs/adr/0044-traces.md)).
 4. **Old upgrade paths removed** (M), each with a documented last
-   version that carries it.
+   version that carries it
+   ([ADR 0043, section 6](docs/adr/0043-rolling-upgrades.md#6-removing-old-paths)).
 
 ## Next
 
