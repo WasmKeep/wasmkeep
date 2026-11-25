@@ -231,44 +231,8 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
     let mut outcome = rt
         .block_on(operator_fence(&bucket, &status::Wall, &key))
         .map_err(|e| anyhow::anyhow!("fencing {}: {e:?}", args.node))?;
-    // A fence created here carries this machine's clock, which the free
-    // rule trusts within the allowed skew: checked against the bucket's own
-    // time for that write (rounded up to its second, plus the skew), and
-    // moved later if this clock runs behind it.
-    if let OperatorFence::Fenced {
-        written_at_ms,
-        created: true,
-        ..
-    } = &mut outcome
-    {
-        let modified = rt
-            .block_on(bucket.modified_ms(&key))
-            .map_err(|e| anyhow::anyhow!("reading the fence back: {e:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("the fence vanished right after it was written"))?;
-        let bucket_ms = modified + 1_000 + lease.max_skew_ms();
-        if bucket_ms > *written_at_ms {
-            if bucket_ms - *written_at_ms > 1_000 + 2 * lease.max_skew_ms() {
-                eprintln!(
-                    "warning: this machine's clock is {:.1} s behind the bucket's; the fence uses the bucket's time",
-                    (bucket_ms - *written_at_ms) as f64 / 1000.0
-                );
-            }
-            rt.block_on(wasmkeep_cluster::node_lease::raise_created_fence(
-                &bucket, &key, bucket_ms,
-            ))
-            .map_err(|e| anyhow::anyhow!("moving the fence to the bucket's time: {e:?}"))?;
-            *written_at_ms = bucket_ms;
-        } else if *written_at_ms > bucket_ms {
-            // Dated ahead: the node's next process writes its first lease
-            // body only once the fence is twice the skew old on its clock
-            // (ADR 0020, amendment on lease reads).
-            eprintln!(
-                "warning: this machine's clock is {:.1} s ahead of the bucket's; node {} can start \
-                 again only once the fence's date has passed on its clock",
-                (*written_at_ms - modified) as f64 / 1000.0,
-                args.node
-            );
-        }
+    if let Some(warning) = rt.block_on(date_by_bucket(&bucket, &key, &lease, &mut outcome))? {
+        eprintln!("warning: {warning}");
     }
     let free_at = |at: u64| {
         let free = at
@@ -312,6 +276,81 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Dates a fence an operator created (no instance) by the bucket's time,
+/// whichever call created it: one this run created, and one this run found
+/// already there (`NotLive`), as after a create whose reply was lost and
+/// whose retry found its own fence, or a create that landed late. Such a
+/// fence carries the clock of whoever sent the create, read before the
+/// create landed, which the free rule trusts within the allowed skew: it
+/// is moved to the bucket's time for the object's last write (rounded up
+/// to its second, plus the skew) if that is later, and `outcome` follows
+/// (ADR 0020, amendment on lease reads). Returns a warning about this
+/// machine's clock, if any.
+async fn date_by_bucket(
+    bucket: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+    key: &str,
+    lease: &wasmkeep_server::LeaseConfig,
+    outcome: &mut wasmkeep_cluster::node_lease::OperatorFence,
+) -> anyhow::Result<Option<String>> {
+    use wasmkeep_cluster::lease::Bucket as _;
+    use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OperatorFence, created_fence};
+    let (written_at_ms, created) = match outcome {
+        OperatorFence::Fenced {
+            written_at_ms,
+            created: true,
+            ..
+        } => (written_at_ms, true),
+        OperatorFence::NotLive {
+            state: NodeState::Fenced,
+            written_at_ms,
+        } => (written_at_ms, false),
+        _ => return Ok(None),
+    };
+    // Only a created fence: a peer's fence keeps its node's own date.
+    if !created {
+        let body = bucket
+            .get(key)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading the fence back: {e:?}"))?;
+        if !body
+            .and_then(|(b, _)| NodeLeaseObject::decode(&b))
+            .is_some_and(|o| created_fence(&o))
+        {
+            return Ok(None);
+        }
+    }
+    let modified = bucket
+        .modified_ms(key)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the fence back: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("the fence vanished right after it was read"))?;
+    let bucket_ms = modified + 1_000 + lease.max_skew_ms();
+    let mut warning = None;
+    if bucket_ms > *written_at_ms {
+        if created && bucket_ms - *written_at_ms > 1_000 + 2 * lease.max_skew_ms() {
+            warning = Some(format!(
+                "this machine's clock is {:.1} s behind the bucket's; the fence uses the bucket's time",
+                (bucket_ms - *written_at_ms) as f64 / 1000.0
+            ));
+        }
+        if wasmkeep_cluster::node_lease::raise_created_fence(bucket, key, bucket_ms)
+            .await
+            .map_err(|e| anyhow::anyhow!("moving the fence to the bucket's time: {e:?}"))?
+        {
+            *written_at_ms = bucket_ms;
+        }
+    } else if created && *written_at_ms > bucket_ms {
+        // Dated ahead: the node's next process writes its first lease body
+        // only once the fence is twice the skew old on its clock.
+        warning = Some(format!(
+            "this machine's clock is {:.1} s ahead of the bucket's; the node can start again only \
+             once the fence's date has passed on its clock",
+            (*written_at_ms - modified) as f64 / 1000.0
+        ));
+    }
+    Ok(warning)
 }
 
 /// `wasmkeep cluster forget` (ADR 0020, section 2).
@@ -365,4 +404,82 @@ pub(super) fn cluster_status(args: StatusArgs) -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::date_by_bucket;
+    use std::sync::Arc;
+    use wasmkeep_cluster::lease::Bucket as _;
+    use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OperatorFence};
+    use wasmkeep_cluster::object_store::ObjectStoreBucket;
+
+    fn body(instance: Option<&str>, at: u64) -> Vec<u8> {
+        NodeLeaseObject {
+            state: NodeState::Fenced,
+            instance: instance.map(str::to_owned),
+            written_at_ms: at,
+        }
+        .encode()
+    }
+
+    /// A created fence this run found already there (its own create whose
+    /// reply was lost, or one that landed late) is dated by the bucket's
+    /// time, as one it created; a peer's fence keeps its node's date.
+    #[tokio::test]
+    async fn a_created_fence_found_is_dated_by_the_bucket() {
+        let lease = wasmkeep_server::LeaseConfig::default_safe();
+        let bucket = ObjectStoreBucket::new(Arc::new(object_store::memory::InMemory::new()), "");
+        let date = |b: Option<(Vec<u8>, _)>| NodeLeaseObject::decode(&b.unwrap().0).unwrap();
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        for (key, created) in [("nodes/a", false), ("nodes/c", true)] {
+            // Dated 100 s, as by a create sent long before it landed.
+            bucket.create(key, body(None, 100_000)).await.unwrap();
+            let mut outcome = if created {
+                OperatorFence::Fenced {
+                    written_at_ms: 100_000,
+                    instance: None,
+                    created: true,
+                }
+            } else {
+                OperatorFence::NotLive {
+                    state: NodeState::Fenced,
+                    written_at_ms: 100_000,
+                }
+            };
+            date_by_bucket(&bucket, key, &lease, &mut outcome)
+                .await
+                .unwrap();
+            let at = date(bucket.get(key).await.unwrap()).written_at_ms;
+            assert!(at >= now, "{key}: dated {at}, before {now}");
+            let reported = match outcome {
+                OperatorFence::Fenced { written_at_ms, .. }
+                | OperatorFence::NotLive { written_at_ms, .. } => written_at_ms,
+                OperatorFence::OldFormat => unreachable!(),
+            };
+            assert_eq!(reported, at, "{key}");
+        }
+        // A peer's fence (an instance): left as it is.
+        bucket
+            .create("nodes/b", body(Some("i1"), 100_000))
+            .await
+            .unwrap();
+        let mut outcome = OperatorFence::NotLive {
+            state: NodeState::Fenced,
+            written_at_ms: 100_000,
+        };
+        date_by_bucket(&bucket, "nodes/b", &lease, &mut outcome)
+            .await
+            .unwrap();
+        assert_eq!(
+            date(bucket.get("nodes/b").await.unwrap()).written_at_ms,
+            100_000
+        );
+    }
 }

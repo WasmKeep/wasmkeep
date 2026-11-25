@@ -553,17 +553,19 @@ impl Cluster {
                     // skew, as for one read first.
                     if o.instance.is_none() {
                         let fenced = at_ms(o.written_at_ms.saturating_add(window));
+                        // Logged only when the fence is what holds the
+                        // first write back.
                         if fenced > deadline {
                             deadline = fenced;
+                            tracing::info!(
+                                "{}",
+                                fence_wait_message(
+                                    &self.node_id,
+                                    "was written during the start check",
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                )
+                            );
                         }
-                        tracing::info!(
-                            "{}",
-                            fence_wait_message(
-                                &self.node_id,
-                                "was written during the start check",
-                                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                            )
-                        );
                     }
                     first_instance = None;
                 } else {

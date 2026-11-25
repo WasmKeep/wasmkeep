@@ -1377,7 +1377,9 @@ fn a_first_stale_read_is_not_closed() {
 #[test]
 fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     let (mut acquired, mut deletions) = (0, 0);
-    for seed in only_seed().map_or(0..seeds(), |s| s..s + 1) {
+    // `WASMKEEP_SIM_SEED` runs that one seed's checks alone (no floor).
+    let only = only_seed();
+    for seed in only.map_or(0..seeds(), |s| s..s + 1) {
         let o = simulate(seed, Variant::StaleHotOperator, Duration::from_secs(30));
         if let Some(d) = double_ownership(&o.claims) {
             panic!("seed {seed}: two owners with a hot operator: {d:?}");
@@ -1387,6 +1389,9 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
         }
         acquired += o.reasons.get("fenced").copied().unwrap_or(0);
         deletions += o.deletions;
+    }
+    if only.is_some() {
+        return;
     }
     eprintln!(
         "{} seeds with a hot operator: {deletions} leases deleted and fenced, \

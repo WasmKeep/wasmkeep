@@ -3266,6 +3266,63 @@ mod tests {
         }
     }
 
+    /// What a created fence cannot close (ADR 0020, "What it does not
+    /// close"): a lease deleted out of band while its node runs. An
+    /// operator's create, dated 100 s by `operator_fence` before it is
+    /// sent, is still in flight (a bucket retrying it after a 5xx) when b
+    /// starts at 108 s over no object and takes the actor. Then b's lease is
+    /// deleted, and the create lands: `If-None-Match: *` cannot tell that
+    /// absence from the one it was sent for. At 115.5 s the fence is ttl plus
+    /// grace old, and a takes the record while b's lease is valid until
+    /// 116 s. Dated by the bucket's time once it is seen (as `cluster fence`
+    /// does for a created fence it finds), the fence frees nothing then.
+    #[test]
+    fn a_created_fence_landing_late_is_not_closed() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let fence = NodeLeaseObject {
+            state: NodeState::Fenced,
+            instance: None,
+            written_at_ms: 100_000,
+        };
+        for raised in [false, true] {
+            let mem = Mem::default();
+            let t = Cell::new(108_000);
+            let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "ib", cfg());
+            run(lb.start(None)).unwrap();
+            let b = Owners::new(&mem, At(&t), "b", "ib", "nodes/", cfg());
+            let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+            assert_eq!(hold.generation, 1);
+            // Deleted out of band; the create lands at 109 s.
+            t.set(109_000);
+            mem.overwrite("nodes/b", None);
+            mem.overwrite("nodes/b", Some(&fence.encode()));
+            if raised {
+                // The bucket's time for that write, plus a second and the
+                // skew.
+                assert_eq!(
+                    run(raise_created_fence(&&mem, "nodes/b", 111_000)),
+                    Ok(true)
+                );
+            }
+            t.set(115_500);
+            assert_eq!(lb.valid_until_ms(), Some(116_000));
+            let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg());
+            let got = run(a.acquire("owners/x", || true, async || Ok(1)));
+            if raised {
+                assert_eq!(
+                    got,
+                    Err(AcquireError::Held {
+                        node: "b".into(),
+                        instance: "ib".into()
+                    })
+                );
+            } else {
+                assert_eq!(got.map(|h| h.generation), Ok(2), "the limit");
+            }
+        }
+    }
+
     /// b's clock steps back while it runs as i2, then b is fenced: the
     /// fence keeps i2's last date, earlier than a live body a read before
     /// the step. The fence is still newer (the same instance's end), so the

@@ -1332,6 +1332,9 @@ the record's, and frees it at once: two owners. The simulation found it
   The node logs the longer wait, and `cluster fence` warns when this
   machine's clock is ahead of the bucket's, since that dates the fence
   ahead.
+- `cluster fence` dates by the bucket's time every created fence it leaves
+  behind: one it created, and one it found already there (`NotLive`), as
+  after a create whose reply was lost and whose retry found its own fence.
 - Why not ttl plus grace (this amendment's first form): every body written
   after a fence but dated less than the window after it makes a reader keep
   the fence as its newest, and the fence served again frees the record
@@ -1355,7 +1358,10 @@ stale reads, in a cluster that mixes 0.8.0 and this version:
   a stale read and keeps the fence; served the fence again once its ttl
   plus grace has passed, it frees the record that node holds
   (`node_lease::tests::a_start_inside_the_fence_window_is_not_closed`).
-  Any read of a later body (a renewal, every third of the ttl) ends it.
+  A read of a body dated past the window ends it: the node's next renewal
+  (every third of the ttl), or, over a fence `cluster fence` dated by the
+  bucket's time plus a second and the skew, the one after, since the
+  node's second body can still fall inside the window then.
 - Compared with the rule before this window (dates alone), that is a
   narrower exposure: dates alone also freed records through a
   predecessor's body dated after a created fence, in a cluster of any
@@ -1364,6 +1370,26 @@ stale reads, in a cluster that mixes 0.8.0 and this version:
   there, any stale read of an earlier body frees a record.
 
 ### What it does not close
+
+- Deleting a live node's lease out of band (a manual `s3 rm`, a lifecycle
+  rule, a sync tool) is outside the guarantee. A created fence that lands
+  late shows why. `operator_fence` dates the fence before it sends the
+  create, and `If-None-Match: *` cannot tell one absence from another.
+  object_store (0.14.2) retries a conditional create after a 5xx for up to
+  180 s. So a create can land over a later absence: after the lease of a
+  process that started over no object and took actors was deleted. Its old
+  date then frees that process's records while its lease is still valid
+  (`node_lease::tests::a_created_fence_landing_late_is_not_closed`: dated
+  100 s, a node started at 108 s, its record taken at 115.5 s with its
+  lease valid until 116 s). `cluster fence` moving any created fence it
+  finds to the bucket's time narrows this to a create that lands after the
+  command has exited. The complete fix is
+  [#303](https://github.com/WasmKeep/wasmkeep/issues/303).
+- The window tolerates exactly the configured skew. A predecessor whose
+  clock ran ahead by more than the skew allowed can date a body past the
+  window, and the rule is then the one before it (dates alone) for that
+  body; as everywhere in this protocol, a clock beyond the skew allowed
+  voids the time bound.
 
 - A first read that is stale: a process that has never read a body of
   A's lease newer than the stale one cannot tell. Closing it needs the
@@ -1442,6 +1468,8 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
   - `a_created_fence_is_newer_than_the_bodies_before_it`: a predecessor's `live` body dated after an operator's created fence, served again once the node runs as another instance that holds the actor, is read again and frees nothing (judged by date alone it took the record).
   - `a_successor_soon_after_a_created_fence_keeps_its_record`: a successor starting 1 s (a node of 0.8.0) or 2 s after the fence, renewed, keeps its record against the current read and the fence served again (a window of ttl plus grace refused the first and freed on the second).
   - `a_start_inside_the_fence_window_is_not_closed`: the limit above, and the same reads leaving the record to a successor dated past the window.
+  - `a_created_fence_landing_late_is_not_closed`: the out-of-band limit above, and the same fence moved to the bucket's time freeing nothing.
+- `wasmkeep-cli` `cluster_cmd::fence_tests::a_created_fence_found_is_dated_by_the_bucket`: a created fence the command finds already there is dated by the bucket's time as one it created; a peer's fence keeps its date.
   - `an_absent_lease_keeps_the_newest_pinned`: absent answers between stale reads keep the window from opening; without them, it opens.
   - `the_newest_reads_only_move_forward`.
   - `a_body_dated_ahead_holds_the_newest_for_a_window_only`: an older body replaces the held one once older bodies have been read for ttl plus grace with no confirming read. A gap with no reads does not shorten the window, a confirming read ends it, and a clock stepping back counts it from the step.
