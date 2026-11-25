@@ -964,14 +964,24 @@ pub(crate) fn idle_snapshot(outcome: &str) {
 }
 
 /// `outcome` of `wasmkeep_idle_compactions_total` (ADR 0042, section 3):
-/// compacted (at least one object deleted, or the history already
-/// compact), the record changed since the release (a wake, a move, an
-/// expiry, the app deleted or recreated), no snapshot of the released
-/// generation to compact from, refused (the node draining, the app
-/// deleted, restoring or recreated, a class with an idle limit, the
-/// bucket failing), the actor in use on this node when it was due.
-pub(crate) const IDLE_COMPACTION_OUTCOMES: [&str; 5] =
-    ["done", "changed", "nothing", "refused", "busy"];
+/// compacted (nothing the window lets go left: at least one object
+/// deleted, or the history already compact), stopped at its deadline
+/// with the rest queued for a further pass, stopped and not continued (an
+/// event waiting, a drain, its hold ending, or the chain's bounds), the
+/// record changed since the release (a wake, a move, an expiry, the app
+/// deleted or recreated), no snapshot of the released generation to
+/// compact from, refused (the node draining, the app deleted, restoring
+/// or recreated, a class with an idle limit, the bucket failing), the
+/// actor in use on this node when it was due.
+pub(crate) const IDLE_COMPACTION_OUTCOMES: [&str; 7] = [
+    "done",
+    "continued",
+    "stopped",
+    "changed",
+    "nothing",
+    "refused",
+    "busy",
+];
 
 /// One idle pass ended with `outcome` ([`IDLE_COMPACTION_OUTCOMES`]).
 pub(crate) fn idle_compaction(outcome: &str) {

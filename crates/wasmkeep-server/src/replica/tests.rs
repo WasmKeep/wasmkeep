@@ -592,7 +592,7 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
     };
     assert_eq!(
         other
-            .collect_idle(std::time::Duration::ZERO, &|| false)
+            .collect_idle(std::time::Duration::ZERO, COLLECT_BATCH, &|| false)
             .await
             .unwrap(),
         IdleCollected::NoSnapshot
@@ -602,7 +602,7 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
     // said.
     assert!(matches!(
         collector
-            .collect_idle(std::time::Duration::ZERO, &|| true)
+            .collect_idle(std::time::Duration::ZERO, COLLECT_BATCH, &|| true)
             .await
             .unwrap(),
         IdleCollected::Collected {
@@ -615,7 +615,7 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
     // 249 segments and one snapshot below 250: three batches, of
     // which the first runs and lapses the lease.
     let done = collector
-        .collect_idle(std::time::Duration::ZERO, &|| false)
+        .collect_idle(std::time::Duration::ZERO, COLLECT_BATCH, &|| false)
         .await
         .unwrap();
     assert_eq!(
@@ -627,13 +627,14 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
             },
             deleted: COLLECT_BATCH,
             kept: 0,
+            left: 250 - COLLECT_BATCH,
             stopped: false,
         }
     );
     assert_eq!(count().await, 253 - COLLECT_BATCH);
     assert!(matches!(
         collector
-            .collect_idle(std::time::Duration::ZERO, &|| false)
+            .collect_idle(std::time::Duration::ZERO, COLLECT_BATCH, &|| false)
             .await,
         Err(ReplicaError::Late)
     ));
@@ -646,7 +647,9 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
     };
     assert_eq!(
         valid
-            .collect_idle(std::time::Duration::from_secs(3600), &|| false)
+            .collect_idle(std::time::Duration::from_secs(3600), COLLECT_BATCH, &|| {
+                false
+            })
             .await
             .unwrap(),
         IdleCollected::Collected {
@@ -656,11 +659,12 @@ async fn an_idle_collection_deletes_below_the_released_snapshot_and_stops_at_a_l
             },
             deleted: 0,
             kept: 250 - COLLECT_BATCH,
+            left: 0,
             stopped: false,
         }
     );
     valid
-        .collect_idle(std::time::Duration::ZERO, &|| false)
+        .collect_idle(std::time::Duration::ZERO, COLLECT_BATCH, &|| false)
         .await
         .unwrap();
     let mut left: Vec<String> = {

@@ -127,7 +127,7 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_restore_failures_total` | counter | none | Restores that failed or ran out of time; the next event restores again. |
 | `wasmkeep_snapshot_upload_failures_total` | counter | none | Snapshot uploads not acknowledged; a periodic one is tried again. |
 | `wasmkeep_idle_snapshots_total` | counter | `outcome` (`created`, `existed`, `failed`, `refused`, `busy`) | Snapshots at the head taken when an actor hibernates. |
-| `wasmkeep_idle_compactions_total` | counter | `outcome` (`done`, `changed`, `nothing`, `refused`, `busy`) | Idle passes a retention window after an actor's release, by outcome. |
+| `wasmkeep_idle_compactions_total` | counter | `outcome` (`done`, `continued`, `stopped`, `changed`, `nothing`, `refused`, `busy`) | Idle passes a retention window after an actor's release, and the passes continuing one stopped at its deadline, by outcome. |
 | `wasmkeep_idle_passes_dropped_total` | counter | none | Idle passes not remembered because the node's queue was full. |
 | `wasmkeep_history_collected_total` | counter | none | Objects of actors' history deleted from the bucket by garbage collection. |
 | `wasmkeep_history_collect_failures_total` | counter | none | Garbage-collection passes that failed; the next snapshot tries again. |

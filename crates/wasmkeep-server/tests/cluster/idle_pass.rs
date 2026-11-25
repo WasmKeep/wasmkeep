@@ -97,7 +97,15 @@ async fn export(store: &Arc<dyn ObjectStore>, name: &str, point: Point) -> (hist
     (result, n)
 }
 
-const OUTCOMES: [&str; 5] = ["done", "changed", "nothing", "refused", "busy"];
+const OUTCOMES: [&str; 7] = [
+    "done",
+    "continued",
+    "stopped",
+    "changed",
+    "nothing",
+    "refused",
+    "busy",
+];
 
 /// Every outcome's count.
 async fn all_compactions() -> Vec<u64> {
@@ -129,6 +137,168 @@ async fn run_passes(node: &Node) -> &'static str {
         .collect();
     assert_eq!(moved.len(), 1, "{moved:?}");
     moved[0]
+}
+
+/// Lets `node`'s one remembered pass run now, waits until it was counted,
+/// and stops the node taking another: its outcome. Unlike [`run_passes`],
+/// the queue may hold the pass's continuation after it.
+async fn run_one_pass(node: &Node) -> &'static str {
+    let before = all_compactions().await;
+    node.service.idle_passes_due_now();
+    node.service.pause_idle_passes(false);
+    eventually("the idle pass ran", async || {
+        all_compactions().await != before
+    })
+    .await;
+    node.service.pause_idle_passes(true);
+    // Its job's hibernation.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = all_compactions().await;
+    let moved: Vec<&str> = OUTCOMES
+        .iter()
+        .zip(before.iter().zip(&after))
+        .filter(|(_, (b, a))| a > b)
+        .map(|(o, _)| *o)
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    moved[0]
+}
+
+/// Two bursts of `t/<name>` on `a`, hibernated, the window passed: the
+/// keys then, and the export at the head.
+async fn burst_and_rest(
+    a: &Node,
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+) -> (Vec<String>, history::Export) {
+    writes(a, name, 0, 5).await;
+    hibernated(a).await;
+    writes(a, name, 5, 5).await;
+    hibernated(a).await;
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    let before = actor_keys(store, name).await;
+    let (head, n) = export(store, name, Point::Head).await;
+    assert_eq!(n, 10);
+    tokio::time::sleep(WINDOW + Duration::from_millis(200)).await;
+    (before, head)
+}
+
+/// The fleet's case (an actor with thousands of objects lost one batch
+/// and stopped), made deterministic: each pass deletes one batch of 2,
+/// then stops as at its deadline. Each stopped pass is counted
+/// `continued` and queues the next on the record its own release wrote,
+/// one generation up, for the writer's snapshot; the last is `done`. The
+/// prefix ends as the snapshot at the head and its segment, the database
+/// unchanged, and a restore on the other node reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_stopped_at_its_deadline_is_continued_until_the_history_is_compact() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = compacting("a", da.path(), &store, WINDOW).await;
+    let b = compacting("b", db.path(), &store, WINDOW).await;
+    settle().await;
+    let (before, head) = burst_and_rest(&a, &store, "long").await;
+    let gone = before.len() - 2;
+    assert!(gone >= 5, "not several batches: {before:?}");
+    a.service.limit_idle_passes(Some((2, 1)));
+    let passes = gone.div_ceil(2);
+    for pass in 1..=passes {
+        let outcome = run_one_pass(&a).await;
+        let left = actor_keys(&store, "long").await;
+        assert_eq!(
+            left.len(),
+            before.len() - (2 * pass).min(gone),
+            "pass {pass}"
+        );
+        let queued = a.service.idle_passes_queued();
+        if pass < passes {
+            assert_eq!(outcome, "continued", "pass {pass}");
+            // The continuation: on the record this pass's release wrote,
+            // at its hold's generation.
+            let (holder, generation) = owner_record(&store, "long").await.unwrap();
+            assert_eq!(holder, None);
+            assert_eq!(generation, head.position.generation + pass as u64);
+            assert_eq!(queued.len(), 1, "pass {pass}: {queued:?}");
+            assert_eq!(queued[0].1, generation, "pass {pass}");
+        } else {
+            assert_eq!(outcome, "done", "pass {pass}");
+            assert!(queued.is_empty(), "{queued:?}");
+        }
+    }
+    let after = actor_keys(&store, "long").await;
+    assert_eq!(after.len(), 2, "not S and the segment at P: {after:?}");
+    let (again, n) = export(&store, "long", Point::Head).await;
+    assert_eq!(
+        (again.position, again.raw_checksum, n),
+        (head.position, head.raw_checksum, 10)
+    );
+    assert_eq!(
+        again.owner_generation,
+        Some(head.position.generation + passes as u64),
+        "one generation per pass"
+    );
+    let r = send(b.addr, "GET", "/actor/t/long/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "10", Some("b")),
+        "{}",
+        r.body
+    );
+}
+
+/// A write between two passes of a chain: the actor woken on the other
+/// node acquires the record the first pass released, writes and
+/// hibernates. The continuation then finds the record changed, as a first
+/// pass after a wake does, and deletes nothing; on the node that queued
+/// it, any acquisition (a wake here) forgets it instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_between_two_passes_stops_the_chain() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = compacting("a", da.path(), &store, WINDOW).await;
+    let b = compacting("b", db.path(), &store, WINDOW).await;
+    settle().await;
+    let (before, _) = burst_and_rest(&a, &store, "between").await;
+    assert!(before.len() - 2 >= 5, "not several batches: {before:?}");
+    a.service.limit_idle_passes(Some((2, 1)));
+    assert_eq!(run_one_pass(&a).await, "continued");
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    // Elsewhere: b takes the record the pass released, and writes.
+    let r = send(b.addr, "POST", "/actor/t/between/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "11", Some("b")),
+        "{}",
+        r.body
+    );
+    hibernated(&b).await;
+    let keys = actor_keys(&store, "between").await;
+    let (head, n) = export(&store, "between", Point::Head).await;
+    assert_eq!(n, 11);
+    assert_eq!(run_one_pass(&a).await, "changed");
+    assert!(a.service.idle_passes_queued().is_empty());
+    assert_eq!(actor_keys(&store, "between").await, keys, "deleted");
+    let (again, n) = export(&store, "between", Point::Head).await;
+    assert_eq!(
+        (again.position, again.raw_checksum, n),
+        (head.position, head.raw_checksum, 11)
+    );
+    // Here: a wake between two passes forgets the continuation.
+    let (before, _) = burst_and_rest(&a, &store, "here").await;
+    assert!(before.len() - 2 >= 5, "not several batches: {before:?}");
+    assert_eq!(run_one_pass(&a).await, "continued");
+    assert_eq!(a.service.idle_passes_queued().len(), 1);
+    let r = send(a.addr, "GET", "/actor/t/here/durable", "").await;
+    assert_eq!(
+        (r.status, r.body.trim(), r.node.as_deref()),
+        (200, "10", Some("a")),
+        "{}",
+        r.body
+    );
+    assert!(
+        a.service.idle_passes_queued().is_empty(),
+        "the wake here forgot it"
+    );
 }
 
 /// ADR 0042, Tests, "Restore identical": a burst over two generations,

@@ -1772,7 +1772,11 @@ lease; deleted objects are counted by `wasmkeep_history_collected_total`
   write at the head. Up to 4 passes run at once per node and app, a new
   one starting as soon as one ends; a pass deletes for at most 5 s, and
   stops as soon as a request for the actor waits behind it or the node
-  begins draining. A wake, a move or an expiry in between changed the
+  begins draining. A pass stopped at its 5 s leaves the rest to another
+  pass 5 s later, on the record its own release wrote, and so on until
+  the history is compact (up to 1,000 passes, given up after 3 in a row
+  that delete nothing): a large history takes one of the 4 at a time,
+  behind every other pass due. A wake, a move or an expiry in between changed the
   record, and the pass is dropped; so is one on a draining node, of an
   app deleted, restoring or recreated since the node started, or of a
   class with `expire-after-idle` (the pass's rewrites would restart its
@@ -1784,7 +1788,8 @@ lease; deleted objects are counted by `wasmkeep_history_collected_total`
 What stays uncompacted: actors released by a node that then restarted
 within the window (the memory is lost), actors woken within the window
 without writing, actors whose node crashed, actors whose release's answer
-was lost, and what a stopped pass did not reach; each is compacted after
+was lost, what a pass stopped by a request, a drain or the end of its
+hold did not reach, and what a chain of passes gave up on; each is compacted after
 it next writes and rests for a window. `--no-idle-compaction` turns both steps off. Late uploads of
 earlier owners that land after a pass stay until the next pass. Old
 deploy versions are removed by `wasmkeep deploy` (see
