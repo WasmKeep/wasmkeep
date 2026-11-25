@@ -1,9 +1,11 @@
 # 0044. Traces
 
-- Status: accepted (2026-11-25), not built. The exporter of section 5 is
-  the choice, on one condition written there as a check: the binary's
-  size and the dependency checks are measured on the branch that builds
-  it.
+- Status: accepted (2026-11-25); the first slice is built (the context,
+  the exporter, and the `request`, `front`, `event` and `bucket` spans on
+  one node). The `call` and `hop` spans and section 3 are not built. The
+  exporter of section 5 is the choice: its size and dependency checks
+  were measured on the building branch and the size accepted there; the
+  load test is still to run.
 - Milestone: `0.9.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: ADR 0011 (the cluster port), ADR 0023 (the front; the
   `x-wasmkeep-` range is the host's), ADR 0025 (several calls at once),
@@ -134,6 +136,17 @@ The context is the W3C Trace Context header:
 version below `ff` with a short value) is treated as absent, and a new
 trace starts. The value the guest then sees is the host's.
 
+**Within the head limits.** The host adds or replaces a guest's header
+only if the client's part of the head stays within the head limits with
+it (the rule of section 3, condition 2); otherwise the guest receives the
+request as the client sent it.
+
+**In the first slice.** All of the above holds on one node. A call that
+leaves the node carries the host's `traceparent` (the calling event's or
+front's context, the guest's value replaced), with no `call` or `hop`
+span yet. A forward carries nothing from the node that received it: the
+client's header, if any, goes on unchanged, as with tracing off.
+
 ### 3. On a hop
 
 Nothing on a hop is signed differently, and no header is added to the
@@ -187,6 +200,13 @@ the header's sampled flag.
   three values (trace id, a parent id, the flag) to pass on, creates no
   span object and exports nothing.
 
+**In the first slice** a hop is not yet told from a request from
+outside: every request a node receives, on either port, is drawn at that
+node's ratio, or follows the incoming flag under
+`--trace-trust-incoming`. A trace that crosses nodes can be sampled on
+one and not on the next. No client and no guest gains anything by it:
+without the trust flag nothing they send decides.
+
 A call's signature does not cover `traceparent`. On plain HTTP between
 nodes (`accept` mode), someone on that network path could flip the flag
 or the id. They can already read every request there; what they gain is
@@ -237,7 +257,9 @@ x86-64, the pinned toolchain, the release profile (symbols stripped),
 
 **+545,280 bytes, 0.95%.**
 
-Added to the CLI crate, exact versions, default features off:
+Added to the CLI crate in that build, exact versions, default features
+off (the implementation adds the first three to the server crate, and
+not the fourth):
 
 - `opentelemetry` 0.33.1 (`trace`)
 - `opentelemetry_sdk` 0.33.1 (`trace`)
@@ -286,8 +308,54 @@ this record:
 If the size or the dependency checks come out materially worse than the
 table above, or the load test fails, the alternative kept in reserve
 applies: spans as structured log lines with no new dependency
-("Alternatives rejected"). The span places and the context are the same
-either way.
+("Alternatives rejected"), unless the project accepts the measured cost
+in this record. The span places and the context are the same either way.
+
+#### The check on the building branch (2026-11-25)
+
+On `feat/traces`, based on `a531d27d86d54112495955a0b79ee48bca38fd21`,
+Linux x86-64, rustc 1.99.1, the same stripped release profile and
+`cargo build --release -p wasmkeep-cli` before and after:
+
+| | Before | After |
+|---|---|---|
+| `wasmkeep` binary | 57,450,544 bytes | 60,063,408 bytes |
+| Packages in `Cargo.lock` | 448 | 460 |
+| `cargo deny check` | Not rerun on the baseline | advisories, bans, licenses, sources ok |
+
+**+2,612,864 bytes, 4.55%**, against the 0.95% of the throwaway build.
+
+The 12 added packages are `opentelemetry`, `opentelemetry_sdk`,
+`opentelemetry-otlp`, `opentelemetry-http`, `opentelemetry-proto`,
+`prost`, `prost-derive`, `futures-executor`, `portable-atomic`,
+`rand` 0.9, `rand_chacha` 0.9 and `rand_core` 0.9: the estimate's list
+less `tracing-opentelemetry`, which is not used. No `deny.toml` exception
+was added. Dependency notices and the license inventory were regenerated.
+
+How each part of the check came out:
+
+- **Dependencies: passed.** One package fewer than estimated, the same
+  licenses, no exception.
+- **Size: larger than estimated, and accepted.** The project accepts
+  +2,612,864 bytes (4.55%) for `0.9.0` and keeps OTLP. The fallback
+  would save that and give up what this record is for: structured log
+  lines need a log pipeline the operator builds before one request can be
+  followed across nodes. A cargo feature was considered and not taken: on
+  by default it saves nothing in the released binary, and off by default
+  the released binary has no traces. The OpenTelemetry crates are used in
+  two files (`traces.rs`, `traces/exporter.rs`); the host's own code
+  already carries the context, samples, queues and batches, so replacing
+  the SDK with a hand-written OTLP encoder stays possible if the size
+  matters later. That was not measured.
+- **Load: open.** The comparison with tracing off and at the default
+  ratio has not been run. The exporter is not final until it passes; the
+  log-line fallback applies if it fails.
+
+The exporter uses asynchronous `reqwest` on a thread and a
+current-thread runtime of its own, with no `blocking` feature. Its
+client follows no redirect and takes no proxy from the environment.
+Compression is not built in: `OTEL_EXPORTER_OTLP_COMPRESSION` is ignored
+with a warning.
 
 ### 6. How spans are made
 
@@ -314,8 +382,14 @@ the implementer's to confirm.
 **Logs.** A warning or an error logged inside a sampled span carries
 `trace_id` as a field. Nothing else changes in the log.
 
-**With tracing off** each of the six places tests one process-wide
-boolean.
+**With tracing off** each of the places does one read that finds
+nothing: whether the process has a tracer (set once at start, never when
+no endpoint is given), or whether the running task carries a context
+(none does). No random number is drawn, no header is read or written,
+and nothing is measured for an attribute.
+
+**Attributes that change.** A span's `outcome` starts as `not_run` and is
+replaced by what happened; it is written once, when the span ends.
 
 ## Alternatives rejected
 
@@ -361,9 +435,9 @@ boolean.
 - With tracing on, the host replaces `traceparent` on `actors.call`. An
   app that carried its own context in that header between actors loses
   it there; it can use a header of its own.
-- The binary grows, by about half a megabyte and 13 packages in the one
-  build measured; each package is one more to keep through the
-  dependency checks.
+- The binary grows by 2.6 MB (4.55%) and 12 packages, measured on the
+  building branch (section 5); each package is one more to keep through
+  the dependency checks.
 - A trace through a node of the previous version has a gap.
 - Bucket spans exist only inside sampled traces. The request counts and
   histograms stay the full picture of bucket use.
@@ -397,8 +471,8 @@ boolean.
 
 ## Not settled
 
-1. **The dependency cost on the real branch** (section 5, the check).
-   One throwaway build was measured; the implementation is not.
+1. ~~The dependency cost on the real branch.~~ Settled (section 5, the
+   check on the building branch): measured, the size accepted.
 2. **Run-time cost.** Not measured at all. The load test at the default
    ratio is the test.
 3. **The default ratio.** `0.01` is a starting value. Under the load
@@ -411,8 +485,8 @@ boolean.
 5. **Socket messages.** A trace per message is right at a low ratio and
    says nothing about a connection as a whole. Whether a socket's
    events should share one trace was left open.
-6. **`tracing-opentelemetry`.** Section 6 expects not to need it; the
-   implementation confirms.
-7. **The `reqwest` client flavour** for the batch processor (section 5).
+6. ~~`tracing-opentelemetry`.~~ Settled: not used.
+7. ~~The `reqwest` client flavour.~~ Settled: the asynchronous client, on
+   the exporter's own thread and runtime.
 8. **Whether the actor name belongs in attributes** for every operator.
    A switch to leave it out is cheap and was not designed.

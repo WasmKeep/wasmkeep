@@ -237,7 +237,10 @@ impl ServiceInner {
         }
 
         let head = request.method.eq_ignore_ascii_case("HEAD");
-        let req = build_request(caller, &target, request)?;
+        let mut req = build_request(caller, &target, request)?;
+        // The host's `traceparent`, before the call runs here or leaves the
+        // node: never the guest's (ADR 0044, section 2).
+        crate::traces::set_call_header(&mut req);
         let mut chain = chain.to_vec();
         if let Some(me) = me {
             chain.push(me.clone());

@@ -90,7 +90,10 @@ impl App {
                     && req.extensions().get::<ArrivedOnClusterPort>().is_none() =>
                 {
                     match &self.actors {
-                        Some(actors) => actors.blob_link(req).await,
+                        Some(actors) => {
+                            crate::traces::attribute("route", "file_link");
+                            actors.blob_link(req).await
+                        }
                         None => text_response(StatusCode::NOT_FOUND, "not found\n"),
                     }
                 }
@@ -111,7 +114,7 @@ impl App {
         if let Some(actors) = &self.actors
             && let Some(why) = actors.judge_hop(&mut req)
         {
-            tracing::warn!(reason = why, "a signed hop refused");
+            crate::traces::warn!(reason = why, "a signed hop refused");
             // A placed call refused so never ran: its sender runs it.
             return crate::cluster::hop_refusal(req.headers());
         }
@@ -145,6 +148,7 @@ impl App {
             if req.headers().contains_key(hyper::header::UPGRADE) {
                 return actors.upgrade(&target.class, &target.name, req).await;
             }
+            crate::traces::attribute("route", "actor");
             return actors.handle(&target.class, &target.name, req).await;
         }
         // `/actor/` never reaches the front, nor does anything that came in
@@ -162,6 +166,7 @@ impl App {
         if let Some(assets) = &assets
             && let Some(response) = assets.answer(&req).await
         {
+            crate::traces::attribute("route", "asset");
             return response;
         }
         let (spa, immutable, unmatched) = assets
@@ -172,7 +177,10 @@ impl App {
             unmatched && self.front.as_ref().is_none_or(|front| !front.has_version());
         let head_not_found = host_not_found && req.method() == hyper::Method::HEAD;
         let mut response = match &self.front {
-            Some(front) => front.serve(req, self.actors.as_ref()).await,
+            Some(front) => {
+                crate::traces::attribute("route", "front");
+                front.serve(req, self.actors.as_ref()).await
+            }
             None => text_response(StatusCode::NOT_FOUND, "not found\n"),
         };
         if spa {
@@ -293,7 +301,7 @@ const HOP_RESERVE_HEADERS: usize = 32;
 /// The client's part of `req`'s head, as the wire counts it: the request
 /// line and each header that is not a node's, name, value and 4 bytes of
 /// framing; and how many such headers.
-fn client_head<B>(req: &Request<B>) -> (usize, usize) {
+pub(crate) fn client_head<B>(req: &Request<B>) -> (usize, usize) {
     let target = req.uri().path_and_query().map_or(1, |p| p.as_str().len())
         + req.uri().authority().map_or(0, |a| a.as_str().len() + 8);
     let line = req.method().as_str().len() + target + " HTTP/1.1\r\n ".len();
@@ -763,7 +771,7 @@ pub(crate) async fn serve_served(
                     // kill the server, nor spin it: back off, and log the
                     // first of a run and then every hundredth.
                     if accept_errors.is_multiple_of(100) {
-                        tracing::warn!(error = %e, "accept failed");
+                        crate::traces::warn!(error = %e, "accept failed");
                     }
                     accept_errors = accept_errors.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -806,7 +814,7 @@ pub(crate) async fn serve_served(
     })
     .await;
     if drained.is_err() {
-        tracing::warn!("shutdown grace period elapsed with connections still open");
+        crate::traces::warn!("shutdown grace period elapsed with connections still open");
         connections.abort_all();
         while connections.join_next().await.is_some() {}
         // Aborting the cluster task drops its connection set, which aborts
@@ -861,7 +869,7 @@ async fn serve_cluster_port(
                 }
                 Err(e) => {
                     if accept_errors.is_multiple_of(100) {
-                        tracing::warn!(error = %e, "cluster port: accept failed");
+                        crate::traces::warn!(error = %e, "cluster port: accept failed");
                     }
                     accept_errors = accept_errors.saturating_add(1);
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -937,63 +945,75 @@ async fn serve_connection<I>(
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
-            let (bytes, count) = client_head(&req);
-            if bytes > MAX_REQUEST_HEAD_BYTES || count > MAX_REQUEST_HEADERS {
-                return Ok(head_too_large());
+            let mut trace = crate::traces::request(&mut req);
+            let result = trace
+                .run(async move {
+                    let (bytes, count) = client_head(&req);
+                    if bytes > MAX_REQUEST_HEAD_BYTES || count > MAX_REQUEST_HEADERS {
+                        return Ok(head_too_large());
+                    }
+                    req.extensions_mut().insert(PeerAddress(peer));
+                    let Some(cluster) = cluster else {
+                        let response = match &app {
+                            Served::One(app) => app.route(req).await,
+                            Served::Table(t) => t.route_public(req, &first).await,
+                        };
+                        return Ok::<_, std::convert::Infallible>(response);
+                    };
+                    if !cluster.is_live() {
+                        // Its heartbeat expired or its pin changed since the
+                        // handshake: no more requests on this connection.
+                        return Ok(not_live());
+                    }
+                    if !cluster_serves(req.uri().path()) {
+                        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
+                    }
+                    // A hop that names its sender must come over that node's own
+                    // connection (ADR 0038, section 5); its signature, checked
+                    // later, binds the name.
+                    if !crate::cluster::sender_presented(req.headers(), Some(&cluster))
+                        && !cluster.sender_listed_soon(req.headers()).await
+                    {
+                        return Ok(text_response(
+                            StatusCode::FORBIDDEN,
+                            "the hop's sender does not publish this connection's certificate\n",
+                        ));
+                    }
+                    let sender = req
+                        .headers()
+                        .get(crate::cluster::SENDER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(crate::cluster::sender_named)
+                        .map(str::to_owned);
+                    let cluster = cluster.sent_by(sender.as_deref());
+                    req.extensions_mut()
+                        .insert(ArrivedOnClusterPort(cluster.clone()));
+                    let response = match &app {
+                        Served::One(app) => app.route(req).await,
+                        Served::Table(t) => t.route_cluster(req).await,
+                    };
+                    // Nor is an answer delivered to a peer whose pin lapsed while
+                    // its request ran, or streamed on after that. The connection
+                    // stays: its next request is refused, and closes it. The
+                    // request ran (a durable write in it may have landed): the
+                    // answer says the outcome is unknown, never "retry".
+                    if !cluster.is_live() {
+                        return Ok(crate::cluster::outcome_unknown(
+                            "the node's certificate stopped being live during the request",
+                        ));
+                    }
+                    Ok(response.map(|body| {
+                        crate::cluster_tls::revocable_body(
+                            body,
+                            Arc::new(move || cluster.is_live()),
+                        )
+                    }))
+                })
+                .await;
+            if let Ok(response) = &result {
+                trace.attribute("status", i64::from(response.status().as_u16()));
             }
-            req.extensions_mut().insert(PeerAddress(peer));
-            let Some(cluster) = cluster else {
-                let response = match &app {
-                    Served::One(app) => app.route(req).await,
-                    Served::Table(t) => t.route_public(req, &first).await,
-                };
-                return Ok::<_, std::convert::Infallible>(response);
-            };
-            if !cluster.is_live() {
-                // Its heartbeat expired or its pin changed since the
-                // handshake: no more requests on this connection.
-                return Ok(not_live());
-            }
-            if !cluster_serves(req.uri().path()) {
-                return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
-            }
-            // A hop that names its sender must come over that node's own
-            // connection (ADR 0038, section 5); its signature, checked
-            // later, binds the name.
-            if !crate::cluster::sender_presented(req.headers(), Some(&cluster))
-                && !cluster.sender_listed_soon(req.headers()).await
-            {
-                return Ok(text_response(
-                    StatusCode::FORBIDDEN,
-                    "the hop's sender does not publish this connection's certificate\n",
-                ));
-            }
-            let sender = req
-                .headers()
-                .get(crate::cluster::SENDER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::cluster::sender_named)
-                .map(str::to_owned);
-            let cluster = cluster.sent_by(sender.as_deref());
-            req.extensions_mut()
-                .insert(ArrivedOnClusterPort(cluster.clone()));
-            let response = match &app {
-                Served::One(app) => app.route(req).await,
-                Served::Table(t) => t.route_cluster(req).await,
-            };
-            // Nor is an answer delivered to a peer whose pin lapsed while
-            // its request ran, or streamed on after that. The connection
-            // stays: its next request is refused, and closes it. The
-            // request ran (a durable write in it may have landed): the
-            // answer says the outcome is unknown, never "retry".
-            if !cluster.is_live() {
-                return Ok(crate::cluster::outcome_unknown(
-                    "the node's certificate stopped being live during the request",
-                ));
-            }
-            Ok(response.map(|body| {
-                crate::cluster_tls::revocable_body(body, Arc::new(move || cluster.is_live()))
-            }))
+            result
         }
     });
     // A hop carries the client's head and the node's own headers; the

@@ -831,3 +831,48 @@ fn placement_is_a_process_switch_on_by_default() {
     assert!(serve(&["--no-placement"]).unwrap().no_placement);
     assert!(!serve(&[]).unwrap().no_placement);
 }
+
+#[test]
+fn traces_node_file_settings_and_ratio_validation() {
+    let text = "[process]\notlp-endpoint = 'http://localhost:4318'\ntrace-sample = 0.5\ntrace-trust-incoming = true\n[[app]]\nname = 'acme/shop'\n";
+    let file = parse_any(text, at()).unwrap();
+    assert_eq!(
+        file.process.otlp_endpoint.as_deref(),
+        Some("http://localhost:4318")
+    );
+    assert_eq!(file.process.trace_sample, Some(0.5));
+    assert_eq!(file.process.trace_trust_incoming, Some(true));
+    for invalid in ["-0.1", "1.1", "nan", "inf", "'0.5'"] {
+        assert!(err_any(&text.replace("0.5", invalid)).contains("trace-sample"));
+    }
+    for ratio in ["0", "1", "0.0", "1.0"] {
+        assert!(parse_any(&text.replace("0.5", ratio), at()).is_ok());
+    }
+}
+
+#[test]
+fn traces_cli_defaults_overrides_and_node_round_trip() {
+    let args = serve(&[]).unwrap();
+    assert!(args.otlp_endpoint.is_none());
+    assert_eq!(args.trace_sample, 0.01);
+    assert!(!args.trace_trust_incoming);
+    for value in ["NaN", "inf", "1.1", "-0.1"] {
+        assert!(serve(&["--trace-sample", value]).is_err());
+    }
+    let args = serve(&[
+        "--bucket",
+        "s3://b",
+        "--app",
+        "acme/shop",
+        "--otlp-endpoint",
+        "http://collector:4318",
+        "--trace-sample",
+        "0.25",
+        "--trace-trust-incoming",
+    ])
+    .unwrap();
+    let round = through_file(&NodeFile::from_serve(&args).unwrap());
+    assert_eq!(round.otlp_endpoint, args.otlp_endpoint);
+    assert_eq!(round.trace_sample, args.trace_sample);
+    assert!(round.trace_trust_incoming);
+}

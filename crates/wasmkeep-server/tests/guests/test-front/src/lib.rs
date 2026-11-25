@@ -1,10 +1,12 @@
 //! Test front: a component of the `wasmkeep:actor/front` world. Routes (any
 //! method; the query's values percent-encoded):
-//! - `/call?to=CLASS/NAME&path=P[&method=M][&delay=MS][&spoof][&copy]`:
+//! - `/call?to=CLASS/NAME&path=P[&method=M][&delay=MS][&spoof][&traceparent=V][&copy]`:
 //!   waits MS (no CPU), then `actors.call` with M (GET) and P; answers
 //!   `STATUS:BODY` (the body's trailing whitespace trimmed),
 //!   or `err:KIND[:DETAIL]`. With `spoof`, the request carries
-//!   `x-wasmkeep-` headers the host must drop. With `copy`, answers the callee's
+//!   `x-wasmkeep-` headers the host must drop. With `traceparent=V`, it
+//!   carries `traceparent: V`, which the host replaces when tracing is on
+//!   (ADR 0044). With `copy`, answers the callee's
 //!   status, headers (trapping if one is refused) and body as they came,
 //!   plus `x-callee-range: NAMES`: the names of the callee's headers in
 //!   the `x-wasmkeep-` range, comma-separated.
@@ -294,6 +296,9 @@ impl wasip2::exports::http::incoming_handler::Guest for Front {
                     for (k, v) in SPOOFED {
                         headers.push(((*k).to_owned(), (*v).to_owned()));
                     }
+                }
+                if let Some(value) = param(query, "traceparent") {
+                    headers.push(("traceparent".to_owned(), value));
                 }
                 let request = actors::Request {
                     method: param(query, "method").unwrap_or_else(|| "GET".into()),

@@ -1202,7 +1202,8 @@ impl Ticket {
             .send_replace(Slot::Uploading { id, post_apply });
         self.reported = true;
         let alarm = self.alarm.take();
-        self.runtime.spawn(async move {
+        let context = crate::traces::current();
+        self.runtime.spawn(crate::traces::scope(context, async move {
             // One budget for the entry and the segment (ADR 0034, section 9).
             let until = tokio::time::Instant::now() + target.budget_for(bytes.len());
             if let Some(entry) = alarm.as_ref().and_then(|a| a.publish.clone().map(|e| (a, e))) {
@@ -1246,13 +1247,13 @@ impl Ticket {
             {
                 tracing::debug!(prefix = %crate::logging::text(&target.prefix), error = %e, "retiring an alarm entry failed");
             }
-        });
+        }));
         Ok(id)
     }
 
     /// Records a failed hand-off: the flag now, the outcome in the cell.
     fn fail(&mut self, reason: String) -> ReplicaError {
-        tracing::error!(prefix = %crate::logging::text(&self.target.prefix), segment = ?self.segment.id, %reason, "a batched capture failed: replication stops");
+        crate::traces::error!(prefix = %crate::logging::text(&self.target.prefix), segment = ?self.segment.id, %reason, "a batched capture failed: replication stops");
         self.reported = true;
         self.shared.failed(
             self.segment.id,

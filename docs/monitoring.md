@@ -819,3 +819,48 @@ per actor event. Its final test source was restored to the default 50 ms.
 The 500-million ceiling shares the full-window test helper with
 StarlingMonkey and provides at least 5x headroom for this diagnostic run.
 This measures work; it is not a successful default-budget test.
+
+## Traces
+
+Tracing is off by default. `wasmkeep serve --otlp-endpoint http://collector:4318`
+exports OTLP over HTTP with protobuf to the collector's standard traces path. `--trace-sample 0.01`
+(the default) samples one percent at random of everything that starts a
+trace on a node: a request received on the public port or the cluster
+port (a hop from another node included, for now), an alarm, and each
+socket message or close. The
+matching node-file settings are `[process]` `otlp-endpoint`, `trace-sample`
+and `trace-trust-incoming`. Collector credentials belong in
+`OTEL_EXPORTER_OTLP_HEADERS`, not the node file.
+
+An incoming `traceparent` keeps its trace id. Its sampled flag is ignored
+unless `--trace-trust-incoming` is set; with that flag both sampled and
+unsampled decisions are honoured. Use it only behind a proxy whose sampling
+you control. Guests receive their event or front context as an ordinary
+`traceparent` header, unless adding it would take the client's part of
+the request head past the head limits (64 KiB, 100 fields): the request
+then goes on as the client sent it. On `actors.call` the host sets the
+header from the calling event, replacing a guest's own. With tracing off,
+headers pass through unchanged.
+
+Spans cover HTTP requests, front execution, actor events (including wake-up)
+and their bucket requests. Background maintenance is not traced. Attributes
+include actor names but no request paths, query strings, headers, bodies or
+bucket keys; a method outside the standard ones reads `other`.
+
+**Across nodes, not yet.** A forwarded request carries no context from the
+node that received it, and each node draws its own sample: the owner's
+spans are a trace of their own (or join the client's trace id, if it sent
+one). An `actors.call` to another node does carry the caller's trace id,
+but the receiving node still draws its own sample unless it runs with
+`--trace-trust-incoming`. A trace through several nodes can therefore be
+partial. Hop spans and following the first node's decision are the next
+slice of [ADR 0044](adr/0044-traces.md#3-on-a-hop).
+
+Export uses a bounded queue of 2,048 spans, batches of up to 256, a two-second
+export timeout and a three-second shutdown flush. A slow collector never
+blocks a request. The exporter follows no redirect and takes no proxy from
+the environment, and sends spans uncompressed
+(`OTEL_EXPORTER_OTLP_COMPRESSION` is ignored, with a warning). Watch `wasmkeep_trace_spans_dropped_total` and
+`wasmkeep_trace_exports_total{outcome="ok"|"error"}`. Export failures log
+at most once a minute. Add the node-file keys only after upgrade finalization,
+or remove them before returning to 0.8.1, which rejects unknown keys.

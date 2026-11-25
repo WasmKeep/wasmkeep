@@ -9,6 +9,12 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+### Added
+
+- **Traces** (ADR 0044, first slice): optional OTLP/HTTP export
+  (`--otlp-endpoint`) of spans for requests, fronts, actor events and
+  their bucket requests. Off by default.
+
 ### Removed
 
 - **`wasmkeep cluster migrate` is removed** (ADR 0022), with

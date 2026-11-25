@@ -378,6 +378,18 @@ pub(super) fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) 
         "Alarm deliveries the mailbox dropped before they answered, rescheduled with backoff.",
         m.alarm_dropped_deliveries.load(Ordering::Relaxed),
     );
+    counter(
+        &mut out,
+        "wasmkeep_trace_spans_dropped_total",
+        "Spans dropped by the bounded export queue.",
+        m.trace_spans_dropped.load(Ordering::Relaxed),
+    );
+    family(
+        &mut out,
+        "wasmkeep_trace_exports_total",
+        "Trace export batches by outcome.",
+        &m.trace_exports,
+    );
     family(
         &mut out,
         "wasmkeep_bucket_requests_total",

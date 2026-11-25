@@ -13,120 +13,197 @@ impl ActorState {
         path: String,
         opener: Opener,
     ) -> Result<Result<(), String>, String> {
-        self.chain = Arc::from(Vec::new());
-        // A socket from outside: under `existing` the actor must exist,
-        // checked in this event (it may have been deleted since the
-        // upgrade's check), with the rules of the class it takes. One the
-        // front handed over is inside (ADR 0027).
-        match self.admit(opener == Opener::Outside).await? {
-            Admitted::Yes => {}
-            Admitted::Missing => return Err("no such actor".into()),
-            Admitted::Unavailable(why) => return Err(why),
-            Admitted::Forbidden => return Err("not reachable from outside".into()),
-            Admitted::Unconfigured(name) => return Err(format!("{name} is not set")),
-        }
-        match self.ensure_owner().await {
-            Ok(()) => {}
-            // Rare: ownership changed between the upgrade's check and now.
-            Err(OwnershipError::NotOwner { owner, .. }) => {
-                return Err(format!("actor runs on node {owner}"));
+        let mut trace = crate::traces::Span::child("event");
+        if trace.recording() {
+            trace.attribute("tenant", self.address.tenant().to_owned());
+            trace.attribute("app", self.app_name.to_string());
+            if let Some(cluster) = &self.cluster {
+                trace.attribute("node", cluster.node_id.clone());
             }
-            // This node started draining since: the client reconnects and
-            // its upgrade goes to the peer.
-            Err(OwnershipError::Elsewhere { peer }) => {
-                return Err(format!("node draining; actor moves to node {peer}"));
-            }
-            Err(
-                OwnershipError::Unavailable(e)
-                | OwnershipError::Refused(e)
-                | OwnershipError::Broken(e),
-            ) => {
-                return Err(format!("lease: {e}"));
-            }
+            trace.attribute("class", self.address.class().to_owned());
+            trace.attribute("actor", self.address.name().to_owned());
+            trace.attribute("kind", "socket_open");
+            trace.attribute("woken", self.live.is_none());
+            trace.attribute(
+                "mailbox_wait_seconds",
+                self.timing
+                    .mailbox_wait_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1e9,
+            );
+            trace.attribute("outcome", "not_run");
         }
-        self.ensure_ready().await?;
-        self.install_call_context().await;
-        let live = self.live.as_mut().ok_or("actor not ready")?;
-        live.start_event("websocket");
-        // During its own open event the guest may send to the new socket
-        // and sees it in `connections`; no other event does until accepted.
-        live.store.data_mut().opening = Some(conn);
-        let run = limit(
-            self.limits.wall,
-            self.held.as_ref(),
-            live.core
-                .call_on_websocket_open(&mut live.store, conn, &path),
-        )
-        .await;
-        if let Some(live) = self.live.as_mut() {
-            live.store.data_mut().opening = None;
-        }
-        let trapped = !matches!(run, Ok(Ok(_)));
-        // Accepted in this same event, so the very next event (a message
-        // already queued behind it) sees the socket.
-        if matches!(run, Ok(Ok(Ok(())))) {
-            self.sockets.accept(conn);
-        }
-        self.finish_event(trapped).await;
-        match run {
-            Ok(Ok(accepted)) => Ok(accepted),
-            Ok(Err(trap)) => {
-                super::state::log_table_full(&self.app_name, &self.address, "websocket", &trap);
-                Err(format!("on-websocket-open trapped: {trap:#}"))
-            }
-            Err(cut) => Err(format!("on-websocket-open {cut}")),
-        }
+        trace
+            .run(async {
+                self.chain = Arc::from(Vec::new());
+                // A socket from outside: under `existing` the actor must exist,
+                // checked in this event (it may have been deleted since the
+                // upgrade's check), with the rules of the class it takes. One the
+                // front handed over is inside (ADR 0027).
+                match self.admit(opener == Opener::Outside).await? {
+                    Admitted::Yes => {}
+                    Admitted::Missing => return Err("no such actor".into()),
+                    Admitted::Unavailable(why) => return Err(why),
+                    Admitted::Forbidden => return Err("not reachable from outside".into()),
+                    Admitted::Unconfigured(name) => return Err(format!("{name} is not set")),
+                }
+                match self.ensure_owner().await {
+                    Ok(()) => {}
+                    // Rare: ownership changed between the upgrade's check and now.
+                    Err(OwnershipError::NotOwner { owner, .. }) => {
+                        return Err(format!("actor runs on node {owner}"));
+                    }
+                    // This node started draining since: the client reconnects and
+                    // its upgrade goes to the peer.
+                    Err(OwnershipError::Elsewhere { peer }) => {
+                        return Err(format!("node draining; actor moves to node {peer}"));
+                    }
+                    Err(
+                        OwnershipError::Unavailable(e)
+                        | OwnershipError::Refused(e)
+                        | OwnershipError::Broken(e),
+                    ) => {
+                        return Err(format!("lease: {e}"));
+                    }
+                }
+                self.ensure_ready().await?;
+                self.install_call_context().await;
+                let live = self.live.as_mut().ok_or("actor not ready")?;
+                live.start_event("websocket");
+                // During its own open event the guest may send to the new socket
+                // and sees it in `connections`; no other event does until accepted.
+                live.store.data_mut().opening = Some(conn);
+                let run = limit(
+                    self.limits.wall,
+                    self.held.as_ref(),
+                    live.core
+                        .call_on_websocket_open(&mut live.store, conn, &path),
+                )
+                .await;
+                if let Some(live) = self.live.as_mut() {
+                    live.store.data_mut().opening = None;
+                }
+                let trapped = !matches!(run, Ok(Ok(_)));
+                // Accepted in this same event, so the very next event (a message
+                // already queued behind it) sees the socket.
+                if matches!(run, Ok(Ok(Ok(())))) {
+                    self.sockets.accept(conn);
+                }
+                self.finish_event(trapped).await;
+                match run {
+                    Ok(Ok(accepted)) => Ok(accepted),
+                    Ok(Err(trap)) => {
+                        super::state::log_table_full(
+                            &self.app_name,
+                            &self.address,
+                            "websocket",
+                            &trap,
+                        );
+                        Err(format!("on-websocket-open trapped: {trap:#}"))
+                    }
+                    Err(cut) => Err(format!("on-websocket-open {cut}")),
+                }
+            })
+            .await
     }
 
     /// `on-websocket-message`.
     pub(super) async fn ws_message(&mut self, conn: u64, msg: WsMessageWit) {
-        // Closed by the server since the frame was read: not delivered (nor
-        // may it wake the actor or claim it).
-        if !self.sockets.is_open(&self.address, conn) {
-            return;
+        let mut trace = crate::traces::Span::child("event");
+        if trace.recording() {
+            trace.attribute("tenant", self.address.tenant().to_owned());
+            trace.attribute("app", self.app_name.to_string());
+            if let Some(cluster) = &self.cluster {
+                trace.attribute("node", cluster.node_id.clone());
+            }
+            trace.attribute("class", self.address.class().to_owned());
+            trace.attribute("actor", self.address.name().to_owned());
+            trace.attribute("kind", "socket_message");
+            trace.attribute("woken", self.live.is_none());
+            trace.attribute(
+                "mailbox_wait_seconds",
+                self.timing
+                    .mailbox_wait_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1e9,
+            );
+            trace.attribute("outcome", "not_run");
         }
-        if !self.ws_prepare(conn).await {
-            return;
-        }
-        let Some(live) = self.live.as_mut() else {
-            return;
-        };
-        let run = limit(
-            self.limits.wall,
-            self.held.as_ref(),
-            live.core
-                .call_on_websocket_message(&mut live.store, conn, &msg),
-        )
-        .await;
-        if let Ok(Err(trap)) = &run {
-            super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
-        }
-        self.ws_done(matches!(run, Ok(Ok(())))).await;
+        trace
+            .run(async {
+                // Closed by the server since the frame was read: not delivered (nor
+                // may it wake the actor or claim it).
+                if !self.sockets.is_open(&self.address, conn) {
+                    return;
+                }
+                if !self.ws_prepare(conn).await {
+                    return;
+                }
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                let run = limit(
+                    self.limits.wall,
+                    self.held.as_ref(),
+                    live.core
+                        .call_on_websocket_message(&mut live.store, conn, &msg),
+                )
+                .await;
+                if let Ok(Err(trap)) = &run {
+                    super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
+                }
+                self.ws_done(matches!(run, Ok(Ok(())))).await;
+            })
+            .await
     }
 
     /// `on-websocket-close`.
     pub(super) async fn ws_close(&mut self, conn: u64, code: u16, reason: String) {
-        // Closed by its actor's delete: the actor stays deleted.
-        if self.sockets.deleted(conn) {
-            return;
+        let mut trace = crate::traces::Span::child("event");
+        if trace.recording() {
+            trace.attribute("tenant", self.address.tenant().to_owned());
+            trace.attribute("app", self.app_name.to_string());
+            if let Some(cluster) = &self.cluster {
+                trace.attribute("node", cluster.node_id.clone());
+            }
+            trace.attribute("class", self.address.class().to_owned());
+            trace.attribute("actor", self.address.name().to_owned());
+            trace.attribute("kind", "socket_close");
+            trace.attribute("woken", self.live.is_none());
+            trace.attribute(
+                "mailbox_wait_seconds",
+                self.timing
+                    .mailbox_wait_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1e9,
+            );
+            trace.attribute("outcome", "not_run");
         }
-        if !self.ws_prepare(conn).await {
-            return;
-        }
-        let Some(live) = self.live.as_mut() else {
-            return;
-        };
-        let run = limit(
-            self.limits.wall,
-            self.held.as_ref(),
-            live.core
-                .call_on_websocket_close(&mut live.store, conn, code, &reason),
-        )
-        .await;
-        if let Ok(Err(trap)) = &run {
-            super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
-        }
-        self.ws_done(matches!(run, Ok(Ok(())))).await;
+        trace
+            .run(async {
+                // Closed by its actor's delete: the actor stays deleted.
+                if self.sockets.deleted(conn) {
+                    return;
+                }
+                if !self.ws_prepare(conn).await {
+                    return;
+                }
+                let Some(live) = self.live.as_mut() else {
+                    return;
+                };
+                let run = limit(
+                    self.limits.wall,
+                    self.held.as_ref(),
+                    live.core
+                        .call_on_websocket_close(&mut live.store, conn, code, &reason),
+                )
+                .await;
+                if let Ok(Err(trap)) = &run {
+                    super::state::log_table_full(&self.app_name, &self.address, "websocket", trap);
+                }
+                self.ws_done(matches!(run, Ok(Ok(())))).await;
+            })
+            .await
     }
 
     /// Readies the instance for a WebSocket event; false if it cannot run.
@@ -189,7 +266,7 @@ impl ActorState {
         // hibernated with the socket open): on a draining node that closes
         // it, and the client's reconnect goes to the peer (ADR 0014).
         if let Err(e) = self.ensure_owner().await {
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = ?e, "websocket event: no longer the owner");
+            crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = ?e, "websocket event: no longer the owner");
             match e {
                 // Another node owns the actor, or this draining node sends
                 // it to a peer: every socket of the actor here is on the
@@ -216,7 +293,7 @@ impl ActorState {
         if let Err(e) = self.ensure_ready().await {
             // Close rather than drop the message silently: the client
             // reconnects, and is answered (or refused) like a new socket.
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "websocket event: actor not ready");
+            crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "websocket event: actor not ready");
             self.sockets.close(
                 &self.address,
                 conn,
@@ -237,7 +314,7 @@ impl ActorState {
 
     pub(super) async fn ws_done(&mut self, ok: bool) {
         if !ok {
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "websocket event trapped; instance discarded");
+            crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), "websocket event trapped; instance discarded");
         }
         self.finish_event(!ok).await;
     }
@@ -344,11 +421,12 @@ impl ServiceInner {
             sockets: Arc::clone(&self.sockets),
             id,
         });
+        let context = crate::traces::current();
         let result = self
             .mailboxes
             .submit_wait_timed(&address, self.wall, move |s: &mut ActorState, waited| {
                 s.record_mailbox_wait(waited);
-                Box::pin(s.ws_open(id, path, opener))
+                Box::pin(crate::traces::scope(context, s.ws_open(id, path, opener)))
             })
             .await;
         let by_guest = matches!(result, Ok(Ok(Err(_))));
@@ -359,11 +437,11 @@ impl ServiceInner {
             Ok(Ok(Err(reason))) => Some((1008, reason)),
             Err(MailboxError::Capacity(_)) => Some((1013, "try again later".to_owned())),
             Ok(Err(e)) => {
-                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
+                crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
                 Some((1008, "unavailable".to_owned()))
             }
             Err(e) => {
-                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
+                crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&address), error = %e, "websocket open failed");
                 Some((1008, "unavailable".to_owned()))
             }
         };

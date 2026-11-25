@@ -443,7 +443,7 @@ impl FrontVersion {
             return false;
         }
         if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::error!(actor = FRONT_CLASS, variables = %missing.join(", "), "required values are not set: the front answers 503 (set them with `wasmkeep secrets set --front NAME`, or stop requiring them (`requires` in wasmkeep.toml, or `--front-requires` without a project file))");
+            crate::traces::error!(actor = FRONT_CLASS, variables = %missing.join(", "), "required values are not set: the front answers 503 (set them with `wasmkeep secrets set --front NAME`, or stop requiring them (`requires` in wasmkeep.toml, or `--front-requires` without a project file))");
         }
         true
     }
@@ -815,7 +815,7 @@ impl HttpComponent {
                 // upgrade, nor any other informational answer. Dropping
                 // `running` stops the instance.
                 if response.status().is_informational() {
-                    tracing::warn!(
+                    crate::traces::warn!(
                         status = response.status().as_u16(),
                         "front answered with an informational status"
                     );
@@ -848,7 +848,7 @@ impl HttpComponent {
                             };
                         }
                         Err(why) => {
-                            tracing::warn!(reason = why, "front answered a broken hand-off");
+                            crate::traces::warn!(reason = why, "front answered a broken hand-off");
                             running.abort.silence();
                             drop(running);
                             outcome(&app, "guest_error");
@@ -898,14 +898,14 @@ impl HttpComponent {
                 {
                     outcome(&app, "busy");
                     observe();
-                    tracing::warn!(error = %format!("{e:#}"), "front request: no instance free");
+                    crate::traces::warn!(error = %format!("{e:#}"), "front request: no instance free");
                     return busy();
                 }
                 let reason = reason(&e);
                 outcome(&app, reason);
                 observe();
                 log_table_full(&e);
-                tracing::warn!(reason, error = %format!("{e:#}"), "front request failed");
+                crate::traces::warn!(reason, error = %format!("{e:#}"), "front request failed");
                 internal_error()
             }
         }
@@ -918,6 +918,9 @@ impl HttpComponent {
         slot: Slot,
         version: Arc<FrontVersion>,
     ) -> wasmtime::Result<(Response<HyperOutgoingBody>, Running)> {
+        let mut req = req;
+        let mut trace = crate::traces::Span::child("front");
+        trace.inject(&mut req);
         let (mut store, meter) = self.runtime.new_metered_async_store_with_budget(
             self.host(actors, Arc::clone(&version.env)),
             self.cpu_budget,
@@ -946,39 +949,52 @@ impl HttpComponent {
         // long as the instance lives.
         let wall = self.wall;
         let task = tokio::task::spawn(async move {
-            let _slot = slot;
-            let run = async {
-                let proxy = pre.instantiate_async(&mut store).await?;
-                proxy
-                    .wasi_http_incoming_handler()
-                    .call_handle(&mut store, req, out)
-                    .await
-            };
-            // Past the wall the instance is dropped, which also ends a
-            // response still streaming.
-            let result = tokio::time::timeout(wall, run)
-                .await
-                .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
-            // Its guest work, instantiation included, whatever its end
-            // (not when the client left first: the task is aborted then).
-            crate::metrics::front_request_work(&app, meter.used(), meter.fuel_used(&store));
-            drop(store);
-            if was_sent.await.is_ok() && !counts.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                match &result {
-                    Ok(()) => outcome(&app, "ok"),
-                    Err(e) => {
-                        let reason = reason(e);
-                        outcome(&app, reason);
-                        log_table_full(e);
-                        tracing::warn!(
-                            reason,
-                            error = %format!("{e:#}"),
-                            "front request failed after its response began"
+            trace
+                .run(async move {
+                    let _slot = slot;
+                    let run = async {
+                        let proxy = pre.instantiate_async(&mut store).await?;
+                        proxy
+                            .wasi_http_incoming_handler()
+                            .call_handle(&mut store, req, out)
+                            .await
+                    };
+                    // Past the wall the instance is dropped, which also ends a
+                    // response still streaming.
+                    let result = tokio::time::timeout(wall, run)
+                        .await
+                        .unwrap_or_else(|_| Err(WallExceeded(wall).into()));
+                    // Its guest work, instantiation included, whatever its end
+                    // (not when the client left first: the task is aborted then).
+                    if crate::traces::recording() {
+                        crate::traces::attribute("cpu_seconds", meter.used().as_secs_f64());
+                        crate::traces::attribute(
+                            "outcome",
+                            result.as_ref().map_or_else(|e| reason(e), |_| "ok"),
                         );
                     }
-                }
-            }
-            result
+                    crate::metrics::front_request_work(&app, meter.used(), meter.fuel_used(&store));
+                    drop(store);
+                    if was_sent.await.is_ok()
+                        && !counts.swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        match &result {
+                            Ok(()) => outcome(&app, "ok"),
+                            Err(e) => {
+                                let reason = reason(e);
+                                outcome(&app, reason);
+                                log_table_full(e);
+                                crate::traces::warn!(
+                                    reason,
+                                    error = %format!("{e:#}"),
+                                    "front request failed after its response began"
+                                );
+                            }
+                        }
+                    }
+                    result
+                })
+                .await
         });
         // A client that leaves before the answer stops the instance, and
         // frees its slot.
@@ -1123,7 +1139,7 @@ fn outcome(app: &str, o: &str) {
 /// so an operator tells it apart from a bug in the front.
 fn log_table_full(e: &wasmtime::Error) {
     if crate::guest_tables::is_table_full(e) {
-        tracing::warn!(
+        crate::traces::warn!(
             cap = crate::MAX_GUEST_RESOURCES,
             "front request trapped: it held as many host resources as a store allows"
         );

@@ -157,6 +157,18 @@ pub(super) struct ServeArgs {
     #[arg(long)]
     usage_ping: bool,
 
+    /// Export traces as OTLP/HTTP protobuf to this collector base URL. Off by default.
+    #[arg(long)]
+    pub(super) otlp_endpoint: Option<String>,
+
+    /// Fraction of outside requests to trace (0 to 1), when an endpoint is set.
+    #[arg(long, default_value_t = 0.01, value_parser = trace_ratio)]
+    pub(super) trace_sample: f64,
+
+    /// Honour both values of an incoming traceparent sampled flag.
+    #[arg(long)]
+    pub(super) trace_trust_incoming: bool,
+
     /// Serve Prometheus metrics at `http://ADDR/metrics` (e.g.
     /// `127.0.0.1:9100`). Off by default. The page names classes and
     /// counts: bind it to a private address.
@@ -376,6 +388,7 @@ pub(super) fn warn_if_public(advertise: &str) {
 
 pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
     huge_pages(args.transparent_huge_pages);
+    let mut trace_guard = None;
     // A node file (ADR 0038) says what its flags would: read and checked
     // before anything else, then served as those flags are. `--app` is a
     // one-entry file with the same meaning, never written to disk.
@@ -389,6 +402,19 @@ pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             }
             // Several apps, or a hostname table: one runtime per app behind
             // the process's ports (ADR 0038).
+            file.apply_traces(&mut args);
+            trace_guard = wasmkeep_server::traces::start(
+                args.otlp_endpoint.as_deref(),
+                args.trace_sample,
+                args.trace_trust_incoming,
+                file.process
+                    .id
+                    .as_deref()
+                    .or_else(|| file.apps.first().and_then(|app| app.node_id.as_deref()))
+                    .or(args.node_id.as_deref())
+                    .unwrap_or("standalone"),
+            )
+            .map_err(anyhow::Error::msg)?;
             if file.several() {
                 tracing::info!(file = %path.display(), apps = file.apps.len(), "node file read");
                 return serve_many::serve_many(&file, &args);
@@ -398,6 +424,16 @@ pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             Some(file)
         }
         None => node_file::NodeFile::from_serve(&args),
+    };
+    let _trace_guard = match trace_guard {
+        Some(guard) => Some(guard),
+        None => wasmkeep_server::traces::start(
+            args.otlp_endpoint.as_deref(),
+            args.trace_sample,
+            args.trace_trust_incoming,
+            args.node_id.as_deref().unwrap_or("standalone"),
+        )
+        .map_err(anyhow::Error::msg)?,
     };
     // With --app the front comes from the deploy only (ADR 0023), whatever
     // is deployed: refused before anything is read or compiled.
@@ -974,5 +1010,16 @@ pub(super) async fn first_deploy(
                 tracing::warn!(error = %e, "reading the app's current version failed; retrying")
             }
         }
+    }
+}
+
+fn trace_ratio(value: &str) -> Result<f64, String> {
+    let ratio: f64 = value
+        .parse()
+        .map_err(|_| "trace-sample must be between 0 and 1")?;
+    if ratio.is_finite() && (0.0..=1.0).contains(&ratio) {
+        Ok(ratio)
+    } else {
+        Err("trace-sample must be between 0 and 1".into())
     }
 }

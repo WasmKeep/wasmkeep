@@ -13,7 +13,12 @@ fn front_wasm() -> &'static [u8] {
 
 /// A node serving class `t` (the test actor) and, with `front`, the test
 /// front beside it, in the cluster sharing `store`.
-async fn front_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, front: bool) -> Node {
+pub(super) async fn front_node(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    front: bool,
+) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let runtime = Runtime::new(&RuntimeConfig {
@@ -69,7 +74,7 @@ async fn front_node(id: &str, data: &Path, store: &Arc<dyn ObjectStore>, front: 
 }
 
 /// `/call` on the test front: `method path` on `t/<name>`.
-fn front_call(name: &str, method: &str, path: &str) -> String {
+pub(super) fn front_call(name: &str, method: &str, path: &str) -> String {
     format!(
         "/call?to=t/{name}&method={method}&path={}",
         path.replace('%', "%25")
@@ -82,7 +87,7 @@ fn front_call(name: &str, method: &str, path: &str) -> String {
 /// [`send`] to a front path, sent again while the call failed before
 /// reaching the owner (a peer briefly out of the view): see
 /// [`send_reachable`].
-async fn front_get(addr: SocketAddr, path: &str) -> Reply {
+pub(super) async fn front_get(addr: SocketAddr, path: &str) -> Reply {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let reply = send(addr, "GET", path, "").await;

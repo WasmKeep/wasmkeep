@@ -71,7 +71,7 @@ impl ActorService {
             None | Some(Ok(None)) => None,
             Some(Ok(Some(signed))) => Some(signed),
             Some(Err(why)) => {
-                tracing::warn!(reason = why, "a signed hop refused");
+                crate::traces::warn!(reason = why, "a signed hop refused");
                 return crate::cluster::hop_refusal(req.headers());
             }
         };
@@ -489,7 +489,7 @@ impl ActorService {
             }
             Hop::Failed(why) => {
                 cluster.placement_backoff(&node);
-                tracing::warn!(node, error = %why, "a placed request's hop failed");
+                crate::traces::warn!(node, error = %why, "a placed request's hop failed");
                 // It may have run there: never run again here, and the
                 // client is told the outcome is unknown.
                 crate::cluster::outcome_unknown("the actor's node did not answer")
@@ -744,6 +744,9 @@ impl ActorService {
         if let Some(response) = super::deploys::finish_ingress(&mut req) {
             return Ok(response);
         }
+        if let Some(context) = crate::traces::current() {
+            req.extensions_mut().insert(context);
+        }
         let (response_tx, response_rx) = oneshot::channel();
         let event = self.inner.mailboxes.submit_wait_timed(
             &address,
@@ -792,7 +795,7 @@ impl ActorService {
                 }))
             }
             Ok(Outcome::Failed(e)) => {
-                tracing::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %crate::logging::text(&e), "event failed");
+                crate::traces::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %crate::logging::text(&e), "event failed");
                 Ok(text_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "actor error\n",
@@ -826,7 +829,7 @@ impl ActorService {
                     text_response(StatusCode::TOO_MANY_REQUESTS, "actor overloaded\n")
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %e, "event not run");
+                    crate::traces::warn!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(&address), error = %e, "event not run");
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                     // Not run (the mailboxes closed: a stop): a placed
                     // event's sender runs it (review item 2).

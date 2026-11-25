@@ -557,6 +557,8 @@ pub(crate) struct Metrics {
     /// `list`, `copy`, `rename`, `multipart`) and status (`ok`,
     /// `not_found`, `precondition`, `error`).
     pub(crate) bucket_requests: Family<AtomicU64>,
+    pub(crate) trace_spans_dropped: AtomicU64,
+    pub(crate) trace_exports: Family<AtomicU64>,
     /// How long each bucket request took, by operation and status
     /// (the labels of `bucket_requests`).
     pub(crate) bucket_request_seconds: Family<Histogram<Wide>>,
@@ -1182,6 +1184,9 @@ impl Metrics {
                 m.failover_waits
                     .get(&[("kind", kind), ("outcome", outcome)]);
             }
+        }
+        for outcome in ["ok", "error"] {
+            m.trace_exports.get(&[("outcome", outcome)]);
         }
         for operation in BUCKET_OPERATIONS {
             for status in BUCKET_STATUSES {
