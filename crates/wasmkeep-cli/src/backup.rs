@@ -31,6 +31,11 @@ const RUN_FORMAT: u64 = 1;
 /// fields it does not know, and would restore the app without its floor.
 /// It refuses this number instead.
 const RUN_FORMAT_FLOOR: u64 = 2;
+/// Said once, by the `create` that writes an archive's first run of
+/// [`RUN_FORMAT_FLOOR`] after one of [`RUN_FORMAT`].
+fn needs_newer_note() -> &'static str {
+    "This run carries an app's upgrade floor (backup format 2): this archive now needs wasmkeep 0.9 or later for create, verify, restore and prune."
+}
 /// The upgrade floor an app record carries, if any: `"floor":"0.9"`, the
 /// record's second line. Anything else is refused, as the record is.
 fn archived_floor(
@@ -1933,6 +1938,7 @@ async fn create_undo(
         ),
         None => None,
     };
+    let previous_format = previous.as_ref().map(|r| r.complete["format"].clone());
     let compatible = previous.as_ref().is_some_and(|r| {
         r.complete["source"] == args.bucket && r.complete["incarnations"] == json!(starts)
     });
@@ -2173,6 +2179,9 @@ async fn create_undo(
         actor_count,
         failures.len()
     );
+    if floors && previous_format == Some(json!(RUN_FORMAT)) {
+        println!("{}", needs_newer_note());
+    }
     ensure!(
         failures.is_empty() || undo_fence.is_some(),
         "partial backup; failed actors are recorded, verification will refuse it"

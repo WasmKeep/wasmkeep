@@ -1494,10 +1494,12 @@ async fn archive_command_late(
 
 /// ADR 0043, section 3, "A restore": an app on manifest format 8 (a
 /// per-class `spread`), finalized at 0.9, restored into another bucket.
-/// Beside a live node of 0.8 there it is refused before it writes
-/// anything. Otherwise the restore creates the app's upgrade floor before
-/// its state and deploy, so a node of 0.8 started on the restored app
-/// stops at the floor, with no lease, and a node of 0.9 serves the state.
+/// A `wasmkeep` older than the app's floor is refused before it writes
+/// anything. The restore creates the app's upgrade floor before its state
+/// and deploy, beside a live node of 0.8 that serves another app there
+/// (the floor is the app's own), so a node of 0.8 started on the restored
+/// app stops at the floor, with no lease, and a node of 0.9 serves the
+/// state.
 /// The nodes and the `wasmkeep` stand for 0.9, whatever this build's
 /// version.
 #[tokio::test(flavor = "multi_thread")]
@@ -1612,25 +1614,23 @@ async fn restore_of_a_gated_deploy_goes_through_the_gate_and_carries_the_floor()
         .map(drop)
     };
 
-    // Beside a live node of 0.8 under the target prefix, serving another
-    // app: refused, naming it, and nothing is written.
+    // A live node of 0.8 under the target prefix, serving another app.
     let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     super::upgrade::lease_of(&target, "old", "0.8.1", "live", "take front restore").await;
-    let e = format!("{:#}", restore(&target, Some(NINE)).await.unwrap_err());
-    assert!(
-        e.contains("old (default/default, 0.8.1)") && e.contains("upgrade floor 0.9"),
-        "{e}"
-    );
-    assert_eq!(keys_of(&target).await, ["nodes/old"]);
-    // A `wasmkeep` older than the app's floor: refused the same way.
+    // A `wasmkeep` older than the app's floor: refused, nothing written.
     if wasmkeep_cluster::upgrade::this_minor().unwrap() < NINE {
         let e = format!("{:#}", restore(&target, None).await.unwrap_err());
         assert!(e.contains("older than the app in the backup"), "{e}");
         assert_eq!(keys_of(&target).await, ["nodes/old"]);
     }
-
-    // That node on 0.9: the restore creates the floor, then the app.
-    super::upgrade::lease_of(&target, "old", "0.9.0", "live", "take front restore").await;
+    // The floor is the app's own: the restore creates it beside that
+    // node, which it names as one that cannot serve the app, then the app.
+    let check = AppRef::new(Arc::clone(&target), "", "default", "shop")
+        .as_version(NINE)
+        .check_restore(Some(NINE), &[])
+        .await
+        .unwrap();
+    assert_eq!(check.shut_out, ["old (default/default, 0.8.1)"]);
     restore(&target, Some(NINE)).await.unwrap();
     assert_eq!(floor_of(&target).await, Some(floor::encode(NINE)));
     let restored = AppRef::new(Arc::clone(&target), "", "default", "shop");

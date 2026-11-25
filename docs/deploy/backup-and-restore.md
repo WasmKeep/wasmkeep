@@ -40,13 +40,32 @@ A run also carries the app's
 [upgrade floor](../cluster.md#versions-the-upgrade-floor-and-finalize) (`formats/<tenant>/<app>/floor`), when the app
 has one: the minor version below which no node may serve it. Such a run is
 backup format 2 (with `--all`, as soon as one app of the run has a floor). A
-`wasmkeep` of 0.8 would restore the app without its floor, so it refuses a
-format 2 run with `unknown or inconsistent backup format`: for `verify`,
-`restore` and an actor restore from that run, and also for `create` into an
-archive whose latest run is one, and `prune` of an archive that keeps one. Use
-0.9 or later on such an archive. A run in which no app has a floor stays
-format 1, which 0.8.1 reads as before. An unreadable floor record fails the
-backup.
+run in which no app has a floor stays format 1, which 0.8.1 reads as before.
+An unreadable floor record fails the backup. The recorded-head setting
+(`formats/<tenant>/<app>/recorded-head`) is not carried: after a restore into
+another prefix, run `wasmkeep app format --enable` again there.
+
+**Upgrade backup jobs to 0.9 before the first 0.9 backup of a finalized
+app.** A `wasmkeep` of 0.8 would restore the app without its floor, so it
+refuses a format 2 run, with `unknown or inconsistent backup format` (the
+message names no version). On an archive that holds one:
+
+- `verify`, `restore` and an actor restore from that run are refused. `restore`
+  has by then written its archive pin `restoring/<run>`, which is permanent and
+  keeps that run from being pruned; remove that one object if the run must be
+  prunable again.
+- `create` is refused when the archive's latest run is format 2, after it
+  wrote `runs/<id>/started` for its own run. That object makes `prune`, of any
+  version, refuse for 24 hours (`backup create in progress: <id>`); after 24
+  hours prune collects it. To prune sooner, delete the `started` object of each
+  refused create, and nothing else.
+- `prune` is refused when it keeps a format 2 run.
+
+The `create` that writes an archive's first format 2 run after a format 1 one
+says so: `this archive now needs wasmkeep 0.9 or later`. An in-place restore
+does it too, without a `create`: its undo run is a backup of the target, so
+restoring a format 1 run in place into an app that has a floor writes a format
+2 undo run, which becomes the archive's latest.
 
 Online create refuses all virtual-hosted-style settings (including an explicit
 false value) and bucket overrides. Explicit endpoint URLs must be origins
@@ -302,12 +321,20 @@ A restore is checked like a deploy, before it writes anything in the target
 - **The restored app keeps its floor.** The target ends on the higher of its
   own floor and the one in the backup. The floor is only ever raised: a
   restore into the prefix the backup came from changes nothing, and a restore
-  into another prefix creates the floor there, before any state or deploy.
-  With `--deploy keep` too: the floor goes with the state.
-- **Never above a live node.** If the floor has to be created or raised and a
-  node under the target prefix, of any app, runs an older version, the restore
-  is refused and names those nodes. Upgrade them, or restore into another
-  prefix. A restore that has no floor to write asks nothing of them.
+  into another prefix creates the floor there. With `--deploy keep` too: the
+  floor goes with the state.
+- **The floor is the app's own.** It is raised whatever the nodes of other
+  apps under the target prefix run. The restore warns, naming them, when such
+  a live node is older than the floor: it keeps serving its own app and cannot
+  start into the restored one. Start the restored app on nodes of the floor's
+  version or later.
+- **The app's own older nodes must be stopped for sure.** Before it raises the
+  floor, the restore lists the app's registered nodes, as `finalize` does. An
+  older one whose lease is neither released nor fenced for long enough refuses
+  the restore, before any write: stop it and run `wasmkeep cluster fence <id>`
+  (for a heartbeat from before node leases, `wasmkeep cluster forget <id>`).
+  Older nodes that are stopped for sure are named; they cannot come back on
+  their version.
 - **Not with an older `wasmkeep`.** A `wasmkeep` older than the floor in the
   backup, or than the target's, is refused.
 - **Every version it installs goes through the deploy's gate**: the current
@@ -315,15 +342,22 @@ A restore is checked like a deploy, before it writes anything in the target
   `spread` (manifest format 8) needs the floor at 0.9, which the backup of
   such an app carries.
 - **A backup without a floor** (made by 0.8, or of an app never finalized)
-  restores as before, and no floor is written.
+  restores as before, and no floor is written. One exception: if it holds a
+  version in manifest format 8 (its floor record was missing when the run was
+  made) and the target has no floor that allows it, the restore creates the
+  floor a first deploy would, for a target app that is new (no deploy, no
+  registered node, and no older node live under the prefix). Otherwise it is
+  refused, and says to finalize the target first or to restore with `--deploy
+  keep`.
 
-Once the floor is written, no node of an older version starts for the app in
-the target: it stops at the floor, naming both versions. The floor stays if
-the restore fails later or is cancelled with `--abort`; a retry finds it. If
-the listing after the write shows an older node of the app that is live, or
-not stopped for sure, the restore stops there, having written nothing of the
-app: stop that node (or `wasmkeep cluster fence` it) and run the restore
-again.
+The floor is written after the undo backup and before any state is removed or
+copied. The app's nodes are listed again after it, on every run, a retry
+included: an older node of the app that is live, or not stopped for sure,
+stops the restore there. Stop and fence it as above, then run the restore
+again. The floor stays if the restore fails later or is cancelled with
+`--abort`: cancelling does not bring back a lower floor, so the target app's
+own stopped nodes of an older version still cannot start. Only upgrading them
+does.
 
 ### What the restore waits for
 

@@ -1434,7 +1434,10 @@ pub async fn born_finalized(
     // As `finalize` lists again after its write: a node of the app that
     // started between the listing above and the create never saw the
     // floor.
-    match below_after(bucket, &served, target, own, now_ms, horizon_ms).await? {
+    match older_nodes(bucket, &served, target, own, now_ms, horizon_ms)
+        .await?
+        .not_stopped
+    {
         None => Ok(Born::Created(target)),
         Some(nodes) => Ok(Born::Late {
             floor: target,
@@ -1443,30 +1446,49 @@ pub async fn born_finalized(
     }
 }
 
-/// The listing after a floor write: the nodes of `served` below `floor`
-/// that are live or not stopped for sure, `own` left out, each with its
-/// version. `None` when there is none.
-async fn below_after<D: Directory>(
+/// The registered nodes of an app below a floor ([`older_nodes`]), each
+/// with its version.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Older {
+    /// Those that are live or not stopped for sure: a lease still `live`
+    /// (stale or not), one fenced too recently, or a heartbeat from
+    /// before node leases.
+    pub not_stopped: Option<String>,
+    /// Those stopped for sure (`released`, or fenced for long enough):
+    /// under the floor they cannot come back on their version.
+    pub stopped: Option<String>,
+}
+
+/// One listing of `nodes/`: the nodes of `served` below `floor`, `own`
+/// left out. What `finalize`, a first deploy and a whole-app restore ask
+/// before and after a floor write.
+///
+/// # Errors
+/// The bucket did not answer.
+pub async fn older_nodes<D: Directory>(
     bucket: &D,
     served: &str,
     floor: Minor,
     own: &str,
     now_ms: u64,
     horizon_ms: u64,
-) -> Result<Option<String>, BucketError> {
-    let again = assess(
+) -> Result<Older, BucketError> {
+    let listed = assess(
         served,
         Ok(Some(floor)),
         &list_nodes(bucket).await?.nodes,
         now_ms,
         horizon_ms,
     );
-    let late: Vec<&NodeVersion> = again
+    let (not_stopped, stopped): (Vec<&NodeVersion>, Vec<&NodeVersion>) = listed
         .nodes
         .iter()
-        .filter(|n| n.id != own && (n.live || !n.stopped()) && n.older_than(floor))
-        .collect();
-    Ok((!late.is_empty()).then(|| named(&late)))
+        .filter(|n| n.id != own && n.older_than(floor))
+        .partition(|n| n.live || !n.stopped());
+    Ok(Older {
+        not_stopped: (!not_stopped.is_empty()).then(|| named(&not_stopped)),
+        stopped: (!stopped.is_empty()).then(|| named(&stopped)),
+    })
 }
 
 /// What a whole-app restore does with the target's floor
@@ -1488,17 +1510,18 @@ pub enum RestoreFloor {
 /// 3, "A restore"). An app's floor is only ever raised, across a restore
 /// too: the target ends on the higher of the floor it has (`existing`)
 /// and the floor the backup carries (`archived`), and nothing is written
-/// when the target's is that already. A floor is never created or raised
-/// above a node live under the target prefix (`live_on_prefix`, of every
-/// app), nor above the restoring `wasmkeep` (`this`): the restore is
-/// refused instead, because a lower floor would let a node the source
-/// app had shut out serve its state.
+/// when the target's is that already. The floor is the app's own: it is
+/// raised whatever the nodes of other apps under the prefix run (as
+/// `finalize` does; [`shut_out`] names those it keeps out of the app),
+/// but never above the restoring `wasmkeep` (`this`), and the app is
+/// never restored below the backup's floor.
 ///
 /// A backup without a floor (one made before `0.9`, or of an app never
 /// finalized) writes none, unless a manifest it brings needs one
 /// (`needs`: the gated manifest format, among those the restore writes,
 /// that the latest version introduced): then the floor is the one a
-/// first deploy would create, for a new app only.
+/// first deploy would create from the live nodes under the prefix
+/// (`live_on_prefix`), for a new app only.
 ///
 /// # Errors
 /// Why the restore is refused, and what to do.
@@ -1515,15 +1538,6 @@ pub fn restore_floor<'a>(
             e.len
         )
     })?;
-    let below = |floor: Minor| -> String {
-        live_on_prefix
-            .clone()
-            .into_iter()
-            .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < floor))
-            .map(|n| format!("{} ({}, {})", n.id, n.app, n.version))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let mut plan = RestoreFloor::Keep;
     let mut floor = floor::in_force(existing);
     if let Some(archived) = archived.filter(|a| *a > floor) {
@@ -1532,16 +1546,6 @@ pub fn restore_floor<'a>(
                 "this `wasmkeep` is older than the app in the backup: its upgrade was \
                  finalized at {archived} and this is {this}. Restore with a `wasmkeep` of \
                  {archived} or later"
-            ));
-        }
-        let older = below(archived);
-        if !older.is_empty() {
-            return Err(format!(
-                "the backup carries the app's upgrade floor {archived}, the target's is \
-                 {floor}, and live nodes under the target prefix run an older version, or \
-                 one that does not parse: {older}. A floor is never set above a live node \
-                 under its prefix, and an app is not restored below its floor. Upgrade \
-                 those nodes to {archived} first, or restore into another prefix"
             ));
         }
         plan = RestoreFloor::Raise(archived);
@@ -1573,38 +1577,43 @@ pub fn restore_floor<'a>(
             "{what}: live nodes under the target prefix run an older version, or one that \
              does not parse, and a new app's floor is never above them: {}. Upgrade those \
              nodes to {needs} first, or restore into another prefix",
-            below(needs)
+            shut_out(needs, "", live_on_prefix).join(", ")
         )),
     }
 }
 
+/// The nodes among `live_on_prefix` that a floor of `floor` for the app
+/// `served` keeps out of it: those of other apps on an older version, or
+/// one that does not parse, each as `id (app, version)`. They keep
+/// serving their own apps.
+pub fn shut_out<'a>(
+    floor: Minor,
+    served: &str,
+    live_on_prefix: impl IntoIterator<Item = &'a NodeInfo>,
+) -> Vec<String> {
+    live_on_prefix
+        .into_iter()
+        .filter(|n| !serves(n, served))
+        .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < floor))
+        .map(|n| format!("{} ({}, {})", n.id, n.app, n.version))
+        .collect()
+}
+
 /// Raises `tenant/app`'s floor to `to` for a whole-app restore, by
-/// conditional write and only upward ([`floor::raise`]), then lists the
-/// nodes again, as `finalize` and a first deploy do: `Some` names the
-/// nodes of the app below the floor that are live or not stopped for
-/// sure. The floor stays either way.
+/// conditional write and only upward ([`floor::raise`]). The caller
+/// lists the nodes before and after ([`older_nodes`]).
 ///
 /// # Errors
 /// The record is unreadable, or the bucket did not answer.
-pub async fn restore_raise<B: Bucket + Directory>(
+pub async fn restore_raise<B: Bucket>(
     bucket: &B,
     tenant: &str,
     app: &str,
     to: Minor,
-    now_ms: u64,
-    horizon_ms: u64,
-) -> Result<Option<String>, floor::RaiseError> {
-    floor::raise(bucket, &floor::relative_key(tenant, app), to).await?;
-    below_after(
-        bucket,
-        &format!("{tenant}/{app}"),
-        to,
-        "",
-        now_ms,
-        horizon_ms,
-    )
-    .await
-    .map_err(|e| floor::RaiseError::Bucket(e.to_string()))
+) -> Result<(), floor::RaiseError> {
+    floor::raise(bucket, &floor::relative_key(tenant, app), to)
+        .await
+        .map(drop)
 }
 
 #[cfg(test)]

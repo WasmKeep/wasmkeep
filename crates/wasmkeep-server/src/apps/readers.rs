@@ -159,6 +159,33 @@ enum Deploy {
     Restore,
 }
 
+/// What [`AppRef::check_restore`] found: the restore may go on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RestoreCheck {
+    /// The floor the restore must raise the target's to before it writes
+    /// anything of the app ([`AppRef::settle_restored_floor`]); `None`:
+    /// the target's is enough.
+    pub raise: Option<Minor>,
+    /// Under that floor, the live nodes of other apps under the prefix
+    /// that cannot start into this app, each as `id (app, version)`.
+    pub shut_out: Vec<String>,
+    /// Under that floor, the app's own registered nodes, stopped for
+    /// sure, that cannot come back on their version.
+    pub left_behind: Option<String>,
+}
+
+/// Now, and how long a heartbeat is live, as `cluster status` counts it.
+fn now_and_horizon() -> (u64, u64) {
+    let horizon = crate::heartbeat_horizon_ms(
+        crate::DEFAULT_HEARTBEAT,
+        &crate::LeaseConfig::default_safe(),
+    );
+    (
+        u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0),
+        horizon,
+    )
+}
+
 /// The live heartbeats under `keys`' prefix.
 async fn live_on(
     keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
@@ -400,24 +427,24 @@ impl AppRef {
     }
 
     /// What a whole-app restore checks before it writes anything, and
-    /// again once it has raised the floor (ADR 0043, section 3, "A
+    /// again before it raises the floor (ADR 0043, section 3, "A
     /// restore"): the floor it leaves in the target
     /// ([`upgrade::restore_floor`]), then every manifest it will write
     /// (`manifests`: the current version's and the kept ones') through
     /// the same gate as a deploy or a rollback, on that floor, and the
-    /// writer's check. `archived` is the floor the backup carries. Reads
-    /// only. `Ok(Some(floor))`: the restore must raise the target's floor
-    /// to it ([`Self::raise_restored_floor`]) before it writes anything
-    /// else of the app.
+    /// writer's check. `archived` is the floor the backup carries. When
+    /// the floor has to be raised, the app's registered nodes are listed
+    /// first, as `finalize` does: an older one that is not stopped for
+    /// sure refuses the restore. Reads only.
     ///
     /// # Errors
-    /// The refusal, naming the format or the floor and what to do; or the
-    /// bucket did not answer.
+    /// The refusal, naming the format, the floor or the nodes and what to
+    /// do; or the bucket did not answer.
     pub async fn check_restore(
         &self,
         archived: Option<Minor>,
         manifests: &[Manifest],
-    ) -> Result<Option<Minor>, DeployError> {
+    ) -> Result<RestoreCheck, DeployError> {
         let app = self.name();
         let refused = |why: String| DeployError::Refused(format!("{app}: {why}"));
         let this = self.this_minor().map_err(refused)?;
@@ -441,14 +468,14 @@ impl AppRef {
             readers.live_on_prefix(),
         )
         .map_err(refused)?;
+        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+            Arc::clone(&self.store),
+            self.prefix.clone(),
+        );
         let raise = match plan {
             upgrade::RestoreFloor::Keep => None,
             upgrade::RestoreFloor::Raise(floor) => Some(floor),
             upgrade::RestoreFloor::CreateIfNew(floor) => {
-                let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
-                    Arc::clone(&self.store),
-                    self.prefix.clone(),
-                );
                 let registered = upgrade::list_nodes(&keys)
                     .await
                     .map_err(bucket)?
@@ -466,51 +493,92 @@ impl AppRef {
                 Some(floor)
             }
         };
+        let mut check = RestoreCheck {
+            raise,
+            ..RestoreCheck::default()
+        };
         let readers = match raise {
-            Some(floor) => Readers::of(
-                app.clone(),
-                Ok(Some(floor)),
-                readers.live_on_prefix().to_vec(),
-            ),
+            Some(floor) => {
+                let (now, horizon) = now_and_horizon();
+                let older = upgrade::older_nodes(&keys, &app, floor, "", now, horizon)
+                    .await
+                    .map_err(bucket)?;
+                if let Some(nodes) = older.not_stopped {
+                    return Err(refused(format!(
+                        "the restore would raise the app's upgrade floor to {floor}, and \
+                         older nodes of the app are registered and not stopped for sure: \
+                         {nodes}. A stale lease is not proof of a stop (the node may be cut \
+                         off or slow, and still act). Stop each, run `wasmkeep cluster fence \
+                         <id>` for it (for a heartbeat from before node leases, `wasmkeep \
+                         cluster forget <id>`), then restore again. Nothing was written"
+                    )));
+                }
+                check.left_behind = older.stopped;
+                check.shut_out = upgrade::shut_out(floor, &app, readers.live_on_prefix());
+                Readers::of(
+                    app.clone(),
+                    Ok(Some(floor)),
+                    readers.live_on_prefix().to_vec(),
+                )
+            }
             None => readers,
         };
         for manifest in manifests {
             self.judge(&readers, manifest, Deploy::Restore)?;
         }
         readers.writer(this).map_err(refused)?;
-        Ok(raise)
+        Ok(check)
     }
 
-    /// Raises the app's floor to `to`, as [`Self::check_restore`] said:
-    /// by conditional write, only upward, then the nodes listed again as
-    /// after a first deploy's create.
+    /// The restore's floor write and the listing after it. Raises the
+    /// app's floor to `raise` when [`Self::check_restore`] said so, by
+    /// conditional write and only upward. Then, on every run and whenever
+    /// the app has a floor above what no record means, lists the nodes
+    /// again as after a first deploy's create: a retry after a failure
+    /// here finds the floor written and must still not go on beside an
+    /// older node.
     ///
     /// # Errors
     /// The bucket did not answer, the record is unreadable, or the
-    /// listing after the write shows an older node of the app that is
-    /// live or not stopped for sure: the floor stays, and the restore
-    /// writes nothing else until it is stopped.
-    pub async fn raise_restored_floor(&self, to: Minor) -> Result<(), DeployError> {
+    /// listing shows an older node of the app that is live or not stopped
+    /// for sure: the floor stays, and the restore writes nothing more
+    /// until it is stopped.
+    pub async fn settle_restored_floor(&self, raise: Option<Minor>) -> Result<(), DeployError> {
+        let app = self.name();
+        let refused = |why: String| DeployError::Refused(format!("{app}: {why}"));
         let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
             Arc::clone(&self.store),
             self.prefix.clone(),
         );
-        let horizon = crate::heartbeat_horizon_ms(
-            crate::DEFAULT_HEARTBEAT,
-            &crate::LeaseConfig::default_safe(),
-        );
-        let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
-        match upgrade::restore_raise(&keys, &self.tenant, &self.app, to, now, horizon).await {
-            Ok(None) => Ok(()),
-            Ok(Some(nodes)) => Err(DeployError::Refused(format!(
-                "{}: this restore set the app's upgrade floor to {to}, and the listing after \
-                 it shows older nodes of the app that are live or not stopped for sure: \
-                 {nodes}. The floor stays, and nothing of the app's state or deploy was \
-                 written. Such a node cannot come back on its old version: stop each of them \
-                 (or `wasmkeep cluster fence` it), then run the restore again",
-                self.name()
+        if let Some(to) = raise {
+            upgrade::restore_raise(&keys, &self.tenant, &self.app, to)
+                .await
+                .map_err(|e| refused(e.to_string()))?;
+        }
+        let found = self.readers().await?.floor().clone().map_err(|e| {
+            refused(format!(
+                "the app's upgrade floor is unreadable ({} bytes); refusing to write",
+                e.len
+            ))
+        })?;
+        let floor = floor::in_force(found);
+        if floor <= floor::ABSENT {
+            return Ok(());
+        }
+        let (now, horizon) = now_and_horizon();
+        let older = upgrade::older_nodes(&keys, &app, floor, "", now, horizon)
+            .await
+            .map_err(bucket)?;
+        match older.not_stopped {
+            None => Ok(()),
+            Some(nodes) => Err(refused(format!(
+                "the app's upgrade floor is {floor}, and the listing after it shows older \
+                 nodes of the app that are live or not stopped for sure: {nodes}. The floor \
+                 stays, and the restore wrote nothing after it. Such a node cannot come back \
+                 on its old version: stop each, run `wasmkeep cluster fence <id>` for it \
+                 (for a heartbeat from before node leases, `wasmkeep cluster forget <id>`), \
+                 then run the restore again"
             ))),
-            Err(e) => Err(DeployError::Refused(format!("{}: {e}", self.name()))),
         }
     }
 

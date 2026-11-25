@@ -79,17 +79,22 @@ The text under a version's heading is its GitHub release text
   node, and not older than the floor.
 - **A whole-app restore is checked like a deploy** (ADR 0043). Every
   version it installs goes through the deploy's gate, on the floor the
-  restore leaves, before anything is written. It is refused, naming
-  them, while a node under the target prefix is older than a floor it
-  would have to create or raise, and from a `wasmkeep` older than the
-  floor.
-- **A backup run that carries a floor is backup format 2.** A
-  `wasmkeep` of 0.8 refuses it (`unknown or inconsistent backup
-  format`) instead of restoring the app without its floor: for `backup
-  verify` and `restore`, and for `create` and `prune` on an archive
-  whose latest or kept run is one. Use 0.9 or later on an archive that
-  0.9 wrote for a finalized app. A run in which no app has a floor
-  stays format 1.
+  restore leaves, before anything is written. It is refused from a
+  `wasmkeep` older than the floor, and, when it has to raise the floor,
+  while an older node of the app is registered and not stopped for
+  sure (fence it, or forget a heartbeat from before node leases). It
+  warns, naming them, when live nodes of other apps under the prefix
+  are older than the floor: they cannot serve the restored app.
+- **A backup run that carries a floor is backup format 2. Upgrade
+  backup jobs to 0.9 before the first 0.9 backup of a finalized app.**
+  A `wasmkeep` of 0.8 refuses such a run (`unknown or inconsistent
+  backup format`) instead of restoring the app without its floor: for
+  `backup verify` and `restore`, and for `create` and `prune` on an
+  archive whose latest or kept run is one. A refused 0.8 `create`
+  leaves a `runs/<id>/started` object that blocks `prune` for 24 hours;
+  [backup and restore](docs/deploy/backup-and-restore.md#online-archives)
+  says how to clear it. `create` says when an archive starts to need
+  0.9. A run in which no app has a floor stays format 1.
 - One check now answers "does every live node announce this word" for
   every writer, the CLI included. The messages are unchanged.
 - **`wasmkeep cluster forget` no longer deletes the lease of a node

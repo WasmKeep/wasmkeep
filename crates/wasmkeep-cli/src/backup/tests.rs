@@ -5398,33 +5398,51 @@ async fn the_restored_floor_precedes_the_apps_state_and_deploy() {
     panic!("the restore never ran out of mutations");
 }
 
-/// Beside live nodes of 0.8 under the target prefix, of another app: no
-/// floor is set above them and the app is not restored below its floor, so
-/// the restore is refused before it writes anything.
+/// The floor is the app's own: beside live nodes of 0.8 under the target
+/// prefix that serve another app, it is raised all the same (as `finalize`
+/// raises it), and the restore names them: they cannot serve this app.
 #[tokio::test]
-async fn restore_beside_live_older_nodes_is_refused_before_any_write() {
+async fn restore_beside_older_nodes_of_another_app_raises_the_floor_and_names_them() {
     let f = Fixture::new().await;
     set_floor(&f.source, NINE).await;
     deploy_format_8(&f.source).await;
     let id = f.create().await;
     let target: Store = Arc::new(object_store::memory::InMemory::new());
     live_neighbour(&target, "0.8.1").await;
-    let e = restore_as(&f, &id, &target, false, Some(NINE))
+    let check = wasmkeep_server::apps::AppRef::new(Arc::clone(&target), "", "acme", "shop")
+        .as_version(NINE)
+        .check_restore(Some(NINE), &[])
         .await
-        .unwrap_err();
-    let text = format!("{e:#}");
-    assert!(
-        text.contains("upgrade floor 0.9")
-            && text.contains("old (acme/blog, 0.8.1)")
-            && text.contains("Upgrade those nodes to 0.9"),
-        "{text}"
+        .unwrap();
+    assert_eq!(check.raise, Some(NINE));
+    assert_eq!(check.shut_out, ["old (acme/blog, 0.8.1)"]);
+    assert_eq!(check.left_behind, None);
+    assert_eq!(
+        keys_of(&target).await,
+        ["nodes/old"],
+        "the check reads only"
     );
-    assert_eq!(keys_of(&target).await, ["nodes/old"]);
-    // The same archive without its deploy: the floor still comes with the
-    // app's state.
-    let mut args = restore_args(&id, false);
-    args.writer = Some(NINE);
-    args.deploy = Some(DeployChoice::Keep);
+    restore_as(&f, &id, &target, false, Some(NINE))
+        .await
+        .unwrap();
+    assert_eq!(floor_at(&target).await, Some(NINE));
+    assert!(
+        read(&target, "apps/acme/shop/v8/manifest", MAX)
+            .await
+            .unwrap()
+            .starts_with(b"wasmkeep-manifest 8\n")
+    );
+}
+
+/// `--deploy keep` installs no version, and the floor still goes with the
+/// state: raised to the backup's, and refused from a `wasmkeep` below it.
+#[tokio::test]
+async fn restore_with_deploy_keep_still_carries_the_floor() {
+    let f = Fixture::new().await;
+    set_floor(&f.source, NINE).await;
+    deploy_format_8(&f.source).await;
+    let id = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
     put(
         &target,
         "apps/acme/shop/current",
@@ -5433,25 +5451,185 @@ async fn restore_beside_live_older_nodes_is_refused_before_any_write() {
     )
     .await
     .unwrap();
+    let keep = async |writer| {
+        let mut args = restore_args(&id, false);
+        args.writer = Some(writer);
+        args.deploy = Some(DeployChoice::Keep);
+        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO).await
+    };
+    let e = keep(upgrade_floor::ABSENT).await.unwrap_err();
+    let text = format!("{e:#}");
     assert!(
-        restore::execute(&args, &f.dest, "", &target, "", std::time::Duration::ZERO)
-            .await
-            .is_err()
+        text.contains("older than the app in the backup")
+            && text.contains("finalized at 0.9 and this is 0.8"),
+        "{text}"
     );
+    assert_eq!(keys_of(&target).await, ["apps/acme/shop/current"]);
+    keep(NINE).await.unwrap();
+    assert_eq!(floor_at(&target).await, Some(NINE));
     assert_eq!(
-        keys_of(&target).await,
-        ["apps/acme/shop/current", "nodes/old"]
+        read(&target, "apps/acme/shop/current", MAX).await.unwrap(),
+        b"v1 1 3\n",
+        "the target's deploy is kept"
     );
-    // Once the neighbour runs 0.9, it goes through.
-    target
-        .delete(&Key::from("apps/acme/shop/current"))
+    assert!(
+        optional(&target, "apps/acme/shop/v8/manifest")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A restore in place that has to raise the floor lists the app's
+/// registered nodes first, as `finalize` does. An older one whose lease
+/// was never released nor fenced is not stopped for sure: refused, naming
+/// it, before the undo backup or any other write. Released, the restore
+/// goes on, and the floor is raised.
+#[tokio::test]
+async fn an_in_place_raise_beside_an_older_node_not_stopped_for_sure_is_refused_first() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let f = Fixture::new().await;
+    set_floor(&f.source, NINE).await;
+    let id = f.create().await;
+    // Another prefix that holds the app, never finalized.
+    let other = Fixture::new().await;
+    let stale = u64::try_from(now_ms().unwrap()).unwrap() - 3_600_000;
+    put(
+        &other.source,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Live, stale),
+        true,
+    )
+    .await
+    .unwrap();
+    let before = keys_of(&other.source).await;
+    let archive_before = keys_of(&f.dest).await;
+    let e = restore_as(&f, &id, &other.source, true, Some(NINE))
+        .await
+        .unwrap_err();
+    let text = format!("{e:#}");
+    assert!(
+        text.contains("would raise the app's upgrade floor to 0.9")
+            && text.contains("n1 (0.0.0)")
+            && text.contains("cluster fence")
+            && text.contains("cluster forget"),
+        "{text}"
+    );
+    assert_eq!(keys_of(&other.source).await, before, "nothing written");
+    assert_eq!(floor_at(&other.source).await, None);
+    // The archive got its pin, and no undo run.
+    let added: Vec<String> = keys_of(&f.dest)
+        .await
+        .into_iter()
+        .filter(|k| !archive_before.contains(k))
+        .collect();
+    assert!(added.iter().all(|k| !k.starts_with("runs/")), "{added:?}");
+
+    put(
+        &other.source,
+        "nodes/n1",
+        app_node_lease("n1", NodeState::Released, stale),
+        true,
+    )
+    .await
+    .unwrap();
+    let check = wasmkeep_server::apps::AppRef::new(Arc::clone(&other.source), "", "acme", "shop")
+        .as_version(NINE)
+        .check_restore(Some(NINE), &[])
         .await
         .unwrap();
-    live_neighbour(&target, "0.9.0").await;
+    assert_eq!(check.left_behind.as_deref(), Some("n1 (0.0.0)"));
+    restore_as(&f, &id, &other.source, true, Some(NINE))
+        .await
+        .unwrap();
+    assert_eq!(floor_at(&other.source).await, Some(NINE));
+    // The undo run was made before the floor was raised: it carries none.
+    let undo = list_bounded(&f.dest, "before-restore/").await.unwrap();
+    let undo = read(
+        &f.dest,
+        undo.values().next().unwrap().location.as_ref(),
+        MAX,
+    )
+    .await
+    .unwrap();
+    let undo = load(&f.dest, "", std::str::from_utf8(&undo).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(undo.complete["format"], 1);
+}
+
+/// A rerun after the listing failed finds the floor written, and lists
+/// again: it does not go on beside the older node.
+#[tokio::test]
+async fn a_rerun_lists_the_older_nodes_again_although_the_floor_is_written() {
+    use wasmkeep_cluster::node_lease::NodeState;
+    let f = Fixture::new().await;
+    set_floor(&f.source, NINE).await;
+    let id = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    // The floor as an earlier run left it, and an older node of the app
+    // that is not stopped for sure.
+    set_floor(&target, NINE).await;
+    let stale = u64::try_from(now_ms().unwrap()).unwrap() - 3_600_000;
+    put(
+        &target,
+        "nodes/n1",
+        node_lease_of("acme/shop", "n1", NodeState::Fenced, stale + 3_600_000),
+        true,
+    )
+    .await
+    .unwrap();
+    let e = restore_as(&f, &id, &target, false, Some(NINE))
+        .await
+        .unwrap_err();
+    let text = format!("{e:#}");
+    assert!(
+        text.contains("upgrade floor is 0.9")
+            && text.contains("n1 (0.0.0)")
+            && text.contains("cluster fence"),
+        "{text}"
+    );
+    assert!(
+        !keys_of(&target)
+            .await
+            .iter()
+            .any(|k| k.starts_with("state/") || k == "apps/acme/shop/current"),
+        "nothing of the app written"
+    );
+    // Fenced for long enough: stopped for sure, and the same operation
+    // goes on.
+    put(
+        &target,
+        "nodes/n1",
+        node_lease_of("acme/shop", "n1", NodeState::Fenced, stale),
+        true,
+    )
+    .await
+    .unwrap();
     restore_as(&f, &id, &target, false, Some(NINE))
         .await
         .unwrap();
     assert_eq!(floor_at(&target).await, Some(NINE));
+}
+
+/// An in-place restore of a run without a floor into an app that has one
+/// since: the floor stays, and the undo run it makes first carries it, so
+/// that run is format 2 and becomes the archive's latest.
+#[tokio::test]
+async fn an_in_place_restore_into_a_finalized_app_writes_a_format_2_undo_run() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    assert_eq!(load(&f.dest, "", &id).await.unwrap().complete["format"], 1);
+    set_floor(&f.source, NINE).await;
+    restore_as(&f, &id, &f.source, true, Some(NINE))
+        .await
+        .unwrap();
+    assert_eq!(floor_at(&f.source).await, Some(NINE));
+    let newest = latest(&f.dest, "").await.unwrap().unwrap();
+    assert_ne!(newest, id);
+    let undo = load(&f.dest, "", &newest).await.unwrap();
+    assert_eq!(undo.complete["format"], 2);
+    assert_eq!(archived_floor(&undo.apps[0]).unwrap(), Some(NINE));
 }
 
 /// A backup without a floor (one made by 0.8, or of an app never

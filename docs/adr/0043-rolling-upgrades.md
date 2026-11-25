@@ -520,12 +520,26 @@ outside the gate, and a backup did not carry the floor.
   that already. So a restore in the prefix the backup came from changes
   nothing: its floor is the backup's or was raised since. This holds
   with `--deploy keep` too: the floor goes with the state.
-- **Never above a live node under the target prefix, nor above the
-  `wasmkeep` that restores**, the rule of a first deploy. A first deploy
-  takes a lower floor, because a new app has nothing an older node could
-  misread. A restore does not: it is refused, naming the nodes to
-  upgrade, before it writes anything. A restore that writes no floor
-  asks nothing of the nodes of other apps.
+- **Never above the `wasmkeep` that restores, and never below the
+  backup's floor.** A `wasmkeep` older than the backup's floor is
+  refused before it writes anything.
+- **The floor is the app's own**, as everywhere else: the gate, the
+  writer's check and `finalize` look at the app's nodes, and `finalize`
+  raises one app's floor beside older nodes of another. So the restore
+  raises the floor whatever the nodes of other apps under the target
+  prefix run, and warns, naming those that are live and older: they
+  keep serving their apps and cannot start into this one. (A process
+  that serves several apps registers one node per app, so a heartbeat
+  names one app.) The first version of this rule refused instead; that
+  made one app's restore depend on another app's upgrade.
+- **The app's own older nodes, before the write.** When the floor has
+  to be raised, the restore first lists the app's registered nodes, as
+  `finalize` does. An older one that is live or not stopped for sure (a
+  lease neither released nor fenced for a ttl plus grace, or a
+  heartbeat from before node leases) refuses the restore before any
+  write, naming it: fence it, or forget the old heartbeat. Those
+  stopped for sure are named in what the restore prints; they cannot
+  come back on their version.
 - **A backup without a floor** (made by `0.8`, or of an app never
   finalized) restores as before and writes none. If it holds a manifest
   in a format behind the floor (the record was missing when the run was
@@ -540,26 +554,35 @@ outside the gate, and a backup did not carry the floor.
   keep` it writes none.
 - **Order.** The whole check runs before the restore writes anything in
   the target (after its own check that no node of the app is live), and
-  again under its lock. The floor is written after the
-  fence and the quiet wait and before any state or deploy; then the
-  nodes are listed again, as after a first deploy's create, and the
-  gate is run on the floor the target now has. An older node of the app
-  that is live or not stopped for sure fails the restore there: the
-  floor stays, and nothing of the app was written. A retry finds the
-  floor. `--abort` leaves it, as a refused deploy leaves the one it
-  created.
-- **What it gives up.** A restore into a prefix where older nodes of
-  other apps are live is refused until they are upgraded, even when the
-  backup holds no format they could not read. And a restore in place
-  from a backup with a higher floor than the target's ends the target's
-  way back without a `finalize`, with no node of the app live: the
-  offline finalize of "Not settled" 10, for this one case.
+  again under its lock. The floor is written after the fence, the quiet
+  wait and the undo backup of a restore in place, and before any state
+  is removed or copied. That step runs on every run, a resume in any
+  later phase included: the write (which finds the floor when it is
+  there), then the nodes listed again whenever the app has a floor above
+  `0.8`, as after a first deploy's create, then the gate on the floor
+  the target now has. An older node of the app that is live or not
+  stopped for sure fails the restore there, and on every rerun until it
+  is fenced: the floor stays. `--abort` leaves the floor, as a refused
+  deploy leaves the one it created; it does not bring back a lower one
+  for the app's own stopped nodes.
+- **What it gives up.** A restore in place from a backup with a higher
+  floor than the target's ends the target's way back without a
+  `finalize`, with no node of the app live: the offline finalize of
+  "Not settled" 10, for this one case. And an archive that holds a
+  format 2 run needs `0.9` for every backup command: a `0.8.1` `create`
+  refused there has already written its run's `started` object, which
+  holds `prune` back for 24 hours, and a refused `0.8.1` `restore` has
+  left its archive pin. Backup jobs are upgraded before the first `0.9`
+  backup of a finalized app; `create` says when an archive crosses that
+  line. An undo run crosses it too: an in-place restore of a format 1
+  run into an app that has a floor writes a format 2 undo run.
 
 Tests: `upgrade::tests` (the rule alone, and the write with its second
 listing), the backup tests of `wasmkeep-cli` (the run's format, a format 8
-app into an empty prefix, beside live older nodes, a backup without a
-floor, the higher floor kept, and the floor written before the app at
-every failed write), and `tests/cluster/restore.rs` (a restored app on
+app into an empty prefix, beside older nodes of another app, an older
+node of the app not stopped for sure, `--deploy keep`, a backup without
+a floor, the higher floor kept, a rerun's listing, the undo run's format,
+and the floor written before the app at every failed write), and `tests/cluster/restore.rs` (a restored app on
 which a node of `0.8` stops at the floor and a node of `0.9` serves).
 
 ### 4. `wasmkeep cluster upgrade status|finalize`
@@ -904,9 +927,10 @@ page says.
 - **The node file is part of going back.** A key added in `0.9` stops a
   `0.8.1` binary. The upgrading page lists the keys to remove first.
 - **A backup carries the floor** (section 3, "A restore"), not the
-  recorded-head setting. A whole-app restore leaves the higher of the
-  target's floor and the backup's, and is refused where it could not. A
-  run that carries a floor is one a `wasmkeep` of `0.8` refuses.
+  recorded-head setting (`app format --enable` is run again after a
+  restore into another prefix). A whole-app restore leaves the higher of
+  the target's floor and the backup's. A run that carries a floor is one
+  a `wasmkeep` of `0.8` refuses, so backup jobs are upgraded first.
 - `app delete` and `deploy --recreate` keep the floor. An app recreated
   after a finalize stays finalized.
 - The frozen rows are a constraint on later records: the node lease's
