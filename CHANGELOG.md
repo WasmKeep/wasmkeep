@@ -85,7 +85,19 @@ Still a **pre-alpha pre-release**.
   if all three are older, the request is answered as unavailable, to be
   retried. Counted by
   `wasmkeep_lease_reads_behind_total`, `wasmkeep_lease_reads_stale_total`
-  and `wasmkeep_lease_reads_unpinned_total`. No format changes
+  and `wasmkeep_lease_reads_unpinned_total`. A fence `cluster fence`
+  created over a deleted node lease counts as newer than every body of
+  that lease dated less than twice the allowed clock skew (2 s) after it,
+  and a node starting over one writes its first body no earlier than
+  that, saying so in its log. `cluster fence` dates by the bucket's time
+  any created fence it leaves behind, also one it found already there,
+  and warns when this machine's clock is ahead of the bucket's. A read
+  that finds a node lease absent restarts the window after which an older
+  body replaces the newest held. Under stale reads, a node of 0.8.0 that
+  starts right as such a fence lands may still have the actor it holds
+  taken by a node of 0.8.1
+  ([what remains](docs/adr/0020-one-lease-per-node.md#nodes-of-080-beside-this-version)).
+  No format changes
   ([ADR 0020](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-24-lease-reads-and-the-upgrade-floor)).
 - **A node reads the app's upgrade floor at start.** The record,
   `formats/<tenant>/<app>/floor`, will be written from 0.9.0 by `cluster

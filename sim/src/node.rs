@@ -708,17 +708,19 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
         self.watch.own_lease(until, self.clock.now_ms());
         for peer in self.setup.peers.clone() {
             let key = format!("{}{peer}", self.setup.nodes_prefix);
-            let seen = self
-                .peers_bucket
-                .get(&key)
-                .await
+            let read = self.peers_bucket.get(&key).await;
+            // As the server's heartbeat rounds do: every lease body read
+            // raises the process's newest reads, and an absent one (or one
+            // they cannot read) is a current answer.
+            if matches!(read, Ok(None)) {
+                self.owners.reads().absent(&peer);
+            }
+            let seen = read
                 .ok()
                 .flatten()
                 .and_then(|(body, _)| NodeLeaseObject::decode(&body));
-            // As the server's heartbeat rounds do: every lease body read
-            // raises the process's newest reads.
             if let Some(o) = &seen {
-                self.owners.reads().observe(&peer, o);
+                self.owners.reads().observe(&peer, o, &cfg);
             }
             match seen.filter(|o| o.state == NodeState::Live) {
                 Some(o) => {
@@ -866,6 +868,7 @@ async fn start_check<B: Bucket, C: Clock>(
     env: &impl Env,
 ) -> Option<Version> {
     let wait = cfg.ttl_ms() + cfg.grace_ms();
+    let window = wasmkeep_cluster::node_lease::fence_window_ms(cfg);
     loop {
         let first = match bucket.get(key).await {
             Ok(first) => first,
@@ -880,7 +883,32 @@ async fn start_check<B: Bucket, C: Clock>(
             .filter(|o| o.state == NodeState::Live)
             .and_then(|o| o.instance);
         env.sleep_ms(wait).await;
-        match (first, bucket.get(key).await) {
+        let second = bucket.get(key).await;
+        // An operator's created fence, read first and unchanged: the first
+        // write lands no earlier than its `written_at` plus twice the skew
+        // on this clock (ADR 0020, amendment on lease reads). One written
+        // over no object meanwhile starts the check again from it: this
+        // check reads twice, so it cannot tell what else was written in
+        // between, as the server's polling does.
+        if let Ok(Some((now, version))) = &second
+            && first.as_ref().is_some_and(|(was, _)| was == now)
+            && let Some(o) =
+                NodeLeaseObject::decode(now).filter(wasmkeep_cluster::node_lease::created_fence)
+        {
+            let left = o
+                .written_at_ms
+                .saturating_add(window)
+                .saturating_sub(clock.now_ms());
+            if left == 0 {
+                return Some(version.clone());
+            }
+            env.sleep_ms(left).await;
+            if matches!(bucket.get(key).await, Ok(Some((again, _))) if &again == now) {
+                return Some(version.clone());
+            }
+            continue;
+        }
+        match (first, second) {
             (None, Ok(None)) => return None,
             (Some((was, _)), Ok(Some((now, version)))) if now == was => return Some(version),
             // A fence or a release over the process first read: it lapsed
