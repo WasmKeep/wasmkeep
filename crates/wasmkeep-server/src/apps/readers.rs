@@ -144,6 +144,18 @@ impl Readers {
     }
 }
 
+/// Which deploy [`AppRef::check_readers`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deploy {
+    /// Of an app that has a deploy already, or a rollback.
+    Later,
+    /// An app's first, before it is accepted: on the floor it would
+    /// create.
+    First,
+    /// An app's first, accepted: on the floor the app then has.
+    FirstAccepted,
+}
+
 /// The live heartbeats under `keys`' prefix.
 async fn live_on(
     keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
@@ -270,7 +282,7 @@ impl AppRef {
     /// the writer itself: refused under a floor above this build's
     /// version, or beside a live node outside its range.
     pub(super) async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
-        self.check_readers_of(manifest, false).await
+        self.check_readers_of(manifest, Deploy::Later).await
     }
 
     /// [`Self::check_readers`] for an app's first deploy: without a floor
@@ -280,7 +292,7 @@ impl AppRef {
     /// format behind the floor is checked again after that
     /// ([`Self::check_floor_after_first`]).
     pub(super) async fn check_first_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
-        self.check_readers_of(manifest, true).await
+        self.check_readers_of(manifest, Deploy::First).await
     }
 
     /// After [`Self::born_finalized`], for a first deploy in a format
@@ -295,16 +307,20 @@ impl AppRef {
         let behind = upgrade::manifest_format(manifest.format_number())
             .is_some_and(|f| f.since > floor::ABSENT);
         if behind {
-            self.check_readers_of(manifest, false).await
+            self.check_readers_of(manifest, Deploy::FirstAccepted).await
         } else {
             Ok(())
         }
     }
 
-    async fn check_readers_of(&self, manifest: &Manifest, first: bool) -> Result<(), DeployError> {
+    async fn check_readers_of(
+        &self,
+        manifest: &Manifest,
+        deploy: Deploy,
+    ) -> Result<(), DeployError> {
         let readers = self.readers().await?;
-        let readers = match (first, self.this_minor()) {
-            (true, Ok(this)) => readers.as_first_deploy(this),
+        let readers = match (deploy, self.this_minor()) {
+            (Deploy::First, Ok(this)) => readers.as_first_deploy(this),
             _ => readers,
         };
         let number = manifest.format_number();
@@ -330,6 +346,35 @@ impl AppRef {
                         "manifest format 6 needs {word} on all live readers: {nodes}"
                     )),
                 });
+            }
+            // A first deploy that gets no floor: `finalize` is no answer
+            // (it needs a live node of the app), so say what works.
+            Err(Blocked::Floor { needs, floor, .. }) if deploy != Deploy::Later => {
+                let older: Vec<String> = readers
+                    .live_on_prefix()
+                    .iter()
+                    .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < needs))
+                    .map(|n| format!("{} ({}, {})", n.id, n.app, n.version))
+                    .collect();
+                let why = if deploy == Deploy::First && !older.is_empty() {
+                    format!(
+                        "live nodes under the bucket prefix run an older version, and a new \
+                         app's floor is never above them: {}. Upgrade those nodes to {needs} \
+                         first, or",
+                        older.join(", ")
+                    )
+                } else {
+                    "the app is not new (it has state, a registered node or a tombstone), so \
+                     this deploy creates no floor for it. Either"
+                        .to_owned()
+                };
+                return Err(DeployError::Refused(format!(
+                    "{app}: a version with a per-class placement key, apart-from or spread \
+                     (manifest format {number}), needs the app's upgrade floor at {needs}, and \
+                     it is {floor}: {why} deploy without those keys, start the app's nodes on \
+                     {needs}, run `wasmkeep cluster upgrade finalize`, then deploy again with \
+                     the keys"
+                )));
             }
             Err(blocked) => return Err(DeployError::Refused(format!("{app}: {blocked}"))),
         }

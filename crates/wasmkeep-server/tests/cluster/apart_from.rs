@@ -343,7 +343,10 @@ async fn a_fresh_apps_first_deploy_may_carry_the_keys() {
         .await
         .unwrap();
     let e = deploy(&with_state, true).await.unwrap_err().to_string();
-    assert!(e.contains("cluster upgrade finalize"), "{e}");
+    assert!(
+        e.contains("the app is not new") && e.contains("deploy without those keys"),
+        "{e}"
+    );
     assert_eq!(floor_of(&with_state).await, None);
     assert!(app_of(&with_state).current().await.unwrap().is_none());
 
@@ -359,7 +362,10 @@ async fn a_fresh_apps_first_deploy_may_carry_the_keys() {
         .await
         .unwrap();
     let e = deploy(&beside, true).await.unwrap_err().to_string();
-    assert!(e.contains("upgrade floor is 0.8"), "{e}");
+    assert!(
+        e.contains("n (default/other, 0.8.1)") && e.contains("Upgrade those nodes to 0.9"),
+        "{e}"
+    );
     assert_eq!(floor_of(&beside).await, None);
     assert!(app_of(&beside).current().await.unwrap().is_none());
 }

@@ -421,6 +421,9 @@ fn placement_lines_are_refused_where_they_do_not_belong() {
         "spread chat yes\n",
         "spread nope on\n",
         "spread chat on\nspread chat off\n",
+        // One rule per class.
+        "apart chat room\nspread chat on\n",
+        "apart chat room\nspread room on\n",
         // Format 8 says it for a placement line.
         "",
     ] {

@@ -868,6 +868,12 @@ and the manifest's decoder all refuse a second pair for a class, and
 class would need the wake-up and the drain to look for each; that is not
 built.
 
+**One rule for a class.** A class is not both spread and kept apart: the
+spread choice could be the node that holds the companion. `spread =
+true` on a class of a pair (by its own entry, by one that names it, or
+by the built-in pair) is refused in the same three places. A class named
+`edge` that an entry pairs is kept apart and not spread.
+
 **In the version.** `apart <class> <other>` (`-` for none) and
 `spread <class> on|off`, one line per class that says the key, in
 manifest format 8. A version without such a line keeps the format it had

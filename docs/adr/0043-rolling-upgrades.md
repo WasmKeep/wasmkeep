@@ -938,7 +938,10 @@ behind the floor and the word `apart`. What the keys mean is in
    floor, and a format behind the floor is checked again on the floor
    the app then has. An app that only looked new (state, a registered
    node) got none, and is refused there, before anything of it is
-   written.
+   written. Such a refusal does not send the operator to `finalize`,
+   which needs a live node of the app: it names the older nodes under
+   the prefix to upgrade, or says to deploy without the keys, start the
+   nodes, finalize, and deploy again.
 7. **The writer's version is a value.** `AppRef::as_version` lets a test
    deploy as a `wasmkeep` of `0.9` while the workspace version is still
    `0.8.1`, as `ClusterConfig::version` does for a node. No command sets
@@ -965,6 +968,12 @@ another app.
 3. **A forward with no proof** (section 6): whether a serving `0.8.1`
    node sends one. Until read or tested, that branch stays.
 4. **A restore into another prefix** and the floor ("Consequences").
+   A whole-app restore writes `current` and the manifest outside the
+   gate and copies no floor. So an app on manifest 8 restored into
+   another prefix has no floor there, and a `0.8.1` node started there
+   passes the floor check and then fails closed on the manifest it
+   cannot read. **To fix before the `0.9.0` release:** the restore goes
+   through the gate and creates the floor.
 5. **Rows of the gate table read once** (history content, alarm index,
    restore fence, control intents) and four items on the wire read only
    in comments: the take call, the socket hand-off relay, the placed

@@ -408,13 +408,36 @@ impl Asked {
                 ));
             }
         }
-        match self.spread.keys().find(|class| !has(class)) {
-            Some(class) => Err((
+        if let Some(class) = self.spread.keys().find(|class| !has(class)) {
+            return Err((
                 class.clone(),
                 "spread, for a class this version does not have".into(),
-            )),
-            None => Ok(()),
+            ));
         }
+        // Not both rules for one class: the spread choice could be the
+        // node that holds the companion. The built-in pair counts.
+        let (a, b) = DEFAULT_APART;
+        let said = |c: &str| self.apart.iter().any(|(k, o)| k == c || o == c);
+        let built_in = has(a) && has(b) && !said(a) && !said(b);
+        for (class, on) in &self.spread {
+            let other = partner
+                .get(class.as_str())
+                .copied()
+                .or_else(|| match class.as_str() {
+                    c if built_in && c == a => Some(b),
+                    c if built_in && c == b => Some(a),
+                    _ => None,
+                });
+            if let (true, Some(other)) = (*on, other) {
+                return Err((
+                    class.clone(),
+                    format!(
+                        "spread, and kept apart from {other}: a class takes one of the two rules"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The entries whose classes `has` still answers for: what a deploy
@@ -465,12 +488,16 @@ impl Asked {
 
     /// Whether `class`'s actors wake spread over the live nodes, in a
     /// version with the classes `classes`: what its entry says, or the
-    /// built-in rule ([`spreads`]) without one.
+    /// built-in rule ([`spreads`]) without one. Never for a class kept
+    /// apart from another ([`Self::companion`]): its spread choice could
+    /// be the node that holds its companion. [`Self::check`] refuses the
+    /// two keys on one class; this covers an `edge` an entry pairs.
     pub fn spreads(&self, classes: &[&str], class: &str) -> bool {
-        match self.spread.get(class) {
+        let on = match self.spread.get(class) {
             Some(on) => *on && classes.contains(&class),
             None => spreads(classes, class),
-        }
+        };
+        on && self.companion(classes, class).is_none()
     }
 }
 
@@ -1018,6 +1045,30 @@ mod tests {
             assert_eq!(at, class, "{bad:?}");
             assert!(said.contains(why), "{bad:?}: {said}");
         }
+        // One rule for a class: not spread and kept apart, by an entry on
+        // it, by one that names it, or by the built-in pair.
+        let both = ["fan", "feed", "pusher", "room"];
+        for (bad, class) in [
+            (asked(&[("fan", "feed")], &[("fan", true)]), "fan"),
+            (asked(&[("fan", "feed")], &[("feed", true)]), "feed"),
+            (asked(&[], &[("room", true)]), "room"),
+        ] {
+            let (at, said) = bad.check(|c| both.contains(&c)).unwrap_err();
+            assert_eq!(at, class, "{bad:?}");
+            assert!(said.contains("one of the two rules"), "{bad:?}: {said}");
+        }
+        for ok in [
+            asked(&[("fan", "feed")], &[("fan", false)]),
+            asked(&[("room", APART_NONE)], &[("room", true)]),
+        ] {
+            assert_eq!(ok.check(|c| both.contains(&c)), Ok(()), "{ok:?}");
+        }
+        // The built-in edge, paired by an entry: kept apart, not spread.
+        let edge = asked(&[("edge", "fan")], &[]);
+        let with_edge = ["edge", "fan", "pusher", "room"];
+        assert!(spreads(&with_edge, "edge"));
+        assert!(!edge.spreads(&with_edge, "edge"));
+        assert_eq!(edge.companion(&with_edge, "edge").as_deref(), Some("fan"));
         // What a deploy keeps when a class goes.
         let all = asked(
             &[("fan", "feed"), ("leaf", APART_NONE), ("room", "leaf")],

@@ -545,13 +545,19 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
         // a class is in one pair at most.
         let asked = placing(&classes);
         if let Err((class, why)) = asked.check(|c| classes.contains_key(c)) {
+            let key = if why.starts_with("spread") {
+                "spread"
+            } else {
+                "apart-from"
+            };
             let span = t
                 .get(class.as_str())
                 .and_then(|v| v.get_ref().as_table())
-                .and_then(|ct| get(ct, "apart-from"))
+                .and_then(|ct| get(ct, key))
                 .map(|(_, v)| v.span())
                 .unwrap_or(0..0);
-            return src.err(span, format!("[classes.{class}] apart-from: {why}"));
+            let why = why.strip_prefix("spread, ").unwrap_or(&why);
+            return src.err(span, format!("[classes.{class}] {key}: {why}"));
         }
     }
     let assets = if let Some(t) = table(&src, root, "assets")? {
@@ -1181,7 +1187,7 @@ env = ".env.dev"
         }
         // Into the deploy, as the version's entries; a class that says
         // nothing has its entry removed.
-        let p = parse_ok(&format!("{base}apart-from = \"feed\"\nspread = true\n"));
+        let p = parse_ok(&format!("{base}apart-from = \"feed\"\nspread = false\n"));
         let parts = Parts {
             front: None,
             classes: ["fan", "feed", "leaf"]
@@ -1197,7 +1203,7 @@ env = ".env.dev"
                 .contains(&(fan.clone(), Some("feed".to_owned())))
         );
         assert!(changes.apart.contains(&("feed".to_owned(), None)));
-        assert!(changes.spread.contains(&(fan, Some(true))));
+        assert!(changes.spread.contains(&(fan, Some(false))));
         assert!(changes.spread.contains(&("leaf".to_owned(), None)));
         for (bad, why) in [
             ("apart-from = \"fan\"\n", "not another class"),
@@ -1209,6 +1215,12 @@ env = ".env.dev"
             let err = parse_err(&format!("{base}{bad}"));
             assert!(err.contains(why), "{bad}: {err}");
         }
+        // One rule per class: not both keys.
+        let err = parse_err(&format!("{base}apart-from = \"feed\"\nspread = true\n"));
+        assert!(
+            err.contains("[classes.fan] spread: and kept apart from feed"),
+            "{err}"
+        );
         // One pair per class: feed cannot be apart from fan and from leaf.
         let err = parse_err(&format!(
             "{base}apart-from = \"feed\"\n[classes.other]\ncomponent = \"o.wasm\"\n\
