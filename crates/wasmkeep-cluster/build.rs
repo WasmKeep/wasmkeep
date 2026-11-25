@@ -10,6 +10,16 @@
 //! git gives (12 hex digits or more), as semver build metadata, so
 //! `0.3.0+0a1b2c3d4e5f` is still version 0.3.0 to anything that compares
 //! versions. Uncommitted changes are not marked.
+//!
+//! Test-only: with the cargo feature `test-version` (off by default, set
+//! by no release build, and by nothing but `scripts/mixed-version.sh`) and
+//! `WASMKEEP_TEST_VERSION=<major>.<minor>.<patch>` in the build's
+//! environment, the build reports that version instead, always marked:
+//! `<that version>+test.<commit>`. It lets the mixed-version check run a
+//! build of this checkout as the next minor version before the workspace
+//! version is bumped (ADR 0043, section 8). The variable is read here,
+//! when the binary is built: nothing changes the version of a built
+//! binary, and without the feature the variable is ignored.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,11 +28,30 @@ fn main() {
     let version = env!("CARGO_PKG_VERSION");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     println!("cargo:rerun-if-changed=build.rs");
-    let full = match commit(&manifest, version) {
-        Some(commit) => format!("{version}+{commit}"),
-        None => version.to_owned(),
+    println!("cargo:rerun-if-env-changed=WASMKEEP_TEST_VERSION");
+    let full = match (test_version(), commit(&manifest, version)) {
+        (Some(test), Some(commit)) => format!("{test}+test.{commit}"),
+        (Some(test), None) => format!("{test}+test"),
+        (None, Some(commit)) => format!("{version}+{commit}"),
+        (None, None) => version.to_owned(),
     };
     println!("cargo:rustc-env=WASMKEEP_VERSION={full}");
+}
+
+/// The version a test build stands for: `WASMKEEP_TEST_VERSION`, three
+/// decimal numbers, read only with the feature `test-version`.
+fn test_version() -> Option<String> {
+    if !cfg!(feature = "test-version") {
+        return None;
+    }
+    let test = std::env::var("WASMKEEP_TEST_VERSION").ok()?;
+    let parts: Vec<&str> = test.split('.').collect();
+    let number = |p: &&str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    assert!(
+        parts.len() == 3 && parts.iter().all(number),
+        "WASMKEEP_TEST_VERSION must be <major>.<minor>.<patch>, not `{test}`"
+    );
+    Some(test)
 }
 
 /// The commit to name, or `None` for a release (the tag `v<version>` on

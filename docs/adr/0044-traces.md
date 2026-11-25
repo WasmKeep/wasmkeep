@@ -546,8 +546,8 @@ replaced by what happened; it is written once, when the span ends.
   forwarded unchanged; a call and a forward with tracing on are the
   bytes captured from the release before plus one header line, the
   call's MAC over the same message; a hop to and from a node of the
-  previous version passes (ADR 0043, the mixed-version check: its
-  tracing phase is not written yet).
+  previous version passes (ADR 0043, the mixed-version check's tracing
+  phase).
 - **One trace, three nodes.** A cluster test with an exporter in
   memory, plain and over TLS: a request through a front on a to an
   actor on b that calls an actor on c gives one trace id, spans from
@@ -587,6 +587,11 @@ replaced by what happened; it is written once, when the span ends.
 10. **A forward over plain HTTP is verified twice** when its flag is
     followed and the app has rate limits: once for the flag, once for
     admission.
-11. **No end-to-end case of a sender without the word.** The unit tests
-    cover it; a tracing phase in the mixed-version check is to cover it
-    before `0.9.0`.
+11. *Settled by the mixed-version check's tracing phase*
+    ([releasing](../releasing.md#the-mixed-version-check)): the
+    end-to-end case of a sender without the word. Two `0.9` nodes export
+    to a collector with `--trace-sample 0`. A client's sampled
+    `traceparent` forwarded by a `0.8.1` node is continued and not
+    followed (the guest sees the flag off, nothing is exported); the
+    same through a `0.9` node with `--trace-trust-incoming` is followed
+    on both.

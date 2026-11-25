@@ -134,7 +134,10 @@ There is no `--force`.
   allowed to serve it. Without a record it is 0.8. `finalize` writes 0.9.
   From then on a 0.8.1 node that starts into the app reads the floor,
   writes no lease and stops, reporting not ready with `the app's upgrade
-  floor is above this node's version, or unreadable`.
+  floor is above this node's version, or unreadable`. Once a version with
+  `apart-from` or `spread` is deployed, a 0.8.1 node stops earlier still,
+  on the manifest: `unreadable <version>/manifest`. It serves nothing
+  either way; that message means the same thing, install 0.9.
 - **Formats that need every node at 0.9 may be written.** Before the
   finalize, nodes and commands of 0.9.0 write only what 0.8.1 reads.
   After it:
@@ -281,8 +284,15 @@ and not older than the app's floor.
   They write what 0.8.1 reads, and stay usable during the upgrade.
 - **A 0.8.1 `wasmkeep` has no such check.** Before the finalize the
   bucket holds only what 0.8.1 reads. Do not use it against a finalized
-  app: it does not read the floor, and what it does there beyond failing
-  on a manifest it cannot parse has not been tested.
+  app: it does not read the floor, and its refusals do not name a
+  version. In the mixed-version check, its `cluster status`, `secrets
+  set` and `cluster drain` still worked there and were read rightly by
+  the 0.9 nodes. Once a version with `apart-from` or `spread` is current,
+  its `deploy` fails with `unreadable <version>/manifest` and its `backup
+  create` with `invalid deploy manifest`; into an archive that already
+  holds a run made by 0.9 after the finalize, `backup create` fails with
+  `unknown or inconsistent backup format`. Each of those means: use a
+  `wasmkeep` of 0.9.
 
 ## Limits, and what is not built
 
