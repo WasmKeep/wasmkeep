@@ -1,5 +1,5 @@
 //! `wasmkeep cluster`: status, drain, undrain, fence and forget (`upgrade`
-//! is in `upgrade_cmd.rs`).
+//! is in `upgrade_cmd.rs`, `verify` in the library's `verify.rs`).
 
 use super::*;
 
@@ -83,6 +83,29 @@ pub(super) enum ClusterCommand {
     /// required behaviour (not a proof of safety), 1 when one did not, 2
     /// when it could not run or finish.
     Diagnose(diagnose::DiagnoseArgs),
+    /// Check that a cluster's bucket is whole, reading it and never
+    /// writing (it is not `backup verify`, which checks a backup's own
+    /// contents, nor `cluster diagnose`, which checks what the bucket's API
+    /// does): every actor can be restored from what the bucket holds, and
+    /// the records around the actors read. Per app: `current` and its
+    /// manifest parse and each component, front and configuration has the
+    /// digest its version names; the format setting and the upgrade floor
+    /// decode. Per actor: a restore plan exists, from a snapshot through
+    /// every segment to the head with no gap; its ownership record
+    /// decodes; in an app that records heads (ADR 0035), the recorded head
+    /// is reached by that chain, by the rule a restore uses. Also: each
+    /// alarm index entry names an actor the bucket knows, the count of
+    /// stored files and the sweep records decode, node leases decode, and
+    /// the per-actor lease markers left from before node leases are
+    /// counted (never deleted). Safe on a running cluster: what looks
+    /// wrong is read again before it is reported. Prints what it read
+    /// (objects, requests, time; a listing counts one request, and one
+    /// more per 1,000 keys) and each problem with its key. Exits with 0
+    /// when the bucket is whole, 1 when a problem was found, 2 when there
+    /// is no verdict: no problem, but something could not be read, listed
+    /// or checked (it is named, and what was found until then is still
+    /// printed).
+    Verify(wasmkeep_cli::verify::VerifyArgs),
 }
 
 #[derive(Debug, Args)]

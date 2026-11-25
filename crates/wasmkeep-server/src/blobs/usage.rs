@@ -32,7 +32,7 @@ impl Count {
         )
     }
 
-    fn decode(body: &[u8]) -> Option<Self> {
+    pub(super) fn decode(body: &[u8]) -> Option<Self> {
         let mut lines = std::str::from_utf8(body).ok()?.lines();
         if lines.next()? != HEADER {
             return None;

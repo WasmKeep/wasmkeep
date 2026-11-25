@@ -742,6 +742,12 @@ fn main() -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
             std::process::exit(code);
         }
+        Command::Cluster(ClusterCommand::Verify(args)) => {
+            let code = wasmkeep_cli::verify::command(&args);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
+        }
         Command::Backup(args) => backup::run(&args),
         Command::Feed(args) => wasmkeep_cli::feed::run(&args),
         Command::Actor(ActorCommand::History(args)) => actor_read::history(&args),

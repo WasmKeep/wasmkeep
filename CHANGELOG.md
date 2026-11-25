@@ -22,6 +22,22 @@ The text under a version's heading is its GitHub release text
   node's lease is stale without a release or a fence (run `wasmkeep
   cluster fence` first). After it, no node of an older version starts. `cluster status` shows the floor and
   `finalize pending` in one line per app.
+- **`wasmkeep cluster verify`** checks that a bucket is whole. It only
+  reads: no write is ever sent. Per app it checks `current`, the
+  manifest and each component's digest. Per actor it checks that a
+  restore plan exists from a snapshot through every segment to the
+  head, that the ownership record decodes, and, in an app that records
+  heads, that the recorded head is reached. It also checks alarm index
+  entries, file records, node leases and the upgrade floor, and counts
+  the per-actor lease markers left. `--deep` reads every history object
+  and checks its checksums. `--app`, `--actor` and `--sample N` narrow
+  it; `--json` is for scripts. It prints objects read, requests and
+  time, and exits with 1 naming the key of each problem. What the
+  bucket refused to give is listed apart and exits with 2: no verdict.
+  It is not
+  `backup verify` (a backup's own contents) nor `cluster diagnose`
+  (what the bucket's API does).
+  [Verifying a bucket](docs/cluster.md#verifying-a-bucket).
 - **A node refuses to start beside a version it cannot run with.** A
   node of minor version N starts only while every live node of its app
   runs N-1, N or N+1, and names the node that stops it. It also refuses

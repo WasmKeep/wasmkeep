@@ -126,6 +126,8 @@ mod traces;
 mod two_apps;
 #[path = "upgrade.rs"]
 mod upgrade;
+#[path = "verify.rs"]
+mod verify;
 #[path = "websockets.rs"]
 mod websockets;
 #[path = "writes_deploys.rs"]

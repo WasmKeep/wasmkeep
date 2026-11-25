@@ -378,6 +378,21 @@ Usage: `wasmkeep cluster diagnose [OPTIONS] --bucket <BUCKET>`
 | `--link-endpoint <URL>` |  | The bucket's endpoint as browsers reach it, for the `blob-links` checks (default: as for `serve`) |
 | `--json` |  | Print JSON instead of lines, for scripts |
 
+#### `wasmkeep cluster verify`
+
+Check that a cluster's bucket is whole, reading it and never writing (it is not `backup verify`, which checks a backup's own contents, nor `cluster diagnose`, which checks what the bucket's API does): every actor can be restored from what the bucket holds, and the records around the actors read.
+
+Usage: `wasmkeep cluster verify [OPTIONS] --bucket <BUCKET>`
+
+| Flag or argument | Default | Meaning |
+|---|---|---|
+| `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables; read access is enough, and no write is ever sent) |
+| `--app <APP>` |  | One app, TENANT/APP, instead of every app under the prefix |
+| `--actor <CLASS/NAME>` |  | One actor of --app, CLASS/NAME: its history and its ownership record, nothing else |
+| `--sample <N>` |  | Read the ownership record (and with --deep the history) of N actors of each app, chosen at random, instead of every actor (the listing is still whole, so every actor's chain is still checked by its key names) |
+| `--deep` |  | Also read every history object a restore would read and check its checksums (without --deep, damage inside one is not found), the previous versions a deploy keeps, and each static asset. |
+| `--json` |  | Print JSON instead of text, for scripts |
+
 ### `wasmkeep actor`
 
 Act on one actor of a cluster, through its bucket

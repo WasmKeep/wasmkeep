@@ -726,6 +726,24 @@ fn checked_header(bytes: &[u8], id: SegmentId, snapshot: bool) -> Result<ltx::He
     Ok(h)
 }
 
+/// Checks one history object against the position its key names, without
+/// applying it: the header [`export`] requires of an object at `id` (a
+/// snapshot or a segment), then the whole file (its pages decode, its page
+/// index and its file checksum hold). Returns the database checksums its
+/// header and trailer carry, before and after it: a restore requires each
+/// file's `before` to be the `after` of the file applied before it. What
+/// only a replay proves is left out: that `after` is the checksum of the
+/// pages themselves.
+///
+/// # Errors
+/// [`Error::Corrupt`], saying what is wrong.
+pub fn check_object(bytes: &[u8], id: SegmentId, snapshot: bool) -> Result<(u64, u64), Error> {
+    let header = checked_header(bytes, id, snapshot)?;
+    let (_, trailer) = ltx::visit(bytes, |_| Ok::<_, ()>(()), |_, _| Ok(()))
+        .map_err(|e| Error::Corrupt(format!("{e:?}")))?;
+    Ok((header.pre_apply_checksum, trailer.post_apply_checksum))
+}
+
 /// Keep identity from the same listing as the keys. An app recreation can
 /// reuse a history key with different bytes, even at the same length.
 pub async fn list_objects(
