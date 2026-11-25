@@ -1,5 +1,11 @@
 //! Lease-free history reads. Only LIST and GET touch the bucket; publication
 //! uses a verified private file without replacing a destination.
+//!
+//! [`get`] and [`list_objects`] are the replica's one reader and one lister
+//! (`replica/bucket.rs`, shared with a restore) under the history's rules:
+//! a read conditional on the listed identity, typed [`Error::Missing`] and
+//! [`Error::Stale`] to plan again on, and a listing that keeps each
+//! object's metadata.
 
 use futures_util::{StreamExt, TryStreamExt};
 use object_store::path::Path as StorePath;
@@ -739,41 +745,32 @@ pub async fn list_objects_bounded(
     list_objects_with_limit(store, prefix, Some(max)).await
 }
 
+/// The history's limits for the replica's one lister
+/// ([`bucket::list`](super::bucket::list)): an attempt silent for
+/// [`READ_IDLE`](super::READ_IDLE) is given up and the prefix listed
+/// again, up to [`READ_ATTEMPTS`](super::READ_ATTEMPTS) times; `max`
+/// counts every object the bucket lists.
 async fn list_objects_with_limit(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     max: Option<usize>,
 ) -> Result<BTreeMap<String, ObjectMeta>, Error> {
-    let base = StorePath::from(prefix.trim_end_matches('/'));
-    let encoded = if base.as_ref().is_empty() {
-        String::new()
-    } else {
-        format!("{}/", base.as_ref())
+    use super::bucket::ListError;
+    let limits = super::bucket::ListLimits {
+        idle: Some(super::READ_IDLE),
+        max,
+        log: false,
     };
-    'attempts: for _ in 0..super::READ_ATTEMPTS {
-        let mut stream = store.list(Some(&base));
-        let mut objects = BTreeMap::new();
-        let mut count = 0;
-        loop {
-            match tokio::time::timeout(super::READ_IDLE, stream.next()).await {
-                Ok(Some(Ok(meta))) => {
-                    count += 1;
-                    if let Some(max) = max
-                        && count > max
-                    {
-                        return Err(Error::Bucket(format!("listing exceeds {max} object limit")));
-                    }
-                    if let Some(key) = meta.location.as_ref().strip_prefix(&encoded) {
-                        objects.insert(key.to_owned(), meta);
-                    }
-                }
-                Ok(Some(Err(e))) => return Err(Error::Bucket(e.to_string())),
-                Ok(None) => return Ok(objects),
-                Err(_) => continue 'attempts,
-            }
+    match super::bucket::list(store.as_ref(), prefix, limits).await {
+        Ok(objects) => Ok(objects.into_iter().collect()),
+        Err(ListError::Refused(e)) => Err(Error::Bucket(e.to_string())),
+        Err(ListError::Over(max)) => {
+            Err(Error::Bucket(format!("listing exceeds {max} object limit")))
+        }
+        Err(ListError::Stalled { .. }) => {
+            Err(Error::Bucket("history listing kept stalling".into()))
         }
     }
-    Err(Error::Bucket("history listing kept stalling".into()))
 }
 
 /// Bounded read with typed missing/stale errors for replanning. A lying body
@@ -861,6 +858,9 @@ async fn prove_listed(
 /// One bounded read. `strict`: conditional on the listed ETag, which the
 /// response must carry too. Otherwise unconditional, with the listed size,
 /// version and last-modified second still required.
+///
+/// These are the history's rules ([`HistoryRead`]) for the replica's one
+/// reader ([`bucket::read`](super::bucket::read)).
 async fn get_once(
     store: &Arc<dyn ObjectStore>,
     path: &StorePath,
@@ -868,74 +868,108 @@ async fn get_once(
     cap: u64,
     strict: bool,
 ) -> Result<bytes::Bytes, Error> {
-    let mut last = String::new();
-    for _ in 0..super::READ_ATTEMPTS {
-        let read = async {
-            let options = object_store::GetOptions {
-                if_match: listed.filter(|_| strict).and_then(|m| m.e_tag.clone()),
-                version: listed.and_then(|m| m.version.clone()),
-                ..Default::default()
-            };
-            let got = tokio::time::timeout(super::READ_IDLE, store.get_opts(path, options))
-                .await
-                .map_err(|_| Error::Bucket("object headers stalled".into()))?
-                .map_err(|e| match e {
-                    object_store::Error::NotFound { .. } => Error::Missing(path.to_string()),
-                    object_store::Error::Precondition { .. }
-                    | object_store::Error::NotModified { .. } => Error::Stale(path.to_string()),
-                    _ => Error::Bucket(e.to_string()),
-                })?;
-            let size = got.meta.size;
-            if listed.is_some_and(|meta| {
-                meta.size != size
-                    || (strict
-                        && meta
-                            .e_tag
-                            .as_ref()
-                            .is_some_and(|tag| got.meta.e_tag.as_ref() != Some(tag)))
-                    || (!strict
-                        && meta.last_modified.timestamp() != got.meta.last_modified.timestamp())
-                    || meta
-                        .version
-                        .as_ref()
-                        .is_some_and(|version| got.meta.version.as_ref() != Some(version))
-            }) {
-                return Err(Error::Stale(path.to_string()));
-            }
-            if size > cap {
-                return Err(Error::Corrupt(format!(
-                    "{path}: object exceeds {cap} byte cap"
-                )));
-            }
-            let mut stream = got.into_stream();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = tokio::time::timeout(super::READ_IDLE, stream.next())
-                .await
-                .map_err(|_| Error::Bucket("object body stalled".into()))?
-            {
-                let chunk = chunk.map_err(|e| Error::Bucket(e.to_string()))?;
-                if (bytes.len() as u64).saturating_add(chunk.len() as u64) > size {
-                    return Err(Error::Corrupt(format!(
-                        "{path}: body exceeds declared size"
-                    )));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            if bytes.len() as u64 != size {
-                return Err(Error::Bucket(format!("{path}: truncated object body")));
-            }
-            Ok(bytes.into())
-        };
-        let allowed = super::READ_IDLE
-            + Duration::from_secs(listed.map_or(cap, |m| m.size).div_ceil(1 << 20));
-        match tokio::time::timeout(allowed, read).await {
-            Ok(Ok(bytes)) => return Ok(bytes),
-            Ok(Err(Error::Bucket(e))) => last = e,
-            Err(_) => last = "object read deadline exceeded".into(),
-            Ok(Err(e)) => return Err(e),
+    let rules = HistoryRead {
+        path,
+        listed,
+        cap,
+        strict,
+        last: String::new(),
+    };
+    super::bucket::read(store.as_ref(), path, rules).await
+}
+
+/// The history's rules for a read ([`get_once`]): a missing or changed
+/// object ends it with the typed error its callers plan again on; every
+/// other refusal, a stall or a short body is an attempt used, and the
+/// next follows at once.
+struct HistoryRead<'a> {
+    path: &'a StorePath,
+    listed: Option<&'a ObjectMeta>,
+    cap: u64,
+    strict: bool,
+    /// Why the last attempt failed.
+    last: String,
+}
+
+impl super::bucket::ReadRules for HistoryRead<'_> {
+    type Error = Error;
+
+    fn options(&self) -> object_store::GetOptions {
+        object_store::GetOptions {
+            if_match: self
+                .listed
+                .filter(|_| self.strict)
+                .and_then(|m| m.e_tag.clone()),
+            version: self.listed.and_then(|m| m.version.clone()),
+            ..Default::default()
         }
     }
-    Err(Error::Bucket(format!("{path}: {last}")))
+
+    /// The idle limit and a second per started megabyte of the listed
+    /// size, or of the cap with nothing listed.
+    fn limit(&self) -> Duration {
+        super::READ_IDLE
+            + Duration::from_secs(self.listed.map_or(self.cap, |m| m.size).div_ceil(1 << 20))
+    }
+
+    fn ends(&self, refusal: &object_store::Error, phase: super::bucket::Phase) -> Option<Error> {
+        match (phase, refusal) {
+            (super::bucket::Phase::Headers, object_store::Error::NotFound { .. }) => {
+                Some(Error::Missing(self.path.to_string()))
+            }
+            (
+                super::bucket::Phase::Headers,
+                object_store::Error::Precondition { .. } | object_store::Error::NotModified { .. },
+            ) => Some(Error::Stale(self.path.to_string())),
+            _ => None,
+        }
+    }
+
+    fn accept(&self, answered: &ObjectMeta) -> Result<(), Error> {
+        let (path, strict, size) = (self.path, self.strict, answered.size);
+        if self.listed.is_some_and(|meta| {
+            meta.size != size
+                || (strict
+                    && meta
+                        .e_tag
+                        .as_ref()
+                        .is_some_and(|tag| answered.e_tag.as_ref() != Some(tag)))
+                || (!strict && meta.last_modified.timestamp() != answered.last_modified.timestamp())
+                || meta
+                    .version
+                    .as_ref()
+                    .is_some_and(|version| answered.version.as_ref() != Some(version))
+        }) {
+            return Err(Error::Stale(path.to_string()));
+        }
+        if size > self.cap {
+            return Err(Error::Corrupt(format!(
+                "{path}: object exceeds {} byte cap",
+                self.cap
+            )));
+        }
+        Ok(())
+    }
+
+    fn too_long(&self, _: u64) -> Error {
+        Error::Corrupt(format!("{}: body exceeds declared size", self.path))
+    }
+
+    async fn failed(&mut self, fault: super::bucket::Fault, _: bool) -> Result<(), Error> {
+        use super::bucket::Fault;
+        self.last = match fault {
+            Fault::NoAnswer => "object headers stalled".into(),
+            Fault::Refused(e) => e.to_string(),
+            Fault::Waited { silent: true, .. } => "object body stalled".into(),
+            Fault::Waited { .. } => "object read deadline exceeded".into(),
+            Fault::Short { .. } => format!("{}: truncated object body", self.path),
+        };
+        Ok(())
+    }
+
+    fn gave_up(self) -> Error {
+        Error::Bucket(format!("{}: {}", self.path, self.last))
+    }
 }
 
 /// Replay an isolated manifest-backed store. The caller must populate only

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)] // test code
 
 mod batched;
+mod one_reader;
 
 use std::collections::BTreeMap;
 

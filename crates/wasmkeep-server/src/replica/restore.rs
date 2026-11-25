@@ -1,5 +1,9 @@
 //! Restoring an actor's database from the bucket: the plan, the bounded reads
 //! and the limits they share, and the listings a restore uses.
+//!
+//! The reads and the listings are the replica's one reader and one lister
+//! ([`bucket`]) under a restore's rules: [`bounded_get`] and
+//! [`list_listed`].
 
 use super::*;
 
@@ -474,7 +478,12 @@ impl<T> Drop for AbortOnDrop<T> {
 /// has its time ([`ReadTime`]). `listed` is the size
 /// the listing gave: an object of another size is not the one the plan
 /// names, and is refused before its body is read (the read-ahead's memory
-/// bound counts listed sizes).
+/// bound counts listed sizes). A body is as long as its answer declared:
+/// a longer one is refused as it passes that size, a shorter one is an
+/// attempt given up.
+///
+/// These are a restore's rules ([`RestoreRead`]) for the replica's one
+/// reader ([`bucket::read`]); the request is unconditional.
 pub(super) async fn bounded_get(
     store: &Arc<dyn ObjectStore>,
     location: &StorePath,
@@ -482,102 +491,132 @@ pub(super) async fn bounded_get(
     cap: u64,
     listed: Option<u64>,
     time: &ReadTime,
-    mut turn: Option<&mut Turn>,
+    turn: Option<&mut Turn>,
 ) -> Result<bytes::Bytes, ReplicaError> {
-    use futures_util::StreamExt;
-    let mut last = String::new();
-    let mut pause = READ_PAUSE;
-    'attempts: for attempt in 1..=READ_ATTEMPTS {
-        if attempt > 1 {
-            time.next_try();
-        }
-        // A failure a resend may get past: an attempt used, then a pause,
-        // without its place under the node's limits on reads if it has
-        // one ([`Turn`]).
-        let mut refused = async |e: object_store::Error| {
-            if attempt < READ_ATTEMPTS {
-                tracing::info!(object = %location, reason = %e, "a restore's read failed; sending it again");
-                match turn.as_deref_mut() {
-                    Some(turn) => turn.pause(pause).await?,
-                    None => tokio::time::sleep(pause).await,
-                }
-                pause = pause.saturating_mul(2);
-            }
-            Ok::<_, ReplicaError>(e.to_string())
-        };
-        // The attempt's whole time, from its request, grown as reads join.
-        let start = tokio::time::Instant::now();
-        let mut limit = time.look().0;
-        let got = match tokio::time::timeout_at(
-            (start + limit).min(start + READ_IDLE),
-            store.get(location),
-        )
-        .await
-        {
-            Ok(Ok(got)) => got,
-            Ok(Err(e)) if definite(&e) => return Err(ReplicaError::Bucket(e.to_string())),
-            Ok(Err(e)) => {
-                last = refused(e).await?;
-                continue;
-            }
-            Err(_) => {
-                last = format!("no answer within {READ_IDLE:?}");
-                tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
-                continue;
-            }
-        };
-        let size = got.meta.size;
-        if let Some(listed) = listed
+    let rules = RestoreRead {
+        location,
+        max_object,
+        cap,
+        listed,
+        time,
+        turn,
+        pause: READ_PAUSE,
+        last: String::new(),
+    };
+    bucket::read(store.as_ref(), location, rules).await
+}
+
+/// A restore's rules for a read ([`bounded_get`]).
+struct RestoreRead<'a> {
+    location: &'a StorePath,
+    max_object: u64,
+    cap: u64,
+    listed: Option<u64>,
+    time: &'a ReadTime,
+    turn: Option<&'a mut Turn>,
+    /// The pause before the next resend of a refused attempt: twice as
+    /// long each time.
+    pause: std::time::Duration,
+    /// Why the last attempt failed.
+    last: String,
+}
+
+impl bucket::ReadRules for RestoreRead<'_> {
+    type Error = ReplicaError;
+
+    fn options(&self) -> object_store::GetOptions {
+        object_store::GetOptions::default()
+    }
+
+    fn next_try(&mut self) {
+        self.time.next_try();
+    }
+
+    fn limit(&self) -> std::time::Duration {
+        self.time.look().0
+    }
+
+    fn ends(&self, refusal: &object_store::Error, _: bucket::Phase) -> Option<ReplicaError> {
+        definite(refusal).then(|| ReplicaError::Bucket(refusal.to_string()))
+    }
+
+    fn accept(&self, answered: &object_store::ObjectMeta) -> Result<(), ReplicaError> {
+        let (location, size) = (self.location, answered.size);
+        if let Some(listed) = self.listed
             && size != listed
         {
             return Err(ReplicaError::Restore(format!(
                 "{location}: {size} bytes, where the listing said {listed}"
             )));
         }
-        if size > max_object {
+        if size > self.max_object {
             return Err(ReplicaError::Restore(format!(
-                "{location}: {size} bytes, more than a database under the {cap}-byte cap can need"
+                "{location}: {size} bytes, more than a database under the {}-byte cap can need",
+                self.cap
             )));
         }
-        let mut body = got.into_stream();
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        loop {
-            let now = tokio::time::Instant::now();
-            limit = time.look().0;
-            let until = start + limit;
-            match tokio::time::timeout_at(until.min(now + READ_IDLE), body.next()).await {
-                Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
-                Ok(Some(Err(e))) if definite(&e) => {
-                    return Err(ReplicaError::Bucket(e.to_string()));
-                }
-                Ok(Some(Err(e))) => {
-                    // Nothing of this answer is kept through the pause:
-                    // the read has no megabytes then to count it by.
-                    drop((body, bytes));
-                    last = refused(e).await?;
-                    continue 'attempts;
-                }
-                Ok(None) => return Ok(bytes.into()),
-                Err(_) if tokio::time::Instant::now() >= start + limit => {
-                    last = format!(
-                        "read too slowly ({} of {size} bytes in {limit:?})",
-                        bytes.len()
-                    );
-                    tracing::info!(object = %location, reason = %last, "a restore's read was too slow; sending it again");
-                    continue 'attempts;
-                }
-                Err(_) => {
-                    last = format!("body stalled after {} of {size} bytes", bytes.len());
-                    tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
-                    continue 'attempts;
-                }
-            }
-        }
+        Ok(())
     }
-    tracing::warn!(object = %location, reason = %last, "a restore's read kept failing");
-    Err(ReplicaError::Bucket(format!(
-        "{location}: {last}, {READ_ATTEMPTS} times"
-    )))
+
+    fn too_long(&self, size: u64) -> ReplicaError {
+        ReplicaError::Restore(format!(
+            "{}: a body longer than the {size} bytes it declared",
+            self.location
+        ))
+    }
+
+    async fn failed(&mut self, fault: bucket::Fault, more: bool) -> Result<(), ReplicaError> {
+        let location = self.location;
+        self.last = match fault {
+            // A failure a resend may get past: an attempt used, then a
+            // pause, without its place under the node's limits on reads
+            // if it has one ([`Turn`]).
+            bucket::Fault::Refused(e) => {
+                if more {
+                    tracing::info!(object = %location, reason = %e, "a restore's read failed; sending it again");
+                    match self.turn.as_deref_mut() {
+                        Some(turn) => turn.pause(self.pause).await?,
+                        None => tokio::time::sleep(self.pause).await,
+                    }
+                    self.pause = self.pause.saturating_mul(2);
+                }
+                e.to_string()
+            }
+            bucket::Fault::NoAnswer => {
+                let last = format!("no answer within {READ_IDLE:?}");
+                tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
+                last
+            }
+            bucket::Fault::Waited {
+                read,
+                size,
+                limit,
+                spent: true,
+                ..
+            } => {
+                let last = format!("read too slowly ({read} of {size} bytes in {limit:?})");
+                tracing::info!(object = %location, reason = %last, "a restore's read was too slow; sending it again");
+                last
+            }
+            bucket::Fault::Waited { read, size, .. } => {
+                let last = format!("body stalled after {read} of {size} bytes");
+                tracing::info!(object = %location, reason = %last, "a restore's read stalled; sending it again");
+                last
+            }
+            bucket::Fault::Short { read, size } => {
+                let last = format!("body ended after {read} of {size} bytes");
+                tracing::info!(object = %location, reason = %last, "a restore's read ended short; sending it again");
+                last
+            }
+        };
+        Ok(())
+    }
+
+    fn gave_up(self) -> ReplicaError {
+        let (location, last) = (self.location, self.last);
+        tracing::warn!(object = %location, reason = %last, "a restore's read kept failing");
+        ReplicaError::Bucket(format!("{location}: {last}, {READ_ATTEMPTS} times"))
+    }
 }
 
 /// Keys under `prefix`, relative to it; with `idle`, giving up an attempt when the bucket is
@@ -589,56 +628,43 @@ pub(super) async fn list_with(
     prefix: &str,
     idle: Option<std::time::Duration>,
 ) -> Result<Vec<String>, ReplicaError> {
-    Ok(list_sized(store, prefix, idle)
+    Ok(list_listed(store, prefix, idle)
         .await?
         .into_iter()
         .map(|(key, _)| key)
         .collect())
 }
 
-/// [`list_with`], with each object's size.
-async fn list_sized(
+/// [`list_with`], with what the listing said of each object (its exact
+/// location, its size, its last-modified time), in the order listed: the
+/// replica's one lister ([`bucket::list`]) for those that hold or are
+/// taking the actor's lease (a restore, the listing that seeds a first
+/// generation, a collection pass). An empty prefix names no actor and
+/// lists nothing: what a collection pass lists, it may delete.
+pub(super) async fn list_listed(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     idle: Option<std::time::Duration>,
-) -> Result<Vec<(String, u64)>, ReplicaError> {
-    use futures_util::StreamExt;
-    let base = StorePath::from(prefix.trim_end_matches('/'));
-    // Listed locations come back in the store's encoding, where a `%` in a
-    // segment (as in an escaped actor name) is escaped again: compare with
-    // the prefix in that same encoding, not with the raw string.
-    let encoded = format!("{}/", base.as_ref());
-    let attempts = if idle.is_some() { READ_ATTEMPTS } else { 1 };
-    'attempts: for _ in 0..attempts {
-        let mut listing = store.list(Some(&base));
-        let mut keys = Vec::new();
-        loop {
-            let next = match idle {
-                Some(idle) => match tokio::time::timeout(idle, listing.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        tracing::info!(prefix, "a restore's listing stalled; listing again");
-                        continue 'attempts;
-                    }
-                },
-                None => listing.next().await,
-            };
-            match next {
-                Some(Ok(meta)) => {
-                    if let Some(key) = meta.location.as_ref().strip_prefix(encoded.as_str()) {
-                        keys.push((key.to_owned(), meta.size));
-                    }
-                }
-                Some(Err(e)) => return Err(ReplicaError::Bucket(e.to_string())),
-                None => return Ok(keys),
-            }
-        }
+) -> Result<Vec<(String, object_store::ObjectMeta)>, ReplicaError> {
+    if prefix.trim_end_matches('/').is_empty() {
+        return Ok(Vec::new());
     }
-    tracing::warn!(prefix, "a restore's listing kept stalling");
-    Err(ReplicaError::Bucket(format!(
-        "{prefix}: the listing stalled ({:?} without a key), {attempts} times",
-        idle.unwrap_or_default()
-    )))
+    let limits = bucket::ListLimits {
+        idle,
+        max: None,
+        log: true,
+    };
+    bucket::list(store.as_ref(), prefix, limits)
+        .await
+        .map_err(|e| match e {
+            bucket::ListError::Refused(e) => ReplicaError::Bucket(e.to_string()),
+            bucket::ListError::Over(max) => {
+                ReplicaError::Bucket(format!("{prefix}: more than {max} objects listed"))
+            }
+            bucket::ListError::Stalled { idle, attempts } => ReplicaError::Bucket(format!(
+                "{prefix}: the listing stalled ({idle:?} without a key), {attempts} times"
+            )),
+        })
 }
 
 impl Replica {
@@ -754,9 +780,12 @@ impl Replica {
     ) -> Result<Self, ReplicaError> {
         let store = Arc::clone(&cluster.store);
         let prefix = format!("{}/", cluster.history_key(address));
-        let sized = list_sized(&store, &prefix, Some(READ_IDLE)).await?;
-        let keys: Vec<String> = sized.iter().map(|(k, _)| k.clone()).collect();
-        let sizes: std::collections::HashMap<String, u64> = sized.into_iter().collect();
+        let listed = list_listed(&store, &prefix, Some(READ_IDLE)).await?;
+        let keys: Vec<String> = listed.iter().map(|(k, _)| k.clone()).collect();
+        let sizes: std::collections::HashMap<String, u64> = listed
+            .into_iter()
+            .map(|(key, meta)| (key, meta.size))
+            .collect();
         let listing = Listing::from_keys(keys.iter().map(String::as_str));
         let plan = plan_restore(&listing).map_err(|e| match e {
             // ADR 0035, section 3: with a recorded floor to reach, a missing

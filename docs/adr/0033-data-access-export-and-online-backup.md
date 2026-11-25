@@ -1168,7 +1168,10 @@ What follows from it:
   `plan_restore`, `wal::Restorer` and the checksums as they stand. The
   bounded reads (`download`, `bounded_get`, `list_sized`) are private to
   `wasmkeep-server` and move to a crate the command line can use, or are
-  written again for it. The command line gains a dependency on `wasmkeep-storage`'s
+  written again for it (they were written again, in `replica/history.rs`;
+  since 0.9.0 both sets are one reader and one lister,
+  `replica/bucket.rs`, under each caller's rules, and `list_sized` is
+  `list_listed`). The command line gains a dependency on `wasmkeep-storage`'s
   restorer and SQLite (already built for the server).
 - The backup guide changes its central rule (section 4), and a
   `backup create` copy becomes the recommended backup. `rclone` stays as
