@@ -164,7 +164,7 @@ async fn check(store: &Store, deep: bool) -> Report {
         deep,
         ..Options::default()
     };
-    let report = verify(Arc::clone(store), PREFIX, &options).await.unwrap();
+    let report = verify(Arc::clone(store), PREFIX, &options).await;
     assert_eq!(report.writes_refused, 0, "verify tried to write");
     report
 }
@@ -201,12 +201,19 @@ async fn a_whole_bucket_under_a_prefix_passes_and_is_counted() {
     assert!(deep.requests > deep.objects_read && deep.keys_listed >= 10);
     assert!(deep.to_text().ends_with("The bucket is whole.\n"));
     assert_eq!(deep.to_json()["apps"][0]["restorable"], 1);
-    // Another prefix holds nothing of it: an error, not a whole bucket.
+    assert_eq!(deep.to_json()["writes_refused"], 0);
+    assert_eq!(deep.to_json()["exit_code"], 0);
+    // Another prefix holds nothing of it: no verdict, not a whole bucket.
     let other = verify(Arc::clone(&store), "p", &Options::default()).await;
     assert!(
-        other.is_err_and(|e| e.to_string().contains("nothing of a cluster")),
+        !other.whole() && other.exit_code() == 2,
         "an empty prefix passed"
     );
+    assert!(
+        other.stopped[0].contains("nothing of a cluster"),
+        "{other:?}"
+    );
+    assert!(other.to_text().contains("stopped: nothing of a cluster"));
 }
 
 #[tokio::test]
@@ -325,11 +332,6 @@ async fn each_record_that_does_not_read_is_named() {
             "alarm",
         ),
         (
-            "p/q/apps/acme/shop/restoring".to_owned(),
-            b"{}".to_vec(),
-            "deploy",
-        ),
-        (
             "p/q/apps/acme/shop/current".to_owned(),
             garbage.clone(),
             "deploy",
@@ -356,6 +358,7 @@ async fn each_record_that_does_not_read_is_named() {
         put(&store, &key, body).await;
         let report = check(&store, false).await;
         assert_eq!(report.problems.len(), 1, "{key}: {}", report.to_text());
+        assert!(report.unread.is_empty(), "{key}: {}", report.to_text());
         let found = &report.problems[0];
         if check_name == "deploy" && key.ends_with("current") && found.key != key {
             assert_eq!(found.key, "p/q/apps/acme/shop/00ff/manifest");
@@ -685,7 +688,7 @@ async fn a_sample_reads_the_records_of_that_many_actors() {
         deep: true,
         ..Options::default()
     };
-    let report = verify(Arc::clone(&store), PREFIX, &options).await.unwrap();
+    let report = verify(Arc::clone(&store), PREFIX, &options).await;
     assert_eq!(report.problems.len(), 1, "{}", report.to_text());
     let a = &report.apps[0];
     assert_eq!(
@@ -706,7 +709,7 @@ async fn one_actor_is_checked_alone() {
         deep: true,
         ..Options::default()
     };
-    let report = verify(Arc::clone(&store), PREFIX, &one("a")).await.unwrap();
+    let report = verify(Arc::clone(&store), PREFIX, &one("a")).await;
     assert!(report.whole(), "{}", report.to_text());
     let text = report.to_text();
     assert!(
@@ -718,9 +721,7 @@ async fn one_actor_is_checked_alone() {
         "{text}"
     );
     assert_eq!((report.apps[0].actors, report.apps[0].restorable), (1, 1));
-    let report = verify(Arc::clone(&store), PREFIX, &one("nobody"))
-        .await
-        .unwrap();
+    let report = verify(Arc::clone(&store), PREFIX, &one("nobody")).await;
     assert_eq!(
         only(&report),
         ("p/q/state/acme/shop/actors/c/nobody", "history")
@@ -731,27 +732,61 @@ async fn one_actor_is_checked_alone() {
         ..Options::default()
     };
     let refused = verify(Arc::clone(&store), PREFIX, &absent).await;
+    assert_eq!(refused.exit_code(), 2, "an app that is not there passed");
+    assert!(refused.stopped[0].contains("acme/typo"), "{refused:?}");
+    // A deleted app's actor is not "whole": nothing of it was checked.
+    put(&store, "p/q/apps/acme/shop/deleted", b"who when".to_vec()).await;
+    let report = verify(Arc::clone(&store), PREFIX, &one("a")).await;
+    assert_eq!(report.exit_code(), 2, "{}", report.to_text());
+    let text = report.to_text();
     assert!(
-        refused.is_err_and(|e| e.to_string().contains("acme/typo")),
-        "an app that is not there passed"
+        text.contains("app acme/shop: deleted, not checked")
+            && text.contains("stopped: app acme/shop: the app is deleted")
+            && !text.contains("is whole")
+            && !text.contains("restorable"),
+        "{text}"
     );
 }
 
-/// A bucket that refuses every read of one key.
+/// What a [`Faulty`] bucket does with its key.
 #[derive(Debug)]
-struct Refuses {
-    inner: Store,
-    key: String,
+enum Fault {
+    /// Refuses that many reads of it, then gives it.
+    Refuses(usize),
+    /// Says once that it is not there.
+    AbsentOnce,
+    /// Refuses every listing whose prefix it is under.
+    NoListing,
+    /// Lists every key under it with an ETag of a megabyte.
+    HugeTags,
 }
 
-impl std::fmt::Display for Refuses {
+/// A bucket with one fault at one key.
+#[derive(Debug)]
+struct Faulty {
+    inner: Store,
+    key: String,
+    fault: Fault,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+fn faulty(inner: Store, key: &str, fault: Fault) -> Store {
+    Arc::new(Faulty {
+        inner,
+        key: key.to_owned(),
+        fault,
+        gets: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+impl std::fmt::Display for Faulty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Refuses")
+        f.write_str("Faulty")
     }
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for Refuses {
+impl ObjectStore for Faulty {
     async fn put_opts(
         &self,
         _: &Key,
@@ -773,10 +808,22 @@ impl ObjectStore for Refuses {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         if location.as_ref() == self.key {
-            return Err(object_store::Error::Generic {
-                store: "Refuses",
-                source: "access denied".into(),
-            });
+            let nth = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.fault {
+                Fault::Refuses(times) if nth < times => {
+                    return Err(object_store::Error::Generic {
+                        store: "Faulty",
+                        source: "access denied".into(),
+                    });
+                }
+                Fault::AbsentOnce if nth == 0 => {
+                    return Err(object_store::Error::NotFound {
+                        path: location.to_string(),
+                        source: "not yet".into(),
+                    });
+                }
+                _ => {}
+            }
         }
         self.inner.get_opts(location, options).await
     }
@@ -790,7 +837,29 @@ impl ObjectStore for Refuses {
         &self,
         prefix: Option<&Key>,
     ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        let under = prefix.is_some_and(|p| self.key.starts_with(p.as_ref()));
+        match self.fault {
+            Fault::NoListing if under => futures_util::stream::once(async {
+                Err(object_store::Error::Generic {
+                    store: "Faulty",
+                    source: "listing denied".into(),
+                })
+            })
+            .boxed(),
+            Fault::HugeTags => {
+                let key = self.key.clone();
+                self.inner
+                    .list(prefix)
+                    .map_ok(move |mut meta| {
+                        if meta.location.as_ref().starts_with(&key) {
+                            meta.e_tag = Some("e".repeat(1 << 20));
+                        }
+                        meta
+                    })
+                    .boxed()
+            }
+            _ => self.inner.list(prefix),
+        }
     }
     async fn list_with_delimiter(
         &self,
@@ -808,25 +877,208 @@ impl ObjectStore for Refuses {
     }
 }
 
+/// What could not be read, alone in `report`: its key and its check. Not
+/// a problem, and no verdict.
+fn only_unread(report: &Report) -> (&str, &str) {
+    assert!(report.problems.is_empty(), "{}", report.to_text());
+    assert_eq!(report.unread.len(), 1, "{}", report.to_text());
+    assert!(!report.whole() && report.exit_code() == 2);
+    (report.unread[0].key.as_str(), report.unread[0].check)
+}
+
 #[tokio::test]
-async fn an_object_the_bucket_refuses_to_give_is_named() {
+async fn an_object_the_bucket_refuses_to_give_is_not_read_not_broken() {
     let root = root();
     let actor = root.bucket_key(Family::History, "c/a");
     for (key, check_name, deep) in [
         (root.bucket_key(Family::Owners, "c/a"), "ownership", false),
         (format!("{actor}/{}", wal(2)), "history", true),
         ("p/q/nodes/n1".to_owned(), "node", false),
+        (app_format::key_of(&root), "format", false),
+        ("p/q/apps/acme/shop/current".to_owned(), "deploy", false),
+        (format!("p/q/{}blob-usage", root.bucket()), "files", false),
     ] {
-        let store: Store = Arc::new(Refuses {
-            inner: whole_bucket().await,
-            key: key.clone(),
-        });
+        let store = faulty(whole_bucket().await, &key, Fault::Refuses(usize::MAX));
         let report = check(&store, deep).await;
-        assert_eq!(only(&report), (key.as_str(), check_name));
+        assert_eq!(only_unread(&report), (key.as_str(), check_name));
         assert!(
-            report.problems[0].detail.contains("access denied"),
+            report.unread[0].detail.contains("access denied"),
             "{:?}",
-            report.problems[0]
+            report.unread[0]
         );
+        let text = report.to_text();
+        assert!(
+            text.contains(&format!("not read: {key}: "))
+                && text.contains("No problem found, but the run was not complete")
+                && !text.contains("is whole"),
+            "{text}"
+        );
+        let json = report.to_json();
+        assert_eq!(
+            (&json["whole"], &json["exit_code"], &json["unread_total"]),
+            (&json!(false), &json!(2), &json!(1))
+        );
+        assert_eq!(json["unread"][0]["key"], key.as_str());
     }
+    // Refused more often than the reader asks at once, then given: asked
+    // again after a pause, and whole.
+    let key = root.bucket_key(Family::Owners, "c/a");
+    let store = faulty(whole_bucket().await, &key, Fault::Refuses(4));
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    // With a problem elsewhere, the verdict is the problem's.
+    let store = whole_bucket().await;
+    put(&store, "p/q/nodes/n2", vec![0]).await;
+    let store = faulty(store, &key, Fault::Refuses(usize::MAX));
+    let report = check(&store, false).await;
+    assert_eq!((report.exit_code(), report.unread.len()), (1, 1));
+    assert!(
+        report
+            .to_text()
+            .contains("1 problems found, and the run was not complete.")
+    );
+}
+
+#[tokio::test]
+async fn a_listing_that_fails_leaves_what_was_found_until_then() {
+    let root = root();
+    let store = whole_bucket().await;
+    // A problem found before the listing that fails.
+    put(&store, &root.bucket_key(Family::Owners, "c/a"), vec![0]).await;
+    let alarms = root.bucket_base(Family::Alarms);
+    let store = faulty(store, &format!("{alarms}/x"), Fault::NoListing);
+    let report = check(&store, false).await;
+    let a = &report.apps[0];
+    assert_eq!((a.actors, a.records, a.files), (1, 1, 0), "{a:?}");
+    assert!(
+        a.stopped
+            .as_ref()
+            .is_some_and(|why| why.contains("listing denied")),
+        "{a:?}"
+    );
+    // The other families go on: the nodes are still read.
+    assert_eq!(report.nodes, 1);
+    assert_eq!(report.problems.len(), 1);
+    assert_eq!(report.exit_code(), 1);
+    let text = report.to_text();
+    assert!(
+        text.contains("stopped: app acme/shop: ") && text.contains("problem: "),
+        "{text}"
+    );
+    assert!(report.to_json()["apps"][0]["stopped"].is_string());
+
+    // Without that problem: no verdict, and the report is still there.
+    let store = faulty(
+        whole_bucket().await,
+        &format!("{alarms}/x"),
+        Fault::NoListing,
+    );
+    let report = check(&store, false).await;
+    assert_eq!(report.exit_code(), 2, "{}", report.to_text());
+    assert_eq!((report.apps[0].restorable, report.nodes), (1, 1));
+    // The listing of the nodes: the apps were checked, and stay.
+    let store = faulty(whole_bucket().await, "p/q/nodes/x", Fault::NoListing);
+    let report = check(&store, false).await;
+    assert_eq!((report.exit_code(), report.apps[0].restorable), (2, 1));
+    assert!(report.stopped[0].contains("listing denied"), "{report:?}");
+}
+
+#[tokio::test]
+async fn a_key_that_is_no_actors_is_named_and_the_rest_is_checked() {
+    let root = root();
+    let store = whole_bucket().await;
+    let actors = root.bucket_base(Family::History);
+    let strays = [format!("{actors}/c/marker"), format!("{actors}/readme")];
+    for key in &strays {
+        put(&store, key, Vec::new()).await;
+    }
+    // Under `owners/`, such a key is left alone and counted.
+    put(&store, &root.bucket_key(Family::Owners, "readme"), vec![1]).await;
+    put(&store, &root.bucket_key(Family::Owners, "c/a/b"), vec![1]).await;
+    let report = check(&store, true).await;
+    assert_eq!(report.exit_code(), 1, "{}", report.to_text());
+    let mut named: Vec<_> = report
+        .problems
+        .iter()
+        .map(|p| (p.key.clone(), p.check))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        strays
+            .iter()
+            .map(|k| (k.clone(), "history"))
+            .collect::<Vec<_>>(),
+        "{}",
+        report.to_text()
+    );
+    let a = &report.apps[0];
+    assert_eq!((a.actors, a.restorable, a.deep_checked), (1, 1, 1), "{a:?}");
+    assert_eq!((a.records, a.records_skipped), (1, 2), "{a:?}");
+}
+
+#[tokio::test]
+async fn an_actor_with_more_keys_than_the_listing_budget_is_not_checked() {
+    let root = root();
+    let store = whole_bucket().await;
+    let busy = root.bucket_key(Family::History, "c/busy");
+    for i in 0..40 {
+        put(&store, &format!("{busy}/{}", wal(i + 1)), Vec::new()).await;
+    }
+    let store = faulty(store, &busy, Fault::HugeTags);
+    let report = check(&store, false).await;
+    assert_eq!(
+        only_unread(&report),
+        (format!("{busy}/").as_str(), "history")
+    );
+    assert!(
+        report.unread[0].detail.contains("memory budget exceeded"),
+        "{:?}",
+        report.unread[0]
+    );
+    let a = &report.apps[0];
+    assert_eq!((a.actors, a.restorable), (2, 1), "{a:?}");
+}
+
+#[tokio::test]
+async fn what_changed_while_it_was_read_is_read_again_before_it_is_a_problem() {
+    let root = root();
+    // The format setting written after it was first read (`app format
+    // --enable`): a version 2 record is then no problem.
+    let store = whole_bucket().await;
+    let format = app_format::key_of(&root);
+    put(&store, &format, app_format::ENABLED_BODY.to_vec()).await;
+    let owner = root.bucket_key(Family::Owners, "c/a");
+    put(&store, &owner, released(Some(complete(3, 3)))).await;
+    let store = faulty(store, &format, Fault::AbsentOnce);
+    let report = check(&store, true).await;
+    assert!(report.whole(), "{}", report.to_text());
+    // An app deleted while it was read: what was found of it says nothing.
+    let store = whole_bucket().await;
+    put(&store, &owner, vec![0]).await;
+    put(&store, "p/q/apps/acme/shop/deleted", b"who when".to_vec()).await;
+    let store = faulty(store, "p/q/apps/acme/shop/deleted", Fault::AbsentOnce);
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(
+        (report.apps[0].state, report.apps[0].actors),
+        ("deleted", 0)
+    );
+    // A restore that is under way: not checked, and no verdict.
+    let store = whole_bucket().await;
+    put(&store, &owner, vec![0]).await;
+    put(&store, "p/q/apps/acme/shop/restoring", b"{}".to_vec()).await;
+    let report = check(&store, false).await;
+    assert_eq!(
+        only_unread(&report),
+        ("p/q/apps/acme/shop/restoring", "deploy")
+    );
+    assert_eq!(report.apps[0].state, "restoring");
+}
+
+#[test]
+fn a_full_set_says_so() {
+    let mut seen = Seen::default();
+    seen.insert("c", "a");
+    assert!(seen.has("c", "a") && !seen.has("c", "b") && !seen.full);
 }

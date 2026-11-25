@@ -101,8 +101,10 @@ pub(super) enum ClusterCommand {
     /// wrong is read again before it is reported. Prints what it read
     /// (objects, requests, time; a listing counts one request, and one
     /// more per 1,000 keys) and each problem with its key. Exits with 0
-    /// when the bucket is whole, 1 when a problem was found, 2 when it
-    /// could not finish.
+    /// when the bucket is whole, 1 when a problem was found, 2 when there
+    /// is no verdict: no problem, but something could not be read, listed
+    /// or checked (it is named, and what was found until then is still
+    /// printed).
     Verify(wasmkeep_cli::verify::VerifyArgs),
 }
 

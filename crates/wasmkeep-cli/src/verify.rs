@@ -16,8 +16,9 @@
 //! sent (`store::ReadOnly`).
 //!
 //! Bounds: an app's history is listed as one stream and held one actor at
-//! a time (16 actors at once, each listing at most 32 MiB); the other
-//! families are streamed key by key; with `--deep` the bodies in memory
+//! a time (16 actors at once, each group at most 32 MiB of names and
+//! ETags; an actor over that is not checked; one listed again alone has
+//! no such limit); the other families are streamed key by key; with `--deep` the bodies in memory
 //! stay under 256 MiB unless one object alone is larger; at most 1,000
 //! problems are kept (all are counted). What grows with
 //! the bucket is one 16-byte entry per actor with history, up to
@@ -48,7 +49,7 @@ use wasmkeep_cluster::state_root::{Family, StateRoot};
 use wasmkeep_cluster::{alarm_index, app_format, blob_sweep};
 use wasmkeep_server::history;
 
-use crate::actor_groups::actor_groups_with_errors;
+use crate::actor_groups::group_listing;
 
 type Store = Arc<dyn ObjectStore>;
 type Objects = BTreeMap<String, ObjectMeta>;
@@ -68,9 +69,11 @@ const MAX_OBJECT: u64 = (2 << 30) + (2 << 30) / 16 + (1 << 20);
 const MAX_COMPONENT: u64 = 2 << 30;
 /// The longest a small record is read.
 const MAX_RECORD: u64 = 64 << 10;
+/// The longest a deploy manifest is read.
+const MAX_MANIFEST: u64 = 4 << 20;
 /// A check that found a problem is made again on a fresh read, this many
 /// times in all: a running cluster collects history and replaces records
-/// while they are read.
+/// while they are read. A read the bucket refuses is sent again as often.
 const ATTEMPTS: usize = 3;
 /// Between two of those attempts.
 const AGAIN_AFTER: Duration = Duration::from_millis(500);
@@ -142,6 +145,11 @@ pub struct Problem {
     pub check: &'static str,
     /// What is wrong.
     pub detail: String,
+    /// Nothing is known of the object: the bucket did not give it, or it
+    /// was not checked. Such a finding is in [`Report::unread`] and makes
+    /// the run incomplete (exit code 2); it does not say the bucket is
+    /// not whole.
+    pub unread: bool,
 }
 
 /// One app's result.
@@ -178,6 +186,12 @@ pub struct AppReport {
     pub history_bytes: u64,
     /// Ownership records listed.
     pub records: u64,
+    /// Keys under `owners/` that are not a record's (left alone).
+    pub records_skipped: u64,
+    /// Why this app's checks stopped before their end (a listing the
+    /// bucket refused or that stalled; with `--actor`, a deleted app).
+    /// What was counted before is kept.
+    pub stopped: Option<String>,
     /// Alarm index entries.
     pub alarms: u64,
     /// Keys under `alarms/` that are not entries (readers skip them).
@@ -220,6 +234,13 @@ pub struct Report {
     pub problems: Vec<Problem>,
     /// How many there are in all.
     pub problems_total: u64,
+    /// What could not be read or was not checked, at most 1,000.
+    pub unread: Vec<Problem>,
+    /// How many there are in all.
+    pub unread_total: u64,
+    /// Why the run stopped before its end, if it did (each app has its
+    /// own [`AppReport::stopped`]).
+    pub stopped: Vec<String>,
     /// Objects read, and their bytes.
     pub objects_read: u64,
     /// See [`Self::objects_read`].
@@ -236,14 +257,30 @@ pub struct Report {
 }
 
 impl Report {
-    /// Nothing wrong was found.
+    /// Nothing wrong was found, and everything was read.
     pub fn whole(&self) -> bool {
-        self.problems_total == 0
+        self.problems_total == 0 && self.complete()
     }
 
-    /// The process's exit code: 0 whole, 1 not.
+    /// Everything that was to be checked was read: no object the bucket
+    /// refused to give, nothing left unchecked, no listing cut short.
+    pub fn complete(&self) -> bool {
+        self.unread_total == 0
+            && self.stopped.is_empty()
+            && self.apps.iter().all(|a| a.stopped.is_none())
+    }
+
+    /// The process's exit code: 0 whole; 1 a problem was found (whether or
+    /// not the run was complete); 2 no problem found, but the run was not
+    /// complete, so there is no verdict.
     pub fn exit_code(&self) -> i32 {
-        i32::from(!self.whole())
+        if self.problems_total > 0 {
+            1
+        } else if self.complete() {
+            0
+        } else {
+            2
+        }
     }
 
     /// For scripts.
@@ -269,6 +306,8 @@ impl Report {
                     "history_objects": a.history_objects,
                     "history_bytes": a.history_bytes,
                     "ownership_records": a.records,
+                    "ownership_keys_skipped": a.records_skipped,
+                    "stopped": a.stopped,
                     "alarm_entries": a.alarms,
                     "alarm_keys_skipped": a.alarms_skipped,
                     "lease_markers": a.lease_markers,
@@ -282,14 +321,18 @@ impl Report {
                 })
             })
             .collect();
-        let problems: Vec<Value> = self
-            .problems
-            .iter()
-            .map(|p| json!({"key": p.key, "check": p.check, "detail": p.detail}))
-            .collect();
+        let listed = |found: &[Problem]| -> Vec<Value> {
+            found
+                .iter()
+                .map(|p| json!({"key": p.key, "check": p.check, "detail": p.detail}))
+                .collect()
+        };
+        let (problems, unread) = (listed(&self.problems), listed(&self.unread));
         json!({
             "bucket": self.bucket,
             "whole": self.whole(),
+            "complete": self.complete(),
+            "exit_code": self.exit_code(),
             "deep": self.deep,
             "sample": self.sample,
             "actor": self.actor,
@@ -297,6 +340,10 @@ impl Report {
             "nodes": {"leases": self.nodes, "old_format": self.nodes_old_format},
             "problems": problems,
             "problems_total": self.problems_total,
+            "unread": unread,
+            "unread_total": self.unread_total,
+            "stopped": self.stopped,
+            "writes_refused": self.writes_refused,
             "objects_read": self.objects_read,
             "bytes_read": self.bytes_read,
             "requests": self.requests,
@@ -317,8 +364,13 @@ impl Report {
                 .map(|n| format!(", {n} actors of each app sampled"))
                 .unwrap_or_default()
         );
+        let unchecked = |a: &AppReport| matches!(a.state, "deleted" | "restoring" | "unreadable");
         if let Some(actor) = &self.actor {
             for a in &self.apps {
+                if unchecked(a) {
+                    let _ = writeln!(out, "app {}: {}, not checked", a.name, a.state);
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "actor {actor} of {}: {} ({} objects, {}); ownership record {}{}",
@@ -355,17 +407,22 @@ impl Report {
                 let _ = write!(out, ", floor {floor}");
             }
             out.push('\n');
-            if matches!(a.state, "deleted" | "restoring" | "unreadable") {
+            if unchecked(a) {
                 continue;
             }
             let _ = writeln!(
                 out,
-                "  actors: {} with history, {} restorable ({} objects, {}); {} ownership records, {} read{}",
+                "  actors: {} with history, {} restorable ({} objects, {}); {} ownership records{}, {} read{}",
                 a.actors,
                 a.restorable,
                 a.history_objects,
                 size(a.history_bytes),
                 a.records,
+                if a.records_skipped > 0 {
+                    format!(" ({} other keys)", a.records_skipped)
+                } else {
+                    String::new()
+                },
                 a.records_read,
                 if self.deep {
                     format!("; {} read whole", a.deep_checked)
@@ -432,6 +489,24 @@ impl Report {
                 self.problems_total - self.problems.len() as u64
             );
         }
+        for p in &self.unread {
+            let _ = writeln!(out, "not read: {}: {} ({})", p.key, p.detail, p.check);
+        }
+        if self.unread_total > self.unread.len() as u64 {
+            let _ = writeln!(
+                out,
+                "... and {} more not read",
+                self.unread_total - self.unread.len() as u64
+            );
+        }
+        for a in &self.apps {
+            if let Some(why) = &a.stopped {
+                let _ = writeln!(out, "stopped: app {}: {why}", a.name);
+            }
+        }
+        for why in &self.stopped {
+            let _ = writeln!(out, "stopped: {why}");
+        }
         let _ = writeln!(
             out,
             "Read {} objects ({}) and listed {} keys in {} requests, {:.1} s.",
@@ -457,8 +532,24 @@ impl Report {
                 "The bucket"
             };
             let _ = writeln!(out, "{what} is whole{scope}.");
+        } else if self.problems_total > 0 {
+            let _ = writeln!(
+                out,
+                "{} problems found{}.",
+                self.problems_total,
+                if self.complete() {
+                    ""
+                } else {
+                    ", and the run was not complete"
+                }
+            );
         } else {
-            let _ = writeln!(out, "{} problems found.", self.problems_total);
+            let _ = writeln!(
+                out,
+                "No problem found, but the run was not complete ({} not read or not \
+                 checked): no verdict.",
+                self.unread_total
+            );
         }
         out
     }
@@ -475,8 +566,9 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// `wasmkeep cluster verify`: prints the report and returns the exit code:
-/// 0 whole, 1 problems found, 2 the run could not start or finish.
+/// `wasmkeep cluster verify`: prints the report, whole or partial, and
+/// returns the exit code: 0 whole, 1 problems found, 2 no verdict (the
+/// run could not start, or something could not be read or listed).
 pub fn command(args: &VerifyArgs) -> i32 {
     let run = || -> anyhow::Result<Report> {
         let actor = match (&args.actor, &args.app) {
@@ -499,7 +591,7 @@ pub fn command(args: &VerifyArgs) -> i32 {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let mut report = rt.block_on(verify(store, &prefix, &options))?;
+        let mut report = rt.block_on(verify(store, &prefix, &options));
         report.bucket.clone_from(&args.bucket);
         Ok(report)
     };
@@ -513,7 +605,7 @@ pub fn command(args: &VerifyArgs) -> i32 {
             report.exit_code()
         }
         Err(e) => {
-            eprintln!("error: the verification did not finish: {e:#}");
+            eprintln!("error: the verification did not start: {e:#}");
             2
         }
     }
@@ -521,10 +613,13 @@ pub fn command(args: &VerifyArgs) -> i32 {
 
 /// Checks the cluster under `prefix` of `store`. Never writes.
 ///
-/// # Errors
-/// The bucket could not be listed or the run could not go on. A problem
-/// with what the bucket holds is not an error: it is in the report.
-pub async fn verify(store: Store, prefix: &str, options: &Options) -> anyhow::Result<Report> {
+/// It always returns a report. A problem with what the bucket holds is in
+/// [`Report::problems`]; what could not be read is in [`Report::unread`];
+/// a listing the bucket refused, a prefix that holds nothing or an app
+/// that is not there ends the run or that app's checks and is in
+/// [`Report::stopped`] or [`AppReport::stopped`], with everything found
+/// until then.
+pub async fn verify(store: Store, prefix: &str, options: &Options) -> Report {
     let started = std::time::Instant::now();
     let (store, counts) = store::ReadOnly::wrap(store);
     let mut prefix = prefix.trim_matches('/').to_owned();
@@ -548,50 +643,33 @@ pub async fn verify(store: Store, prefix: &str, options: &Options) -> anyhow::Re
             .map(|(class, name)| format!("{class}/{name}")),
         ..Report::default()
     };
-    let found = run.apps().await?;
-    let apps = match &options.app {
-        Some(named) => {
-            anyhow::ensure!(
-                found.contains(named),
-                "nothing of the app {}/{} is under this bucket prefix",
-                named.0,
-                named.1
-            );
-            BTreeSet::from([named.clone()])
-        }
-        None => found,
-    };
-    for (tenant, app) in apps {
-        let checked = match &options.actor {
-            Some((class, name)) => run.one_actor(&tenant, &app, class, name).await?,
-            None => run.app(&tenant, &app).await?,
-        };
-        report.apps.push(checked);
-    }
-    if options.actor.is_none() {
-        (report.nodes, report.nodes_old_format) = run.nodes().await?;
-        anyhow::ensure!(
-            !report.apps.is_empty() || report.nodes + report.nodes_old_format > 0,
-            "nothing of a cluster is under this bucket prefix: no app and no node"
-        );
+    if let Err(e) = run.all(options, &mut report).await {
+        report.stopped.push(format!("{e:#}"));
     }
     let found = run.found.into_inner().unwrap_or_else(|p| p.into_inner());
     report.problems = found.problems;
     report.problems_total = found.total;
+    report.unread = found.unread;
+    report.unread_total = found.unread_total;
     report.objects_read = counts.objects();
     report.bytes_read = counts.bytes();
     report.requests = counts.gets() + counts.lists();
     report.keys_listed = counts.listed();
     report.writes_refused = counts.writes();
     report.seconds = started.elapsed().as_secs_f64();
-    Ok(report)
+    report
 }
 
 #[derive(Debug, Default)]
 struct Found {
     problems: Vec<Problem>,
     total: u64,
+    unread: Vec<Problem>,
+    unread_total: u64,
 }
+
+/// Where the findings stood: [`Run::mark`].
+type Mark = (usize, u64, usize, u64);
 
 struct Run {
     /// Read-only and counted.
@@ -609,14 +687,28 @@ struct Run {
 enum Read {
     Body(bytes::Bytes),
     Absent,
-    /// The bucket did not give it: why.
-    Failed(String),
+    /// No body: why, and whether nothing is known of the object (the
+    /// bucket did not give it) rather than something wrong (too large).
+    Failed(String, bool),
+}
+
+/// Why a history object did not pass.
+struct Fault {
+    why: String,
+    /// Nothing is known of it.
+    unread: bool,
+    /// It is not the object that was listed any more: list again.
+    changed: bool,
 }
 
 /// One actor's result.
 #[derive(Debug, Default)]
 struct Actor {
+    /// What was found, problems and what could not be read alike.
     problems: Vec<Problem>,
+    /// Worth another look on a fresh listing: something looks wrong, or
+    /// an object changed while it was read.
+    again: bool,
     /// A restore plan exists (its head is not the empty database).
     planned: bool,
     record_read: bool,
@@ -633,14 +725,38 @@ struct AppView {
     /// Whether the app records heads; `None` when its setting did not
     /// read, and nothing is concluded from a record's version.
     recorded_head: Option<bool>,
+    /// The setting, read again, says the app records heads now (`wasmkeep
+    /// app format --enable` ran meanwhile).
+    enabled_since: std::sync::atomic::AtomicBool,
 }
 
 fn problem(key: impl Into<String>, check: &'static str, detail: impl Into<String>) -> Problem {
+    failed(key, check, detail, false)
+}
+
+/// Something that could not be read or was not checked.
+fn unread(key: impl Into<String>, check: &'static str, detail: impl Into<String>) -> Problem {
+    failed(key, check, detail, true)
+}
+
+fn failed(
+    key: impl Into<String>,
+    check: &'static str,
+    detail: impl Into<String>,
+    unread: bool,
+) -> Problem {
     Problem {
         key: key.into(),
         check,
         detail: detail.into(),
+        unread,
     }
+}
+
+/// Whether a read's error says nothing of the object (the bucket refused,
+/// stalled or the object changed) rather than that it is wrong.
+fn lost(e: &history::Error) -> bool {
+    !matches!(e, history::Error::Corrupt(_))
 }
 
 /// The key as the bucket spells it (the store escapes a `%` once more).
@@ -695,23 +811,185 @@ fn keys_under(
 impl Run {
     fn add(&self, new: impl IntoIterator<Item = Problem>) {
         let mut found = self.found.lock().unwrap_or_else(|p| p.into_inner());
+        let found = &mut *found;
         for p in new {
-            if found.problems.contains(&p) {
+            let (kept, total) = if p.unread {
+                (&mut found.unread, &mut found.unread_total)
+            } else {
+                (&mut found.problems, &mut found.total)
+            };
+            if kept.contains(&p) {
                 continue;
             }
-            found.total += 1;
-            if found.problems.len() < MAX_PROBLEMS {
-                found.problems.push(p);
+            *total += 1;
+            if kept.len() < MAX_PROBLEMS {
+                kept.push(p);
             }
         }
     }
 
-    /// Reads the object at `raw` whole, through the replica's reader.
+    /// Where the findings stand, to [`Self::rewind`] to.
+    fn mark(&self) -> Mark {
+        let found = self.found.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            found.problems.len(),
+            found.total,
+            found.unread.len(),
+            found.unread_total,
+        )
+    }
+
+    /// Forgets what was found since `mark`.
+    fn rewind(&self, mark: Mark) {
+        let mut found = self.found.lock().unwrap_or_else(|p| p.into_inner());
+        found.problems.truncate(mark.0);
+        found.total = mark.1;
+        found.unread.truncate(mark.2);
+        found.unread_total = mark.3;
+    }
+
+    /// One read through the replica's reader, sent again after a pause
+    /// while the bucket refuses it (the reader's own attempts follow each
+    /// other at once).
+    async fn get(
+        &self,
+        location: &Key,
+        listed: Option<&ObjectMeta>,
+        cap: u64,
+    ) -> Result<bytes::Bytes, history::Error> {
+        let mut attempt = 1;
+        loop {
+            match history::get(&self.store, location, listed, cap).await {
+                Err(history::Error::Bucket(_)) if attempt < ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(AGAIN_AFTER).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Reads the object at `raw` whole.
     async fn read(&self, raw: &str, cap: u64) -> Read {
-        match history::get(&self.store, &Key::from(raw), None, cap).await {
+        match self.get(&Key::from(raw), None, cap).await {
             Ok(body) => Read::Body(body),
             Err(history::Error::Missing(_)) => Read::Absent,
-            Err(e) => Read::Failed(e.to_string()),
+            Err(e) => Read::Failed(e.to_string(), lost(&e)),
+        }
+    }
+
+    /// Whether anything is under `folder` (raw, ending in `/`).
+    async fn any_under(&self, folder: &str) -> anyhow::Result<bool> {
+        Ok(keys_under(&self.store, folder).try_next().await?.is_some())
+    }
+
+    /// The whole run: every app (or the one asked), then the nodes.
+    async fn all(&self, options: &Options, report: &mut Report) -> anyhow::Result<()> {
+        let found = self.apps().await?;
+        let apps = match &options.app {
+            Some(named) => {
+                anyhow::ensure!(
+                    found.contains(named),
+                    "nothing of the app {}/{} is under this bucket prefix",
+                    named.0,
+                    named.1
+                );
+                BTreeSet::from([named.clone()])
+            }
+            None => found,
+        };
+        for (tenant, app) in apps {
+            let mark = self.mark();
+            let mut checked = AppReport {
+                name: format!("{tenant}/{app}"),
+                ..AppReport::default()
+            };
+            let done = match &options.actor {
+                Some((class, name)) => {
+                    self.one_actor(&tenant, &app, class, name, &mut checked)
+                        .await
+                }
+                None => self.app(&tenant, &app, &mut checked).await,
+            };
+            if let Err(e) = done {
+                checked.stopped = Some(format!("{e:#}"));
+            }
+            // An app deleted or put under restore while it was read: what
+            // was found of it says nothing.
+            if self.mark() != mark || checked.stopped.is_some() {
+                let before = checked.state;
+                self.app_marks(&tenant, &app, &mut checked).await;
+                if checked.state != before && matches!(checked.state, "deleted" | "restoring") {
+                    self.rewind(mark);
+                    checked = AppReport {
+                        name: checked.name,
+                        state: checked.state,
+                        ..AppReport::default()
+                    };
+                    self.app_marks(&tenant, &app, &mut checked).await;
+                }
+            }
+            if options.actor.is_some() && checked.state == "deleted" {
+                checked.stopped = Some("the app is deleted: nothing of it is checked".into());
+            }
+            report.apps.push(checked);
+        }
+        if options.actor.is_none() {
+            self.nodes(report).await?;
+            anyhow::ensure!(
+                !report.apps.is_empty() || report.nodes + report.nodes_old_format > 0,
+                "nothing of a cluster is under this bucket prefix: no app and no node"
+            );
+        }
+        Ok(())
+    }
+
+    /// The app's `deleted` and `restoring` marks: sets the state and says
+    /// whether the app's state is to be checked.
+    async fn app_marks(&self, tenant: &str, app: &str, report: &mut AppReport) -> bool {
+        let base = format!("{}apps/{tenant}/{app}", self.prefix);
+        match self.read(&format!("{base}/deleted"), MAX_RECORD).await {
+            Read::Body(_) => {
+                report.state = "deleted";
+                return false;
+            }
+            Read::Absent => {}
+            Read::Failed(why, lost) => {
+                let key = spelled(&format!("{base}/deleted"));
+                self.add([failed(key, "deploy", why, lost)]);
+            }
+        }
+        match self.read(&format!("{base}/restoring"), MAX_RECORD).await {
+            Read::Body(_) => {
+                report.state = "restoring";
+                self.add([unread(
+                    spelled(&format!("{base}/restoring")),
+                    "deploy",
+                    "a restore of this app is under way or did not finish: its state is not \
+                     checked",
+                )]);
+                false
+            }
+            Read::Absent => true,
+            Read::Failed(why, lost) => {
+                let key = spelled(&format!("{base}/restoring"));
+                self.add([failed(key, "deploy", why, lost)]);
+                true
+            }
+        }
+    }
+
+    /// The app's recorded-head setting; `None` when it does not read (the
+    /// finding says why).
+    async fn format_setting(&self, root: &StateRoot) -> (Option<bool>, Option<Problem>) {
+        let key = app_format::key_of(root);
+        match self.read(&key, MAX_RECORD).await {
+            Read::Body(body) => match app_format::decode(Some(&body)) {
+                Ok(format) => (Some(format == app_format::AppFormat::RecordedHead), None),
+                Err(e) => (None, Some(problem(spelled(&key), "format", e.to_string()))),
+            },
+            Read::Absent => (Some(false), None),
+            Read::Failed(why, lost) => (None, Some(failed(spelled(&key), "format", why, lost))),
         }
     }
 
@@ -756,25 +1034,8 @@ impl Run {
         report: &mut AppReport,
     ) -> Option<AppView> {
         let base = format!("{}apps/{tenant}/{app}", self.prefix);
-        report.name = format!("{tenant}/{app}");
         report.state = "not deployed";
-        match self.read(&format!("{base}/deleted"), MAX_RECORD).await {
-            Read::Body(_) => {
-                report.state = "deleted";
-                return None;
-            }
-            Read::Absent => {}
-            Read::Failed(why) => {
-                self.add([problem(spelled(&format!("{base}/deleted")), "deploy", why)]);
-            }
-        }
-        if let Read::Body(_) = self.read(&format!("{base}/restoring"), MAX_RECORD).await {
-            report.state = "restoring";
-            self.add([problem(
-                spelled(&format!("{base}/restoring")),
-                "deploy",
-                "a restore of this app has not finished: its state is not checked",
-            )]);
+        if !self.app_marks(tenant, app, report).await {
             return None;
         }
         if deploy {
@@ -788,7 +1049,8 @@ impl Run {
                 problems = self.deploy(&base, &mut again).await;
                 (report.state, report.version, report.versions_checked) =
                     (again.state, again.version, again.versions_checked);
-                if problems.is_empty() {
+                // What the bucket refused was already asked again.
+                if problems.iter().all(|p| p.unread) {
                     break;
                 }
             }
@@ -798,21 +1060,8 @@ impl Run {
             }
         }
         let root = StateRoot::new(&self.prefix, tenant, app);
-        let key = app_format::key_of(&root);
-        let recorded_head = match self.read(&key, MAX_RECORD).await {
-            Read::Body(body) => match app_format::decode(Some(&body)) {
-                Ok(format) => Some(format == app_format::AppFormat::RecordedHead),
-                Err(e) => {
-                    self.add([problem(spelled(&key), "format", e.to_string())]);
-                    None
-                }
-            },
-            Read::Absent => Some(false),
-            Read::Failed(why) => {
-                self.add([problem(spelled(&key), "format", why)]);
-                None
-            }
-        };
+        let (recorded_head, found) = self.format_setting(&root).await;
+        self.add(found);
         report.recorded_head = recorded_head == Some(true);
         let key = app_format::floor::key_of(&root);
         match self.read(&key, MAX_RECORD).await {
@@ -821,11 +1070,12 @@ impl Run {
                 Err(e) => self.add([problem(spelled(&key), "format", e.to_string())]),
             },
             Read::Absent => {}
-            Read::Failed(why) => self.add([problem(spelled(&key), "format", why)]),
+            Read::Failed(why, lost) => self.add([failed(spelled(&key), "format", why, lost)]),
         }
         Some(AppView {
             root,
             recorded_head,
+            enabled_since: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -841,9 +1091,9 @@ impl Run {
                 report.state = "not deployed";
                 return problems;
             }
-            Read::Failed(why) => {
+            Read::Failed(why, lost) => {
                 report.state = "unreadable";
-                problems.push(problem(spelled(&key), "deploy", why));
+                problems.push(failed(spelled(&key), "deploy", why, lost));
                 return problems;
             }
         };
@@ -894,7 +1144,7 @@ impl Run {
     ) -> Option<wasmkeep_server::apps::Manifest> {
         use wasmkeep_server::apps::Manifest;
         let key = format!("{base}/{version}/manifest");
-        let body = match self.read(&key, MAX_COMPONENT).await {
+        let body = match self.read(&key, MAX_MANIFEST).await {
             Read::Body(body) => body,
             Read::Absent if !current => return None,
             Read::Absent => {
@@ -905,8 +1155,8 @@ impl Run {
                 ));
                 return None;
             }
-            Read::Failed(why) => {
-                problems.push(problem(spelled(&key), "deploy", why));
+            Read::Failed(why, lost) => {
+                problems.push(failed(spelled(&key), "deploy", why, lost));
                 return None;
             }
         };
@@ -979,8 +1229,8 @@ impl Run {
                 ));
                 None
             }
-            Read::Failed(why) => {
-                problems.push(problem(spelled(key), "deploy", why));
+            Read::Failed(why, lost) => {
+                problems.push(failed(spelled(key), "deploy", why, lost));
                 None
             }
         }
@@ -1008,7 +1258,7 @@ impl Run {
             match history::list_objects(&self.store, &folder).await {
                 Ok(listed) => *contents = Some(listed),
                 Err(e) => {
-                    problems.push(problem(spelled(&folder), "deploy", e.to_string()));
+                    problems.push(unread(spelled(&folder), "deploy", e.to_string()));
                     return;
                 }
             }
@@ -1045,28 +1295,30 @@ impl Run {
         }
     }
 
-    /// One app, whole.
-    async fn app(&self, tenant: &str, app: &str) -> anyhow::Result<AppReport> {
-        let mut report = AppReport::default();
-        let Some(view) = self.app_settings(tenant, app, true, &mut report).await else {
-            return Ok(report);
+    /// One app, whole. An error ends its checks: what `report` counted
+    /// until then stays.
+    async fn app(&self, tenant: &str, app: &str, report: &mut AppReport) -> anyhow::Result<()> {
+        let Some(view) = self.app_settings(tenant, app, true, report).await else {
+            return Ok(());
         };
-        let seen = self.histories(&view, &mut report).await?;
+        let seen = self.histories(&view, report).await?;
         if self.sample.is_none() {
-            self.records(&view, &seen, &mut report).await?;
+            self.records(&view, &seen, report).await?;
         } else {
             let folder = format!("{}/", view.root.bucket_base(Family::Owners));
-            report.records = keys_under(&self.store, &folder)
-                .try_fold(0u64, |n, _| async move { Ok(n + 1) })
-                .await?;
+            let mut listing = keys_under(&self.store, &folder);
+            while listing.try_next().await?.is_some() {
+                report.records += 1;
+            }
         }
-        self.alarms(&view, &seen, &mut report).await?;
+        self.alarms(&view, &seen, report).await?;
         let folder = format!("{}/", view.root.bucket_base(Family::Leases));
-        report.lease_markers = keys_under(&self.store, &folder)
-            .try_fold(0u64, |n, _| async move { Ok(n + 1) })
-            .await?;
-        self.files(tenant, app, &view, &mut report).await?;
-        Ok(report)
+        let mut listing = keys_under(&self.store, &folder);
+        while listing.try_next().await?.is_some() {
+            report.lease_markers += 1;
+        }
+        drop(listing);
+        self.files(tenant, app, &view, report).await
     }
 
     /// One actor of an app: its history and its record.
@@ -1076,10 +1328,10 @@ impl Run {
         app: &str,
         class: &str,
         name: &str,
-    ) -> anyhow::Result<AppReport> {
-        let mut report = AppReport::default();
-        let Some(view) = self.app_settings(tenant, app, false, &mut report).await else {
-            return Ok(report);
+        report: &mut AppReport,
+    ) -> anyhow::Result<()> {
+        let Some(view) = self.app_settings(tenant, app, false, report).await else {
+            return Ok(());
         };
         let encoded = wasmkeep_storage::encode_segment(name);
         let actor = self.actor(&view, class, &encoded, None, true).await;
@@ -1096,20 +1348,47 @@ impl Run {
         }
         report.actors = u64::from(actor.planned);
         report.records = u64::from(actor.record_read);
-        tally(&mut report, &actor);
+        tally(report, &actor);
         self.add(actor.problems);
-        Ok(report)
+        Ok(())
     }
 
     /// Every actor with history: its chain, and (unless sampling) its
     /// record and with `--deep` its bodies. Returns the set of them.
     async fn histories(&self, view: &AppView, report: &mut AppReport) -> anyhow::Result<Seen> {
-        let folder = format!("{}/", view.root.bucket_base(Family::History));
+        let base = Key::from(view.root.bucket_base(Family::History));
+        // As the bucket spells it, which is how listed keys compare.
+        let folder = format!("{}/", base.as_ref());
         let full = self.sample.is_none();
         let mut seen = Seen::default();
         let mut sample = Reservoir::new(self.sample);
         let mut names = Vec::new();
-        let mut checks = actor_groups_with_errors(&self.store, &folder)
+        // A key that is no actor's history object (directly under
+        // `actors/` or under a class: a sync tool's directory marker, a
+        // stray file) is named and left out; the grouping shared with
+        // `backup create` and `feed` refuses the whole listing at one.
+        let strays: Arc<Mutex<(Vec<String>, u64)>> = Arc::default();
+        let listing = {
+            let (strays, folder) = (Arc::clone(&strays), folder.clone());
+            // S3's paginated stream must not be polled again after its end.
+            self.store.list(Some(&base)).fuse().filter(move |item| {
+                let stray = item.as_ref().is_ok_and(|meta| {
+                    meta.location
+                        .as_ref()
+                        .strip_prefix(folder.as_str())
+                        .is_some_and(|rel| rel.splitn(3, '/').count() < 3)
+                });
+                if let (true, Ok(meta)) = (stray, item) {
+                    let mut strays = strays.lock().unwrap_or_else(|p| p.into_inner());
+                    strays.1 += 1;
+                    if strays.0.len() < MAX_PROBLEMS {
+                        strays.0.push(meta.location.as_ref().to_owned());
+                    }
+                }
+                std::future::ready(!stray)
+            })
+        };
+        let mut checks = group_listing(listing.boxed(), folder.clone())
             .map_ok(|(actor_prefix, group)| {
                 let folder = &folder;
                 async move {
@@ -1118,13 +1397,29 @@ impl Run {
                         .strip_prefix(folder.as_str())
                         .and_then(|rest| rest.trim_end_matches('/').split_once('/'))
                         .with_context(|| format!("{actor_prefix}: not an actor's folder"))?;
-                    let encoded = crate::backup::object_segment(name)?;
-                    let actor = match group {
-                        Ok(objects) => self.actor(view, class, &encoded, Some(objects), full).await,
-                        Err(e) => Actor {
-                            problems: vec![problem(actor_prefix.clone(), "history", e.to_string())],
-                            ..Actor::default()
-                        },
+                    let found = |p: Problem| Actor {
+                        problems: vec![p],
+                        ..Actor::default()
+                    };
+                    let (encoded, actor) = match (crate::backup::object_segment(name), group) {
+                        (Ok(encoded), Ok(objects)) => {
+                            let actor =
+                                self.actor(view, class, &encoded, Some(objects), full).await;
+                            (encoded, actor)
+                        }
+                        // More keys than the listing budget holds: not checked.
+                        (Ok(encoded), Err(e)) => {
+                            let p = unread(actor_prefix.as_str(), "history", e.to_string());
+                            (encoded, found(p))
+                        }
+                        (Err(_), _) => (
+                            name.to_owned(),
+                            found(problem(
+                                actor_prefix.as_str(),
+                                "history",
+                                "the folder's name is not one a node writes for an actor",
+                            )),
+                        ),
                     };
                     Ok::<_, anyhow::Error>((class.to_owned(), encoded, actor))
                 }
@@ -1144,6 +1439,27 @@ impl Run {
             }
         }
         drop(checks);
+        let (strays, total) =
+            std::mem::take(&mut *strays.lock().unwrap_or_else(|p| p.into_inner()));
+        let kept = strays.len() as u64;
+        self.add(strays.into_iter().map(|key| {
+            problem(
+                key,
+                "history",
+                "not an actor's history object (a directory marker or a stray file?): \
+                 `backup create` and `feed` stop at a key here",
+            )
+        }));
+        if total > kept {
+            self.add([problem(
+                folder.as_str(),
+                "history",
+                format!(
+                    "{} more keys that are no actor's history objects",
+                    total - kept
+                ),
+            )]);
+        }
         // The sample: each listed again, its record and its bodies read.
         let mut sampled = futures_util::stream::iter(
             names
@@ -1185,7 +1501,7 @@ impl Run {
                     Ok(objects) => objects,
                     Err(e) => {
                         return Actor {
-                            problems: vec![problem(spelled(&folder), "history", e.to_string())],
+                            problems: vec![unread(spelled(&folder), "history", e.to_string())],
                             ..Actor::default()
                         };
                     }
@@ -1194,7 +1510,7 @@ impl Run {
             actor = self
                 .actor_once(view, class, encoded, &folder, &objects, full)
                 .await;
-            if actor.problems.is_empty() || attempt + 1 == ATTEMPTS {
+            if !actor.again || attempt + 1 == ATTEMPTS {
                 break;
             }
             tokio::time::sleep(AGAIN_AFTER).await;
@@ -1281,9 +1597,31 @@ impl Run {
                 }
             }
         }
+        actor.again = !actor.problems.is_empty();
         if !full {
             return actor;
         }
+        let mut actor = self
+            .actor_full(view, class, encoded, objects, &listing, plan, &chain, actor)
+            .await;
+        actor.again |= actor.problems.iter().any(|p| !p.unread);
+        actor
+    }
+
+    /// The part of an actor's check that reads: its record, with `--deep`
+    /// its bodies, and its recorded head.
+    #[allow(clippy::too_many_arguments)]
+    async fn actor_full(
+        &self,
+        view: &AppView,
+        class: &str,
+        encoded: &str,
+        objects: &Objects,
+        listing: &Listing,
+        plan: Option<wasmkeep_cluster::replication::Plan>,
+        chain: &[(String, SegmentId, bool)],
+        mut actor: Actor,
+    ) -> Actor {
         let history_whole = actor.problems.is_empty();
         // The record, read after the listing: its generation only grows.
         let owner_key = view
@@ -1309,10 +1647,10 @@ impl Run {
                 actor.record_absent = true;
                 None
             }
-            Read::Failed(why) => {
+            Read::Failed(why, lost) => {
                 actor
                     .problems
-                    .push(problem(spelled(&owner_key), "ownership", why));
+                    .push(failed(spelled(&owner_key), "ownership", why, lost));
                 None
             }
         };
@@ -1324,7 +1662,7 @@ impl Run {
         if self.deep && history_whole {
             actor.deep = true;
             let mut before = None;
-            for (rel, id, snapshot) in &chain {
+            for (rel, id, snapshot) in chain {
                 let Some(meta) = objects.get(rel) else {
                     continue;
                 };
@@ -1342,10 +1680,14 @@ impl Run {
                         before = Some(post);
                         sums.insert(*id, post);
                     }
-                    Err(why) => {
-                        actor
-                            .problems
-                            .push(problem(meta.location.as_ref(), "history", why));
+                    Err(fault) => {
+                        actor.again |= fault.changed;
+                        actor.problems.push(failed(
+                            meta.location.as_ref(),
+                            "history",
+                            fault.why,
+                            fault.unread,
+                        ));
                         break;
                     }
                 }
@@ -1354,16 +1696,32 @@ impl Run {
         let Some(record) = record else {
             return actor;
         };
-        if record.recorded.is_some() && view.recorded_head == Some(false) {
-            actor.problems.push(problem(
-                spelled(&owner_key),
-                "ownership",
-                "a version 2 ownership record in an app that has not enabled the \
-                 recorded-head format: no node takes this actor",
-            ));
-            return actor;
+        use std::sync::atomic::Ordering;
+        let mut records_heads = view.recorded_head;
+        if view.enabled_since.load(Ordering::Relaxed) {
+            records_heads = Some(true);
         }
-        if view.recorded_head != Some(true) || !actor.problems.is_empty() {
+        if record.recorded.is_some() && records_heads == Some(false) {
+            // The setting may have been written since it was read
+            // (`wasmkeep app format --enable`): read it again.
+            let (now, found) = self.format_setting(&view.root).await;
+            actor.problems.extend(found);
+            records_heads = now;
+            match now {
+                Some(true) => view.enabled_since.store(true, Ordering::Relaxed),
+                Some(false) => {
+                    actor.problems.push(problem(
+                        spelled(&owner_key),
+                        "ownership",
+                        "a version 2 ownership record in an app that has not enabled the \
+                         recorded-head format: no node takes this actor",
+                    ));
+                    return actor;
+                }
+                None => return actor,
+            }
+        }
+        if records_heads != Some(true) || !actor.problems.is_empty() {
             return actor;
         }
         // ADR 0035, section 3, as a restore proves it.
@@ -1396,7 +1754,7 @@ impl Run {
             Proof::Missing => {
                 let linked = plan
                     .snapshot
-                    .is_some_and(|base| linked_back(floor.as_ref(), base, &listing));
+                    .is_some_and(|base| linked_back(floor.as_ref(), base, listing));
                 if !linked {
                     actor.problems.push(problem(
                         spelled(&owner_key),
@@ -1420,13 +1778,18 @@ impl Run {
     }
 
     /// Reads one history object as listed and checks it: the checksums
-    /// before and after it, or what is wrong with it.
+    /// before and after it, or why it did not pass.
     async fn body(
         &self,
         meta: &ObjectMeta,
         id: SegmentId,
         snapshot: bool,
-    ) -> Result<(u64, u64), String> {
+    ) -> Result<(u64, u64), Fault> {
+        let fault = |why: String, unread: bool, changed: bool| Fault {
+            why,
+            unread,
+            changed,
+        };
         let mib = u32::try_from(meta.size.div_ceil(1 << 20))
             .unwrap_or(BODY_BUDGET)
             .clamp(1, BODY_BUDGET);
@@ -1434,14 +1797,27 @@ impl Run {
             .budget
             .acquire_many(mib)
             .await
-            .map_err(|e| e.to_string())?;
-        let bytes = history::get(&self.store, &meta.location, Some(meta), MAX_OBJECT)
+            .map_err(|e| fault(e.to_string(), true, false))?;
+        let bytes = self
+            .get(&meta.location, Some(meta), MAX_OBJECT)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match &e {
+                history::Error::Missing(_) => fault(
+                    "listed, but the bucket has no such object".into(),
+                    false,
+                    true,
+                ),
+                history::Error::Stale(_) => fault(
+                    "it kept changing while it was read: not checked".into(),
+                    true,
+                    true,
+                ),
+                _ => fault(e.to_string(), lost(&e), false),
+            })?;
         tokio::task::spawn_blocking(move || history::check_object(&bytes, id, snapshot))
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())
+            .map_err(|e| fault(e.to_string(), true, false))?
+            .map_err(|e| fault(e.to_string(), false, false))
     }
 
     /// The ownership records of actors without history (those with one
@@ -1453,17 +1829,36 @@ impl Run {
         report: &mut AppReport,
     ) -> anyhow::Result<()> {
         let folder = format!("{}/", view.root.bucket_base(Family::Owners));
-        let mut listed = 0u64;
+        let (mut listed, mut skipped) = (0u64, 0u64);
         let mut checks = keys_under(&self.store, &folder)
             .map_ok(|(rel, _)| {
-                listed += 1;
+                // `<class>/<name>`, the name as the store spells it; any
+                // other key is nothing of WasmKeep's, and is left alone.
+                let record = rel.split_once('/').and_then(|(class, name)| {
+                    let encoded = crate::backup::object_segment(name).ok()?;
+                    (!name.contains('/')).then(|| (class.to_owned(), encoded))
+                });
+                match record {
+                    Some(_) => listed += 1,
+                    None => skipped += 1,
+                }
                 async move {
-                    let Some((class, name)) = rel.split_once('/') else {
+                    let Some((class, encoded)) = record else {
                         return Ok(None);
                     };
-                    let encoded = crate::backup::object_segment(name)?;
+                    let class = class.as_str();
                     if seen.has(class, &encoded) {
                         return Ok(None);
+                    }
+                    // The set had no room for every actor: one with
+                    // history was checked with it, not here again.
+                    if seen.full {
+                        let history = view
+                            .root
+                            .bucket_key(Family::History, &format!("{class}/{encoded}"));
+                        if self.any_under(&format!("{history}/")).await? {
+                            return Ok(None);
+                        }
                     }
                     // Its history, listed now: none, or one that started
                     // since (or that the set had no room for).
@@ -1484,7 +1879,7 @@ impl Run {
             self.add(actor.problems);
         }
         drop(checks);
-        report.records = listed;
+        (report.records, report.records_skipped) = (listed, skipped);
         Ok(())
     }
 
@@ -1549,19 +1944,21 @@ impl Run {
             match self.read(&owner_key, MAX_RECORD).await {
                 Read::Absent => {}
                 Read::Body(_) => return None,
-                Read::Failed(why) => return Some(problem(spelled(&owner_key), "ownership", why)),
+                Read::Failed(why, lost) => {
+                    return Some(failed(spelled(&owner_key), "ownership", why, lost));
+                }
             }
-            match history::list_objects_bounded(&self.store, &folder, 1).await {
-                Ok(objects) if objects.is_empty() => {}
-                // History, or more of it than was asked for.
-                _ => return None,
+            match self.any_under(&folder).await {
+                Ok(false) => {}
+                Ok(true) => return None,
+                Err(e) => return Some(unread(spelled(&folder), "history", format!("{e:#}"))),
             }
-            let gone = matches!(
-                history::get(&self.store, &entry.location, None, MAX_RECORD).await,
-                Err(history::Error::Missing(_))
-            );
-            if gone {
-                return None;
+            match self.get(&entry.location, None, MAX_RECORD).await {
+                Err(history::Error::Missing(_)) => return None,
+                Err(e) if lost(&e) => {
+                    return Some(unread(entry.location.as_ref(), "alarm", e.to_string()));
+                }
+                _ => {}
             }
         }
         Some(problem(
@@ -1590,8 +1987,9 @@ impl Run {
                 match self.read(&format!("{base}/{marker}"), MAX_RECORD).await {
                     Read::Body(body) => Some(body),
                     Read::Absent => None,
-                    Read::Failed(why) => {
-                        self.add([problem(spelled(&format!("{base}/{marker}")), "files", why)]);
+                    Read::Failed(why, lost) => {
+                        let key = spelled(&format!("{base}/{marker}"));
+                        self.add([failed(key, "files", why, lost)]);
                         None
                     }
                 },
@@ -1619,21 +2017,18 @@ impl Run {
                 )]),
             },
             Read::Absent => {}
-            Read::Failed(why) => self.add([problem(spelled(&key), "files", why)]),
+            Read::Failed(why, lost) => self.add([failed(spelled(&key), "files", why, lost)]),
         }
         let folder = format!("{state}blob-sweeps/");
-        let mut records = 0u64;
         let mut checks = keys_under(&self.store, &folder)
-            .map_ok(|(rel, meta)| {
-                records += 1;
-                async move { Ok::<_, anyhow::Error>(self.sweep_record(&rel, &meta).await) }
+            .map_ok(|(rel, meta)| async move {
+                Ok::<_, anyhow::Error>(self.sweep_record(&rel, &meta).await)
             })
             .try_buffer_unordered(CONCURRENCY);
         while let Some(found) = checks.try_next().await? {
+            report.sweep_records += 1;
             self.add(found);
         }
-        drop(checks);
-        report.sweep_records = records;
         Ok(())
     }
 
@@ -1641,11 +2036,14 @@ impl Run {
     async fn sweep_record(&self, rel: &str, meta: &ObjectMeta) -> Option<Problem> {
         // A key nothing of WasmKeep wrote is left alone, as the sweep does.
         let (_, name_id, _) = blob_sweep::parse_key(rel)?;
-        let body = match history::get(&self.store, &meta.location, None, MAX_RECORD).await {
+        let body = match self.get(&meta.location, None, MAX_RECORD).await {
             Ok(body) => body,
             // Dropped since it was listed.
             Err(history::Error::Missing(_)) => return None,
-            Err(e) => return Some(problem(meta.location.as_ref(), "files", e.to_string())),
+            Err(e) => {
+                let key = meta.location.as_ref();
+                return Some(failed(key, "files", e.to_string(), lost(&e)));
+            }
         };
         match blob_sweep::Record::decode(&body) {
             None => Some(problem(
@@ -1665,21 +2063,25 @@ impl Run {
         }
     }
 
-    /// The node leases: each decodes. Returns how many do, and how many
-    /// heartbeats are in an older format.
-    async fn nodes(&self) -> anyhow::Result<(u64, u64)> {
+    /// The node leases: each decodes. Counts in `report` how many do, and
+    /// how many heartbeats are in an older format.
+    async fn nodes(&self, report: &mut Report) -> anyhow::Result<()> {
         let folder = format!("{}nodes/", self.prefix);
         let mut checks = keys_under(&self.store, &folder)
             .map_ok(|(_, meta)| async move {
-                let body = match history::get(&self.store, &meta.location, None, MAX_RECORD).await {
+                let body = match self.get(&meta.location, None, MAX_RECORD).await {
                     Ok(body) => body,
                     // Forgotten since it was listed.
                     Err(history::Error::Missing(_)) => return Ok((0, 0, None)),
                     Err(e) => {
-                        let p = problem(meta.location.as_ref(), "node", e.to_string());
+                        let key = meta.location.as_ref();
+                        let p = failed(key, "node", e.to_string(), lost(&e));
                         return Ok((0, 0, Some(p)));
                     }
                 };
+                // TODO: once `cluster forget` leaves a mark at the key
+                // (`wasmkeep-node-forgotten 1`), read it as "not a node"
+                // through `node_lease::forgotten`.
                 Ok::<_, anyhow::Error>(if NodeLeaseObject::decode(&body).is_some() {
                     (1, 0, None)
                 } else if wasmkeep_cluster::membership::NodeInfo::decode(&body).is_some() {
@@ -1694,13 +2096,12 @@ impl Run {
                 })
             })
             .try_buffer_unordered(CONCURRENCY);
-        let (mut leases, mut old) = (0u64, 0u64);
         while let Some((lease, older, found)) = checks.try_next().await? {
-            leases += lease;
-            old += older;
+            report.nodes += lease;
+            report.nodes_old_format += older;
             self.add(found);
         }
-        Ok((leases, old))
+        Ok(())
     }
 }
 
@@ -1722,7 +2123,14 @@ fn file_epoch(rel: &str) -> Option<&str> {
 }
 
 fn tally(report: &mut AppReport, actor: &Actor) {
-    report.restorable += u64::from(actor.planned && actor.problems.is_empty());
+    // With nothing found, or with only its record unread, it restores.
+    report.restorable += u64::from(
+        actor.planned
+            && actor
+                .problems
+                .iter()
+                .all(|p| p.unread && p.check != "history"),
+    );
     report.records_read += u64::from(actor.record_read);
     report.without_record += u64::from(actor.record_absent);
     report.deep_checked += u64::from(actor.deep);
@@ -1735,12 +2143,16 @@ fn tally(report: &mut AppReport, actor: &Actor) {
 #[derive(Debug, Default)]
 struct Seen {
     ids: HashSet<[u8; 16]>,
+    /// An actor was left out: not being in the set says nothing.
+    full: bool,
 }
 
 impl Seen {
     fn insert(&mut self, class: &str, encoded: &str) {
         if self.ids.len() < MAX_SEEN {
             self.ids.insert(seen_id(class, encoded));
+        } else {
+            self.full = true;
         }
     }
 

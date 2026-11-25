@@ -1277,7 +1277,8 @@ What it checks:
   names is listed with its size. The recorded-head setting and the
   upgrade floor decode. An app with state and no deploy (served with
   `--actor`) is `not deployed`, which is not a problem. A deleted app is
-  not checked. An unfinished `backup restore` is a problem.
+  not checked. An app under `backup restore` (running, or left
+  unfinished) is not checked either, and that is reported as not read.
 - **Per actor.** A restore plan exists: from the listing, the chain
   from the head back to a snapshot (or to transaction 1) has every
   segment, as a node's restore plans it. Each object on it is at least
@@ -1287,7 +1288,10 @@ What it checks:
   recorded head is reached by that chain, by the rule a restore uses: it
   is on the chain, or the chain's snapshot links back to it, or the
   chain holds an object of a later generation. A version 2 record in an
-  app that has not enabled the format is a problem.
+  app that has not enabled the format is a problem. A key under
+  `actors/` that is no actor's history object (a directory marker from a
+  sync tool, a stray file) is a problem too: `backup create` and `feed`
+  stop at one.
 - **Alarms.** Each entry of the alarm index names an actor that has
   history or an ownership record.
 - **Files.** The count of stored files and each sweep record of a deleted
@@ -1298,6 +1302,21 @@ What it checks:
   node leases is counted, not a problem.
 - **Lease markers.** The per-actor markers left under `leases/` from
   before node leases are counted. They are never read or deleted.
+
+What it does not check:
+
+- Secrets (`apps/<tenant>/<app>/secrets/`), the cluster secret, and the
+  requests under `moves/`, `deletes/`, `restores/` and `control/`.
+- The bodies of files (`blobs/`). They are listed and counted, never
+  read, with or without `--deep`: nothing in the bucket says what a
+  file should hold.
+- Anything below the snapshot a restore starts from. A gap in older
+  history, which only `actor export --txid` or `--at` and `backup create
+  --history all` read, is not reported.
+- A history cut at its end. With the newest segments gone, what is left
+  is still a whole chain to an older head, and it passes. It is found
+  only in an app that records heads, when the actor's ownership record
+  names a head the chain no longer reaches.
 
 `--deep` also reads every object a restore would read (the snapshot and
 each segment after it). It checks each file's checksum, that it is the
@@ -1316,7 +1335,18 @@ checks one actor's history and record, nothing else.
 
 On a running cluster, nodes collect old history and replace records
 while the command reads. What looks wrong is listed and read again, up
-to three times, before it is reported.
+to three times, before it is reported. Before an app's problems are
+reported, its `deleted` and `restoring` marks are read again: an app
+deleted or put under restore meanwhile is not checked. A version 2
+record is a problem only if the format setting, read again, is still
+absent.
+
+A read the bucket refuses (an error, a timeout, access denied) is not a
+problem with what the bucket holds. It is sent again, three times with
+a pause, and then listed apart, as `not read:` lines and `unread` in
+`--json`. So is an actor with more history keys than the listing budget
+holds (32 MiB of key names and ETags), which is not checked, and an app
+under restore.
 
 Each problem is one line with the key it is about, and `check` and
 `detail` in `--json`. For a missing segment the key is the one it would
@@ -1332,17 +1362,45 @@ one more for every 1,000 keys it returns. Without `--deep` it is about
 one small GET per actor plus the listings and the current components.
 `--deep` reads the restorable history of every actor once.
 
-The exit code is 0 when the bucket is whole, 1 when a problem was found,
-2 when the run could not finish: the bucket refused a listing, `--app`
-names an app the prefix holds nothing of, or the prefix holds no app
-and no node at all (a mistyped prefix is not a whole bucket). At most
-1,000 problems are printed; all are counted.
+The exit code:
 
-Memory stays bounded: an app's history is listed as one stream, 16
-actors are checked at once, and `--deep` keeps at most 256 MiB of
-history objects in memory unless one object alone is larger. It
-remembers 16 bytes per actor with history, up to 4 million actors per
-app.
+- **0**: the bucket is whole, and everything was read.
+- **1**: a problem was found, whether or not the run was complete.
+- **2**: no problem was found, but there is no verdict, because
+  something was not read or not checked: an object the bucket refused
+  to give, an actor over the listing budget, an app under restore, a
+  listing the bucket refused or that stalled for 30 s, `--app` naming
+  an app the prefix holds nothing of, `--actor` in a deleted app, or a
+  prefix that holds no app and no node at all (a mistyped prefix is not
+  a whole bucket). Also when the command could not start (a bucket URL
+  it cannot read).
+
+A run that stops early still prints what it found until then, in text
+and in `--json` (`stopped`, and `stopped` in the app whose listing
+failed; the other apps and the nodes are still checked). `--json` also
+has `whole`, `complete`, `exit_code` and `writes_refused`, which is
+always 0. At most 1,000 problems and 1,000 unread objects are printed;
+all are counted.
+
+`--deep` reads every history object on a restore's path. On a bucket
+with access-based tiering (S3 Intelligent-Tiering and the like), a read
+moves an object back to the frequent tier, so a deep run undoes the
+tiering of that history. Objects in an archive class that needs a
+restore before a GET are reported as not read.
+
+What it keeps in memory:
+
+- The listing of an app's history is one stream, grouped by actor, 16
+  actors at once. One actor's group is at most 32 MiB of key names and
+  ETags; an actor over that is not checked.
+- An actor that looked wrong is listed again alone, and that listing
+  has no such limit. Neither has the listing of an app's static assets
+  (the contents of every version it keeps).
+- With `--deep`, at most 256 MiB of history objects at once, unless one
+  object alone is larger. Components are read one at a time, whole.
+- 16 bytes per actor with history, up to 4 million actors per app
+  (about 100 MiB). Past that, each further ownership record and alarm
+  entry costs one listing request instead.
 
 ## Draining a node
 

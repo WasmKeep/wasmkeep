@@ -32,7 +32,9 @@ The text under a version's heading is its GitHub release text
   the per-actor lease markers left. `--deep` reads every history object
   and checks its checksums. `--app`, `--actor` and `--sample N` narrow
   it; `--json` is for scripts. It prints objects read, requests and
-  time, and exits with 1 naming the key of each problem. It is not
+  time, and exits with 1 naming the key of each problem. What the
+  bucket refused to give is listed apart and exits with 2: no verdict.
+  It is not
   `backup verify` (a backup's own contents) nor `cluster diagnose`
   (what the bucket's API does).
   [Verifying a bucket](docs/cluster.md#verifying-a-bucket).

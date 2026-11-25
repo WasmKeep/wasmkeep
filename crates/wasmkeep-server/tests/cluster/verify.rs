@@ -102,9 +102,8 @@ async fn run(store: &Arc<dyn ObjectStore>, options: Options) -> Report {
         inner: Arc::clone(store),
         writes: AtomicUsize::new(0),
     });
-    let report = verify(Arc::clone(&guarded) as Arc<dyn ObjectStore>, "", &options)
-        .await
-        .unwrap();
+    let report = verify(Arc::clone(&guarded) as Arc<dyn ObjectStore>, "", &options).await;
+    assert!(report.complete(), "{}", report.to_text());
     assert_eq!(guarded.writes.load(Ordering::SeqCst), 0, "verify wrote");
     assert_eq!(report.writes_refused, 0, "verify tried to write");
     report
