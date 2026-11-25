@@ -370,7 +370,13 @@ impl Cluster {
             path,
             on_cluster_port,
         ) {
-            Ok(sender) => Some((Signed { sender, ..signed }, given.to_owned())),
+            Ok(sender) => Some((
+                Signed {
+                    sender: Some(sender),
+                    ..signed
+                },
+                given.to_owned(),
+            )),
             Err(why) => {
                 self.note_refused(why);
                 None
@@ -386,7 +392,6 @@ impl Cluster {
         let given = given.as_str();
         let encoded = given.split(' ').nth(2)?;
         let (encoded, charged) = match encoded.len() {
-            32 => (encoded, false), // Previous uncharged identity format.
             33 if encoded.starts_with('0') || encoded.starts_with('1') => {
                 (&encoded[1..], encoded.starts_with('1'))
             }

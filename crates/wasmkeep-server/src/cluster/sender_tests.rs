@@ -27,7 +27,7 @@ async fn node(id: &str) -> Arc<Cluster> {
     c
 }
 
-fn peer(app: &str) -> Peer {
+pub(super) fn peer(app: &str) -> Peer {
     Peer {
         plain: Some("http://x".into()),
         tls: None,
@@ -43,8 +43,8 @@ fn peer(app: &str) -> Peer {
     }
 }
 
-/// A call to `to`, signed as node `sender` signs it (`None`: as a node of
-/// an older version, without a sender).
+/// A call to `to`, signed as node `sender` signs it (`None`: without a
+/// sender, as a node from before 0.6.0 signed it).
 fn call(to: &str, path: &str, sender: Option<&str>) -> hyper::HeaderMap {
     let mut headers = hyper::HeaderMap::new();
     headers.insert(APP, "t/default".parse().unwrap());
@@ -115,12 +115,137 @@ async fn a_hop_from_a_live_node_of_this_app_is_taken() {
         b.is_internal(&m, PATH, &call("b", PATH, Some("a")), true)
             .is_some()
     );
-    // An older node's hop, without a sender: still taken (ADR 0038,
-    // rolling upgrade, stage 1).
-    assert!(
-        b.is_internal(&m, PATH, &call("b", PATH, None), true)
-            .is_some()
+}
+
+/// A signed hop that names no sender is refused on every port and in
+/// every mode, with a reason of its own (ADR 0043, section 6): no node of
+/// 0.8.1 sends one, so a peer of the previous minor version never meets
+/// this refusal. Before 0.9 a process serving one app took such a hop.
+#[tokio::test]
+async fn a_signed_hop_without_a_sender_is_refused() {
+    let b = node("b").await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    let m = hyper::Method::POST;
+    for on_cluster_port in [true, false] {
+        let anonymous = call("b", PATH, None);
+        assert_eq!(
+            b.hop_refused(&m, PATH, &anonymous, on_cluster_port),
+            Some(NO_SENDER),
+            "cluster port: {on_cluster_port}"
+        );
+        assert!(
+            b.is_internal(&m, PATH, &anonymous, on_cluster_port)
+                .is_none()
+        );
+    }
+    // A hello too: it is a signed call like any other.
+    assert_eq!(
+        b.hop_refused(&m, HELLO_PATH, &call("b", HELLO_PATH, None), true),
+        Some(NO_SENDER)
     );
+    assert_eq!(
+        b.hello_received(&m, &call("b", HELLO_PATH, None), b"", true),
+        StatusCode::FORBIDDEN
+    );
+    // As a request goes: refused with 503 by the router, never served as
+    // a client's.
+    let mut req = Request::builder().method(&m).uri(PATH).body(()).unwrap();
+    *req.headers_mut() = call("b", PATH, None);
+    assert_eq!(b.judge_hop(&mut req), Some(NO_SENDER));
+    assert_eq!(b.signed_hop(&req).unwrap_err(), NO_SENDER);
+}
+
+/// A forward's proof whose sender was removed is not a proof: the forward
+/// is judged as one without any (a client's identity is not taken from
+/// it). What a node of 0.8.1 sends, proof and sender together, is taken.
+#[tokio::test]
+async fn a_forwards_proof_without_a_sender_is_not_taken() {
+    let a = node("a").await;
+    let b = node("b").await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    let mut fwd = Request::get("/actor/c/x").body(()).unwrap();
+    fwd.extensions_mut()
+        .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+    a.sign_admission("b", "/actor/c/x", &mut fwd).await.unwrap();
+    assert!(b.admission_checked(&fwd).is_some());
+    fwd.headers_mut().remove(SENDER);
+    assert!(b.admission_checked(&fwd).is_none());
+    assert!(b.admission_received(&fwd).is_none());
+}
+
+/// The client's address in a forward's proof is read in the two forms a
+/// node writes (`sign_admission`): a flag and 32 digits, or a charged
+/// proof's 64. The 32 digits alone, the form from before the charged
+/// flag, are no longer read (ADR 0043, section 6): no node of 0.8.1
+/// writes them.
+#[tokio::test]
+async fn a_forwards_proof_in_the_form_before_the_charged_flag_is_not_read() {
+    let b = node("b").await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    let proof = |nonce: &str| {
+        let mut req = Request::get("/actor/c/x").body(()).unwrap();
+        let key = format!("wasmkeep-ingress-identity-v2:{SECRET}");
+        let ts = now_ms();
+        let body = body_sha256(&[]);
+        let mac = signature(
+            &key,
+            ts,
+            nonce,
+            "b",
+            &hyper::Method::GET,
+            "/actor/c/x",
+            &body,
+            req.headers(),
+        );
+        req.headers_mut().insert(
+            ADMITTED,
+            format!("v4 {ts} {nonce} {body} {mac}").parse().unwrap(),
+        );
+        req.headers_mut().insert(
+            SENDER,
+            sender_value(SECRET, "admitted", &mac, "a").parse().unwrap(),
+        );
+        req
+    };
+    let ip = format!(
+        "{:032x}",
+        u128::from(std::net::Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped())
+    );
+    // As 0.8.1 writes it: taken, with the client's address.
+    let now = proof(&format!("0{ip}"));
+    assert_eq!(
+        b.admission_received(&now),
+        Some(("192.0.2.1".parse().unwrap(), false))
+    );
+    // The older form: its signature and sender check, its address is not
+    // read.
+    let old = proof(&ip);
+    assert!(b.admission_checked(&old).is_some());
+    assert_eq!(b.admission_received(&old), None);
+}
+
+/// A relayed socket hand-off (ADR 0027) carries a forward's proof and a
+/// call's signature, and one sender, the call's (`sign_hop` replaces the
+/// header): the call is taken, and the proof, whose sender it is not, is
+/// not. Nodes of 0.8.1 send the same, so requiring the sender changes
+/// nothing for a relay.
+#[tokio::test]
+async fn a_relayed_hand_off_names_the_calls_sender() {
+    let a = node("a").await;
+    let b = node("b").await;
+    *b.peers.write().unwrap() = HashMap::from([("a".to_owned(), peer("t/default"))]);
+    let mut out = Request::get("/actor/c/x").body(()).unwrap();
+    out.headers_mut().insert(APP, "t/default".parse().unwrap());
+    out.extensions_mut()
+        .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+    a.sign_admission("b", "/actor/c/x", &mut out).await.unwrap();
+    a.sign_hand_off("b", "/actor/c/x", &mut out).await.unwrap();
+    assert_eq!(out.headers().get_all(SENDER).iter().count(), 1);
+    let signed = b
+        .is_internal(&hyper::Method::GET, "/actor/c/x", out.headers(), true)
+        .expect("the call is taken");
+    assert_eq!(signed.sender.as_deref(), Some("a"));
+    assert!(b.admission_checked(&out).is_none());
 }
 
 #[tokio::test]
@@ -219,7 +344,7 @@ async fn a_connection_must_present_its_senders_own_pin() {
     assert!(sender_presented(&call("b", PATH, Some("a")), Some(&on_a)));
     // c's hop over a's connection: refused.
     assert!(!sender_presented(&call("b", PATH, Some("c")), Some(&on_a)));
-    // No sender (an older node), or plain HTTP: as before.
+    // No sender (a forward with no proof), or plain HTTP: passes here.
     assert!(sender_presented(&call("b", PATH, None), Some(&on_a)));
     assert!(sender_presented(&call("b", PATH, Some("c")), None));
 }

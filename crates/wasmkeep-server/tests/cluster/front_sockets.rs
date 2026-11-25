@@ -268,7 +268,8 @@ async fn only_a_signed_hand_off_opens_an_internal_room_from_another_node() {
         };
         format!(
             "x-wasmkeep-internal: v4 {ts} {ts:x} {hash} {mac}\r\nx-wasmkeep-forwarded: 1\r\n\
-             x-wasmkeep-app: default/default\r\nx-wasmkeep-caller: default/_front/main\r\n{mark_header}"
+             x-wasmkeep-app: default/default\r\nx-wasmkeep-caller: default/_front/main\r\n{mark_header}{}",
+            sender_line(&secret, &mac, "by-hand")
         )
     };
     // A client's forgery: the mark and the caller, no valid signature.

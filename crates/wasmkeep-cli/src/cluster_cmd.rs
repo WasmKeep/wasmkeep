@@ -67,7 +67,10 @@ pub(super) enum ClusterCommand {
     /// is older than 25 s (its horizon plus a lease's ttl and grace).
     /// Refuses a recent one (that node may still run), a released lease a
     /// record still names (it is what frees that record), and a live or
-    /// fenced node lease (never deleted: fence a live one instead).
+    /// fenced node lease (never deleted: fence a live one instead). Once
+    /// the app's upgrade to 0.9 is finalized, a node that starts under
+    /// that id at the same moment keeps its lease; before, it may lose it
+    /// and be started again, and the command says so.
     Forget(NodeArgs),
     /// Follow and end an upgrade of WasmKeep itself, one node at a time:
     /// `status` shows each node's version, each app's upgrade floor and
@@ -288,6 +291,13 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
             state.as_str(),
             free_at(written_at_ms)
         ),
+        OperatorFence::Forgotten => anyhow::bail!(
+            "{}'s node lease is being removed by `wasmkeep cluster forget`, which did not finish: \
+             nothing is held under that id (the lease it removes was released). Run `wasmkeep \
+             cluster forget {}` again; to fence the id after that, run this command again",
+            args.node,
+            args.node
+        ),
         OperatorFence::OldFormat => anyhow::bail!(
             "{}'s heartbeat is in the format from before node leases: that node would not read a fence. Stop it; once its heartbeat is stale, `wasmkeep cluster forget {}` removes it",
             args.node,
@@ -480,7 +490,7 @@ mod fence_tests {
             let reported = match outcome {
                 OperatorFence::Fenced { written_at_ms, .. }
                 | OperatorFence::NotLive { written_at_ms, .. } => written_at_ms,
-                OperatorFence::OldFormat => unreachable!(),
+                OperatorFence::OldFormat | OperatorFence::Forgotten => unreachable!(),
             };
             assert_eq!(reported, at, "{key}");
         }

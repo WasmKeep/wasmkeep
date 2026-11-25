@@ -2328,4 +2328,26 @@ mod tests {
             assert!(validate_node_id(bad).is_err(), "{bad}");
         }
     }
+
+    /// The mark `cluster forget` leaves while it removes a released lease
+    /// (ADR 0043) is not a node: no listing and no read by key gives one
+    /// for it.
+    #[test]
+    fn a_forgotten_mark_is_not_a_node() {
+        let mem = Mem::default();
+        let t = Cell::new(1_000);
+        let a = Membership::new(&mem, At(&t), "a", "x:1", 3_000, 0).unwrap();
+        run(a.heartbeat()).unwrap();
+        mem.0
+            .borrow_mut()
+            .insert("nodes/b".into(), crate::node_lease::encode_forgotten(900));
+        let ids = |nodes: Vec<NodeInfo>| nodes.into_iter().map(|n| n.id).collect::<Vec<_>>();
+        assert_eq!(ids(run(a.live_nodes()).unwrap()), ["a"]);
+        assert_eq!(ids(run(a.heartbeats()).unwrap()), ["a"]);
+        assert_eq!(ids(run(all_heartbeats(&&mem)).unwrap()), ["a"]);
+        assert_eq!(
+            ids(run(heartbeats_of(&&mem, &["a".to_owned(), "b".to_owned()])).unwrap()),
+            ["a"]
+        );
+    }
 }

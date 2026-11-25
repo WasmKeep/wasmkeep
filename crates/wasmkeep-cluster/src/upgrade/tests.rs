@@ -1149,7 +1149,12 @@ fn a_later_header_is_never_read_as_a_known_one() {
         if_head: None,
     };
     type Reads = fn(&[u8]) -> bool;
-    let cases: [(&str, Vec<u8>, Reads); 9] = [
+    let cases: [(&str, Vec<u8>, Reads); 10] = [
+        (
+            "wasmkeep-node-forgotten 1",
+            crate::node_lease::encode_forgotten(42),
+            |b| crate::node_lease::forgotten(b).is_some(),
+        ),
         ("wasmkeep-node 3", node_body("a", "0.9.0", "live", "take"), |b| {
             NodeInfo::decode(b).is_some()
         }),
@@ -1195,5 +1200,145 @@ fn a_later_header_is_never_read_as_a_known_one() {
                 "{header} read with the number {later}"
             );
         }
+    }
+}
+
+/// The mark of `cluster forget` (ADR 0043) in a listing of the nodes: not
+/// a node, and not an object this version cannot read. So it registers
+/// no node for any app, is never "rewritten by a version this one cannot
+/// read", and an app's state does not count it.
+#[cfg(feature = "object-store")]
+mod forgotten {
+    use super::*;
+    use crate::control::Keys as _;
+    use crate::node_lease::encode_forgotten;
+    use crate::object_store::ObjectStoreBucket;
+
+    fn bucket() -> ObjectStoreBucket {
+        ObjectStoreBucket::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "wk",
+        )
+    }
+
+    async fn put(bucket: &ObjectStoreBucket, key: &str, body: Vec<u8>) {
+        bucket.put_body(key, body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_mark_is_no_node_and_no_unread_object() {
+        let b = bucket();
+        put(&b, "nodes/a", node_body("a", "0.9.0", "live", "take")).await;
+        let before = list_nodes(&b).await.unwrap();
+        put(&b, "nodes/b", encode_forgotten(NOW)).await;
+        put(&b, "nodes/junk", b"junk".to_vec()).await;
+        let listed = list_nodes(&b).await.unwrap();
+        let ids: Vec<&str> = listed.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["a"]);
+        // Junk is unread; the mark is not.
+        let unread: Vec<&str> = listed.unread.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(unread, ["nodes/junk"]);
+        assert_eq!(listed.rewritten(&before), ["nodes/junk"]);
+        // Alone, the mark registers nothing and is no rewritten object.
+        b.delete("nodes/junk").await.unwrap();
+        b.delete("nodes/a").await.unwrap();
+        let alone = list_nodes(&b).await.unwrap();
+        assert_eq!(alone, Listed::default());
+        assert!(!alone.registered("acme/shop", "x"));
+        assert!(!alone.registered_at_start("acme/shop", "b", v(0, 9)));
+        assert!(alone.rewritten(&Listed::default()).is_empty());
+        // The mark written over a lease between two listings: the lease
+        // is gone from the second, and nothing reads as rewritten.
+        put(&b, "nodes/b", node_body("b", "0.9.0", "released", "take")).await;
+        let first = list_nodes(&b).await.unwrap();
+        put(&b, "nodes/b", encode_forgotten(NOW)).await;
+        let second = list_nodes(&b).await.unwrap();
+        assert!(second.nodes.is_empty() && second.rewritten(&first).is_empty());
+    }
+
+    /// `cluster status`, `cluster upgrade status` and `finalize` read the
+    /// nodes through `all_heartbeats`: a mark is no node of the app there.
+    #[tokio::test]
+    async fn an_apps_upgrade_state_does_not_count_a_forgotten_mark() {
+        let b = bucket();
+        put(&b, "nodes/a", node_body("a", "0.9.0", "live", "take")).await;
+        put(&b, "nodes/b", encode_forgotten(NOW)).await;
+        assert_eq!(apps_with_nodes(&b).await.unwrap(), ["acme/shop"]);
+        let status = read_status(&b, "acme", "shop", NOW, HORIZON).await.unwrap();
+        let ids: Vec<&str> = status.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["a"]);
+        // Finalized by the one live node, the mark in the way of nothing.
+        assert_eq!(
+            finalize_write(&b, "acme", "shop", v(0, 9), NOW, HORIZON).await,
+            Ok(Finalize::Raise(None, v(0, 9)))
+        );
+        let confirmed = finalize_confirm(&b, "acme", "shop", v(0, 9), NOW, HORIZON)
+            .await
+            .unwrap();
+        assert_eq!(confirmed, Confirmed::default());
+        // A fresh app beside it is still one that never ran.
+        b.delete("nodes/a").await.unwrap();
+        assert!(!list_nodes(&b).await.unwrap().registered("acme/blog", "n"));
+    }
+
+    /// The mark is written only where every node that can start knows it:
+    /// the app's floor at 0.9 or later, and no live node of the app
+    /// older. Before the finalize, `forget` deletes as it did.
+    #[tokio::test]
+    async fn the_forgotten_mark_waits_for_the_finalize() {
+        let b = bucket();
+        put(&b, "nodes/a", node_body("a", "0.9.0", "live", "take")).await;
+        put(
+            &b,
+            "nodes/gone",
+            node_body("gone", "0.9.0", "released", "take"),
+        )
+        .await;
+        let gate = async || forget_gate(&b, "acme/shop", NOW, HORIZON).await.unwrap();
+        // No floor record: 0.8, a node of 0.8.1 may still start.
+        let blocked = gate().await.unwrap_err();
+        assert_eq!(
+            blocked,
+            Blocked::Floor {
+                format: "wasmkeep-node-forgotten 1",
+                needs: v(0, 9),
+                floor: v(0, 8),
+            }
+        );
+        assert!(blocked.to_string().contains("cluster upgrade finalize"));
+        // Finalized at 0.9: allowed.
+        floor::raise(&b, "formats/acme/shop/floor", v(0, 9))
+            .await
+            .unwrap();
+        assert_eq!(gate().await, Ok(()));
+        // A live node of the app that passed its floor read before the
+        // finalize: not while it is live.
+        put(&b, "nodes/old", node_body("old", "0.8.1", "live", "take")).await;
+        assert!(matches!(
+            gate().await,
+            Err(Blocked::OlderNodes { nodes, .. }) if nodes == ["old (0.8.1)"]
+        ));
+        // Stopped, it no longer blocks; another app's older node never did.
+        put(
+            &b,
+            "nodes/old",
+            node_body("old", "0.8.1", "released", "take"),
+        )
+        .await;
+        put(
+            &b,
+            "nodes/other",
+            node_body_of("acme/blog", "other", "0.8.1", "live", "take"),
+        )
+        .await;
+        assert_eq!(gate().await, Ok(()));
+        // An unreadable floor: no mark.
+        put(&b, "formats/acme/shop/floor", b"junk".to_vec()).await;
+        assert_eq!(gate().await, Err(Blocked::FloorUnreadable { len: 4 }));
+        // An app nobody finalized, on the same prefix: its own floor.
+        assert!(matches!(
+            forget_gate(&b, "acme/blog", NOW, HORIZON).await.unwrap(),
+            Err(Blocked::Floor { .. })
+        ));
     }
 }

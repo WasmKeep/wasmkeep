@@ -41,6 +41,7 @@ at the start of `serve`'s exit line, followed there by the details:
 | `an older version of WasmKeep runs with this node id` | a heartbeat in the format from before node leases under this id |
 | `a node of an older WasmKeep version runs in this cluster` | another node of a version from before node leases (stop every older node first) |
 | `this node's lease object holds something this version cannot read` | an unreadable object under this id |
+| `this node's lease is being removed by cluster forget` | the mark of a `wasmkeep cluster forget` under this id that the command did not remove |
 | `the bucket does not enforce conditional writes` | the bucket check at start failed |
 | `the app's upgrade floor is above this node's version, or unreadable` | the app's upgrade floor (`formats/<tenant>/<app>/floor`, written by a finalized upgrade) names a newer minor version than this binary, or cannot be read; the node does not start |
 

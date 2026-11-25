@@ -73,6 +73,16 @@ The text under a version's heading is its GitHub release text
   node, and not older than the floor.
 - One check now answers "does every live node announce this word" for
   every writer, the CLI included. The messages are unchanged.
+- **`wasmkeep cluster forget` no longer races a node that starts under
+  the same id**, once the app's upgrade to 0.9 is finalized. It replaces
+  the released lease with a mark, by a write that fails if the lease
+  changed, then deletes the mark. A node that starts meanwhile writes
+  nothing over the mark and waits for it to be gone. If the command
+  stopped between its two steps, the node does not start after 60 s and
+  says to run the command again. Before the finalize the command
+  deletes as it did, and says so
+  ([cluster](docs/cluster.md#how-it-works),
+  [ADR 0043](docs/adr/0043-rolling-upgrades.md#built-the-removals-and-the-mark-of-cluster-forget)).
 
 ### Fixed
 
@@ -84,6 +94,12 @@ The text under a version's heading is its GitHub release text
 
 ### Removed
 
+- **Nodes no longer accept what only versions before 0.6.0 sent.** A
+  signed call, or a forward's proof, that names no sender is refused
+  with 503. The forward proof's older form of the client address is not
+  read. A hello answered 404 counts as failed and is sent again. Nodes
+  of 0.8.1 send none of these, so an upgrade from 0.8.1 is not affected
+  ([ADR 0038, amendment](docs/adr/0038-several-apps-per-process.md#amendment-2026-11-25-the-older-forms-are-no-longer-accepted)).
 - **`wasmkeep cluster migrate` is removed** (ADR 0022), with
   `--rollback` and `--remove-old`. A cluster older than 0.4.0 upgrades
   through 0.8.x first: pin the 0.8.1 binary, migrate with it, then

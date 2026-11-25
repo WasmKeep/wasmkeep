@@ -375,3 +375,140 @@ async fn an_older_node_starting_while_a_fresh_apps_floor_is_created_is_reported(
         "no lease written"
     );
 }
+
+/// `wasmkeep cluster forget` after the finalize (ADR 0043): a released
+/// node lease is replaced with the command's mark by a write conditioned
+/// on the lease as checked, and the mark is then deleted. Here the node
+/// starts again while the command is half-way, the mark written and not
+/// yet deleted. Before the mark, its first lease write landed over the
+/// released lease and the command's delete removed it. Now the node
+/// waits, writes nothing over the mark, and creates its lease once the
+/// mark is gone; meanwhile the mark is no node to the others. And a
+/// command that checked the lease before the node started removes
+/// nothing once the node wrote its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_forgotten_after_the_finalize_starts_again_with_its_lease() {
+    use wasmkeep_cluster::lease::Bucket as _;
+    use wasmkeep_cluster::node_lease::{
+        Forgot, encode_forgotten, forget_finish, forget_released, forgotten,
+    };
+    // 0.9, the version that introduces the mark, or this build's if later.
+    let minor = upgrade::this_minor()
+        .unwrap()
+        .max(floor::Minor { major: 0, minor: 9 });
+    let version = format!("{minor}.0");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let bucket = ObjectStoreBucket::new(Arc::clone(&store), "");
+    let start = async |id: &str, dir: &Path| {
+        let version = version.clone();
+        node_configured(
+            id,
+            dir,
+            &store,
+            Duration::from_secs(60),
+            &["counter"],
+            counter_wasm(),
+            Duration::from_secs(30),
+            "",
+            |config| config.cluster.as_mut().unwrap().version = Some(version),
+        )
+        .await
+    };
+    let gate = async || {
+        upgrade::forget_gate(&bucket, "default/default", now_ms(), horizon())
+            .await
+            .unwrap()
+    };
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+    // The first node of a fresh app creates its floor at its own version:
+    // the app is finalized at 0.9 from its first day.
+    let a = start("a", da.path()).await;
+    a.service.node_id_checked().await.unwrap();
+    assert_eq!(floor_record(&store).await, Some(floor::encode(minor)));
+    let b = start("b", db.path()).await;
+    b.service.node_id_checked().await.unwrap();
+    settle().await;
+    let r = send(a.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"));
+    settle().await;
+
+    // `a` stops cleanly: its lease is released.
+    a.service.shutdown(Duration::from_secs(2)).await;
+    stop_listening(a).await;
+    let (released, checked) = bucket.get("nodes/a").await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&released).contains("\nreleased "));
+    // Every node that can start here knows the mark: it may be written.
+    assert_eq!(gate().await, Ok(()));
+
+    // The command's first request: the mark, over the lease as checked.
+    let mark = encode_forgotten(now_ms());
+    bucket
+        .replace("nodes/a", mark.clone(), &checked)
+        .await
+        .unwrap();
+    // `a` starts again before the command's delete, which comes past its
+    // start check's own wait (1.2 s in these timings).
+    let half_way = async {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // It wrote nothing over the mark.
+        let (body, _) = bucket.get("nodes/a").await.unwrap().unwrap();
+        assert_eq!(body, mark, "{}", String::from_utf8_lossy(&body));
+        // To the others the mark is no node, and nothing unreadable: the
+        // app's state is one live node on one version, and `b` serves.
+        let status = upgrade::read_status(&bucket, "default", "default", now_ms(), horizon())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = status.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["b"]);
+        assert_eq!(status.state, State::OneVersion, "{}", status.detail);
+        let listed = upgrade::list_nodes(&bucket).await.unwrap();
+        assert!(listed.unread.is_empty(), "{:?}", listed.unread);
+        assert!(!listed.registered("default/default", "b"));
+        let r = send(b.addr, "POST", "/actor/counter/bob", "").await;
+        assert_eq!((r.status, r.body.trim()), (200, "1"));
+        // The command's second request. The node then checks its id
+        // again, over no object, and creates its lease.
+        assert_eq!(forget_finish(&bucket, "nodes/a").await, Ok(Forgot::Removed));
+        std::time::Instant::now()
+    };
+    let (again, deleted) = tokio::join!(start("a", da.path()), half_way);
+    assert!(
+        deleted.elapsed() >= Duration::from_millis(1_100),
+        "the whole check ran again: {:?}",
+        deleted.elapsed()
+    );
+    again.service.node_id_checked().await.unwrap();
+    let (live, _) = bucket.get("nodes/a").await.unwrap().unwrap();
+    assert!(forgotten(&live).is_none());
+    assert!(
+        String::from_utf8_lossy(&live).starts_with("wasmkeep-node 3\nlive "),
+        "{}",
+        String::from_utf8_lossy(&live)
+    );
+    settle().await;
+    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"));
+
+    // A command that checked the released lease before the node started,
+    // and writes after: its condition fails, and the node keeps the lease
+    // it wrote. (A delete without a condition removed it.)
+    assert_eq!(
+        forget_released(&bucket, "nodes/a", &checked, now_ms()).await,
+        Ok(Forgot::Changed)
+    );
+    assert_eq!(forget_finish(&bucket, "nodes/a").await, Ok(Forgot::Changed));
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let (still, _) = bucket.get("nodes/a").await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&still).starts_with("wasmkeep-node 3\nlive "));
+    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "3"));
+
+    // A node of 0.8.1 live in the app (it passed its floor read before
+    // the finalize): no mark while it is.
+    lease_of(&store, "old", "0.8.1", "live", "take front").await;
+    assert!(matches!(
+        gate().await,
+        Err(upgrade::Blocked::OlderNodes { .. })
+    ));
+}

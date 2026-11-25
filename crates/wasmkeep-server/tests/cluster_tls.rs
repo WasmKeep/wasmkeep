@@ -337,7 +337,7 @@ fn heartbeats(store: &Arc<dyn ObjectStore>, pin: String, alive: Arc<AtomicBool>)
                 .unwrap()
                 .as_millis();
             let body = format!(
-                "wasmkeep-node 2\nx\nhttp://127.0.0.1:9\n0.0.0\n{now}\ndefault/\nhttps://127.0.0.1:9\n{pin}\n"
+                "wasmkeep-node 2\nx\nhttp://127.0.0.1:9\n0.0.0\n{now}\ndefault/default\nhttps://127.0.0.1:9\n{pin}\n"
             );
             store
                 .put(&StorePath::from("nodes/x"), body.into_bytes().into())
@@ -577,10 +577,17 @@ fn signed_post(secret: &str, to: &str, path: &str, caller: &str) -> String {
          x-wasmkeep-app:default/default\n"
     );
     let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
+    // Sent by `x`, the node whose heartbeat the test writes: a signed call
+    // names its sender, bound to its signature (ADR 0038, section 5).
+    let sender = hmac_hex(
+        secret.as_bytes(),
+        format!("wasmkeep-sender v1\ninternal\n{mac}\nx\n").as_bytes(),
+    );
     format!(
         "POST {path} HTTP/1.1\r\nHost: n\r\nContent-Length: 0\r\n\
          x-wasmkeep-caller: {caller}\r\n\
          x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\n\
+         x-wasmkeep-sender: x {sender}\r\n\
          x-wasmkeep-forwarded: 1\r\nx-wasmkeep-app: default/default\r\n\
          Connection: close\r\n\r\n"
     )

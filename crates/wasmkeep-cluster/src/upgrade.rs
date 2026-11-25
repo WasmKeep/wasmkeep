@@ -142,6 +142,18 @@ const fn row(name: &'static str, since: Minor, rule: Rule, unknown: &'static str
     }
 }
 
+/// The row of the mark `wasmkeep cluster forget` leaves while it removes
+/// a released node lease ([`crate::node_lease::forgotten`]): new in 0.9,
+/// so behind the floor, with no word of its own. The node it matters to
+/// is one that is starting, which no live-node gate sees; the floor is
+/// what keeps a node that does not know the mark from starting.
+const FORGOTTEN: Format = row(
+    crate::node_lease::FORGOTTEN_HEADER,
+    m(0, 9),
+    Rule::Gate(&[]),
+    "a_forgotten_mark_is_exact_or_not_one",
+);
+
 /// The gate table (ADR 0043, section 2), as data. A test fails when a
 /// `wasmkeep-<name> <n>` literal exists in the crates without a row here.
 /// `since` is the first release whose tree holds the form.
@@ -168,6 +180,7 @@ pub const FORMATS: &[Format] = &[
         Rule::Frozen,
         "a_later_header_is_never_read_as_a_known_one",
     ),
+    FORGOTTEN,
     row(
         "wasmkeep-owner 1",
         m(0, 1),
@@ -485,6 +498,30 @@ pub fn gate<'a>(
         }
     }
     Ok(())
+}
+
+/// Whether `wasmkeep cluster forget` may leave its mark while it removes
+/// a released lease of `app` (`tenant/app`): [`gate`] on the mark's row,
+/// from the app's floor and its live nodes, read here at `now_ms`. Until
+/// the app's upgrade to 0.9 is finalized a node of 0.8.1 may start under
+/// that id, and it would write its lease over a mark it does not know.
+///
+/// # Errors
+/// The bucket did not answer. Inside: what blocks the mark.
+pub async fn forget_gate<B: Bucket + Directory>(
+    bucket: &B,
+    app: &str,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Result<Result<(), Blocked>, BucketError> {
+    let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
+    let floor = bucket.get(&floor::relative_key(tenant, name)).await?;
+    let floor = floor::decode(floor.as_ref().map(|(body, _)| body.as_slice()));
+    let nodes = crate::membership::all_heartbeats(bucket).await?;
+    let live = nodes
+        .iter()
+        .filter(|n| serves(n, app) && is_live(n, now_ms, horizon_ms));
+    Ok(gate(&FORGOTTEN, floor, live))
 }
 
 /// Whether a writer of minor version `this` may write to an app at all
@@ -1200,6 +1237,9 @@ pub async fn list_nodes<D: Directory>(directory: &D) -> Result<Listed, BucketErr
             // written once: not a heartbeat, and not a running node.
             None if crate::node_lease::NodeLeaseObject::decode(&body)
                 .is_some_and(|o| crate::node_lease::created_fence(&o)) => {}
+            // The mark of a `cluster forget`: not a node, and no version
+            // this one cannot read wrote it.
+            None if crate::node_lease::forgotten(&body).is_some() => {}
             None => listed.unread.push((key, body)),
         }
     }

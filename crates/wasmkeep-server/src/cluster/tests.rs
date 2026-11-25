@@ -1213,8 +1213,10 @@ async fn refuse_mode_honours_node_signatures_on_the_cluster_port_only() {
         INTERNAL,
         format!("v4 {ts} a1 {hash} {mac}").parse().unwrap(),
     );
+    name_sender(&secret, &mut headers);
     for c in [&accept, &refuse] {
         c.load_secret().await;
+        list_sender(c);
         assert!(c.is_internal(&method, path, &headers, true).is_some());
     }
     assert!(accept.is_internal(&method, path, &headers, false).is_some());
@@ -1247,7 +1249,34 @@ fn signed_call(secret: &str, ts: u64, n: u64, marker: Option<&str>) -> hyper::He
         INTERNAL,
         format!("v4 {ts} {nonce} {hash} {mac}").parse().unwrap(),
     );
+    name_sender(secret, &mut headers);
     headers
+}
+
+/// Names node `b` the sender of the call signed in `headers`, as every
+/// node names itself ([`Cluster::sign_hop`]): a signed hop without a
+/// sender is refused.
+fn name_sender(secret: &str, headers: &mut hyper::HeaderMap) {
+    let mac = headers[INTERNAL]
+        .to_str()
+        .unwrap()
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    headers.insert(
+        SENDER,
+        sender_value(secret, "internal", &mac, "b").parse().unwrap(),
+    );
+}
+
+/// Lists `b`, the sender [`name_sender`] names, as a live node of `c`'s
+/// app.
+fn list_sender(c: &Cluster) {
+    c.peers
+        .write()
+        .unwrap()
+        .insert("b".to_owned(), sender_tests::peer("t/default"));
 }
 
 /// Node `a` in refuse mode, the cluster secret `secret` loaded.
@@ -1267,6 +1296,7 @@ async fn refuse_node(secret: &str) -> Arc<Cluster> {
     config.cluster_plaintext = ClusterPlaintext::Refuse;
     let c = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
     c.load_secret().await;
+    list_sender(&c);
     c
 }
 
@@ -1337,6 +1367,7 @@ async fn a_signature_made_before_this_node_started_is_refused() {
         config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
         let c = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
         c.load_secret().await;
+        list_sender(&c);
         c
     }] {
         let m = hyper::Method::POST;
@@ -1441,6 +1472,7 @@ async fn only_a_nodes_signed_hello_asks_for_a_listing() {
             INTERNAL,
             format!("v4 {ts} {nonce} {hash} {mac}").parse().unwrap(),
         );
+        name_sender(&secret, &mut headers);
         headers
     };
     // Unsigned.
@@ -1639,6 +1671,10 @@ async fn a_replaced_node_lease_stops_the_node() {
         ("twin", "another process runs with this node id"),
         ("old", "an older version of WasmKeep runs with this node id"),
         (
+            "forgotten",
+            "this node's lease is being removed by cluster forget",
+        ),
+        (
             "released",
             "this node's lease was released by another process",
         ),
@@ -1685,6 +1721,12 @@ async fn a_replaced_node_lease_stops_the_node() {
                     .put(&key, b"not a node lease".to_vec().into())
                     .await
                     .unwrap();
+            }
+            // Not what `cluster forget` does to a live lease (it marks
+            // only a released one): what the node does if it meets it.
+            "forgotten" => {
+                let mark = wasmkeep_cluster::node_lease::encode_forgotten(now_ms());
+                store.put(&key, mark.into()).await.unwrap();
             }
             "old" => {
                 let body = format!(
@@ -1787,6 +1829,91 @@ async fn a_fence_during_the_start_check_is_not_a_twin() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.starts_with("wasmkeep-node 3\nlive "), "{text}");
     assert!(!text.contains("beef"), "{text}");
+}
+
+/// A node that starts while `wasmkeep cluster forget` is half-way (ADR
+/// 0043): its released lease is replaced with the command's mark, and the
+/// delete, which takes no condition, has not landed. The node never
+/// writes over the mark (its lease would be deleted with it). It waits
+/// for the key to be absent, runs its whole start check again, and
+/// creates its lease. The mark is met at the check's first read, or
+/// written during the check over the released lease it was watching.
+#[tokio::test]
+async fn a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete() {
+    for during_the_check in [false, true] {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let key = StorePath::from("nodes/a");
+        let mark = wasmkeep_cluster::node_lease::encode_forgotten(now_ms());
+        let released = format!(
+            "wasmkeep-node 3\nreleased beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            now_ms()
+        );
+        let first = if during_the_check {
+            released.into_bytes()
+        } else {
+            mark.clone()
+        };
+        store.put(&key, first.into()).await.unwrap();
+        let a = fast_node("a", &store);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if during_the_check {
+            // `forget`'s conditional write, over the lease as checked.
+            store.put(&key, mark.clone().into()).await.unwrap();
+        }
+        // Past the check's own wait (ttl plus grace, 1.2 s here), when
+        // an object to write over would have been written over, and
+        // within the wait for the mark (four times that): the mark is
+        // untouched and the node holds nothing.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(body.as_ref(), mark.as_slice(), "{during_the_check}");
+        assert_eq!(
+            a.not_ready(),
+            Some("checking that no other process runs with this node id"),
+            "{during_the_check}"
+        );
+        assert!(!a.node_lease_valid(), "{during_the_check}");
+        // The command's delete.
+        store.delete(&key).await.unwrap();
+        let deleted = std::time::Instant::now();
+        a.identity().await.unwrap();
+        // The whole check ran again, over no object.
+        assert!(
+            deleted.elapsed() >= Duration::from_millis(1_100),
+            "{during_the_check}: started {:?} after the delete",
+            deleted.elapsed()
+        );
+        let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        let instance = a.membership.instance().unwrap().to_owned();
+        assert!(
+            text.starts_with(&format!("wasmkeep-node 3\nlive {instance}\n")),
+            "{during_the_check}: {text}"
+        );
+    }
+}
+
+/// A mark its command never deleted (it stopped between its two
+/// requests): the node does not start, never writes over it, and says to
+/// run the command again.
+#[tokio::test]
+async fn a_forgotten_mark_never_removed_stops_the_start() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let key = StorePath::from("nodes/a");
+    let mark = wasmkeep_cluster::node_lease::encode_forgotten(now_ms());
+    store.put(&key, mark.clone().into()).await.unwrap();
+    let a = fast_node("a", &store);
+    let why = tokio::time::timeout(Duration::from_secs(10), a.identity())
+        .await
+        .expect("the wait for the mark is bounded")
+        .unwrap_err();
+    let words = "this node's lease is being removed by cluster forget";
+    assert!(why.starts_with(words), "{why}");
+    assert!(why.contains("`wasmkeep cluster forget a` again"), "{why}");
+    assert_eq!(a.not_ready(), Some(words));
+    assert!(!a.node_lease_valid());
+    let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(body.as_ref(), mark.as_slice());
 }
 
 #[test]

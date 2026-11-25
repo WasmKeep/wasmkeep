@@ -8,8 +8,7 @@
 //! once if it made no listing yet that period (one early listing a
 //! period at most, the rest at the next period): a node lists at most twice
 //! a period, as before over TLS. Unsigned,
-//! badly signed or replayed, it is refused and changes nothing. Nodes of
-//! 0.4.1 and before answer 404 and list every period anyway. With TLS, the
+//! badly signed or replayed, it is refused and changes nothing. With TLS, the
 //! handshake of a node whose pin a peer has not listed yet already makes
 //! that peer list (an unknown pin); the hello covers plain HTTP, and a
 //! peer that saw the pin knock before its own listing.
@@ -30,8 +29,10 @@ impl Cluster {
     /// of its own; failures are logged at debug level (the peer lists by
     /// its own schedule anyway).
     /// `failed` is set if a peer did not take it (no answer, or an answer
-    /// other than 200 and the 404 of a node of 0.4.1): the heartbeat loop
-    /// sends another round.
+    /// other than 200): the heartbeat loop sends another round. The 404
+    /// of a node of 0.4.1 and before is no longer taken as an answer (ADR
+    /// 0043, section 6): every node this version runs beside answers a
+    /// hello.
     ///
     /// Peers of this app only (ADR 0038): a process serving several apps
     /// routes a hop to the runtime of the app it names, this one, which
@@ -57,11 +58,6 @@ impl Cluster {
                 let taken = match tokio::time::timeout(HELLO_TIMEOUT, c.hello(&peer)).await {
                     Ok(Ok(StatusCode::OK)) => {
                         tracing::debug!(%peer, "said hello");
-                        true
-                    }
-                    // A node of 0.4.1: it lists every period anyway.
-                    Ok(Ok(StatusCode::NOT_FOUND)) => {
-                        tracing::debug!(%peer, "hello not known there (an older node)");
                         true
                     }
                     Ok(Ok(status)) => {

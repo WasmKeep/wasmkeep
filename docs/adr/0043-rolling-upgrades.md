@@ -8,7 +8,10 @@
   ["Built: the upgrade mechanics"](#built-the-upgrade-mechanics). The
   first gated format, deploy manifest 8 with the word `apart`, is under
   ["Built: the first gated format"](#built-the-first-gated-format).
-  Sections 6 to 8 are still to build.
+  Section 6's removals of older senders, and a second gated format, the
+  mark of `cluster forget`, are under
+  ["Built: the removals, and the mark of `cluster forget`"](#built-the-removals-and-the-mark-of-cluster-forget).
+  Section 8 is still to build.
 - Milestone: `0.9.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: ADR 0008 (deploys roll; this record is about the binary), ADR
   0011 (the cluster port), ADR 0020 (node leases, the heartbeat, and the
@@ -255,6 +258,7 @@ format it really writes behind the gate, or the gate ships untested
 |---|---|---|---|
 | Heartbeat and node lease, lines 1 to 3 | `wasmkeep-node 3`, `<state> <instance>`, `<written-at>` | Unknown header: the node is invisible to gates and never failed over. Extra word on line 2: its actors are taken over while it lives | **Frozen, byte grammar included.** It carries the gates, so it cannot be gated |
 | Heartbeat payload, lines 1 to 4 | id, address, version, app | A missing line: the node is invisible | **Frozen** |
+| The mark of `cluster forget` at `nodes/<id>` | n/a (`wasmkeep-node-forgotten 1`, from `0.9`) | Not a heartbeat: skipped by every listing. A node of `0.8.1` starting under that id would write its lease over it | Gate on the floor at `0.9`; no word (the node it matters to is not live) |
 | Heartbeat payload, later lines | Cluster address, pins, drain, `secrets`, words, load | Unknown words and load keys ignored; lines after the load ignored | Extend by words, by load keys, and by appended lines. No gate; a test |
 | Deploy manifest | `wasmkeep-manifest 1` to `7`, exact match, every line known | Refused as corrupt (table above) | A new line is a new number. Gate each number, as `check_readers` does for 3 to 7. `wasmkeep-manifest 8` (`0.9`, the `apart` and `spread` lines): gated on the floor at `0.9` and on the word `apart`, and written only for a version that has such a line |
 | `current` | `<version> <seq> 3` | Refused as corrupt | Frozen until a gated change is needed |
@@ -693,13 +697,22 @@ that carries a proof. So `0.9.0` may remove:
   which section 5 handles: it blocks a start only if it is rewritten.
 
 What stays: a forward with no proof at all. `sign_admission` sends none
-when the cluster secret is not loaded or the peer address is unknown,
-and whether a serving `0.8.1` node can be in that state was not settled
-by reading (see "Not settled"). Plain-HTTP `accept` mode is a
+when the cluster secret is not loaded or the peer address is unknown.
+A `0.8.1` node that serves one app can be in the first state (it
+forwards without waiting for the secret), so that form is one `0.8.1`
+sends, and the rule keeps it. Plain-HTTP `accept` mode is a
 configuration, not a shim, and stays.
 
+As built, the first three are removed and the fourth is not: see
+["Built: the removals, and the mark of `cluster forget`"](#built-the-removals-and-the-mark-of-cluster-forget).
+
 Each of these removals gets a mixed-version case with `0.8.1` on the
-other side before it merges.
+other side before it merges. That was not done for the change that
+removed them: it rests on the reading of the `v0.8.1` senders and on
+unit tests of each refusal. The mixed-version check
+(`scripts/mixed-version.sh`, section 8) sends every kind of hop between
+the two versions and must pass with these removals before `0.9.0` is
+tagged.
 
 ### 7. The wire rule for hops
 
@@ -896,8 +909,9 @@ Not built by that change:
 - **A serving node's read of the floor** when it sees a newer live node,
   and its drain and stop below the floor (section 3, "Readers"), and the
   once-a-minute error for a live node outside its range (section 5).
-- **Writes with no gated format** (`cluster drain`, `fence`, `forget`,
-  `actor delete` and `move`, `backup create`) do not run the writer's
+- **Writes with no gated format** (`cluster drain`, `fence`,
+  `actor delete` and `move`, `backup create`; `forget` too, which asks
+  the gate only for its mark, below) do not run the writer's
   check; a whole-app restore and an actor restore check their words, not
   the floor. `secrets rotate-key` has none either, on purpose: it stays
   usable during an upgrade, and writes the format `0.8.1` reads.
@@ -956,6 +970,149 @@ beside a node without the word, then accepted; and the first deploy of
 a fresh app, of one with state, and of one beside older nodes of
 another app.
 
+## Built: the removals, and the mark of `cluster forget`
+
+Built on 2026-11-25, as the fifth item of `0.9.0`.
+
+### Older senders (section 6)
+
+Before anything was removed, the senders were read in the tree at the
+`v0.8.1` tag. `sign_hop` (`cluster/signing.rs`) is the only function
+that writes a hop's signature, and it writes the sender right after, on
+every path: `sign_call` (an actor call, a take call and an alarm
+hand-off through `call_once`, the hello, and the relayed socket
+hand-off through `sign_hand_off`) and `sign_admission` (a forward and a
+WebSocket upgrade relay). The sender's value is always a valid header:
+a node id is `[a-z0-9-]{1,64}`, checked at start. `sign_admission`
+writes the client's address as a flag and 32 digits, or 64 for a
+charged proof. What was read is recorded in
+[ADR 0038, amendment of 2026-11-25](0038-several-apps-per-process.md#amendment-2026-11-25-the-older-forms-are-no-longer-accepted).
+
+Removed:
+
+1. **A signed hop without a sender is refused** in every configuration
+   (`sender_checked`): a node call answers 503 and is never served as a
+   client's request; a forward's proof without a sender is not a proof.
+2. **The 32-digit client address** in a forward's proof is no longer
+   read (`admission_received`).
+3. **A 404 to a hello** is no longer taken as an answer: it is sent
+   again as any failed hello, three rounds at most.
+
+Kept:
+
+1. **A forward with no proof.** `0.8.1` sends one from a single-app
+   process whose secret is not loaded, or when the client's address is
+   unknown ("Not settled" 3, now settled by reading).
+2. **The heartbeat formats `wasmkeep-node 1` and `2`** and their start
+   guard. Section 6 lists them as removable; they were left out of this
+   change, which keeps `cluster forget` and `cluster fence` saying "the
+   format from before node leases" for such an object. To remove in
+   `0.9.x` or `0.10`.
+3. **The per-actor lease marker**, as section 6 says.
+
+A relayed socket hand-off carries one sender, the call's, in `0.8.1` as
+in `0.9`: the receiver takes the call and not the proof, and requiring
+the sender changes nothing there. A test pins it.
+
+### The mark of `cluster forget`
+
+`cluster forget` deleted a released node lease after reading it twice;
+a store's DELETE takes no condition, so a process that started under
+that id between the second read and the delete lost its lease
+([ADR 0020](0020-one-lease-per-node.md#long-released-node-leases-cluster-forget)).
+The bucket adapter still has no conditional delete (`object_store`
+0.14.2), so the removal is made of a conditional write and a delete.
+
+1. **The mark.** `wasmkeep-node-forgotten 1\n<written-at ms>\n` at
+   `nodes/<id>`: the header, then the operator's clock when it was
+   written. Decoding is exact (the bytes the encoder writes, nothing
+   else). It is `upgrade::FORMATS`' second row behind the floor: since
+   `0.9`, no word.
+2. **The command.** After its checks (released, older than 25 s, no
+   ownership record names the node), `forget` replaces the lease with
+   the mark, `If-Match` on the version it checked, then deletes the
+   mark. A failed condition means the object changed: nothing is
+   deleted, and the command says to run it again.
+3. **The rule for a node.** Only `forget` writes over a mark or deletes
+   it. A node's lease writes are all conditional, so none lands over a
+   mark by accident; the start check adds the rest. A node that reads
+   the mark under its id, at the check's first read or at any later
+   one, judges nothing, waits until the key is absent (a read every
+   half period), and then runs the whole check again, its ttl plus
+   grace included: it creates its lease over no object. A first write
+   whose condition fails because the mark landed after the check comes
+   back to the same wait. So the three orders are safe: the node writes
+   first (the command's condition fails), the command writes first and
+   the node reads the mark (it waits), or the command finishes first
+   (the node starts as on a new id).
+4. **The bound.** A mark still there four times a lease's ttl plus grace
+   after the node first read it (60 s at the defaults) is one its
+   command did not delete. The node does not start, reports `this
+   node's lease is being removed by cluster forget`, and names the
+   remedy: run `wasmkeep cluster forget <node>` again, which deletes a
+   mark it finds (read right before the delete), whatever its age. The
+   node does not take the mark over after the bound: a command that is
+   only slow would then delete the node's lease, which is the gap this
+   closes.
+5. **Only after the finalize.** A node of `0.8.1` does not know the
+   mark: starting under that id it would watch it as an object it
+   cannot read and then write its lease over it. So the mark is written
+   only when `gate` allows its row for the app the lease names: that
+   app's floor at `0.9` or later (no node of `0.8.1` starts there any
+   more), and no live node of the app older than `0.9`. Otherwise
+   `forget` reads twice and deletes, as before `0.9`, and its answer
+   says so and names what blocks the mark. A heartbeat from before node
+   leases is removed that way too. The command takes no version of its
+   own into account: the gate is about the nodes.
+6. **Not a node.** Every reader of `nodes/<id>` skips the mark, and none
+   counts it as an object this version cannot read:
+   - the heartbeat listing and the reads by key (`membership`), so
+     routing, the peers' pins, `cluster status`, `cluster upgrade
+     status`, `finalize`'s two listings and every capability gate;
+   - `upgrade::list_nodes`, so the skew check does not wait for it, a
+     start is not refused for an object "rewritten meanwhile", and it
+     does not make an app one that ran;
+   - a record's reader (`frees`): as an absent object, it frees nothing,
+     and no record names the node by then;
+   - `cluster fence`: refused, saying to run `forget` again (a fence
+     written over the mark would be deleted with it);
+   - a peer's fence: not live, nothing to fence.
+   `node_lease::forgotten` is the one test of "is this a mark", for
+   commands that read `nodes/` themselves.
+
+Limits, kept as documented:
+
+- **Two `forget` of one node at once.** Each deletes the mark it read.
+  If the first delete, a node's create and the second delete land in
+  that order, the node's new lease is deleted: it stops at its next
+  write and is started again. Availability only, and it needs two
+  operators and a node start in the same second.
+- **Before the finalize** the gap of ADR 0020 is as it was.
+- **A whole-app restore in place** reads `nodes/` itself and takes an
+  object it cannot decode as a node whose app is unknown; a mark that
+  is there at that moment makes it take its cautious path, as any such
+  object does. That reader was not changed here.
+- **Nodes of `0.8.1` of another app on the same prefix** list the mark
+  and skip it (their heartbeat decoder reads an unknown first line as
+  nothing). One starting under the very id being forgotten, for
+  another app that is not finalized, would write over the mark; a node
+  id belongs to one app, so this needs a node id moved between apps
+  during the removal.
+
+Tests: the mark's decode (`a_forgotten_mark_is_exact_or_not_one`) and a
+node's writes over it (`a_node_never_writes_over_a_forgotten_mark`),
+the command's two steps (`node_lease::tests::forget`), every listing
+(`membership::tests::a_forgotten_mark_is_not_a_node`,
+`upgrade::tests::forgotten`), the gate before and after the finalize
+(`the_forgotten_mark_waits_for_the_finalize`, and the command's own
+`forget_marks_a_released_lease_only_after_the_finalize`), the start
+check (`a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete`,
+`a_forgotten_mark_never_removed_stops_the_start`), and one cluster case,
+`tests/cluster/upgrade.rs`:
+`a_node_forgotten_after_the_finalize_starts_again_with_its_lease`. No
+simulation case: the lease protocol between nodes is unchanged, and the
+node-lease simulation was run again over the changed module.
+
 ## Not settled
 
 1. **The window after an upgrade** (Context, 1). Why a room's edges
@@ -965,8 +1122,9 @@ another app.
 2. **The cost of `cluster status` and of the two new commands with many
    released node leases** (Context, 2): to measure, then bound or
    document.
-3. **A forward with no proof** (section 6): whether a serving `0.8.1`
-   node sends one. Until read or tested, that branch stays.
+3. *Settled by reading* (section 6): a serving `0.8.1` node of one app
+   sends a forward with no proof while its cluster secret is not
+   loaded, and when the client's address is unknown. The branch stays.
 4. **A restore into another prefix** and the floor ("Consequences").
    A whole-app restore writes `current` and the manifest outside the
    gate and copies no floor. So an app on manifest 8 restored into
@@ -1001,7 +1159,8 @@ another app.
     accepted when every registered lease of the app is released or
     fenced and names the target version or a later one.
 11. **An object under `nodes/` that does not decode** is never removed
-    by a command: `cluster forget` reads only what it can decode. It
+    by a command: `cluster forget` reads only what it can decode (and
+    its own mark, which is not such an object). It
     holds every start back by a lease's ttl plus grace and keeps its
     prefix's apps from being born finalized, until it is deleted from
     the bucket by hand.
