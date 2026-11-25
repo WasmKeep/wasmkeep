@@ -374,7 +374,8 @@ and not older than the app's floor.
   on a prefix with about 140 of them, measured on 0.8.1. `cluster
   forget` removes them.
 - **The removals above** were made on a reading of the 0.8.1 senders and
-  unit tests of each refusal.
+  unit tests of each refusal; the mixed-version check runs 0.9.0 beside
+  0.8.1 nodes, which no longer send the removed forms.
 - **0.x to 1.0** is not covered by these rules.
 
 ## Measured
@@ -391,7 +392,8 @@ bucket:
 
 - **A rolling upgrade under load**, 0.8.1 to 0.9.0 one node at a time,
   under 4,500 clients at 10 messages/s:
-  - nothing was lost: 0 unacknowledged writes and 0 repeats;
+  - nothing was lost: every publish was acknowledged in the end, and no
+    message was delivered twice or skipped;
   - each node was `serving` again 16 to 25 s after its stop;
   - while a node restarts, its clients reconnect: for those minutes the
     delivery p99 is seconds to tens of seconds (3.6 to 23 s measured),

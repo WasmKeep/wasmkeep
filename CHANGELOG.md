@@ -9,8 +9,10 @@ The text under a version's heading is its GitHub release text
 
 ## 0.9.0
 
-**0.9 is upgraded one node at a time: a cluster moves from 0.8.1 to 0.9.0
-without stopping as a whole, and one command ends the upgrade.** A node
+**0.9 can be upgraded one node at a time: a cluster moves from 0.8.1 to
+0.9.0 without stopping as a whole, and one command ends the upgrade.
+Stopping every node is still the recommended way for 0.9.0 (see Known
+limits).** A node
 refuses to start beside a version it cannot run with, each app has an
 upgrade floor, and `wasmkeep cluster upgrade finalize` raises it once
 every node runs the new version. Until then any node may go back to 0.8.1
