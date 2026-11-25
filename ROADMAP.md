@@ -6,35 +6,13 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0` and `0.8.0`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0` and `0.8.1`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.8.1`: **0.8 settled.** No new feature. `0.8.0` made a big room need
-no hand placement (what it brings is under [Built](#built); the limits
-known at release are in the [changelog](CHANGELOG.md)). This release
-closes what it left open:
-
-1. **Availability follow-ups** (M): reads of other nodes' leases that
-   never trust an older copy, and the remaining follow-ups of the slow
-   bucket work in `0.7.0`.
-2. **Limits a guest can reach** (S/M): a configurable SQLite memory cap,
-   `LIKE` and `GLOB` under the statement's budgets, caps on open file
-   reads.
-3. **Idle history compaction, observed** (S): built and tested in
-   `0.8.0` ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md));
-   still to be watched on a cluster left running longer than its
-   retention window, and simulated against a backup that reads meanwhile.
-4. **The mixed-version check as a gate** (M): three nodes moved one at a
-   time from the previous release to this one, and back
-   ([releasing](docs/releasing.md#the-mixed-version-check)). Whether this
-   release can be installed one node at a time is stated on its upgrading
-   page, from that check's result.
-
-## Next
-
-`0.9.0`: **operating without the author.** Not before the release above.
+`0.9.0`: **operating without the author.** `0.8.1` settled 0.8 (what it
+fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
 
 1. **Rolling upgrades of WasmKeep** (L): one node at a time from the
    previous minor version, with no stop of the whole cluster and no
@@ -48,6 +26,10 @@ closes what it left open:
    the calls it makes, the hop between nodes and the bucket write.
 4. **Old upgrade paths removed** (M), each with a documented last
    version that carries it.
+
+## Next
+
+After 0.9.0, the items below, not before it.
 
 ## After that
 
@@ -357,6 +339,12 @@ Started alongside M3; what is left of it is under [Now](#now) and
 - In `0.8.0`, hardening from an internal audit of the guest boundary,
   the cluster's signatures, uploads and local files
   ([security](docs/security.md),
+  [upgrading](docs/deploy/upgrading-to-0.8.md)).
+- In `0.8.1`, 0.8 settled, with no format change: a `LIKE` or `GLOB`
+  pattern that could stop a node is fixed, reads of other nodes' leases
+  never trust an older copy, an idle pass stopped at its deadline
+  continues, and the mixed-version check against the previous release is
+  a release gate ([changelog](CHANGELOG.md),
   [upgrading](docs/deploy/upgrading-to-0.8.md)).
 
 ## Stretch goal: the benchmark showdown

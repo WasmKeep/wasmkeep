@@ -7,7 +7,7 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## Unreleased
+## 0.8.1
 
 **0.8 settled: a security fix, the follow-ups 0.8.0 left open, and no
 format change.** A `LIKE` or `GLOB` pattern full of wildcards could stop a
