@@ -49,10 +49,10 @@ The text under a version's heading is its GitHub release text
 ### Fixed
 
 - A restore's read of a history object, and an upload's read-back,
-  refuse a body longer than the size its answer declared, and read one
-  that ends short of it again, as exports and backups already did. A
-  long body was read without a bound, and a short one was taken as the
-  object.
+  keep no more of a body than the size its answer declared, and read
+  again one that goes past it or ends short of it (a read-back takes a
+  longer one for other bytes at once). A long body was read without a
+  bound, and a short one was taken as the object.
 
 ### Removed
 

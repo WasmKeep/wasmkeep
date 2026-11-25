@@ -479,8 +479,9 @@ impl<T> Drop for AbortOnDrop<T> {
 /// the listing gave: an object of another size is not the one the plan
 /// names, and is refused before its body is read (the read-ahead's memory
 /// bound counts listed sizes). A body is as long as its answer declared:
-/// a longer one is refused as it passes that size, a shorter one is an
-/// attempt given up.
+/// one that ends short of it, or goes past it (no more of it is read
+/// then), is an attempt given up, sent again at once: a broken transfer,
+/// not a history that cannot be restored.
 ///
 /// These are a restore's rules ([`RestoreRead`]) for the replica's one
 /// reader ([`bucket::read`]); the request is unconditional.
@@ -500,6 +501,34 @@ pub(super) async fn bounded_get(
         listed,
         time,
         turn,
+        expected: false,
+        pause: READ_PAUSE,
+        last: String::new(),
+    };
+    bucket::read(store.as_ref(), location, rules).await
+}
+
+/// Reads back the object at `location`, where an upload expects the
+/// `len` bytes it sent: [`bounded_get`] for a read with no place under
+/// the node's limits, whose time counts its own bytes alone, except that
+/// a body longer than its answer declared ends the read
+/// ([`ReplicaError::Restore`], as an object of another size does): more
+/// bytes than the upload sent are not its bytes, however often they are
+/// read.
+pub(super) async fn get_expected(
+    store: &Arc<dyn ObjectStore>,
+    location: &StorePath,
+    len: u64,
+) -> Result<bytes::Bytes, ReplicaError> {
+    let time = ReadTime::new(len, None);
+    let rules = RestoreRead {
+        location,
+        max_object: len,
+        cap: len,
+        listed: Some(len),
+        time: &time,
+        turn: None,
+        expected: true,
         pause: READ_PAUSE,
         last: String::new(),
     };
@@ -514,6 +543,9 @@ struct RestoreRead<'a> {
     listed: Option<u64>,
     time: &'a ReadTime,
     turn: Option<&'a mut Turn>,
+    /// A read-back ([`get_expected`]): a body longer than declared ends
+    /// the read.
+    expected: bool,
     /// The pause before the next resend of a refused attempt: twice as
     /// long each time.
     pause: std::time::Duration,
@@ -558,11 +590,13 @@ impl bucket::ReadRules for RestoreRead<'_> {
         Ok(())
     }
 
-    fn too_long(&self, size: u64) -> ReplicaError {
-        ReplicaError::Restore(format!(
-            "{}: a body longer than the {size} bytes it declared",
-            self.location
-        ))
+    fn too_long(&self, size: u64) -> Option<ReplicaError> {
+        self.expected.then(|| {
+            ReplicaError::Restore(format!(
+                "{}: a body longer than the {size} bytes it declared",
+                self.location
+            ))
+        })
     }
 
     async fn failed(&mut self, fault: bucket::Fault, more: bool) -> Result<(), ReplicaError> {
@@ -606,6 +640,11 @@ impl bucket::ReadRules for RestoreRead<'_> {
             bucket::Fault::Short { read, size } => {
                 let last = format!("body ended after {read} of {size} bytes");
                 tracing::info!(object = %location, reason = %last, "a restore's read ended short; sending it again");
+                last
+            }
+            bucket::Fault::Long { size } => {
+                let last = format!("a body longer than the {size} bytes it declared");
+                tracing::info!(object = %location, reason = %last, "a restore's read went past its size; sending it again");
                 last
             }
         };

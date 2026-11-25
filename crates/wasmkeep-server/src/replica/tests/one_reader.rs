@@ -25,10 +25,12 @@ use object_store::path::Path as StorePath;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt,
 };
+use wasmkeep_storage::ltx::DbChecksum;
 
 use crate::replica::history::{self, Error};
 use crate::replica::{
-    READ_ATTEMPTS, READ_IDLE, READ_PAUSE, ReadTime, ReplicaError, bounded_get, list_with,
+    OwnInFlight, READ_ATTEMPTS, READ_IDLE, READ_PAUSE, ReadTime, ReplicaError, Turn, bounded_get,
+    get_expected, list_with,
 };
 
 const MIB: usize = 1 << 20;
@@ -56,8 +58,16 @@ enum Piece {
     Wait(Duration),
     /// The connection breaks.
     Break,
+    /// The object is gone, the bucket says, its body half sent.
+    Gone,
     /// Nothing, ever.
     Hang,
+}
+
+/// What the bucket makes of the next create.
+enum Put {
+    /// Applied, and answered with a broken connection.
+    LandsUnanswered,
 }
 
 /// What the bucket makes of the next LIST.
@@ -78,6 +88,7 @@ enum List {
 struct Scripted {
     inner: InMemory,
     gets: Mutex<VecDeque<Get>>,
+    puts: Mutex<VecDeque<Put>>,
     lists: Mutex<VecDeque<List>>,
     /// The conditions of each GET received: `If-Match` and the version.
     asked: Mutex<Vec<(Option<String>, Option<String>)>>,
@@ -172,7 +183,12 @@ impl ObjectStore for Scripted {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
+        let next = self.puts.lock().unwrap().pop_front();
+        let put = self.inner.put_opts(location, payload, opts).await;
+        match next {
+            None => put,
+            Some(Put::LandsUnanswered) => put.and(Err(reset())),
+        }
     }
 
     async fn put_multipart_opts(
@@ -189,6 +205,10 @@ impl ObjectStore for Scripted {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         if !self.scripted(Some(location)) {
+            return self.inner.get_opts(location, options).await;
+        }
+        // A HEAD is not a read of the object: answered as the bucket does.
+        if options.head {
             return self.inner.get_opts(location, options).await;
         }
         self.asked
@@ -228,6 +248,7 @@ impl ObjectStore for Scripted {
                         }
                         Piece::Wait(time) => tokio::time::sleep(time).await,
                         Piece::Break => return Some((Err(reset()), (pieces, all, at))),
+                        Piece::Gone => return Some((Err(not_found()), (pieces, all, at))),
                         Piece::Hang => std::future::pending::<()>().await,
                     }
                 }
@@ -665,12 +686,12 @@ async fn sizes_are_checked_before_the_body_is_read() {
     assert_eq!(scripted.gets(), 1);
 }
 
-/// A body longer than the size its answer declared is refused by both
-/// as it passes that size: no more of it is read, and it is not sent
-/// again.
+/// No more of a body is read once it passes the size its answer
+/// declared. The history refuses the object; a restore's read is sent
+/// again; a read-back takes it for other bytes.
 #[tokio::test(start_paused = true)]
 async fn a_body_longer_than_it_declared_is_refused() {
-    let (scripted, store, at, _) = one_object(64).await;
+    let (scripted, store, at, body) = one_object(64).await;
     let long = || Get::Body(vec![Piece::Bytes(64), Piece::Extra(1), Piece::Hang]);
 
     scripted.next_gets([long()]);
@@ -681,12 +702,134 @@ async fn a_body_longer_than_it_declared_is_refused() {
     );
     assert_eq!(scripted.gets(), 1);
 
+    // A restore's read gives the attempt up and sends it again at once:
+    // a broken transfer, not a history that cannot be restored.
+    let start = tokio::time::Instant::now();
     scripted.next_gets([long()]);
-    let read = as_restore(&store, &at, 64).await;
+    assert_eq!(as_restore(&store, &at, 64).await.unwrap(), body);
+    assert_eq!(scripted.gets(), 2);
+    scripted.next_gets((0..READ_ATTEMPTS).map(|_| long()));
+    let why = bucket_error(as_restore(&store, &at, 64).await);
+    assert_eq!(
+        why,
+        format!("{at}: a body longer than the 64 bytes it declared, 3 times")
+    );
+    assert_eq!((scripted.gets(), start.elapsed()), (3, Duration::ZERO));
+
+    // A read-back expects the bytes its upload sent: more are other
+    // bytes, however often they are read.
+    scripted.next_gets([long()]);
+    let read = get_expected(&store, &at, 64).await;
     assert!(
         matches!(&read, Err(ReplicaError::Restore(why)) if why.ends_with("a body longer than the 64 bytes it declared")),
         "{read:?}"
     );
+    assert_eq!(scripted.gets(), 1);
+}
+
+/// A refusal no resend changes that comes while the body is read (the
+/// object collected half-way) ends a restore's read as one before the
+/// body does; the history sends the read again.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_in_the_body_ends_only_a_restores_read() {
+    let (scripted, store, at, body) = one_object(64).await;
+    let gone = || Get::Body(vec![Piece::Bytes(32), Piece::Gone]);
+    let start = tokio::time::Instant::now();
+
+    scripted.next_gets([gone()]);
+    let why = bucket_error(as_restore(&store, &at, 64).await);
+    assert!(why.contains("gone"), "{why}");
+    assert_eq!(scripted.gets(), 1);
+
+    scripted.next_gets([gone()]);
+    assert_eq!(as_history(&store, &at, 64).await.unwrap(), body);
+    assert_eq!(scripted.gets(), 2);
+    scripted.next_gets((0..READ_ATTEMPTS).map(|_| gone()));
+    let read = as_history(&store, &at, 64).await;
+    assert!(matches!(read, Err(Error::Bucket(_))), "{read:?}");
+    assert_eq!((scripted.gets(), start.elapsed()), (3, Duration::ZERO));
+}
+
+/// A restore's read keeps its place under the node's limits through an
+/// attempt given up without a pause (a body that ends short, here): only
+/// the pause before a refused read is sent again gives it up.
+#[tokio::test(start_paused = true)]
+async fn a_read_sent_again_without_a_pause_keeps_its_place() {
+    let (scripted, store, at, body) = one_object(64).await;
+    for (fault, pauses) in [
+        (Get::Body(vec![Piece::Bytes(40)]), false),
+        (Get::Fail(reset()), true),
+    ] {
+        let own = OwnInFlight::default();
+        let (has, mut has_turn) = tokio::sync::watch::channel(false);
+        let mut turn = Turn::new(64, Arc::clone(&own), has, Arc::from("t/default"));
+        turn.take().await.unwrap();
+        assert!(*has_turn.borrow_and_update());
+        let start = tokio::time::Instant::now();
+        scripted.next_gets([fault]);
+        let time = ReadTime::new(64, Some(own));
+        let read = bounded_get(&store, &at, 64, 64, Some(64), &time, Some(&mut turn)).await;
+        assert_eq!(read.unwrap(), body);
+        assert_eq!(scripted.gets(), 2);
+        // Its place is given up and taken again only around a pause.
+        assert_eq!(has_turn.has_changed().unwrap(), pauses);
+        let paused = if pauses { READ_PAUSE } else { Duration::ZERO };
+        assert_eq!(start.elapsed(), paused);
+    }
+}
+
+/// A replica on `scripted`, its next segment upload landing unanswered:
+/// the resend is refused as existing, and the upload reads back what is
+/// there (`UploadTarget::read_back`).
+async fn read_back_replica(
+    dir: &std::path::Path,
+    scripted: &Arc<Scripted>,
+) -> crate::replica::Replica {
+    let mut r = super::replica(dir).await;
+    r.store = scripted.store();
+    r.upload_idle = Duration::from_millis(200);
+    *scripted.puts.lock().unwrap() = [Put::LandsUnanswered].into();
+    r
+}
+
+/// A read-back whose body ends short of its declared size is not other
+/// bytes at the key: it is read again, and the upload that landed is
+/// acknowledged once its bytes come back whole.
+#[tokio::test]
+async fn a_read_back_cut_short_is_read_again_and_the_upload_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripted = Scripted::new();
+    let mut r = read_back_replica(dir.path(), &scripted).await;
+    scripted.next_gets([Get::Body(vec![Piece::Bytes(8)])]);
+    let shipped = tokio::time::timeout(
+        Duration::from_secs(25),
+        r.ship(&super::changes(DbChecksum::from_value(7))),
+    )
+    .await
+    .expect("the upload waited past the event's limit");
+    assert!(shipped.is_ok(), "{shipped:?}");
+    assert_eq!(r.head.txid, 2);
+    assert!(r.failed().is_none());
+    assert_eq!(scripted.gets(), 2, "the short body, then the whole one");
+    assert_eq!(list_with(&r.store, &r.prefix, None).await.unwrap().len(), 1);
+}
+
+/// A read-back whose body goes past its declared size is other bytes at
+/// the key: a conflict, at the first read.
+#[tokio::test]
+async fn a_read_back_longer_than_declared_is_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripted = Scripted::new();
+    let mut r = read_back_replica(dir.path(), &scripted).await;
+    scripted.next_gets([Get::Body(vec![Piece::Bytes(usize::MAX), Piece::Extra(1)])]);
+    let shipped = tokio::time::timeout(
+        Duration::from_secs(25),
+        r.ship(&super::changes(DbChecksum::from_value(7))),
+    )
+    .await
+    .expect("the upload waited past the event's limit");
+    assert!(matches!(shipped, Err(ReplicaError::Exists)), "{shipped:?}");
+    assert!(r.failed().is_some());
     assert_eq!(scripted.gets(), 1);
 }
 

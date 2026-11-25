@@ -19,7 +19,8 @@
 //! What is the same for all of them is here: [`READ_ATTEMPTS`] attempts,
 //! an attempt given up when the bucket is silent for [`READ_IDLE`] or
 //! when its whole time is spent, nothing kept of an attempt given up,
-//! and a body that must be exactly as long as its answer declared.
+//! and a body that is exactly as long as its answer declared, of which
+//! no more than that is ever kept.
 
 use std::time::Duration;
 
@@ -66,7 +67,17 @@ pub(super) enum Fault {
         /// The size the answer declared.
         size: u64,
     },
+    /// The body went past the size the answer declared.
+    Long {
+        /// The size the answer declared.
+        size: u64,
+    },
 }
+
+/// The most reserved for a body before any of it is read: the buffer
+/// grows with what comes, so an answer that declares gigabytes (within
+/// its caller's cap) costs nothing until it sends them.
+const RESERVED: u64 = 8 << 20;
 
 /// A caller's rules for [`read`].
 pub(super) trait ReadRules {
@@ -92,9 +103,10 @@ pub(super) trait ReadRules {
     /// that is not the one wanted, or too large, ends the read.
     fn accept(&self, answered: &ObjectMeta) -> Result<(), Self::Error>;
 
-    /// The body went past the `size` its answer declared: the read ends,
-    /// no more of the body read.
-    fn too_long(&self, size: u64) -> Self::Error;
+    /// The body went past the `size` its answer declared, and no more of
+    /// it is read: `Some`, the error that ends the read; `None` for a
+    /// failed attempt ([`Fault::Long`]).
+    fn too_long(&self, size: u64) -> Option<Self::Error>;
 
     /// An attempt failed, nothing of its answer kept; `more` if another
     /// follows. The caller notes why, and may pause here before the next
@@ -113,9 +125,10 @@ pub(super) trait ReadRules {
 /// has taken its whole time ([`ReadRules::limit`]). An attempt given up
 /// is dropped whole and the next reads the object again from its start.
 /// The body returned is exactly as long as its answer declared: a longer
-/// one ends the read as it passes that size (so a lying body allocates
-/// no more than the caller accepted in [`ReadRules::accept`]), a shorter
-/// one is a failed attempt.
+/// one is given up as it passes that size (so a lying body allocates no
+/// more than the caller accepted in [`ReadRules::accept`]), and ends the
+/// read or is a failed attempt as the caller says
+/// ([`ReadRules::too_long`]); a shorter one is a failed attempt.
 pub(super) async fn read<R: ReadRules>(
     store: &dyn ObjectStore,
     location: &StorePath,
@@ -151,7 +164,7 @@ pub(super) async fn read<R: ReadRules>(
         rules.accept(&got.meta)?;
         let size = got.meta.size;
         let mut body = got.into_stream();
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        let mut bytes = Vec::with_capacity(usize::try_from(size.min(RESERVED)).unwrap_or(0));
         loop {
             let asked = tokio::time::Instant::now();
             let limit = rules.limit();
@@ -159,11 +172,14 @@ pub(super) async fn read<R: ReadRules>(
                 tokio::time::timeout_at((start + limit).min(asked + READ_IDLE), body.next()).await;
             let fault = match next {
                 Ok(Some(Ok(chunk))) => {
-                    if (bytes.len() as u64).saturating_add(chunk.len() as u64) > size {
-                        return Err(rules.too_long(size));
+                    if (bytes.len() as u64).saturating_add(chunk.len() as u64) <= size {
+                        bytes.extend_from_slice(&chunk);
+                        continue;
                     }
-                    bytes.extend_from_slice(&chunk);
-                    continue;
+                    if let Some(end) = rules.too_long(size) {
+                        return Err(end);
+                    }
+                    Fault::Long { size }
                 }
                 Ok(Some(Err(e))) => {
                     if let Some(end) = rules.ends(&e, Phase::Body) {

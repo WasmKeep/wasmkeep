@@ -318,20 +318,7 @@ impl UploadTarget {
             Ok(Ok(_)) => {}
         }
         let max = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        match timeout_at(
-            deadline,
-            bounded_get(
-                &self.store,
-                location,
-                max,
-                max,
-                Some(max),
-                &ReadTime::new(max, None),
-                None,
-            ),
-        )
-        .await
-        {
+        match timeout_at(deadline, get_expected(&self.store, location, max)).await {
             Err(_) => ReadBack::OutOfTime,
             Ok(Ok(found)) if found.as_ref() == bytes => ReadBack::Ours,
             // Other bytes, or more of them than this upload sent.

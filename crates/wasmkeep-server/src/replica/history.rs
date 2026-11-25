@@ -951,8 +951,11 @@ impl super::bucket::ReadRules for HistoryRead<'_> {
         Ok(())
     }
 
-    fn too_long(&self, _: u64) -> Error {
-        Error::Corrupt(format!("{}: body exceeds declared size", self.path))
+    fn too_long(&self, _: u64) -> Option<Error> {
+        Some(Error::Corrupt(format!(
+            "{}: body exceeds declared size",
+            self.path
+        )))
     }
 
     async fn failed(&mut self, fault: super::bucket::Fault, _: bool) -> Result<(), Error> {
@@ -963,6 +966,8 @@ impl super::bucket::ReadRules for HistoryRead<'_> {
             Fault::Waited { silent: true, .. } => "object body stalled".into(),
             Fault::Waited { .. } => "object read deadline exceeded".into(),
             Fault::Short { .. } => format!("{}: truncated object body", self.path),
+            // Never reported: a longer body ends the read (`too_long`).
+            Fault::Long { .. } => format!("{}: body exceeds declared size", self.path),
         };
         Ok(())
     }
