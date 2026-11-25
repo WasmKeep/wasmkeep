@@ -301,6 +301,78 @@ async fn a_write_between_two_passes_stops_the_chain() {
     );
 }
 
+/// A chain whose pass's release is left to the background: the bucket
+/// refuses releases of ownership records for longer than the pass tries
+/// one (a second), so the release comes back pending and the pass counts
+/// nothing yet. Once the bucket takes releases again, the background
+/// retry lands and queues the continuation on the record it wrote, at the
+/// pass's hold's generation, and the pass counts `continued`. The chain
+/// then goes on to `done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_continues_after_a_release_retried_in_the_background() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&flaky) as Arc<dyn ObjectStore>;
+    let da = tempfile::tempdir().unwrap();
+    let a = compacting("a", da.path(), &shared, WINDOW).await;
+    settle().await;
+    let (before, head) = burst_and_rest(&a, &store, "slow").await;
+    let gone = before.len() - 2;
+    assert!(gone >= 5, "not several batches: {before:?}");
+    a.service.limit_idle_passes(Some((2, 1)));
+    let counts = all_compactions().await;
+    flaky.fail_owner_releases.store(true, Ordering::SeqCst);
+    a.service.idle_passes_due_now();
+    a.service.pause_idle_passes(false);
+    // The pass acquired (one generation up) and deleted its batch.
+    eventually("the pass deleted its batch", async || {
+        actor_keys(&store, "slow").await.len() == before.len() - 2
+    })
+    .await;
+    a.service.pause_idle_passes(true);
+    // Its release tried for a second, then was left to the background.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        owner_record(&store, "slow").await,
+        Some((Some("a".to_owned()), head.position.generation + 1)),
+        "not released yet"
+    );
+    assert_eq!(all_compactions().await, counts, "counted before it ended");
+    assert!(a.service.idle_passes_queued().is_empty());
+    flaky.fail_owner_releases.store(false, Ordering::SeqCst);
+    eventually("the background release continued the chain", async || {
+        compactions("continued").await > counts[1]
+    })
+    .await;
+    let (holder, generation) = owner_record(&store, "slow").await.unwrap();
+    assert_eq!((holder, generation), (None, head.position.generation + 1));
+    let queued = a.service.idle_passes_queued();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].1, generation);
+    let mut after = all_compactions().await;
+    after[1] -= 1;
+    assert_eq!(after, counts, "counted once, continued");
+    // The rest of the chain, as when every release lands at once.
+    let passes = gone.div_ceil(2);
+    for pass in 2..=passes {
+        let outcome = run_one_pass(&a).await;
+        assert_eq!(
+            outcome,
+            if pass < passes { "continued" } else { "done" },
+            "pass {pass}"
+        );
+    }
+    assert_eq!(actor_keys(&store, "slow").await.len(), 2);
+    let (again, n) = export(&store, "slow", Point::Head).await;
+    assert_eq!(
+        (again.position, again.raw_checksum, n),
+        (head.position, head.raw_checksum, 10)
+    );
+}
+
 /// ADR 0042, Tests, "Restore identical": a burst over two generations,
 /// hibernated, then the pass a window later. The prefix is exactly the
 /// snapshot at the head and the segment at the head; a restore on the

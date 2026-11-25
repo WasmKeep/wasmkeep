@@ -1046,6 +1046,9 @@ struct Flaky {
     fail_gets_of: Arc<std::sync::Mutex<Option<String>>>,
     /// Writes of ownership records (`owners/...`) fail while set.
     fail_owner_puts: Arc<AtomicBool>,
+    /// Releases of ownership records (a record naming nobody) fail
+    /// while set; acquisitions go through.
+    fail_owner_releases: Arc<AtomicBool>,
     /// The next this-many segment (`/wal/`) uploads never answer and are
     /// not applied: a PUT the bucket left hanging.
     hang_wal_puts: Arc<std::sync::atomic::AtomicU32>,
@@ -1110,6 +1113,7 @@ impl Flaky {
             delay_node_lists_ms: Arc::default(),
             fail_gets_of: Arc::default(),
             fail_owner_puts: Arc::default(),
+            fail_owner_releases: Arc::default(),
             hang_wal_puts: Arc::default(),
             fail_released: Arc::default(),
             fail_puts_of: Arc::default(),
@@ -1257,6 +1261,18 @@ impl ObjectStore for Flaky {
             return Err(object_store::Error::Generic {
                 store: "flaky",
                 source: "write refused".into(),
+            });
+        }
+        if location.as_ref().starts_with(&test_key(Family::Owners, ""))
+            && self.fail_owner_releases.load(Ordering::SeqCst)
+            && String::from_utf8_lossy(&bytes::Bytes::from(payload.clone()))
+                .lines()
+                .nth(1)
+                .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+        {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "ownership record release failed".into(),
             });
         }
         if location.as_ref().starts_with(&test_key(Family::Owners, ""))

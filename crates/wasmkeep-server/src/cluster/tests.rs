@@ -1846,6 +1846,9 @@ struct HangOneLeaseWrite {
     slow_owner_writes_ms: std::sync::atomic::AtomicU64,
     /// Writes of ownership records started.
     owner_writes: std::sync::atomic::AtomicU64,
+    /// While set, releases of ownership records (a record naming nobody)
+    /// fail, not applied.
+    refuse_owner_releases: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Display for HangOneLeaseWrite {
@@ -1882,6 +1885,23 @@ impl ObjectStore for HangOneLeaseWrite {
             let body: bytes::Bytes = payload.clone().into();
             String::from_utf8_lossy(&body).contains("\nreleased ")
         };
+        if location.as_ref().starts_with("state/t/default/owners/")
+            && self
+                .refuse_owner_releases
+                .load(std::sync::atomic::Ordering::SeqCst)
+            && {
+                let body: bytes::Bytes = payload.clone().into();
+                String::from_utf8_lossy(&body)
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+            }
+        {
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "ownership record release refused".into(),
+            });
+        }
         if location.as_ref().starts_with("nodes/")
             && self.fail_releases.load(std::sync::atomic::Ordering::SeqCst) > 0
             && released()
@@ -1981,6 +2001,7 @@ async fn one_hung_lease_write_does_not_make_the_node_not_ready() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", store);
@@ -2020,6 +2041,7 @@ async fn a_clean_stop_during_a_hung_lease_write_still_releases() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2062,6 +2084,7 @@ async fn a_clean_stop_retries_a_failed_released_write() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2105,6 +2128,7 @@ async fn a_released_write_that_landed_unanswered_is_not_retried_wrongly() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(1),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2301,6 +2325,7 @@ async fn a_hung_fence_does_not_hold_up_the_listing() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     // As in the room test: a 3 h ttl, so the node never passes its start
@@ -2633,6 +2658,7 @@ async fn many_parked_releases_land_quickly() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let a = fast_node("a", &store);
@@ -2701,6 +2727,7 @@ async fn a_pass_over_a_refusing_bucket_stops_early() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let a = fast_node("a", &store);
@@ -3135,6 +3162,7 @@ async fn an_acquisition_whose_epoch_moved_writes_nothing() {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -3637,6 +3665,7 @@ fn quiet_gate() -> Arc<HangOneLeaseWrite> {
         lose_release_replies: std::sync::atomic::AtomicU32::new(0),
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -6431,4 +6460,203 @@ async fn a_late_read_does_not_bring_a_gone_node_back() {
     );
     assert!(all.is_empty(), "a late read brought a gone node back");
     assert_eq!(a.transport.heard_ids(), ["b"], "still remembered as gone");
+}
+
+/// `wasmkeep_idle_compactions_total{outcome}` in this process.
+fn idle_compactions(outcome: &str) -> u64 {
+    crate::metrics::METRICS
+        .idle_compactions
+        .get(&[("outcome", outcome)])
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The counts of `continued` and `stopped` idle passes.
+fn continued_stopped() -> (u64, u64) {
+    (idle_compactions("continued"), idle_compactions("stopped"))
+}
+
+/// What [`pending_pass_release`] leaves.
+struct PassReleasePending {
+    gate: Arc<HangOneLeaseWrite>,
+    store: Arc<dyn ObjectStore>,
+    a: Arc<Cluster>,
+    x: ActorAddress,
+    key: String,
+    generation: u64,
+}
+
+impl PassReleasePending {
+    /// Lets releases through and retries the pending set until it is
+    /// empty.
+    async fn let_releases_land(&self) {
+        self.gate
+            .refuse_owner_releases
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        while !self.a.nothing_pending() {
+            assert!(started.elapsed() < Duration::from_secs(10), "never ended");
+            self.a.retry_pending().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// ADR 0042: an idle pass stopped at its deadline whose release came back
+/// pending. A node over a bucket that refuses releases of ownership
+/// records holds `t/c/<name>`, arms a continuation for that hold as the
+/// pass does, and releases: pending after a second, retried in the
+/// background. The pass then detaches from its continuation, which stays
+/// armed, and counts nothing.
+async fn pending_pass_release(name: &str) -> PassReleasePending {
+    let gate = Arc::new(HangOneLeaseWrite {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        hang: std::sync::atomic::AtomicBool::new(false),
+        slow_owner_reads_ms: std::sync::atomic::AtomicU64::new(0),
+        fail_releases: std::sync::atomic::AtomicU32::new(0),
+        lose_release_replies: std::sync::atomic::AtomicU32::new(0),
+        slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
+        owner_writes: std::sync::atomic::AtomicU64::new(0),
+        refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+    });
+    let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
+    let a = fast_node("a", &store);
+    a.identity().await.unwrap();
+    wait_lease_valid(&a).await;
+    let x = ActorAddress::new("t", "c", name).unwrap();
+    let key = a.owner_key(&x);
+    let hold = LeaseHold::acquire(&a, &x).await.unwrap();
+    let generation = hold.generation().unwrap();
+    a.idle_passes.arm(
+        generation,
+        crate::actor::compaction::Entry {
+            key: key.clone(),
+            generation: generation - 1,
+            snapshot_generation: generation - 1,
+            version: wasmkeep_cluster::lease::Version("before".into()),
+            released_ms: 1,
+            due_ms: 1,
+            attempts: 0,
+            continued: 1,
+            fruitless: 0,
+        },
+    );
+    gate.refuse_owner_releases
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(hold.release().await, LeaseReturn::Pending);
+    let counts = continued_stopped();
+    assert_eq!(a.idle_passes.detach(&key, generation), None, "deferred");
+    assert!(a.idle_passes.armed(&key));
+    assert!(a.idle_passes.entries().is_empty());
+    assert_eq!(continued_stopped(), counts, "not counted yet");
+    PassReleasePending {
+        gate,
+        store,
+        a,
+        x,
+        key,
+        generation,
+    }
+}
+
+/// ADR 0042, a chain whose release is retried in the background: once it
+/// lands, the continuation is queued on the version that release wrote,
+/// at the pass's hold's generation, and the pass counts `continued`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_release_landing_in_the_background_queues_its_continuation() {
+    let p = pending_pass_release("landed").await;
+    let (continued, stopped) = continued_stopped();
+    p.let_releases_land().await;
+    let meta = p
+        .store
+        .head(&StorePath::from(p.key.as_str()))
+        .await
+        .unwrap();
+    let now = format!(
+        "{}\n{}",
+        meta.e_tag.unwrap_or_default(),
+        meta.version.unwrap_or_default()
+    );
+    let queued = p.a.idle_passes.entries();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(
+        (
+            queued[0].generation,
+            queued[0].snapshot_generation,
+            queued[0].continued
+        ),
+        (p.generation, p.generation - 1, 1)
+    );
+    assert!(
+        same_version(&now, &queued[0].version.0),
+        "the version the release wrote: {now:?} {:?}",
+        queued[0].version
+    );
+    assert!(!p.a.idle_passes.armed(&p.key));
+    assert_eq!(continued_stopped(), (continued + 1, stopped));
+}
+
+/// ADR 0042: a release retried in the background that finds the record
+/// moved on (superseded) clears the armed continuation: nothing queued,
+/// the pass counted `stopped`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_background_release_clears_the_continuation() {
+    use wasmkeep_cluster::node_lease::OwnerRecord;
+    let p = pending_pass_release("superseded").await;
+    let (continued, stopped) = continued_stopped();
+    // Another writer's record, a generation up.
+    p.gate
+        .inner
+        .put(
+            &StorePath::from(p.key.as_str()),
+            OwnerRecord {
+                holder: None,
+                generation: p.generation + 1,
+                recorded: None,
+            }
+            .encode()
+            .into(),
+        )
+        .await
+        .unwrap();
+    p.let_releases_land().await;
+    assert!(!p.a.idle_passes.armed(&p.key));
+    assert!(p.a.idle_passes.entries().is_empty());
+    assert_eq!(continued_stopped(), (continued, stopped + 1));
+}
+
+/// ADR 0042: an acquisition of the key here while the pass's release is
+/// still retried clears the armed continuation (the record it would have
+/// continued from is gone), and the release, superseded, queues nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acquisition_here_clears_a_continuation_left_armed() {
+    let p = pending_pass_release("acquired").await;
+    let (continued, stopped) = continued_stopped();
+    // The record still names this process: taken a generation up.
+    let hold = LeaseHold::acquire(&p.a, &p.x).await.unwrap();
+    assert_eq!(hold.generation(), Some(p.generation + 1));
+    assert!(!p.a.idle_passes.armed(&p.key));
+    assert_eq!(continued_stopped(), (continued, stopped + 1));
+    p.let_releases_land().await;
+    assert!(p.a.idle_passes.entries().is_empty());
+    assert_eq!(
+        continued_stopped(),
+        (continued, stopped + 1),
+        "counted once"
+    );
+    drop(hold);
+}
+
+/// ADR 0042: a lapse of this node's lease clears every armed continuation,
+/// so a release that lands after it queues nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lapse_clears_a_continuation_left_armed() {
+    let p = pending_pass_release("lapsed").await;
+    let (continued, stopped) = continued_stopped();
+    p.a.end_holds_after_lapse();
+    assert!(!p.a.idle_passes.armed(&p.key));
+    assert_eq!(continued_stopped(), (continued, stopped + 1));
+    wait_lease_valid(&p.a).await;
+    p.let_releases_land().await;
+    assert!(p.a.idle_passes.entries().is_empty(), "queued after a lapse");
+    assert_eq!(continued_stopped(), (continued, stopped + 1));
 }

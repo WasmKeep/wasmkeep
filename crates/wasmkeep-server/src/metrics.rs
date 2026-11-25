@@ -967,7 +967,9 @@ pub(crate) fn idle_snapshot(outcome: &str) {
 /// compacted (nothing the window lets go left: at least one object
 /// deleted, or the history already compact), stopped at its deadline
 /// with the rest queued for a further pass, stopped and not continued (an
-/// event waiting, a drain, its hold ending, or the chain's bounds), the
+/// event waiting, a drain, its hold ending, the chain's bounds, or its
+/// release not landing with its version; a pass whose release is retried
+/// in the background is counted once that retry ends), the
 /// record changed since the release (a wake, a move, an expiry, the app
 /// deleted or recreated), no snapshot of the released generation to
 /// compact from, refused (the node draining, the app deleted, restoring
