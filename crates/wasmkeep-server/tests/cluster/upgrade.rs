@@ -15,7 +15,7 @@ use wasmkeep_server::apps::{Changes, DeployError, Writes};
 use super::*;
 
 /// Live as the CLI counts it: the default timings.
-fn horizon() -> u64 {
+pub(super) fn horizon() -> u64 {
     wasmkeep_server::heartbeat_horizon_ms(
         wasmkeep_server::DEFAULT_HEARTBEAT,
         &LeaseConfig::default_safe(),
@@ -25,7 +25,13 @@ fn horizon() -> u64 {
 /// The node lease of `id` for `default/default`, written directly: a node
 /// of `version` that announces `words`, in `state` (`live` or `released`).
 /// A live one is dated ahead, so it stays live for the whole test.
-async fn lease_of(store: &Arc<dyn ObjectStore>, id: &str, version: &str, state: &str, words: &str) {
+pub(super) async fn lease_of(
+    store: &Arc<dyn ObjectStore>,
+    id: &str,
+    version: &str,
+    state: &str,
+    words: &str,
+) {
     let at = now_ms() + if state == "live" { 60_000 } else { 0 };
     let body = format!(
         "wasmkeep-node 3\n{state} beef\n{at}\n{id}\nhttp://127.0.0.1:9\n{version}\ndefault/default\n\n\nserving\n\n{words}\n"

@@ -105,6 +105,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     let nodes = [
@@ -3098,6 +3099,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     a.note_future_leases(&[lease(now_ms())]);
@@ -3269,6 +3271,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     }
 }
@@ -5232,6 +5235,7 @@ fn node_info(id: &str) -> NodeInfo {
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
     }
 }

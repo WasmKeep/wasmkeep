@@ -701,6 +701,7 @@ pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             config.config = deployed.config;
             config.requires = deployed.requires;
             config.batched = deployed.batched;
+            config.placing = deployed.placing;
             config.limits = deployed.limits;
             config.assets = deployed.assets;
             config.assets_cache = wasmkeep_server::assets::Cache::new(args.assets_cache_bytes);

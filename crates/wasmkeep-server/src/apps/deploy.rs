@@ -447,6 +447,36 @@ impl AppRef {
                 }
             }
         }
+        // What the version asks of placement (ADR 0043, section 2): kept
+        // for the classes still there unless the whole set is given, with
+        // the changes applied, then checked as a whole.
+        let mut placing = match (keep_requires, &base) {
+            (true, Some((_, m, _))) => m.placing.kept(|c| table.contains_key(c)),
+            _ => wasmkeep_cluster::placement::Asked::default(),
+        };
+        for (class, entry) in changes.apart {
+            match entry {
+                Some(other) => {
+                    placing.apart.insert(class, other);
+                }
+                None => {
+                    placing.apart.remove(&class);
+                }
+            }
+        }
+        for (class, entry) in changes.spread {
+            match entry {
+                Some(on) => {
+                    placing.spread.insert(class, on);
+                }
+                None => {
+                    placing.spread.remove(&class);
+                }
+            }
+        }
+        placing
+            .check(|c| table.contains_key(c))
+            .map_err(|(class, why)| DeployError::Invalid(class, why))?;
         let mut manifest = Manifest {
             assets,
             previous: None,
@@ -457,6 +487,7 @@ impl AppRef {
             requires,
             expire,
             batched,
+            placing,
             limits: changes.limits.clone().unwrap_or_else(|| {
                 base.as_ref()
                     .map(|(_, m, _)| m.limits.clone())
@@ -516,7 +547,11 @@ impl AppRef {
             manifest.previous = Some(current.version.clone());
         }
         if !unchanged {
-            self.check_readers(&manifest).await?;
+            if read.is_none() {
+                self.check_first_readers(&manifest).await?;
+            } else {
+                self.check_readers(&manifest).await?;
+            }
             self.check_imports(Some(runtime), &imports, &kept).await?;
         }
         if !unchanged && !plan(&diff) {
@@ -526,6 +561,7 @@ impl AppRef {
         // of the app: a fresh app is born finalized (ADR 0043, section 3).
         if read.is_none() {
             self.born_finalized().await?;
+            self.check_floor_after_first(&manifest).await?;
         }
         let supplied = match &changes.assets {
             crate::assets::Change::Set(b) => Some(b),

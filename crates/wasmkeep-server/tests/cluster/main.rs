@@ -47,6 +47,8 @@ mod guests;
 mod alarms;
 #[path = "apart.rs"]
 mod apart;
+#[path = "apart_from.rs"]
+mod apart_from;
 #[path = "app_delete.rs"]
 mod app_delete;
 #[path = "apps.rs"]
@@ -2097,8 +2099,10 @@ async fn node_app_leased(
     let mut config = ActorConfig::new(data);
     config.access = version.access;
     config.config = version.config;
-    // As `serve --app` does: the classes the version makes batched.
+    // As `serve --app` does: the classes the version makes batched, and
+    // what it asks of placement.
     config.batched = version.batched;
+    config.placing = version.placing;
     config.mailbox.idle_timeout = idle;
     let mut cluster = ClusterConfig::new(id, advertised(addr), Arc::clone(store));
     cluster.lease = lease;

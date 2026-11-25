@@ -469,6 +469,10 @@ pub(super) fn deploy(args: DeployArgs) -> anyhow::Result<()> {
             }
         };
         let changes = wasmkeep_server::apps::Changes {
+            // Kept: only the project file sets them (`apart-from`,
+            // `spread`).
+            apart: Vec::new(),
+            spread: Vec::new(),
             assets: match &asset_scan {
                 Some(scan) => wasmkeep_server::assets::Change::Set(scan.bundle.clone()),
                 None if args.no_assets => wasmkeep_server::assets::Change::Remove,

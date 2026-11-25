@@ -883,6 +883,7 @@ async fn format_lifecycle(seed: u64, erase_format: bool, allow_v1: bool) -> bool
         can_recorded_head: false,
         can_multi_app: false,
         can_place: false,
+        can_apart: false,
         process: None,
         instance: Some("i1".into()),
         lease: Some(NodeState::Live),

@@ -30,21 +30,23 @@ pub(super) struct ActorClass {
     /// at a `Flushed` barrier ([`super::held::Held::switch_writes`]).
     pub(super) writes: crate::apps::Writes,
     /// The class whose actor of the same name this class's actor wakes
-    /// apart from (ADR 0041, amendment of 2026-11-22): the built-in pair's
-    /// other class, when the version has both
-    /// ([`wasmkeep_cluster::placement::companion`]).
-    pub(super) apart: Option<&'static str>,
+    /// apart from (ADR 0041, amendment of 2026-11-22): the class the
+    /// version's `apart` entry pairs it with, or the built-in pair's other
+    /// class when the version has both and says nothing
+    /// ([`wasmkeep_cluster::placement::Asked::companion`]).
+    pub(super) apart: Option<String>,
     /// Whether this class's actors wake spread over the live nodes (ADR
-    /// 0040, amendment of 2026-11-22): the broadcast SDKs' edge, when the
-    /// version has the room and its pusher
-    /// ([`wasmkeep_cluster::placement::spreads`]).
+    /// 0040, amendment of 2026-11-22): what the version's `spread` entry
+    /// says, or the broadcast SDKs' edge when the version has the room
+    /// and its pusher and says nothing
+    /// ([`wasmkeep_cluster::placement::Asked::spreads`]).
     pub(super) spread: bool,
 }
 
 /// The actor `address` is kept apart from, by `class` (ADR 0041,
 /// amendment of 2026-11-22): the same name in the companion class.
 pub(super) fn companion_of(class: &ActorClass, address: &ActorAddress) -> Option<ActorAddress> {
-    ActorAddress::new(address.tenant(), class.apart?, address.name()).ok()
+    ActorAddress::new(address.tenant(), class.apart.as_deref()?, address.name()).ok()
 }
 
 impl ActorClass {

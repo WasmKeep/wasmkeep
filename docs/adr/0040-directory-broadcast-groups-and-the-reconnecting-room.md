@@ -1039,8 +1039,9 @@ others see it serving) before draining the next, and repeat `actor where`
 and the metric after the last.
 
 Not spread: the room, the pusher, the directory and relays (relays exist
-only past 16 edges, and wake beside the pusher). A setting for other
-class names is future work, as for the pair.
+only past 16 edges, and wake beside the pusher). For other class names,
+the per-class key `spread` asks for the same rule (`0.9.0`,
+[ADR 0041, amendment of 2026-11-25](0041-placement-at-wake-up.md#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names)).
 
 **Mixed versions.** Nothing new in the bucket or on the heartbeat: a 0.7
 node keeps the edges it wakes and acquires those sent to it. It does not

@@ -75,6 +75,8 @@ least one class.
 | `requires` | optional | names that must be set (by the configuration, the app's secrets or a node's `--env`) before the class or front runs |
 | `expire-after-idle` | classes only | how long an actor of the class may stay idle before it is deleted: a whole number and one unit, `s`, `m`, `h` or `d` (`"7d"`, `"36h"`), at least `"1h"`; none by default (actors are kept). In a cluster only ([idle expiry](cluster.md#idle-expiry)) |
 | `writes` | classes only | how the class's plain writes reach the bucket: `"strict"` (the default, every release's behaviour: an event's writes are uploaded before the next event starts) or `"batched"` (uploaded behind the events, several to a segment, [ADR 0034](adr/0034-batched-plain-writes.md)). Every `wasmkeep` build deploys and runs `"batched"`; nodes of 0.4.2 and earlier cannot run it, and a deploy holds it back while a live node lacks `flush`. The same as `deploy --writes CLASS=MODE`. `"strict"` written or not makes the same version, byte for byte |
+| `apart-from` | classes only | another class of the file: an actor of this class and the actor of the same name in that class wake on different nodes when they can (`fan/lobby` and `feed/lobby`), as the classes named `room` and `pusher` do without it ([placement](designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node)). One entry is enough for a pair, and a class is in one pair at most. `false`: kept apart from no class, which turns the default off for a class named `room` or `pusher`. Not on a class with `spread = true`, nor naming one. Needs every node on 0.9 (below) |
+| `spread` | classes only | `true`: an actor of this class that a call or an alarm wakes goes to the node chosen for its own name among the live nodes, as the class named `edge` does beside `room` and `pusher` without it. `false` turns that default off. Not `true` on a class that is kept apart from another: a class takes one of the two rules. Needs every node on 0.9 (below) |
 | `build` | optional | a command for the system shell (`sh -c`, `cmd.exe` on Windows), run in the file's directory before `component` is read |
 | `watch` | optional | files or directories of sources; `wasmkeep dev` runs `build` again when one changes (name sources, not what the build writes) |
 
@@ -270,8 +272,8 @@ acme/todo: version 3c2f0a9e41d5b7a0 is current (deploy 7)
 
 **The file is the whole truth.** A class or front not in the file is
 removed. A class without `access` is `internal`. A class or front without
-`config`, `requires` or `expire-after-idle` has none, even if a deploy
-with flags set some.
+`config`, `requires`, `expire-after-idle`, `apart-from` or `spread` has
+none, even if a deploy with flags or an earlier file set some.
 Deploying the same file again keeps the version identity. With assets,
 it still repairs missing objects; `--assets-verify` also checks digests. A removed class's actors
 keep their state in the bucket; a later deploy that brings the class back
@@ -285,6 +287,22 @@ read (the deploy is refused while an older node of the app is live). The
 first deploy from the
 file of an app deployed with flags may change only that; the plan then
 says `access c: open, now written in the version`.
+
+**`apart-from` and `spread` need 0.9 on every node.** A class with
+either makes the version manifest format 8, which nodes of 0.8 cannot
+read. The key's presence does it, not its effect: `spread = false` and
+`apart-from = false` need 0.9 too, even where they change nothing. The deploy is refused, saying why, until the app's upgrade to 0.9
+is finalized (`wasmkeep cluster upgrade finalize`), and while a live
+node of the app is older or does not announce `apart`
+([ADR 0043](adr/0043-rolling-upgrades.md#2-the-gate-table)). A new
+app needs no `finalize`: its first deploy may carry the keys when no
+older node is live under the bucket prefix. Otherwise deploy without
+the keys, start the app's nodes, finalize, then deploy with them.
+`wasmkeep dev` runs one node and ignores both keys. A file
+without these keys deploys as before, in the format a node of 0.8
+reads, so an app that uses the class names `room`, `pusher` and `edge`
+needs neither. No flag sets them: a deploy with flags keeps what the
+version has.
 
 **With flags.** Beside a file, `--actor`, `--access`, `--config`,
 `--requires`, `--expire-after-idle`, `--front`, `--no-front`,

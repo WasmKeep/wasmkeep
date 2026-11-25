@@ -54,6 +54,10 @@ pub struct Diff {
     /// changed, or an added class's when it is not strict (ADR 0034,
     /// section 15).
     pub writes: Vec<String>,
+    /// `"class: apart from none -> feed"`, `"class: spread on"` and the
+    /// like: a class's placement keys changed, or an added class has one
+    /// (ADR 0043, section 2). `default` is a key the version does not say.
+    pub placement: Vec<String>,
     /// Policy additions, changes and removals, without client values.
     pub limits: Vec<String>,
 }
@@ -79,6 +83,7 @@ impl Diff {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            placing: Default::default(),
             limits: Default::default(),
         };
         let empty = Settings::default();
@@ -214,6 +219,31 @@ impl Diff {
                     format!("{class}: {}", wa.as_str())
                 });
             }
+            fn apart<'a>(m: &'a Manifest, class: &str) -> &'a str {
+                match m.placing.apart.get(class).map(String::as_str) {
+                    None => "default",
+                    Some(wasmkeep_cluster::placement::APART_NONE) => "none",
+                    Some(other) => other,
+                }
+            }
+            fn spread(m: &Manifest, class: &str) -> &'static str {
+                match m.placing.spread.get(class) {
+                    None => "default",
+                    Some(true) => "on",
+                    Some(false) => "off",
+                }
+            }
+            let was = bm.classes.contains_key(class);
+            for (what, b, a) in [
+                ("apart from", apart(bm, class), apart(am, class)),
+                ("spread", spread(bm, class), spread(am, class)),
+            ] {
+                if was && a != b {
+                    diff.placement.push(format!("{class}: {what} {b} -> {a}"));
+                } else if !was && a != "default" {
+                    diff.placement.push(format!("{class}: {what} {a}"));
+                }
+            }
             let (b, a) = (bm.expire.get(class), am.expire.get(class));
             if class != FRONT && a != b && (a.is_some() || bm.classes.contains_key(class)) {
                 diff.expire.push(format!(
@@ -258,6 +288,7 @@ impl Diff {
         out.extend(self.requires.iter().map(|l| format!("requires {l}")));
         out.extend(self.expire.iter().cloned());
         out.extend(self.writes.iter().map(|l| format!("writes {l}")));
+        out.extend(self.placement.iter().map(|l| format!("placement {l}")));
         out.extend(
             self.open_past_front.iter().map(|c| {
                 format!("class {c}: open, reachable at /actor/{c}/<name>, past the front")

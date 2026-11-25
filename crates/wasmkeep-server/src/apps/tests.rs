@@ -16,6 +16,7 @@ fn two_classes() -> Manifest {
         requires: BTreeMap::new(),
         expire: BTreeMap::new(),
         batched: std::collections::BTreeSet::new(),
+        placing: Default::default(),
         limits: Default::default(),
     }
 }
@@ -198,6 +199,7 @@ fn version_debug_shows_no_value() {
         requires: BTreeMap::new(),
         expire: BTreeMap::new(),
         batched: std::collections::BTreeSet::new(),
+        placing: Default::default(),
         limits: Default::default(),
         front: None,
     };
@@ -249,8 +251,8 @@ fn rules_and_config_make_format_2_and_a_new_version() {
 fn manifests_with_unknown_or_inconsistent_lines_are_refused() {
     let base = "wasmkeep-manifest 2\nclass chat 11\n";
     for bad in [
-        // A format after this version's (7, ADR 0030).
-        "wasmkeep-manifest 8\nclass chat 11\n".to_owned(),
+        // A format after this version's (8, ADR 0043).
+        "wasmkeep-manifest 9\nclass chat 11\n".to_owned(),
         format!("{base}secret chat 11\n"),
         // Idle limits (ADR 0028): format 4 only, a known class, once,
         // between an hour and the longest.
@@ -325,7 +327,7 @@ fn writes_lines_are_refused_where_they_do_not_belong() {
         "wasmkeep-manifest 4\nclass chat 11\nwrites chat batched\n",
         "wasmkeep-manifest 1\nclass chat 11\nwrites chat batched\n",
         // A format this version does not know.
-        "wasmkeep-manifest 8\nclass chat 11\n",
+        "wasmkeep-manifest 9\nclass chat 11\n",
     ] {
         assert_eq!(Manifest::parse(bad), None, "{bad}");
     }
@@ -336,6 +338,189 @@ fn writes_lines_are_refused_where_they_do_not_belong() {
     ] {
         assert_eq!(Manifest::parse(bad), None, "{bad}");
     }
+}
+
+/// ADR 0043, section 2: a per-class placement key makes format 8, the
+/// first behind the upgrade floor. Without one the version keeps its
+/// format, bytes and id, so a node of 0.8 still reads it.
+#[test]
+fn a_placement_key_makes_format_8_and_reads_back() {
+    use wasmkeep_cluster::placement::APART_NONE;
+    let mut m = two_classes();
+    let before = (m.format(), m.version_id());
+    assert_eq!(m.format_number(), 1);
+    m.placing.apart.insert("chat".into(), "counter".into());
+    assert_eq!(m.format_number(), 8);
+    let text = m.format();
+    assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+    assert!(text.ends_with("apart chat counter\n"), "{text}");
+    assert_ne!(m.version_id(), before.1);
+    assert_eq!(Manifest::parse(&text), Some(m.clone()));
+    // `spread` alone makes it too, on or off.
+    for on in [true, false] {
+        let mut m = two_classes();
+        m.placing.spread.insert("counter".into(), on);
+        let text = m.format();
+        assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+        let line = if on {
+            "spread counter on\n"
+        } else {
+            "spread counter off\n"
+        };
+        assert!(text.ends_with(line), "{text}");
+        assert_eq!(Manifest::parse(&text), Some(m));
+    }
+    // `-`: apart from nothing. With everything the formats below carry.
+    m.placing.apart.clear();
+    m.placing.apart.insert("counter".into(), APART_NONE.into());
+    m.placing.spread.insert("chat".into(), true);
+    m.batched.insert("chat".into());
+    m.expire.insert("chat".into(), 7 * 86_400);
+    m.assets = Some("a".repeat(64));
+    m.limits.insert(
+        "login".into(),
+        limits::Policy::parse("POST /login", "ip", None, "5/s", 10).unwrap(),
+    );
+    let text = m.format();
+    assert!(text.starts_with("wasmkeep-manifest 8\n"), "{text}");
+    assert_eq!(Manifest::parse(&text), Some(m.clone()));
+    // The keys removed: the format the rest of the version needs.
+    m.placing = Default::default();
+    assert_eq!(m.format_number(), 7);
+    let mut m = two_classes();
+    m.placing.spread.insert("chat".into(), true);
+    m.placing = Default::default();
+    assert_eq!((m.format(), m.version_id()), before);
+}
+
+#[test]
+fn placement_lines_are_refused_where_they_do_not_belong() {
+    let eight = "wasmkeep-manifest 8\nclass chat 11\nclass room 22\nclass fan 33\n";
+    for ok in [
+        "apart chat room\n",
+        "apart chat room\napart room chat\n",
+        "apart chat -\n",
+        "spread chat on\n",
+        "spread chat off\napart fan room\n",
+    ] {
+        assert!(Manifest::parse(&format!("{eight}{ok}")).is_some(), "{ok}");
+    }
+    for bad in [
+        // Another class of the version, or `-`; once per class.
+        "apart chat chat\n",
+        "apart chat nope\n",
+        "apart nope chat\n",
+        "apart chat\n",
+        "apart chat room x\n",
+        "apart chat -\napart chat -\n",
+        // One pair per class.
+        "apart chat room\napart fan room\n",
+        "apart chat room\napart room -\n",
+        // `on` or `off`, a class of the version, once.
+        "spread chat\n",
+        "spread chat yes\n",
+        "spread nope on\n",
+        "spread chat on\nspread chat off\n",
+        // One rule per class.
+        "apart chat room\nspread chat on\n",
+        "apart chat room\nspread room on\n",
+        // Format 8 says it for a placement line.
+        "",
+    ] {
+        assert_eq!(Manifest::parse(&format!("{eight}{bad}")), None, "{bad}");
+    }
+    // Not before format 8: an older reader never meets one.
+    for line in ["apart chat -\n", "spread chat on\n"] {
+        let five = format!("wasmkeep-manifest 5\nclass chat 11\n{line}");
+        assert_eq!(Manifest::parse(&five), None, "{five}");
+        let assets = format!("assets {}\n", "a".repeat(64));
+        let seven = format!("wasmkeep-manifest 7\nclass chat 11\n{assets}{line}");
+        assert_eq!(Manifest::parse(&seven), None, "{seven}");
+        assert!(Manifest::parse(&seven.replace("manifest 7", "manifest 8")).is_some());
+    }
+}
+
+/// A live heartbeat of a node of `version` serving `default/shop` with
+/// these words.
+async fn heartbeat_of(store: &Arc<dyn ObjectStore>, id: &str, version: &str, words: &str) {
+    let body = format!(
+        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n{version}\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+        crate::alarm::now_ms_i64()
+    );
+    store
+        .put(
+            &format!("nodes/{id}").as_str().into(),
+            body.into_bytes().into(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Format 8 goes through the one gate (ADR 0043, section 2), both halves:
+/// the app's floor at 0.9 or above, and every live node at 0.9 or later
+/// announcing `apart`. The writer is a `wasmkeep` of 0.9, whatever this
+/// build's version.
+#[tokio::test]
+async fn format_8_needs_the_floor_and_apart_on_every_live_node() {
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    let nine = Minor { major: 0, minor: 9 };
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop").as_version(nine);
+    let mut m = two_classes();
+    m.placing.apart.insert("chat".into(), "counter".into());
+    let every = "take front handoff ends flush rate_limits assets blobs";
+    let with = format!("{every} apart");
+    let set_floor = async |at: Minor| {
+        store
+            .put(
+                &"formats/default/shop/floor".into(),
+                floor::encode(at).into(),
+            )
+            .await
+            .unwrap();
+    };
+
+    // No floor (what 0.8 means), then a floor at 0.8: the upgrade is not
+    // finalized, whatever the nodes announce.
+    heartbeat_of(&store, "n", "0.9.0", &with).await;
+    for floor in [None, Some(Minor { major: 0, minor: 8 })] {
+        if let Some(at) = floor {
+            set_floor(at).await;
+        }
+        let e = app.check_readers(&m).await.unwrap_err().to_string();
+        assert!(
+            e.contains("wasmkeep-manifest 8 needs every node at 0.9")
+                && e.contains("cluster upgrade finalize"),
+            "{e}"
+        );
+    }
+    set_floor(nine).await;
+    app.check_readers(&m).await.unwrap();
+    // A live node of 0.8.1 that started while the floor was written.
+    heartbeat_of(&store, "old", "0.8.1", every).await;
+    let e = app.check_readers(&m).await.unwrap_err().to_string();
+    assert!(e.contains("old (0.8.1)"), "{e}");
+    // A node of 0.9 that does not announce the word.
+    heartbeat_of(&store, "old", "0.9.0", every).await;
+    let e = app.check_readers(&m).await.unwrap_err();
+    assert!(
+        matches!(&e, DeployError::NodesWithoutApart { nodes, .. } if nodes == "old"),
+        "{e}"
+    );
+    assert!(e.to_string().contains("manifest format 8"), "{e}");
+    // Every live node announces it: written.
+    heartbeat_of(&store, "old", "0.9.0", &with).await;
+    app.check_readers(&m).await.unwrap();
+    // Without the keys the version is not format 8, and the wordless node
+    // reads it as before.
+    heartbeat_of(&store, "old", "0.9.0", every).await;
+    app.check_readers(&two_classes()).await.unwrap();
+    // This build's own `wasmkeep`: accepted exactly when it is 0.9 or
+    // later, the version that introduced the format.
+    heartbeat_of(&store, "old", "0.9.0", &with).await;
+    let own = AppRef::new(Arc::clone(&store), "", "default", "shop");
+    let this = wasmkeep_cluster::upgrade::this_minor().unwrap();
+    assert_eq!(own.check_readers(&m).await.is_ok(), this >= nine);
 }
 
 /// A live heartbeat of a node serving `default/shop` with these words,
@@ -525,6 +710,7 @@ fn a_front_makes_format_3_and_a_new_version() {
         requires: BTreeMap::new(),
         expire: BTreeMap::new(),
         batched: std::collections::BTreeSet::new(),
+        placing: Default::default(),
         limits: Default::default(),
     };
     assert_eq!(alone.format(), "wasmkeep-manifest 3\nfront main 44\n");

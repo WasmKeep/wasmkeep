@@ -26,6 +26,18 @@ The text under a version's heading is its GitHub release text
   node of minor version N starts only while every live node of its app
   runs N-1, N or N+1, and names the node that stops it. It also refuses
   an app whose previous upgrade was never finalized.
+- **`apart-from` and `spread` for your own class names.** Placement
+  keeps a room and its pusher on different nodes and spreads a room's
+  edges, for classes named `room`, `pusher` and `edge`. A class in
+  `wasmkeep.toml` can now ask for the same: `apart-from = "<class>"`
+  keeps its actor and that class's actor of the same name apart, and
+  `spread = true` spreads its actors over the nodes. `false` turns the
+  default off. A version with either key is manifest format 8: a deploy
+  is refused until the app's upgrade to 0.9 is finalized, and while a
+  live node is older or does not announce `apart`. Without the keys a
+  version keeps the format nodes of 0.8.1 read
+  ([project file](docs/project-file.md#front-and-classes),
+  [ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names)).
 - **A new app is born finalized.** The first deploy of an app that
   never ran, or the first node of an app served without a deploy,
   creates its upgrade floor at its own version. An app that already has

@@ -89,8 +89,24 @@ apart at wake-up, the broadcast SDKs' default class names. A wake-up of
 goes to another node, and the other way round. This applies to a
 request, a call, an alarm or a drain
 ([ADR 0041, amendment](adr/0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
-Nothing to configure, and `--no-placement` turns it off. Renamed classes
-are not kept apart in this version.
+Nothing to configure, and `--no-placement` turns it off.
+
+**With your own class names**, say which class to keep apart in
+`wasmkeep.toml`, on either class of the pair:
+
+```toml
+[classes.feed]
+component = "feed.wasm"
+
+[classes.fan]
+component = "fan.wasm"
+apart-from = "feed"   # fan/<name> and feed/<name> wake on different nodes
+```
+
+The rule is the same one. A class is in one pair at most, and
+`apart-from = false` on a class named `room` or `pusher` turns the
+default off. The key needs every node on 0.9 and the upgrade finalized
+([the project file](project-file.md#front-and-classes)).
 
 With one node alive, or every other node draining, both wake where they
 land: the rule never refuses a wake-up. It does not move a running
@@ -155,7 +171,10 @@ reconnect no more than before. A drain releases its node's edges; each
 wakes where its first event after takes it: a reconnecting client's
 socket wakes it where that client landed, the pusher's next push on its
 spread choice. With one node alive the edges wake where they are called;
-`--no-placement` turns it off. List the edges with the same command:
+`--no-placement` turns it off. For a class with another name, write
+`spread = true` in its `[classes.<name>]` table (`false` turns the
+default off for a class named `edge`); it needs every node on 0.9, as
+`apart-from` does. List the edges with the same command:
 
 ```bash
 wasmkeep actor where --app acme/chat edge/lobby.e1 edge/lobby.e2 edge/lobby.e3 --bucket s3://acme-wasmkeep/prod

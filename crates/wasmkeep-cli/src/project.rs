@@ -63,6 +63,14 @@ pub(crate) struct Class {
     pub(crate) expire_after_idle: Option<u64>,
     /// `writes` (ADR 0034): `strict` when the file says nothing.
     pub(crate) writes: wasmkeep_server::apps::Writes,
+    /// `apart-from` (ADR 0043, section 2): the class whose actor of the
+    /// same name this class's actor wakes apart from, or `-` for none
+    /// (`apart-from = false`); `None` when the file says nothing: the
+    /// built-in rule.
+    pub(crate) apart: Option<String>,
+    /// `spread`: whether this class's actors wake spread over the live
+    /// nodes; `None` when the file says nothing: the built-in rule.
+    pub(crate) spread: Option<bool>,
 }
 
 /// `[dev]`: for `wasmkeep dev` only.
@@ -88,6 +96,8 @@ const CLASS: &[&str] = &[
     "watch",
     "expire-after-idle",
     "writes",
+    "apart-from",
+    "spread",
 ];
 const DEV: &[&str] = &["port", "data-dir", "env"];
 
@@ -489,6 +499,36 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     }
                 },
             };
+            // ADR 0043, section 2: another class of the file (its actor of
+            // the same name), or `false` for none, which also turns the
+            // built-in pair off for this class.
+            let off = matches!(
+                get(ct, "apart-from").map(|(_, v)| v.get_ref()),
+                Some(DeValue::Boolean(false))
+            );
+            let apart = if off {
+                Some(wasmkeep_cluster::placement::APART_NONE.to_owned())
+            } else {
+                match string(&src, ct, "apart-from", &what) {
+                    Ok(apart) => apart,
+                    Err(e) => return Err(format!("{e} (a class of this file, or false)")),
+                }
+            };
+            let spread = match get(ct, "spread") {
+                None => None,
+                Some((_, v)) => match v.get_ref() {
+                    DeValue::Boolean(on) => Some(*on),
+                    other => {
+                        return src.err(
+                            v.span(),
+                            format!(
+                                "{what} spread: expected true or false, got {}",
+                                other.type_str()
+                            ),
+                        );
+                    }
+                },
+            };
             classes.insert(
                 name_str.to_owned(),
                 Class {
@@ -496,8 +536,28 @@ fn parse_inner(text: &str, path: &Path, app_only: bool) -> Result<Project, Strin
                     access,
                     expire_after_idle,
                     writes,
+                    apart,
+                    spread,
                 },
             );
+        }
+        // The pairs as a whole: each names another class of the file, and
+        // a class is in one pair at most.
+        let asked = placing(&classes);
+        if let Err((class, why)) = asked.check(|c| classes.contains_key(c)) {
+            let key = if why.starts_with("spread") {
+                "spread"
+            } else {
+                "apart-from"
+            };
+            let span = t
+                .get(class.as_str())
+                .and_then(|v| v.get_ref().as_table())
+                .and_then(|ct| get(ct, key))
+                .map(|(_, v)| v.span())
+                .unwrap_or(0..0);
+            let why = why.strip_prefix("spread, ").unwrap_or(&why);
+            return src.err(span, format!("[classes.{class}] {key}: {why}"));
         }
     }
     let assets = if let Some(t) = table(&src, root, "assets")? {
@@ -824,6 +884,21 @@ pub(crate) struct Parts {
     pub(crate) config: BTreeMap<String, wasmkeep_server::env::Vars>,
 }
 
+/// What the file's classes ask of placement (`apart-from`, `spread`): the
+/// version's entries, as the deploy writes them.
+pub(crate) fn placing(classes: &BTreeMap<String, Class>) -> wasmkeep_cluster::placement::Asked {
+    wasmkeep_cluster::placement::Asked {
+        apart: classes
+            .iter()
+            .filter_map(|(name, class)| Some((name.clone(), class.apart.clone()?)))
+            .collect(),
+        spread: classes
+            .iter()
+            .filter_map(|(name, class)| Some((name.clone(), class.spread?)))
+            .collect(),
+    }
+}
+
 /// Reads every component and configuration file the project names.
 /// `warn` gets each configuration name that looks like a secret.
 pub(crate) fn read_parts(project: &Project, warn: &mut dyn FnMut(String)) -> anyhow::Result<Parts> {
@@ -888,6 +963,8 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
                 requires: class.item.requires.clone(),
                 expire: class.expire_after_idle,
                 writes: class.writes,
+                apart: class.apart.clone(),
+                spread: class.spread,
             };
             Some((name, class.access.clone(), part))
         })
@@ -899,6 +976,8 @@ pub(crate) fn to_changes(project: &Project, parts: Parts) -> wasmkeep_server::ap
             requires: item.requires.clone(),
             expire: None,
             writes: wasmkeep_server::apps::Writes::Strict,
+            apart: None,
+            spread: None,
         }),
         _ => None,
     };
@@ -1074,6 +1153,86 @@ env = ".env.dev"
             "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\nwrites = \"strict\"\n",
         );
         assert!(err.contains("writes"), "{err}");
+    }
+
+    #[test]
+    fn apart_from_and_spread_are_class_keys() {
+        // ADR 0043, section 2: `apart-from` names another class of the
+        // file, or is false for none (`-` in the version); `spread` is
+        // true or false; classes only. Absent: the built-in rules, and
+        // nothing written.
+        let base = "[app]\ntenant = \"acme\"\nname = \"shop\"\n\
+                    [classes.feed]\ncomponent = \"f.wasm\"\n\
+                    [classes.leaf]\ncomponent = \"l.wasm\"\n\
+                    [classes.fan]\ncomponent = \"g.wasm\"\n";
+        let p = parse_ok(base);
+        assert!(
+            p.classes
+                .values()
+                .all(|c| c.apart.is_none() && c.spread.is_none())
+        );
+        assert!(placing(&p.classes).is_empty());
+        for (line, want) in [
+            ("apart-from = \"feed\"\n", "feed"),
+            ("apart-from = false\n", "-"),
+        ] {
+            let p = parse_ok(&format!("{base}{line}"));
+            assert_eq!(p.classes["fan"].apart.as_deref(), Some(want), "{line}");
+            assert_eq!(p.classes["feed"].apart, None);
+        }
+        for (line, want) in [("spread = true\n", true), ("spread = false\n", false)] {
+            let p = parse_ok(&format!("{base}{line}"));
+            assert_eq!(p.classes["fan"].spread, Some(want), "{line}");
+            assert_eq!(p.classes["leaf"].spread, None);
+        }
+        // Into the deploy, as the version's entries; a class that says
+        // nothing has its entry removed.
+        let p = parse_ok(&format!("{base}apart-from = \"feed\"\nspread = false\n"));
+        let parts = Parts {
+            front: None,
+            classes: ["fan", "feed", "leaf"]
+                .map(|c| (c.to_owned(), vec![]))
+                .to_vec(),
+            config: BTreeMap::new(),
+        };
+        let changes = to_changes(&p, parts);
+        let fan = "fan".to_owned();
+        assert!(
+            changes
+                .apart
+                .contains(&(fan.clone(), Some("feed".to_owned())))
+        );
+        assert!(changes.apart.contains(&("feed".to_owned(), None)));
+        assert!(changes.spread.contains(&(fan, Some(false))));
+        assert!(changes.spread.contains(&("leaf".to_owned(), None)));
+        for (bad, why) in [
+            ("apart-from = \"fan\"\n", "not another class"),
+            ("apart-from = \"nope\"\n", "not another class"),
+            ("apart-from = true\n", "a class of this file, or false"),
+            ("apart-from = \"\"\n", "must not be empty"),
+            ("spread = \"yes\"\n", "expected true or false"),
+        ] {
+            let err = parse_err(&format!("{base}{bad}"));
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        // One rule per class: not both keys.
+        let err = parse_err(&format!("{base}apart-from = \"feed\"\nspread = true\n"));
+        assert!(
+            err.contains("[classes.fan] spread: and kept apart from feed"),
+            "{err}"
+        );
+        // One pair per class: feed cannot be apart from fan and from leaf.
+        let err = parse_err(&format!(
+            "{base}apart-from = \"feed\"\n[classes.other]\ncomponent = \"o.wasm\"\n\
+             apart-from = \"feed\"\n"
+        ));
+        assert!(err.contains("one class at most"), "{err}");
+        for key in ["apart-from = \"x\"", "spread = true"] {
+            let err = parse_err(&format!(
+                "[app]\ntenant = \"acme\"\nname = \"shop\"\n[front]\ncomponent = \"f.wasm\"\n{key}\n"
+            ));
+            assert!(err.contains(key.split(' ').next().unwrap()), "{err}");
+        }
     }
 
     #[test]

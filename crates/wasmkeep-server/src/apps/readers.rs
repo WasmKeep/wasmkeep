@@ -76,6 +76,20 @@ impl Readers {
         }
     }
 
+    /// The same, for the first deploy of an app without a floor record
+    /// (ADR 0043, section 3): on the floor that deploy would create for a
+    /// fresh app ([`upgrade::deploy_floor`]), so a new app's first deploy
+    /// may be in a format behind the floor. The deploy creates the floor
+    /// only once it is accepted, and is checked again on the floor it
+    /// then finds: an app that is not fresh gets none.
+    #[must_use]
+    pub fn as_first_deploy(mut self, this: Minor) -> Self {
+        if matches!(self.floor, Ok(None)) {
+            self.floor = Ok(upgrade::deploy_floor(this, &self.nodes));
+        }
+        self
+    }
+
     /// The live nodes of the app.
     pub fn live(&self) -> impl Iterator<Item = &NodeInfo> + Clone {
         self.nodes.iter().filter(|n| n.app == self.served)
@@ -128,6 +142,18 @@ impl Readers {
     pub fn writer(&self, this: Minor) -> Result<(), String> {
         upgrade::writer(this, self.floor.clone(), self.live())
     }
+}
+
+/// Which deploy [`AppRef::check_readers`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deploy {
+    /// Of an app that has a deploy already, or a rollback.
+    Later,
+    /// An app's first, before it is accepted: on the floor it would
+    /// create.
+    First,
+    /// An app's first, accepted: on the floor the app then has.
+    FirstAccepted,
 }
 
 /// The live heartbeats under `keys`' prefix.
@@ -185,7 +211,7 @@ impl AppRef {
             Arc::clone(&self.store),
             self.prefix.clone(),
         );
-        let this = upgrade::this_minor().map_err(DeployError::Refused)?;
+        let this = self.this_minor().map_err(DeployError::Refused)?;
         let horizon = crate::heartbeat_horizon_ms(
             crate::DEFAULT_HEARTBEAT,
             &crate::LeaseConfig::default_safe(),
@@ -250,11 +276,53 @@ impl AppRef {
     /// Refuses `manifest` while it may not be written (ADR 0043, section
     /// 2): its format's row of the gate table, through [`Readers::gate`].
     /// Format 5 needs `flush` (ADR 0034), and every format inherits the
-    /// words of those below it (4 needs `ends`, 3 needs `front`). Then
+    /// words of those below it (4 needs `ends`, 3 needs `front`). Format 8
+    /// is the first that also needs the floor: at 0.9 or above, with every
+    /// live node at 0.9 or later and announcing `apart`. Then
     /// the writer itself: refused under a floor above this build's
     /// version, or beside a live node outside its range.
     pub(super) async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        self.check_readers_of(manifest, Deploy::Later).await
+    }
+
+    /// [`Self::check_readers`] for an app's first deploy: without a floor
+    /// record, on the floor this deploy would create for a fresh app
+    /// ([`Readers::as_first_deploy`]). Whether the app is fresh is known
+    /// only once the deploy is accepted ([`Self::born_finalized`]), so a
+    /// format behind the floor is checked again after that
+    /// ([`Self::check_floor_after_first`]).
+    pub(super) async fn check_first_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
+        self.check_readers_of(manifest, Deploy::First).await
+    }
+
+    /// After [`Self::born_finalized`], for a first deploy in a format
+    /// behind the floor: the gate again, on the floor the app now has.
+    /// An app that only looked new (state, or a registered node) got no
+    /// floor, and the deploy is refused before it writes anything of the
+    /// app. A format every floor allows is not read for again.
+    pub(super) async fn check_floor_after_first(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<(), DeployError> {
+        let behind = upgrade::manifest_format(manifest.format_number())
+            .is_some_and(|f| f.since > floor::ABSENT);
+        if behind {
+            self.check_readers_of(manifest, Deploy::FirstAccepted).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn check_readers_of(
+        &self,
+        manifest: &Manifest,
+        deploy: Deploy,
+    ) -> Result<(), DeployError> {
         let readers = self.readers().await?;
+        let readers = match (deploy, self.this_minor()) {
+            (Deploy::First, Ok(this)) => readers.as_first_deploy(this),
+            _ => readers,
+        };
         let number = manifest.format_number();
         let format = upgrade::manifest_format(number)
             .ok_or_else(|| DeployError::Refused(format!("manifest format {number} has no gate")))?;
@@ -264,6 +332,7 @@ impl AppRef {
             Err(Blocked::Nodes { word, nodes, .. }) => {
                 let nodes = nodes.join(", ");
                 return Err(match word {
+                    "apart" => DeployError::NodesWithoutApart { app, nodes },
                     "assets" => DeployError::NodesWithoutAssets { app, nodes },
                     "flush" => DeployError::NodesWithoutFlush {
                         app,
@@ -278,9 +347,38 @@ impl AppRef {
                     )),
                 });
             }
+            // A first deploy that gets no floor: `finalize` is no answer
+            // (it needs a live node of the app), so say what works.
+            Err(Blocked::Floor { needs, floor, .. }) if deploy != Deploy::Later => {
+                let older: Vec<String> = readers
+                    .live_on_prefix()
+                    .iter()
+                    .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < needs))
+                    .map(|n| format!("{} ({}, {})", n.id, n.app, n.version))
+                    .collect();
+                let why = if deploy == Deploy::First && !older.is_empty() {
+                    format!(
+                        "live nodes under the bucket prefix run an older version, and a new \
+                         app's floor is never above them: {}. Upgrade those nodes to {needs} \
+                         first, or",
+                        older.join(", ")
+                    )
+                } else {
+                    "the app is not new (it has state, a registered node or a tombstone), so \
+                     this deploy creates no floor for it. Either"
+                        .to_owned()
+                };
+                return Err(DeployError::Refused(format!(
+                    "{app}: a version with a per-class placement key, apart-from or spread \
+                     (manifest format {number}), needs the app's upgrade floor at {needs}, and \
+                     it is {floor}: {why} deploy without those keys, start the app's nodes on \
+                     {needs}, run `wasmkeep cluster upgrade finalize`, then deploy again with \
+                     the keys"
+                )));
+            }
             Err(blocked) => return Err(DeployError::Refused(format!("{app}: {blocked}"))),
         }
-        upgrade::this_minor()
+        self.this_minor()
             .and_then(|this| readers.writer(this))
             .map_err(|why| DeployError::Refused(format!("{app}: {why}")))
     }

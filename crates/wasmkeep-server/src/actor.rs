@@ -183,6 +183,9 @@ pub struct ActorConfig {
     /// The classes whose writes are batched (ADR 0034, section 1): the
     /// deployed version's; every other class is strict.
     pub batched: std::collections::BTreeSet<String>,
+    /// What the deployed version asks of placement for its own class names
+    /// (ADR 0043, section 2); empty, the built-in rules alone.
+    pub placing: wasmkeep_cluster::placement::Asked,
     /// Public ingress rate limits for this app.
     pub limits: crate::apps::limits::Policies,
     /// `--max-unsent-age` (ADR 0034, section 3): how long a committed write
@@ -282,6 +285,7 @@ impl std::fmt::Debug for ActorConfig {
             requires,
             expire_after_idle,
             batched,
+            placing,
             limits,
             max_unsent_age,
             access,
@@ -331,6 +335,7 @@ impl std::fmt::Debug for ActorConfig {
             .field("requires", requires)
             .field("expire_after_idle", expire_after_idle)
             .field("batched", batched)
+            .field("placing", placing)
             .field("limits", limits)
             .field("max_unsent_age", max_unsent_age)
             .field("access", access)
@@ -381,6 +386,7 @@ impl ActorConfig {
             requires: std::collections::BTreeMap::new(),
             expire_after_idle: std::collections::BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            placing: Default::default(),
             limits: Default::default(),
             max_unsent_age: DEFAULT_UNSENT_AGE,
             access: crate::access::AccessRules::default(),
