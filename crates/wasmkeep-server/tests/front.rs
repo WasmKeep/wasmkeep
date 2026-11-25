@@ -381,7 +381,7 @@ async fn an_informational_status_from_the_front_becomes_500() {
     let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
     assert!(
         page.contains(
-            "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"guest_error\"} 3\n"
+            "wasmkeep_front_requests_total{tenant=\"default\",app=\"default\",outcome=\"no_response\"} 3\n"
         ),
         "{page}"
     );

@@ -161,7 +161,7 @@ or the other way round. It checks names only; types, labels and meanings are kep
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `wasmkeep_front_requests_total` | counter | app, `outcome` (`ok`, `handoff`, `busy`, `unconfigured`, `cpu_budget`, `wall`, `guest_error`, `client_gone`) | Front requests. |
+| `wasmkeep_front_requests_total` | counter | app, `outcome` (`ok`, `handoff`, `busy`, `unconfigured`, `cpu_budget`, `wall`, `trap`, `no_response`, `client_gone`) | Front requests. |
 | `wasmkeep_front_request_seconds` | histogram | app | How long front requests took, to the response's last byte. |
 | `wasmkeep_front_cpu_seconds` | histogram | app | Guest CPU time each front request was charged against its budget. |
 | `wasmkeep_front_fuel` | histogram | app | Wasmtime fuel units each front request consumed; excludes host work. |

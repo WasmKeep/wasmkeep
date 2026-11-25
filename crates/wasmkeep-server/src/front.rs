@@ -527,6 +527,8 @@ pub struct HttpComponent {
     max_requests: usize,
     /// Calls waiting on each actor, for the per-actor bound.
     waits: Arc<Waits>,
+    /// The bound on the WARN lines of failed requests.
+    warns: Arc<crate::warn_limit::WarnLimit>,
     /// The process's front reservations shared between its apps, and this
     /// front's app (ADR 0038, section 8): a request beyond the app's share
     /// is refused as busy, never waited for.
@@ -560,6 +562,7 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            warns: crate::warn_limit::WarnLimit::new("front request failed"),
             share: None,
         })
     }
@@ -582,6 +585,7 @@ impl HttpComponent {
             slots: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             max_requests,
             waits: Arc::default(),
+            warns: crate::warn_limit::WarnLimit::new("front request failed"),
             share: None,
         }
     }
@@ -815,13 +819,15 @@ impl HttpComponent {
                 // upgrade, nor any other informational answer. Dropping
                 // `running` stops the instance.
                 if response.status().is_informational() {
-                    crate::traces::warn!(
-                        status = response.status().as_u16(),
-                        "front answered with an informational status"
-                    );
+                    if self.warns.allow(&app, "no_response") {
+                        crate::traces::warn!(
+                            status = response.status().as_u16(),
+                            "front answered with an informational status"
+                        );
+                    }
                     running.abort.silence();
                     drop(running);
-                    outcome(&app, "guest_error");
+                    outcome(&app, "no_response");
                     observe();
                     return internal_error();
                 }
@@ -848,10 +854,15 @@ impl HttpComponent {
                             };
                         }
                         Err(why) => {
-                            crate::traces::warn!(reason = why, "front answered a broken hand-off");
+                            if self.warns.allow(&app, "no_response") {
+                                crate::traces::warn!(
+                                    reason = why,
+                                    "front answered a broken hand-off"
+                                );
+                            }
                             running.abort.silence();
                             drop(running);
-                            outcome(&app, "guest_error");
+                            outcome(&app, "no_response");
                             observe();
                             return internal_error();
                         }
@@ -898,14 +909,25 @@ impl HttpComponent {
                 {
                     outcome(&app, "busy");
                     observe();
-                    crate::traces::warn!(error = %format!("{e:#}"), "front request: no instance free");
+                    if self.warns.allow(&app, "busy") {
+                        crate::traces::warn!(
+                            error = %crate::warn_limit::error_chain(&e),
+                            "front request: no instance free"
+                        );
+                    }
                     return busy();
                 }
                 let reason = reason(&e);
                 outcome(&app, reason);
                 observe();
-                log_table_full(&e);
-                crate::traces::warn!(reason, error = %format!("{e:#}"), "front request failed");
+                if self.warns.allow(&app, reason) {
+                    log_table_full(&e);
+                    crate::traces::warn!(
+                        reason,
+                        error = %crate::warn_limit::error_chain(&e),
+                        "front request failed"
+                    );
+                }
                 internal_error()
             }
         }
@@ -943,6 +965,7 @@ impl HttpComponent {
         let counts = Arc::clone(&counted);
         let app = front_app(actors);
         let its_app = Arc::clone(&app);
+        let warns = Arc::clone(&self.warns);
 
         // The guest may keep streaming the body after it has set the
         // response, so it runs in its own task, which holds the slot for as
@@ -983,12 +1006,14 @@ impl HttpComponent {
                             Err(e) => {
                                 let reason = reason(e);
                                 outcome(&app, reason);
-                                log_table_full(e);
-                                crate::traces::warn!(
-                                    reason,
-                                    error = %format!("{e:#}"),
-                                    "front request failed after its response began"
-                                );
+                                if warns.allow(&app, reason) {
+                                    log_table_full(e);
+                                    crate::traces::warn!(
+                                        reason,
+                                        error = %crate::warn_limit::error_chain(e),
+                                        "front request failed after its response began"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1013,7 +1038,7 @@ impl HttpComponent {
             Ok(Ok(response)) => Ok((response, Running { abort, sent })),
             Ok(Err(code)) => {
                 abort.silence();
-                Err(code.into())
+                Err(NoResponse(format!("guest answered an error: {code}")).into())
             }
             // The sender was dropped with the store: the guest returned or
             // trapped without setting a response.
@@ -1021,7 +1046,7 @@ impl HttpComponent {
                 abort.silence();
                 drop(sent);
                 let cause = match task.await {
-                    Ok(Ok(())) => wasmtime::format_err!("guest returned without a response"),
+                    Ok(Ok(())) => NoResponse("guest returned without a response".into()).into(),
                     Ok(Err(e)) => e,
                     Err(join) => join.into(),
                 };
@@ -1134,7 +1159,6 @@ fn outcome(app: &str, o: &str) {
     crate::metrics::front_request(app, o);
 }
 
-/// Why an instance failed, as an outcome.
 /// A line of its own when the front trapped on its resource table's cap,
 /// so an operator tells it apart from a bug in the front.
 fn log_table_full(e: &wasmtime::Error) {
@@ -1146,15 +1170,33 @@ fn log_table_full(e: &wasmtime::Error) {
     }
 }
 
+/// Why an instance failed, as an outcome: its budget, its wall, an end
+/// without an answer (`no_response`), or anything else that stopped it
+/// (`trap`: a trap, or a host call's error it did not handle).
 fn reason(e: &wasmtime::Error) -> &'static str {
     if e.downcast_ref::<CpuBudgetExceeded>().is_some() {
         "cpu_budget"
     } else if e.downcast_ref::<WallExceeded>().is_some() {
         "wall"
+    } else if e.downcast_ref::<NoResponse>().is_some() {
+        "no_response"
     } else {
-        "guest_error"
+        "trap"
     }
 }
+
+/// The guest ended without an answer the host could send, and without
+/// trapping: it returned with none, or set an error as its response.
+#[derive(Debug)]
+struct NoResponse(String);
+
+impl std::fmt::Display for NoResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoResponse {}
 
 /// 503, `Retry-After: 1`: no slot or no instance for the front.
 fn busy() -> Response<HyperOutgoingBody> {
@@ -1348,6 +1390,7 @@ mod share_tests {
                 slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
                 max_requests: 8,
                 waits: std::sync::Arc::default(),
+                warns: crate::warn_limit::WarnLimit::new("front request failed"),
                 share: None,
             };
             f.share = Some((std::sync::Arc::clone(&shares), std::sync::Arc::from(app)));
@@ -1487,6 +1530,30 @@ mod tests {
             );
         }
         h
+    }
+
+    /// A front that ends without an answer is told apart from one that
+    /// trapped, also when it trapped before answering (the same context).
+    #[test]
+    fn a_failure_is_a_trap_or_an_end_without_an_answer() {
+        let context = "guest did not set a response";
+        let returned: wasmtime::Error =
+            NoResponse("guest returned without a response".into()).into();
+        assert_eq!(reason(&returned), "no_response");
+        let returned = returned.context(context);
+        assert_eq!(reason(&returned), "no_response");
+        assert_eq!(
+            crate::warn_limit::error_chain(&returned),
+            "guest did not set a response: guest returned without a response"
+        );
+        let trapped: wasmtime::Error = wasmtime::Trap::UnreachableCodeReached.into();
+        assert_eq!(reason(&trapped.context(context)), "trap");
+        assert_eq!(reason(&wasmtime::format_err!("a host call failed")), "trap");
+        let late: wasmtime::Error = WallExceeded(Duration::from_secs(30)).into();
+        assert_eq!(reason(&late.context(context)), "wall");
+        for o in ["trap", "no_response", "wall", "cpu_budget"] {
+            assert!(crate::metrics::FRONT_REQUEST_OUTCOMES.contains(&o), "{o}");
+        }
     }
 
     #[test]
