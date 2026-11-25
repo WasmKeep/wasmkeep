@@ -448,7 +448,11 @@ Running `Idle::Windowed` changes no other case: with it off, nothing is listed w
 - `madsim_floor_proof.rs`: on half the seeds a chain of 2 to 4 passes, each acquiring the previous pass's released record (one generation up), inheriting from it and deleting part of what is left for the writer's generation; the acquirer after the last proves the writer's head exactly. The mutations now act in the last pass, so on a chain in a continuation, and each is still caught.
 - What no simulation checks: the server's own link from the release's answer to the queued continuation (`continue_from`); the cluster and unit tests above do. The sims read the released version back by a GET, as they do for the first pass.
 
-SIM_RESULTS_PLACEHOLDER
+At 20,000 seeds (release, `WASMKEEP_SIM_SEEDS=20000`):
+
+- `madsim_replication.rs`, idle compaction: 391,096 acknowledged writes, all restored; 32,081 passes, 8,239 deleted, 1,885 dropped for a changed record; 3,315 stopped early, 1,759 continuations, 845 of them deleted and 189 found the record changed by a wake in between. Beside periodic collection: 997 continuations, 541 deleted, 104 changed. With the version check dropped: 562 passes took a changed record and deleted, every write restored. Each oracle still catches its mutation within the first 6 seeds.
+- `madsim_backup.rs`: in the replication model 571,300 backups, 478 on a second attempt, none gave up, 12,113 passes deleted (966 continuations); in the focused model 651,769 backups, 8,199 on a second attempt, none gave up, 296,304 passes deleted (106,755 continuations). Passes ignoring the window are caught on 769 of 20,000 seeds; a window at the read deadline, below the bound, is now first caught at seed 250 of the 400 the test runs (166 before passes stopped part way, which delete less at a time).
+- `madsim_floor_proof.rs`: an exact proof after every pass, 9,614 seeds over a chain of 2 to 4 passes; the mutations, acting in the last pass, caught on 4,873 (the segment at P), 19,390 (`S`), 3,509 (a segment between), 15,711 (a stale idle snapshot) and 20,000 (the inherited head dropped) seeds.
 
 ## Simulation results
 
