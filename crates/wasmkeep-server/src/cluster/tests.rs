@@ -1849,6 +1849,9 @@ struct HangOneLeaseWrite {
     /// While set, releases of ownership records (a record naming nobody)
     /// fail, not applied.
     refuse_owner_releases: std::sync::atomic::AtomicBool,
+    /// The next this-many releases of ownership records land, and answer
+    /// an error.
+    lose_owner_release_replies: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Display for HangOneLeaseWrite {
@@ -1900,6 +1903,29 @@ impl ObjectStore for HangOneLeaseWrite {
             return Err(object_store::Error::Generic {
                 store: "test",
                 source: "ownership record release refused".into(),
+            });
+        }
+        if location.as_ref().starts_with("state/t/default/owners/")
+            && {
+                let body: bytes::Bytes = payload.clone().into();
+                String::from_utf8_lossy(&body)
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|holder| holder.split(' ').next() == Some("-"))
+            }
+            && self
+                .lose_owner_release_replies
+                .try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
+            self.inner.put_opts(location, payload, opts).await?;
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "ownership record release reply lost".into(),
             });
         }
         if location.as_ref().starts_with("nodes/")
@@ -2002,6 +2028,7 @@ async fn one_hung_lease_write_does_not_make_the_node_not_ready() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", store);
@@ -2042,6 +2069,7 @@ async fn a_clean_stop_during_a_hung_lease_write_still_releases() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2085,6 +2113,7 @@ async fn a_clean_stop_retries_a_failed_released_write() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2129,6 +2158,7 @@ async fn a_released_write_that_landed_unanswered_is_not_retried_wrongly() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -2326,6 +2356,7 @@ async fn a_hung_fence_does_not_hold_up_the_listing() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     // As in the room test: a 3 h ttl, so the node never passes its start
@@ -2659,6 +2690,7 @@ async fn many_parked_releases_land_quickly() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let a = fast_node("a", &store);
@@ -2728,6 +2760,7 @@ async fn a_pass_over_a_refusing_bucket_stops_early() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let a = fast_node("a", &store);
@@ -3163,6 +3196,7 @@ async fn an_acquisition_whose_epoch_moved_writes_nothing() {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let mut config = ClusterConfig::new("a", "http://a", Arc::clone(&store));
@@ -3666,6 +3700,7 @@ fn quiet_gate() -> Arc<HangOneLeaseWrite> {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
@@ -6517,6 +6552,7 @@ async fn pending_pass_release(name: &str) -> PassReleasePending {
         slow_owner_writes_ms: std::sync::atomic::AtomicU64::new(0),
         owner_writes: std::sync::atomic::AtomicU64::new(0),
         refuse_owner_releases: std::sync::atomic::AtomicBool::new(false),
+        lose_owner_release_replies: std::sync::atomic::AtomicU32::new(0),
     });
     let store: Arc<dyn ObjectStore> = Arc::clone(&gate) as Arc<dyn ObjectStore>;
     let a = fast_node("a", &store);
@@ -6591,6 +6627,44 @@ async fn a_pass_release_landing_in_the_background_queues_its_continuation() {
         "the version the release wrote: {now:?} {:?}",
         queued[0].version
     );
+    assert!(!p.a.idle_passes.armed(&p.key));
+    assert_eq!(continued_stopped(), (continued + 1, stopped));
+}
+
+/// ADR 0042: a release retried in the background whose write lands with
+/// its answer lost. The next try conflicts with it and comes back
+/// superseded; the record read back names nobody at the pass's
+/// generation, so it is that release: the continuation is queued on the
+/// version read, and the pass counts `continued`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_release_landed_with_its_answer_lost_queues_its_continuation() {
+    let p = pending_pass_release("lost").await;
+    let (continued, stopped) = continued_stopped();
+    p.gate
+        .lose_owner_release_replies
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    p.let_releases_land().await;
+    assert_eq!(
+        p.gate
+            .lose_owner_release_replies
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no reply was lost"
+    );
+    let meta = p
+        .store
+        .head(&StorePath::from(p.key.as_str()))
+        .await
+        .unwrap();
+    let now = format!(
+        "{}\n{}",
+        meta.e_tag.unwrap_or_default(),
+        meta.version.unwrap_or_default()
+    );
+    let queued = p.a.idle_passes.entries();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].generation, p.generation);
+    assert!(same_version(&now, &queued[0].version.0));
     assert!(!p.a.idle_passes.armed(&p.key));
     assert_eq!(continued_stopped(), (continued + 1, stopped));
 }

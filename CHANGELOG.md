@@ -30,14 +30,17 @@ The text under a version's heading is its GitHub release text
   the next pass, and a large actor kept part of its history until it
   next wrote and rested. The continuation now stays armed while the
   release is retried, and the retry queues it when it lands, on the
-  record that release wrote. A retry that finds the record changed, a
+  record that release wrote. A retry that finds the record taken since, a
   lapse of the node's lease, or any acquisition of the actor on the node
   clears it. Such a pass is counted once its release ends, `continued`
   or `stopped`; the outcomes of `wasmkeep_idle_compactions_total` are
-  unchanged. A release that landed with its answer lost still comes back
-  superseded and ends the chain
+  unchanged. A release that landed with its answer lost (a try cut off
+  at its one-second bound after its write went through) comes back
+  superseded; the record is then read back once, and if it names nobody
+  at the pass's generation, which only that release writes, the chain
+  continues from it
   ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md), "As
-  built: continuing a stopped pass").
+  built: a release retried in the background").
 
 ## 0.8.1
 

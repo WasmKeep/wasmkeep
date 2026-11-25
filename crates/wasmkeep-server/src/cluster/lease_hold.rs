@@ -1483,11 +1483,14 @@ impl Cluster {
                                 self.release_landed(&hold, written);
                                 Retried::Ended
                             }
-                            // Not this hold's record any more: a
-                            // continuation an idle pass armed for it
-                            // can never be queued (ADR 0042).
+                            // Not this hold's record any more, unless it
+                            // is this release, landed with its answer lost:
+                            // a continuation an idle pass armed for it is
+                            // queued on the record read back, or cleared
+                            // (ADR 0042).
                             Released::Superseded => {
-                                self.idle_passes.end_armed(&hold.key, Some(hold.generation));
+                                self.idle_release_superseded(&hold.key, hold.generation)
+                                    .await;
                                 Retried::Ended
                             }
                             Released::Pending | Released::Unchanged => {

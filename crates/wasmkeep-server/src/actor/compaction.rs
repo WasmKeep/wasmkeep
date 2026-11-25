@@ -61,10 +61,14 @@
 //! A pass whose release does not land within a second leaves its
 //! continuation armed ([`Queue::detach`]): the release, retried in the
 //! background, queues it when it lands with its version, and the pass is
-//! counted then (`continued`). A retry that comes back `Superseded`, a
-//! lapse of this node's lease, or any acquisition of the actor here
-//! clears it first (`stopped`), so no armed entry outlives the record its
-//! release would have written.
+//! counted then (`continued`). A release that comes back `Superseded`, in
+//! the pass or in the background, reads the record back once: naming
+//! nobody at the hold's generation, it is that release, landed with its
+//! answer lost, and the chain continues on the version read
+//! ([`Cluster::idle_release_superseded`]). Any other record, a read with
+//! no answer, a lapse of this node's lease, or any acquisition of the
+//! actor here clears it (`stopped`), so no armed entry outlives the
+//! record its release would have written.
 //!
 //! For a first pass the entry is only a hint of when to try: what it
 //! deletes rests on the record and the listing it reads itself. A
@@ -352,32 +356,52 @@ impl Queue {
     /// generation. A pass whose release was retried in the background is
     /// counted here: `Some(queued)`.
     fn continue_from(&self, hold: &Hold, version: Version, now_ms: u64) -> Option<bool> {
+        self.continue_at(&hold.key, hold.generation, version, now_ms)
+    }
+
+    /// [`Self::continue_from`] for the hold of `key` at `generation`.
+    fn continue_at(
+        &self,
+        key: &str,
+        generation: u64,
+        version: Version,
+        now_ms: u64,
+    ) -> Option<bool> {
         let mut continuing = self.continuing();
         let Some(Continuing::Armed {
             hold_generation,
             next,
             detached,
-        }) = continuing.get(&hold.key)
+        }) = continuing.get(key)
         else {
             return None;
         };
-        if *hold_generation != hold.generation {
+        if *hold_generation != generation {
             return None;
         }
         let detached = *detached;
         let mut next = next.clone();
-        next.generation = hold.generation;
+        next.generation = generation;
         next.version = version;
         next.due_ms = now_ms.saturating_add(u64::try_from(CONTINUE_AFTER.as_millis()).unwrap_or(0));
         let queued = self.push(next);
         if detached {
-            continuing.remove(&hold.key);
+            continuing.remove(key);
             drop(continuing);
-            count_detached(&hold.key, queued);
+            count_detached(key, queued);
             return Some(queued);
         }
-        continuing.insert(hold.key.clone(), Continuing::Queued(queued));
+        continuing.insert(key.to_owned(), Continuing::Queued(queued));
         None
+    }
+
+    /// Whether a continuation is armed for the hold of `key` at
+    /// `generation`.
+    pub(crate) fn armed_for(&self, key: &str, generation: u64) -> bool {
+        matches!(
+            self.continuing().get(key),
+            Some(Continuing::Armed { hold_generation, .. }) if *hold_generation == generation
+        )
     }
 
     /// Ends `key`'s continuation once its pass released (or its release
@@ -543,6 +567,35 @@ impl Cluster {
             continued: 0,
             fruitless: 0,
         });
+    }
+
+    /// A release of the hold of `key` at `generation` came back
+    /// `Superseded` (in the pass, or retried in the background) while an
+    /// idle pass's continuation is armed for that hold: the record is read
+    /// back once. Naming nobody at `generation`, it is that release, landed
+    /// with its answer lost (ADR 0042, "As built: a release retried in the
+    /// background"): the continuation is queued on the version read, as a
+    /// release that landed would have. Anything else, or no answer, clears
+    /// it. Nothing armed for that hold: nothing read.
+    pub(crate) async fn idle_release_superseded(&self, key: &str, generation: u64) {
+        if !self.idle_passes.armed_for(key, generation) {
+            return;
+        }
+        let read =
+            tokio::time::timeout(self.lease_attempt, self.owners.released_at(key, generation))
+                .await;
+        match read {
+            Ok(Ok(Some(version))) if self.idle_compaction && self.app_refusal().is_none() => {
+                tracing::debug!(key = %crate::logging::text(key), generation, "idle pass: its release landed with its answer lost; continued on the record read back");
+                // As `note_idle_release` for a release that did not write.
+                self.idle_passes.remove(key);
+                self.idle_passes
+                    .continue_at(key, generation, version, now_ms());
+            }
+            _ => {
+                self.idle_passes.end_armed(key, Some(generation));
+            }
+        }
     }
 
     /// The app's epoch as its markers give it now, read again from the
@@ -815,6 +868,11 @@ impl ActorState {
         // with the idle origin its acquisition carried.
         let returned = hold.release().await;
         let key = cluster.owner_key(&self.address);
+        // Superseded in the pass: a try cut off at its bound may have
+        // landed, its answer lost, and a later try conflicted with it.
+        if let (LeaseReturn::Superseded, Some(generation)) = (returned, armed) {
+            cluster.idle_release_superseded(&key, generation).await;
+        }
         // Left to the background: the continuation stays armed for that
         // release to queue when it lands with its version, which counts
         // the pass then (unless it already landed, or was cleared).

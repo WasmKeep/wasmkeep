@@ -373,6 +373,67 @@ async fn a_chain_continues_after_a_release_retried_in_the_background() {
     );
 }
 
+/// A chain whose passes' releases land with their answers lost. The
+/// first pass's release lands and answers after 1.5 s, past the pass's
+/// one-second try: it is left to the background, whose retry conflicts
+/// with it and comes back superseded. The second's answers an error at
+/// once: the pass's next try conflicts and comes back superseded in the
+/// pass. Each time the record read back names nobody at the pass's
+/// generation, so it is that release: the continuation is queued on the
+/// version read, the pass counts `continued`, and the chain runs to
+/// `done` with the same database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_continues_after_a_release_whose_answer_was_lost() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let flaky = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let shared: Arc<dyn ObjectStore> = Arc::clone(&flaky) as Arc<dyn ObjectStore>;
+    let da = tempfile::tempdir().unwrap();
+    let a = compacting("a", da.path(), &shared, WINDOW).await;
+    settle().await;
+    let (before, head) = burst_and_rest(&a, &store, "lost").await;
+    let gone = before.len() - 2;
+    assert!(gone >= 5, "not several batches: {before:?}");
+    a.service.limit_idle_passes(Some((2, 1)));
+    let passes = gone.div_ceil(2);
+    for pass in 1..=passes {
+        match pass {
+            1 => flaky.slow_owner_release_replies.store(1, Ordering::SeqCst),
+            2 => flaky.lost_owner_release_replies.store(1, Ordering::SeqCst),
+            _ => {}
+        }
+        let outcome = run_one_pass(&a).await;
+        assert_eq!(
+            flaky.slow_owner_release_replies.load(Ordering::SeqCst)
+                + flaky.lost_owner_release_replies.load(Ordering::SeqCst),
+            0,
+            "pass {pass}: no answer was lost"
+        );
+        if pass < passes {
+            assert_eq!(outcome, "continued", "pass {pass}");
+            let (holder, generation) = owner_record(&store, "lost").await.unwrap();
+            assert_eq!(
+                (holder, generation),
+                (None, head.position.generation + pass as u64),
+                "pass {pass}"
+            );
+            let queued = a.service.idle_passes_queued();
+            assert_eq!(queued.len(), 1, "pass {pass}: {queued:?}");
+            assert_eq!(queued[0].1, generation, "pass {pass}");
+        } else {
+            assert_eq!(outcome, "done", "pass {pass}");
+        }
+    }
+    assert_eq!(actor_keys(&store, "lost").await.len(), 2);
+    let (again, n) = export(&store, "lost", Point::Head).await;
+    assert_eq!(
+        (again.position, again.raw_checksum, n),
+        (head.position, head.raw_checksum, 10)
+    );
+}
+
 /// ADR 0042, Tests, "Restore identical": a burst over two generations,
 /// hibernated, then the pass a window later. The prefix is exactly the
 /// snapshot at the head and the segment at the head; a restore on the

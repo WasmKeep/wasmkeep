@@ -1894,6 +1894,30 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 .is_some_and(|(n, i)| n == &self.node && i == &self.instance))
     }
 
+    /// The record at `key`, read once, if it names nobody at `generation`:
+    /// its version (ADR 0042, a release whose answer was lost). Within one
+    /// incarnation of the app only the release of the hold at `generation`
+    /// writes that state: every acquisition writes a new generation naming
+    /// its holder, a release keeps its hold's generation, and a record's
+    /// generation never goes down. `Ok(None)` for any other record or none;
+    /// `Err` if the bucket did not answer or the record is unreadable.
+    pub async fn released_at(
+        &self,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<Version>, AcquireError> {
+        let Some((body, version)) = self
+            .bucket
+            .get(key)
+            .await
+            .map_err(|_| AcquireError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        let record = OwnerRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
+        Ok((record.holder.is_none() && record.generation == generation).then_some(version))
+    }
+
     /// Whether the record at `key` names this instance at any generation
     /// (one read): after a release found the record moved on, whether the
     /// actor is still this node's (a wake of it whose write landed
