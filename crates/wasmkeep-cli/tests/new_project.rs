@@ -222,7 +222,7 @@ fn clean_log(dev: &support::Dev) {
     std::thread::sleep(Duration::from_millis(200));
     let log = dev.log();
     assert!(
-        !log.contains("guest_error") && !log.contains("trapped"),
+        !log.contains("front request failed") && !log.contains("trapped"),
         "{log}"
     );
 }

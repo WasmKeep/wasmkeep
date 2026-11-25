@@ -305,7 +305,7 @@ fn signs_in_and_reaches_the_internal_actor(server: &Server) {
     std::thread::sleep(Duration::from_millis(200));
     let log = server.log();
     assert!(
-        !log.contains("guest_error") && !log.contains("trapped"),
+        !log.contains("front request failed") && !log.contains("trapped"),
         "{log}"
     );
 }

@@ -142,6 +142,20 @@ a **pre-alpha pre-release**.
   deletes as it did, and says so
   ([cluster](docs/cluster.md#how-it-works),
   [ADR 0043](docs/adr/0043-rolling-upgrades.md#built-the-removals-and-the-mark-of-cluster-forget)).
+- **`wasmkeep_front_requests_total` no longer has `outcome="guest_error"`:
+  it is `trap` or `no_response`.** `trap` is a front that trapped, or
+  that did not handle a host call's error. `no_response` is one that
+  ended without an answer the node could send: it returned with none,
+  or answered an error, a `1xx` status or a broken hand-off. Change
+  dashboards and alerts that select `guest_error`; the `reason` of the
+  node's `front request failed` log lines changes the same way
+  ([monitoring](docs/monitoring.md)).
+- **A front that keeps failing no longer fills the node's log.** The
+  WARN line of a failed front request (`front request failed`, and `no
+  instance free`) is logged for the first 10 requests per reason in 60
+  s; one line then says how many more were suppressed. The error on a
+  line is cut at 2 KiB. `wasmkeep_front_requests_total` still counts
+  every request.
 
 ### Removed
 

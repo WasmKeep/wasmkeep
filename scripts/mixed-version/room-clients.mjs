@@ -9,7 +9,8 @@
 // acknowledged publish reached every client (`have`). Repeats and new
 // epochs (a room's cold start, ADR 0040, section 3) are counted, never an
 // error. The test front reads the history at epoch 1 only, so after a new
-// epoch it may refuse a client's cursor: that is counted (`historyRefused`)
+// epoch it may refuse a client's cursor (409; the 0.8.1 fixture traps, 500):
+// that is counted (`historyRefused`)
 // and the client reads the history from the start instead (a refusal of
 // that is counted too, `historyStartRefused`). An unexpected close code is
 // recorded as a problem.
@@ -25,8 +26,10 @@ if (!stateDir || !room || !(Number(per) > 0) || ports.length === 0) {
 }
 let stopping = false;
 
-// The numbers after `from` (comma separated), or null when the front keeps
-// refusing (503, or a trap on a cursor of another epoch).
+// The numbers after `from` (comma separated), or null when the front
+// refuses: at once on a 409 (a cursor of another epoch, or lost numbers)
+// and on a 500 (the 0.8.1 fixture traps there instead), after six tries
+// on a 503 or a network error (a node restarting).
 async function history(port, from) {
   for (let attempt = 0; attempt < 6 && !stopping; attempt++) {
     try {
@@ -35,6 +38,7 @@ async function history(port, from) {
       });
       const body = await r.text();
       if (r.status === 200) return body === "" ? [] : body.split(",").map(Number);
+      if (r.status !== 503) return null;
     } catch {
       // A node restarting: retry.
     }
@@ -69,8 +73,9 @@ function client(port, k) {
     if (ns === null) {
       s.historyRefused++;
       ns = await history(port, 0);
-      // The fixture traps on a page that would carry a reset or a void
-      // range; whether the numbers came anyway is the script's check.
+      // The fixture refuses a page that would carry a reset or a void
+      // range (409; a trap, 500, from the 0.8.1 one); whether the numbers
+      // came anyway is the script's check.
       if (ns === null) { s.historyStartRefused++; return; }
     }
     for (const n of ns) take(n, "fetched");

@@ -671,7 +671,7 @@ pub(crate) struct Metrics {
     /// How long a batched `flush` (or `exec-durable`'s flush) took.
     pub(crate) flush_seconds: Histogram,
     /// Front requests (ADR 0023), by outcome (`ok`, `busy`,
-    /// `unconfigured`, `cpu_budget`, `wall`, `guest_error`); rendered with
+    /// `unconfigured`, `cpu_budget`, `wall`, `trap`, `no_response`); rendered with
     /// the node's tenant and app.
     pub(crate) front_requests: Family<AtomicU64>,
     asset_requests: Family<AtomicU64>,
@@ -1129,14 +1129,15 @@ pub(crate) const PLAIN_DROP_REASONS: [&str; 7] = [
     "unbarriered",
 ];
 /// `outcome` of `wasmkeep_front_requests_total`.
-pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 8] = [
+pub(crate) const FRONT_REQUEST_OUTCOMES: [&str; 9] = [
     "ok",
     "handoff",
     "busy",
     "unconfigured",
     "cpu_budget",
     "wall",
-    "guest_error",
+    "trap",
+    "no_response",
     "client_gone",
 ];
 /// `outcome` of `wasmkeep_front_calls_total`.

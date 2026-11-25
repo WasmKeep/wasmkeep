@@ -148,6 +148,33 @@ fn r6(path: &str, out: http::ResponseOutparam) {
             }
         })
     };
+    // A page that says the cursor is of another epoch, or that numbers
+    // were lost: refused as a conflict, for the client to read from the
+    // start (503 would be retried).
+    if endpoint == "/r6/history" {
+        let from = Position {
+            e: 1,
+            n: query(path, "n").unwrap().parse().unwrap(),
+        };
+        return match room.history(Some(from), 2000, None) {
+            Ok(h) if h.reset.is_some() => {
+                http::respond(out, 409, "text/plain", b"reset: the cursor is of another epoch")
+            }
+            Ok(h) if h.lost.is_some() => {
+                http::respond(out, 409, "text/plain", b"lost: numbers after the cursor are gone")
+            }
+            Ok(h) => {
+                let ns = h
+                    .messages
+                    .iter()
+                    .map(|m| m.position.n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                http::respond(out, 200, "text/plain", ns.as_bytes())
+            }
+            Err(e) => http::respond(out, 503, "text/plain", e.as_bytes()),
+        };
+    }
     let result: Result<String, String> = match endpoint {
         "/r6/warm-pusher" => call(format!("pusher/{name}"), "/wasmkeep-pusher/v1/poke".into()),
         "/r6/trap" => call(format!("room/{name}"), "/test-trap".into()),
@@ -222,26 +249,6 @@ fn r6(path: &str, out: http::ResponseOutparam) {
                     .join(",")
             })
             .map_err(|e| e.to_string()),
-        "/r6/history" => room
-            .history(
-                Some(Position {
-                    e: 1,
-                    n: query(path, "n").unwrap().parse().unwrap(),
-                }),
-                2000,
-                None,
-            )
-            .map(|h| {
-                assert!(
-                    h.reset.is_none() && h.lost.is_none(),
-                    "R6 must retain every published number"
-                );
-                h.messages
-                    .iter()
-                    .map(|m| m.position.n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }),
         _ => Err("unknown R6 route".into()),
     };
     match result {
