@@ -750,7 +750,8 @@ fn proof_after_a_pass(seed: u64, breaks: PassBreak) -> Result<(bool, bool, u64),
                 .find(|seg| seg.id == id)
                 .map(segment_key)
         };
-        if n == 1 {
+        // A mutation in the last pass: a continuation, on a chain.
+        if n == passes {
             match breaks {
                 PassBreak::DropSegmentAtP => gone.extend(boundary(s)),
                 PassBreak::DropSnapshot => gone.push(snapshot_key(s)),

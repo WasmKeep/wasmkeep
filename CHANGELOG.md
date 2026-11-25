@@ -154,7 +154,10 @@ Still a **pre-alpha pre-release**.
   used to lose one batch of 100 and keep the rest until it next wrote,
   and the pass counted `done`). `wasmkeep_idle_compactions_total{outcome}`
   gains `continued` and `stopped`, and `done` now means nothing old
-  enough was left
+  enough was left. Each pass raises the record's generation, so on a
+  version 2 app an actor compacted over several passes is refused by
+  `--require-owner-match` until it next writes, as after two wakes that
+  only read
   ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md), "As
   built: continuing a stopped pass").
 - **`lost_lease` is counted.** A batched write dropped because another

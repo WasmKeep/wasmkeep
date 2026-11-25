@@ -924,6 +924,7 @@ async fn a_request_during_a_slow_pass_is_served_after_it() {
     let (_, generation) = owner_record(&hooked.inner, "w2").await.unwrap();
     hooked.delay_list_ms.store(2_000, Ordering::SeqCst);
     let lists = hooked.lists.load(Ordering::SeqCst);
+    let (stopped, continued) = (compactions("stopped").await, compactions("continued").await);
     a.service.idle_passes_due_now();
     a.service.pause_idle_passes(false);
     eventually("the pass lists", async || {
@@ -940,6 +941,12 @@ async fn a_request_during_a_slow_pass_is_served_after_it() {
     );
     hooked.delay_list_ms.store(0, Ordering::SeqCst);
     assert_eq!(actor_keys(&hooked.inner, "w2").await, before, "deleted");
+    // Stopped by the waiting event: counted, and not continued.
+    eventually("the pass is counted", async || {
+        compactions("stopped").await > stopped
+    })
+    .await;
+    assert_eq!(compactions("continued").await, continued);
     // The pass's hold at generation + 1, released; the event's at + 2.
     let (holder, now) = owner_record(&hooked.inner, "w2").await.unwrap();
     assert_eq!((holder.as_deref(), now), (Some("a"), generation + 2));

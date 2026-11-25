@@ -771,7 +771,9 @@ async fn compact_under(
             .await
         {
             Ok(IdleCollected::NoSnapshot) => return (Compacted::Nothing, None),
-            Ok(IdleCollected::Collected { deleted, left: 0, .. }) => {
+            Ok(IdleCollected::Collected {
+                deleted, left: 0, ..
+            }) => {
                 return (Compacted::Done { deleted }, None);
             }
             Ok(IdleCollected::Collected {
@@ -794,6 +796,19 @@ async fn compact_under(
             }
             Err(e) => {
                 crate::metrics::inc(&crate::metrics::METRICS.history_collect_failures);
+                // Failed at or past the deadline under a valid hold: the
+                // chain goes on, as for a stop there (its deletes so far
+                // are counted in `wasmkeep_history_collected_total`).
+                if collector.lease_valid() && std::time::Instant::now() >= deadline {
+                    return (
+                        Compacted::Stopped {
+                            deleted: 0,
+                            left: 0,
+                            why: format!("a bucket error at its deadline: {e}"),
+                        },
+                        Some(Stop::Deadline),
+                    );
+                }
                 if attempt == PASS_ATTEMPTS || !collector.lease_valid() || stop() {
                     return (Compacted::Refused(e.to_string()), None);
                 }
@@ -1068,6 +1083,66 @@ mod tests {
         q.remove("c");
         assert!(q.take_due(30, 2).is_empty());
         assert_eq!(q.len(), 0);
+    }
+
+    fn hold(key: &str, generation: u64) -> Hold {
+        Hold {
+            key: key.into(),
+            generation,
+            version: Version(format!("held-{generation}")),
+            previous: None,
+            head: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_armed_continuation_is_queued_only_by_its_own_holds_release() {
+        let q = Queue::default();
+        let next = Entry {
+            continued: 1,
+            ..entry("k", 0)
+        };
+        // Another hold's release (another generation): nothing queued, and
+        // the pass that armed it learns it was not.
+        q.arm(7, next.clone());
+        q.continue_from(&hold("k", 8), Version("v8".into()), 1_000);
+        assert_eq!(q.len(), 0);
+        assert!(!q.disarm("k"));
+        // Its own release: queued on the version and generation it wrote,
+        // for the writer's generation, `CONTINUE_AFTER` later.
+        q.arm(7, next.clone());
+        q.continue_from(&hold("k", 7), Version("v7".into()), 1_000);
+        assert!(q.disarm("k"));
+        let queued = q.entries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (
+                queued[0].generation,
+                queued[0].snapshot_generation,
+                queued[0].version.0.as_str(),
+                queued[0].due_ms,
+                queued[0].continued
+            ),
+            (7, 1, "v7", 1_000 + CONTINUE_AFTER.as_millis() as u64, 1)
+        );
+        // Disarmed: a release landing later (in the background) queues
+        // nothing more, and a release with nothing armed neither.
+        q.clear();
+        q.continue_from(&hold("k", 7), Version("v7".into()), 2_000);
+        assert_eq!(q.len(), 0);
+        assert!(!q.disarm("k"));
+    }
+
+    #[test]
+    fn a_continuation_the_full_queue_refuses_is_said_not_queued() {
+        let q = Queue::default();
+        for i in 0..QUEUE_MAX as u64 {
+            assert!(q.push(entry(&format!("k{i}"), 1_000 + i)));
+        }
+        q.arm(2, entry("new", 0));
+        q.continue_from(&hold("new", 2), Version("v2".into()), 1_000);
+        assert!(!q.disarm("new"), "refused, so not continued");
+        assert_eq!(q.len(), QUEUE_MAX);
     }
 
     #[test]
