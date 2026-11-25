@@ -519,14 +519,18 @@ one-time, so it is outside the mixed-version promise. Cut-off: a cluster older t
 `0.4.0` goes through `0.8.x`.
 
 - What stays is a small start check that recognises an unmigrated
-  layout and says "migrate with 0.8.x first". `migrate::start_check` is
-  called by every deploy (`check_layout`) and is the only part with a
-  production caller outside the migration.
-- What does not need to stay: reading a migration tombstone at an
-  ownership key. `OwnerObject::decode` has no caller outside tests and
-  the migration itself. The migration wrote tombstones over keys of the
-  layout from before `0.4.0`, which no node reads; at a current
-  ownership key such a body already reads as corrupt.
+  layout and says "migrate with 0.8.x first". `legacy_layout::start_check`
+  (`crates/wasmkeep-cluster/src/legacy_layout.rs`) is called by every
+  deploy (`check_layout`) and is the only part with a production caller
+  outside the migration.
+- Reading a migration tombstone at an ownership key stays too
+  (`OwnerObject::decode`, with `legacy_layout::tombstone_target`).
+  Migrated buckets keep their tombstones for good, so a tombstone must
+  still decode as one, never as a record or an unknown version. It has
+  no production caller: no node reads the layout from before `0.4.0`,
+  and the start check reads a tenant's commit before it lists those keys.
+- The upgrading page of `0.9` (`upgrading-to-0.9.md`, not written yet)
+  must name this removal and its last carrier, `0.8.1`.
 
 **The per-actor lease marker: not removed in `0.9.0`.** `mark_old_lease`
 costs one GET and one PUT when an actor's first ownership record is

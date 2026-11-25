@@ -467,7 +467,7 @@ app's actor state is under its own root, `state/<tenant>/<app>/` (written
 | `cluster/secret` | The secret nodes sign their calls to each other with | Created once |
 | `control/drain/` | Drain requests | By the operator's commands |
 | `control/changed` | Rewritten after every drain, undrain or move request, so nodes list the requests when they change | By the operator's commands, and by a node that completes a move |
-| `cluster/migration`, `cluster/migrated/<tenant>`, `cluster/removed/<tenant>` | The lock of a running `cluster migrate`, each migrated tenant's commit, and the mark `--remove-old` writes before it deletes the tenant's old keys ([upgrading to 0.4.0](upgrading-to-0.4.md)) | By `cluster migrate` |
+| `cluster/migration`, `cluster/migrated/<tenant>`, `cluster/removed/<tenant>` | The lock of a running `cluster migrate`, each migrated tenant's commit, and the mark `--remove-old` writes before it deletes the tenant's old keys ([upgrading to 0.4.0](upgrading-to-0.4.md)). From 0.9.0, which has no `cluster migrate`, nodes and commands only read them | By `cluster migrate` (0.8.x and earlier) |
 | `R leases/<class>/<name>` | One small marker per actor, written by the node that first takes it. It carries the generation the actor's first ownership record starts from, and keeps a binary from before node leases from taking the actor ([ADR 0020](../adr/0020-one-lease-per-node.md)) | Created once, never collected |
 | `probe/` | The object a node's start check writes to test conditional writes | Deleted right after the check |
 | `diagnose/` | Scratch objects of `wasmkeep cluster diagnose` ([buckets](buckets.md)) | Deleted when the run ends |
@@ -697,7 +697,9 @@ actors test different parts of recovery.
 A bucket prefix that holds actor state is migrated once, offline, by
 `wasmkeep cluster migrate`, and the old keys removed later by
 `--remove-old`: the whole procedure, with its backup and rollback, is in
-[Upgrade a cluster to 0.4.0](upgrading-to-0.4.md). For backups:
+[Upgrade a cluster to 0.4.0](upgrading-to-0.4.md). The command was
+removed in 0.9.0: a cluster older than 0.4.0 upgrades through 0.8.x
+first (pin the 0.8.1 binary). For backups:
 
 - Keep one backup from before the migration until `--remove-old --apply`
   has run.

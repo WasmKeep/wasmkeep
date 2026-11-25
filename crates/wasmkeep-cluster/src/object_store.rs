@@ -270,8 +270,8 @@ fn percent_decode(segment: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-impl crate::migrate::Store for ObjectStoreBucket {
-    async fn list(&self, prefix: &str) -> Result<Vec<crate::migrate::ObjectMeta>, BucketError> {
+impl crate::store::Store for ObjectStoreBucket {
+    async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ObjectMeta>, BucketError> {
         use futures_util::TryStreamExt;
         let metas: Vec<_> = self
             .store
@@ -282,7 +282,7 @@ impl crate::migrate::Store for ObjectStoreBucket {
         let mut out: Vec<_> = metas
             .into_iter()
             .filter_map(|meta| {
-                Some(crate::migrate::ObjectMeta {
+                Some(crate::store::ObjectMeta {
                     key: self.written_key(&meta.location)?,
                     size: meta.size,
                     modified_ms: u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0),
@@ -408,12 +408,13 @@ mod tests {
         (At(Arc::clone(&cell)), cell)
     }
 
-    /// Keys the migration lists come back as written, so a copy, read or
-    /// delete of a listed key reaches the same object (an escaped or long
-    /// actor name, under a prefix that needs escaping too).
+    /// Keys a [`Store`](crate::store::Store) listing gives come back as
+    /// written, so a copy, read or delete of a listed key reaches the same
+    /// object (an escaped or long actor name, under a prefix that needs
+    /// escaping too).
     #[tokio::test]
-    async fn migration_keys_round_trip_through_the_store_escaping() {
-        use crate::migrate::Store as _;
+    async fn listed_keys_round_trip_through_the_store_escaping() {
+        use crate::store::Store as _;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let b = ObjectStoreBucket::new(Arc::clone(&store), "p%x/q");
         let long = format!("{}~85e62acd750c4eb56b7b6a1d66dca5bf", "x".repeat(167));
@@ -422,11 +423,11 @@ mod tests {
             format!("owners/acme/chat/{long}"),
         ];
         for key in &raw {
-            crate::migrate::Store::put(&b, key, key.as_bytes().to_vec())
+            crate::store::Store::put(&b, key, key.as_bytes().to_vec())
                 .await
                 .unwrap();
         }
-        let listed: Vec<String> = crate::migrate::Store::list(&b, "owners/acme/")
+        let listed: Vec<String> = crate::store::Store::list(&b, "owners/acme/")
             .await
             .unwrap()
             .into_iter()
@@ -440,7 +441,7 @@ mod tests {
             let to = key.replacen("owners/acme/", "state/acme/shop/owners/", 1);
             b.copy(key, &to).await.unwrap();
             assert_eq!(b.get(&to).await.unwrap().unwrap().0, key.as_bytes());
-            crate::migrate::Store::delete(&b, &to).await.unwrap();
+            crate::store::Store::delete(&b, &to).await.unwrap();
             assert!(b.get(&to).await.unwrap().is_none());
         }
     }

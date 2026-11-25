@@ -816,8 +816,10 @@ wasmkeep deploy --app acme/shop --bucket s3://wasmkeep-demo --rollback
 - A bucket prefix that holds actor state written by a version before
   0.4.0 is migrated once with `wasmkeep cluster migrate` while every node
   is stopped ([Upgrade a cluster to 0.4.0](deploy/upgrading-to-0.4.md)).
-  Until then, nodes and `deploy` of this version refuse that tenant and
-  print the command to run.
+  The command was removed in 0.9.0: a cluster older than 0.4.0 upgrades
+  through 0.8.x first (pin the 0.8.1 binary to migrate). Until then,
+  nodes and `deploy` of this version refuse that tenant and say to
+  migrate with 0.8.1.
 - The tenant and app names of a new app match `[a-z][a-z0-9-]{0,63}`; an
   app deployed earlier keeps its name.
 - `deploy` compiles and checks every component before uploading anything;
@@ -1635,9 +1637,10 @@ versions follows the rule above.
    version in the summary, no warning.
 
 Going back to the previous binary is the same procedure, except across
-the 0.4.0 layout change: `cluster migrate --rollback` works only until
-the first node starts after the migration, and never after
-`--remove-old --apply` ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
+the 0.4.0 layout change: `cluster migrate --rollback` (0.8.x and earlier;
+removed in 0.9.0) works only until the first node starts after the
+migration, and never after `--remove-old --apply`
+([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 a git checkout report the release they follow and their commit
 (`0.8.1+4f1c2a9e7b3d`), a release's tag the release alone, so the version
 column tells two builds of `main` apart. A build without git (a source
@@ -1663,7 +1666,8 @@ for the rule; there may be others nobody has listed):
 - **The layout of actor state** (0.4.0, [ADR 0022](adr/0022-app-owned-state-and-the-one-time-migration.md)):
   0.4.0 keys every app's actors under `state/<tenant>/<app>/`, and a
   bucket written by an earlier version is migrated once, with every node
-  stopped, by `wasmkeep cluster migrate`. A 0.3 binary refuses a bucket
+  stopped, by `wasmkeep cluster migrate` (removed in 0.9.0: migrate with
+  0.8.1 first). A 0.3 binary refuses a bucket
   being migrated or migrated; 0.2's `serve --app` and `deploy` cannot read
   the `current` token `3` and stop; a 0.2 `serve --actor` node finds a
   tombstone over each migrated actor's old record and answers 503 for it

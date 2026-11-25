@@ -671,7 +671,7 @@ impl Cluster {
         &self,
         class: &str,
     ) -> Result<Vec<wasmkeep_cluster::expiry::Listed>, String> {
-        use wasmkeep_cluster::migrate::Store as _;
+        use wasmkeep_cluster::store::Store as _;
         let folder = format!("{}/", self.root.key(Family::Owners, class));
         let listed = self
             .control_keys
@@ -725,7 +725,7 @@ impl Cluster {
     pub(crate) async fn alarmed_actors(
         &self,
     ) -> Result<std::collections::BTreeSet<(String, String)>, String> {
-        use wasmkeep_cluster::migrate::Store as _;
+        use wasmkeep_cluster::store::Store as _;
         let folder = format!("{}/", self.root.base(Family::Alarms));
         let listed = self
             .control_keys

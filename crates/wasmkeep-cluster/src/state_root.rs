@@ -21,8 +21,9 @@
 //! The tenant and app are raw in keys, as under `apps/` (the name grammar
 //! keeps them one safe segment), and encoded on disk. Everything after the
 //! family is byte-identical to the layout before 0.4.0, the bare one
-//! ([`Family::bare`], `<family>/<tenant>/<tail>`), which only
-//! `cluster migrate` still reads ([`crate::migrate`]).
+//! ([`Family::bare`], `<family>/<tenant>/<tail>`), which only the start
+//! check still reads ([`crate::legacy_layout`]; `cluster migrate` was
+//! removed in 0.9.0).
 
 use std::path::{Path, PathBuf};
 

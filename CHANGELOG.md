@@ -7,6 +7,21 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+### Removed
+
+- **`wasmkeep cluster migrate` is removed** (ADR 0022), with
+  `--rollback` and `--remove-old`. A cluster older than 0.4.0 upgrades
+  through 0.8.x first: pin the 0.8.1 binary, migrate with it, then
+  upgrade ([upgrading to 0.4.0](docs/deploy/upgrading-to-0.4.md)). A
+  bucket migrated earlier keeps working: nodes and commands still read
+  its commits and tombstones. If its old keys were never removed, run
+  `cluster migrate --remove-old --apply` with the 0.8.1 binary while the
+  cluster is still on 0.8.1, before upgrading: 0.9.0 cannot remove them.
+  Nodes and commands still refuse a tenant left in the old layout, or a
+  prefix a 0.8.x migration holds, and now say to use 0.8.1.
+
 ## 0.8.1
 
 **0.8 settled: a security fix, the follow-ups 0.8.0 left open, and no

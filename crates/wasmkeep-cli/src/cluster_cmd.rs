@@ -66,18 +66,6 @@ pub(super) enum ClusterCommand {
     /// record still names (it is what frees that record), and a live or
     /// fenced node lease (never deleted: fence a live one instead).
     Forget(NodeArgs),
-    /// Move the actor state of a bucket prefix written by a version before
-    /// 0.4.0 into each app's own root, once, while every node is stopped
-    /// (ADR 0022). Without --apply, a dry run: prints the plan (the app
-    /// each class goes to, the nodes it sees, object counts, an estimate)
-    /// and writes nothing. --apply copies, verifies, puts barriers in front
-    /// of older binaries, proves no node ran, then commits; it can be run
-    /// again after a crash. --rollback undoes it until a node starts.
-    /// --remove-old (a dry run; deletes with --apply) later removes the
-    /// copies left in the old layout, keeping the tombstones.
-    /// Exits with 0 when done, 1 when refused or aborted (nothing new
-    /// committed), 2 when some tenants were committed and others not.
-    Migrate(migrate_cmd::MigrateArgs),
     /// Check that a bucket does what WasmKeep needs from it: conditional
     /// creates and replaces, reads and listings that follow writes and
     /// deletes, large objects, last-modified times and the clock. Runs

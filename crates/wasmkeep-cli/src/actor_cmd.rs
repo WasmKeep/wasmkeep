@@ -100,7 +100,7 @@ pub(super) fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
 /// [`actor_move`] on the bucket `open` gives (opened once the request is
 /// valid): the start check `serve` runs
 /// first (ADR 0022), so that a request for a tenant left in the layout
-/// before 0.4.0 is refused with the migrate command rather than written
+/// before 0.4.0 is refused (migrate with 0.8.x first) rather than written
 /// where no node reads it.
 pub(super) fn actor_move_on(
     args: &MoveArgs,

@@ -31,11 +31,11 @@ impl AppRef {
             Arc::clone(&self.store),
             self.prefix.clone(),
         );
-        wasmkeep_cluster::migrate::start_check(&keys, &self.tenant)
+        wasmkeep_cluster::legacy_layout::start_check(&keys, &self.tenant)
             .await
             .map(drop)
             .map_err(|e| match e {
-                wasmkeep_cluster::migrate::StartRefusal::Bucket(e) => bucket(e),
+                wasmkeep_cluster::legacy_layout::StartRefusal::Bucket(e) => bucket(e),
                 e => DeployError::Layout(e.to_string()),
             })
     }

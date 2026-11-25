@@ -21,7 +21,8 @@ pub struct Current {
     /// The app's actor state lives under its own root (ADR 0022): token
     /// `3`, which implies `marked` and which versions before 0.4.0 cannot
     /// read, so their `serve --app` and `deploy` stop. Written by every
-    /// deploy and rollback of this version, and by `cluster migrate`.
+    /// deploy and rollback of this version, and by `cluster migrate` (0.8.x
+    /// and earlier; removed in 0.9.0).
     pub rooted: bool,
 }
 

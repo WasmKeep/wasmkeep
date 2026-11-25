@@ -35,6 +35,7 @@ fn a_current_from_before_0_4_is_refused_at_start() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("cluster migrate --bucket s3://b/p"), "{e}");
+    assert!(e.contains("0.8.1"), "{e}");
     assert!(e.contains("acme/shop"), "{e}");
     let rooted = Current::parse(b"v 4 3\n").unwrap();
     super::require_rooted(&rooted, "acme", "shop", "s3://b/p").unwrap();
@@ -70,6 +71,7 @@ fn the_layout_check_refuses_an_unmigrated_tenant_and_a_running_migration() {
     put("wk/owners/acme/c/n");
     let e = check("acme").unwrap_err().to_string();
     assert!(e.contains("cluster migrate --bucket s3://b/wk"), "{e}");
+    assert!(e.contains("0.8.1"), "{e}");
     check("other").unwrap();
     put("wk/cluster/migrated/acme");
     check("acme").unwrap();
@@ -146,7 +148,7 @@ fn a_node_started_before_the_first_deploy_waits_for_it() {
 
 /// `actor move` runs the start check `serve` runs (ADR 0022): it
 /// refuses a tenant whose state is still in the layout before 0.4.0,
-/// naming the migrate command, and writes nothing.
+/// naming the 0.8.1 migrate command, and writes nothing.
 #[test]
 fn actor_move_refuses_an_unmigrated_tenant() {
     use clap::Parser as _;
@@ -181,6 +183,7 @@ fn actor_move_refuses_an_unmigrated_tenant() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("cluster migrate --bucket s3://b/wk"), "{e}");
+    assert!(e.contains("0.8.1"), "{e}");
     let listed: Vec<_> = rt.block_on(async {
         use futures_util::TryStreamExt as _;
         store.list(None).try_collect::<Vec<_>>().await.unwrap()
@@ -352,27 +355,6 @@ fn actor_delete_writes_its_request_and_waits_for_it() {
         .is_err(),
         "--no-wait with --wait"
     );
-}
-
-/// `--remove-old` takes its own flags only, and never with
-/// `--rollback` or `--heir`.
-#[test]
-fn remove_old_flags_come_with_it() {
-    use clap::Parser as _;
-    let parse = |extra: &[&str]| {
-        let mut argv = vec!["wasmkeep", "cluster", "migrate", "--bucket", "s3://b"];
-        argv.extend_from_slice(extra);
-        super::Cli::try_parse_from(argv)
-            .map(drop)
-            .map_err(|e| e.to_string())
-    };
-    parse(&["--remove-old"]).unwrap();
-    parse(&["--remove-old", "--apply", "--forgo-rollback"]).unwrap();
-    parse(&["--remove-old", "--history-retention-secs", "0"]).unwrap();
-    assert!(parse(&["--forgo-rollback"]).is_err());
-    assert!(parse(&["--history-retention-secs", "0"]).is_err());
-    assert!(parse(&["--remove-old", "--rollback"]).is_err());
-    assert!(parse(&["--remove-old", "--heir", "a/b"]).is_err());
 }
 
 /// `actor move` names the actor's app with `--app`, or the implicit
