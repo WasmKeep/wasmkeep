@@ -91,7 +91,7 @@ pub(crate) fn run(command: UpgradeCommand) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let this = upgrade::this_minor();
+    let this = upgrade::this_minor().map_err(anyhow::Error::msg)?;
     let (out, code) = match command {
         UpgradeCommand::Status(args) => {
             let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
@@ -179,6 +179,19 @@ fn reader_warning(app: &AppUpgrade, this: Minor) -> Option<String> {
     })
 }
 
+/// A node's LIVE cell: `yes`, or `no` with what its lease says. A lease
+/// that is stale but neither released nor fenced is not proof of a stop.
+fn live_text(node: &upgrade::NodeVersion) -> &'static str {
+    use wasmkeep_cluster::node_lease::NodeState;
+    match (node.live, node.lease) {
+        (true, _) => "yes",
+        (false, Some(NodeState::Released)) => "no (released)",
+        (false, Some(NodeState::Fenced)) => "no (fenced)",
+        (false, Some(NodeState::Live)) => "no (stale, not fenced)",
+        (false, None) => "no (old format)",
+    }
+}
+
 pub(crate) fn status_text(bucket: &str, apps: &[AppUpgrade], this: Minor) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Upgrade of {bucket} (this wasmkeep: {this})\n");
@@ -201,7 +214,7 @@ pub(crate) fn status_text(bucket: &str, apps: &[AppUpgrade], this: Minor) -> Str
                     [
                         format!("  {}", n.id),
                         n.version.clone(),
-                        if n.live { "yes" } else { "no" }.to_owned(),
+                        live_text(n).to_owned(),
                     ]
                 })
                 .collect();
@@ -237,6 +250,10 @@ pub(crate) fn app_json(app: &AppUpgrade) -> Value {
                 "version": n.version,
                 "minor": n.minor.map(|m| m.to_string()),
                 "live": n.live,
+                // Its node lease's state; null for a heartbeat from
+                // before node leases. Only `released` and `fenced` prove
+                // a stop.
+                "lease": n.lease.map(wasmkeep_cluster::node_lease::NodeState::as_str),
             }))
             .collect::<Vec<_>>(),
     })
@@ -346,8 +363,9 @@ pub(crate) async fn finalize(
             failed = true;
             let _ = writeln!(
                 out,
-                "error: {}: live nodes are older than the floor {target}: {}. Each started \
-                 while the floor was written, or keeps checking a floor it cannot read: stop \
+                "error: {}: nodes older than the floor {target} are live, or stale without a \
+                 release or a fence: {}. Each started while the floor was written, or keeps \
+                 checking a floor it cannot read: stop it, or run `wasmkeep cluster fence` on \
                  it. The floor stays, and formats that need {target} stay refused while it is \
                  live",
                 app.app,
@@ -496,10 +514,51 @@ mod tests {
         let (out, code) = run(&b, Some("acme/shop"), v(0, 9), true).await;
         assert_eq!(code, 1, "{out}");
         assert!(
-            out.contains("error: acme/shop: live nodes are older than the floor 0.9: late (0.8.1)"),
+            out.contains(
+                "error: acme/shop: nodes older than the floor 0.9 are live, or stale without a \
+                 release or a fence: late (0.8.1)"
+            ),
             "{out}"
         );
         assert!(floor(&b, "acme/shop").await.is_some(), "the floor stays");
+        // M2: an older lease still `live` but stale is not a stopped node.
+        // The finalize is refused and names the fence; once fenced or
+        // released, it goes through.
+        let c = bucket();
+        put(&c, "acme/shop", "a", "0.9.0", "live").await;
+        let stale = format!(
+            "wasmkeep-node 3\nlive i-cut\n{}\ncut\nhttp://cut\n0.8.1\nacme/shop\n\n\nserving\n\ntake\n",
+            crate::status::now_ms() - 3_600_000
+        );
+        c.put_body("nodes/cut", stale.clone().into_bytes())
+            .await
+            .unwrap();
+        let (out, code) = run(&c, None, v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("their lease was never released or fenced: cut (0.8.1)")
+                && out.contains("`wasmkeep cluster fence <id>` for each (cut)"),
+            "{out}"
+        );
+        assert_eq!(floor(&c, "acme/shop").await, None, "nothing written");
+        let apps = upgrade::read_statuses(&c, None, crate::status::now_ms(), horizon_ms())
+            .await
+            .unwrap();
+        assert_eq!(apps[0].blocks, ["cut"]);
+        assert!(
+            status_text("s3://b", &apps, v(0, 9)).contains("no (stale, not fenced)"),
+            "{}",
+            status_text("s3://b", &apps, v(0, 9))
+        );
+        c.put_body(
+            "nodes/cut",
+            stale.replacen("\nlive ", "\nfenced ", 1).into_bytes(),
+        )
+        .await
+        .unwrap();
+        let (out, code) = run(&c, None, v(0, 9), true).await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("stopped nodes still name an older version: cut (0.8.1)"));
         // No app at all.
         let empty = bucket();
         let mut say = |_: String| {};

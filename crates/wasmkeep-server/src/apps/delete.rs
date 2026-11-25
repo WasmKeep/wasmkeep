@@ -375,11 +375,12 @@ async fn tombstone_readers(
 ) -> Result<(Vec<String>, Result<(), String>), DeployError> {
     use wasmkeep_cluster::upgrade::{self, Blocked};
     let readers = super::Readers::read(Arc::clone(store), prefix, tenant, name).await?;
-    let writer = readers.writer(upgrade::this_minor());
+    // An unreadable floor is the writer's refusal, which `--force`
+    // passes: a delete is how an app with a broken floor is removed.
+    let writer = upgrade::this_minor().and_then(|this| readers.writer(this));
     let ignoring = match upgrade::format(TOMBSTONE_HEADER).map(|f| readers.gate(f)) {
         Some(Err(Blocked::Nodes { nodes, .. })) => nodes,
-        Some(Err(blocked)) => return Err(DeployError::Refused(blocked.to_string())),
-        Some(Ok(())) | None => Vec::new(),
+        Some(Ok(()) | Err(_)) | None => Vec::new(),
     };
     Ok((ignoring, writer))
 }

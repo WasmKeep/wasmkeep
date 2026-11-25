@@ -1592,8 +1592,9 @@ page says; these are the commands it uses.
   the floor does not start (0.8.1 reads it too). Without a record the
   floor is 0.8. A new app gets its floor at the version that creates it:
   the first deploy of an app that never ran (no deploy, no state, no
-  registered node), or the first node of one served without a deploy.
-  Deploy a new app with the `wasmkeep` of its oldest node.
+  registered node), or its first node. A deploy never sets the floor
+  above the lowest version live under the bucket prefix, so the nodes
+  that run the other apps can start into the new one.
 - **`wasmkeep cluster upgrade status`** shows, per app, each node's
   version, the floor, and one state: `one version`, `mixed`, `finalize
   pending` (every live node runs the new version, the floor is still the
@@ -1621,7 +1622,15 @@ version introduces is refused until the app is finalized, and then still
 while a live node does not announce its capability word. Commands that
 write (`deploy`, `secrets`, `app delete`, `app format --enable`) are
 refused from a `wasmkeep` older than the app's floor, or while a live
-node of the app is more than one minor version away from it.
+node of the app is more than one minor version away from it. The way
+out is in the message: use a `wasmkeep` within one minor version of
+every live node, and not older than the floor.
+
+`finalize` counts an older node as stopped only when its lease is
+`released` or `fenced`. A lease that is merely stale (the machine
+vanished, or is cut off) is refused: run `wasmkeep cluster fence <id>`
+first. It also needs a live node: after an upgrade done with every node
+stopped, start the nodes, then finalize.
 
 `node below the floor` means a node of an older version is live under a
 floor above it. Either it started while the floor was being written, or

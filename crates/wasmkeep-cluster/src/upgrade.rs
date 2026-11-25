@@ -20,9 +20,18 @@ use crate::lease::{Bucket, BucketError};
 use crate::membership::{Directory, NODES_PREFIX, NodeInfo, is_live, serves};
 
 /// The minor version of this build ([`crate::VERSION`]).
-pub fn this_minor() -> Minor {
-    // The workspace version is three numbers: checked by a test here.
-    Minor::of_version(crate::VERSION).unwrap_or(floor::ABSENT)
+///
+/// # Errors
+/// The version has no minor version to compare: nothing is judged by a
+/// guess, so a node does not start and a command does not write.
+pub fn this_minor() -> Result<Minor, String> {
+    Minor::of_version(crate::VERSION).ok_or_else(|| {
+        format!(
+            "this build's version {} has no minor version to check the app's upgrade floor \
+             and the other nodes' versions against",
+            crate::VERSION
+        )
+    })
 }
 
 /// Whether a binary of minor version `this` runs beside one of `other`
@@ -369,6 +378,22 @@ pub enum Blocked {
         /// The floor in force.
         floor: Minor,
     },
+    /// Live nodes of the app run a version from before the format: one
+    /// that started while the floor was written and read it before the
+    /// write.
+    #[error(
+        "{format} needs every live node at {needs} or later; older, or naming a version that \
+         does not parse: {}. Stop or upgrade each",
+        nodes.join(", ")
+    )]
+    OlderNodes {
+        /// The format.
+        format: &'static str,
+        /// The version that introduced it.
+        needs: Minor,
+        /// The live nodes below it, each with its version.
+        nodes: Vec<String>,
+    },
     /// Live nodes of the app do not announce a word the format needs.
     #[error("{format} needs `{word}` on every live node; without it: {}", nodes.join(", "))]
     Nodes {
@@ -400,9 +425,12 @@ pub fn without<'a>(words: &[&str], live: impl IntoIterator<Item = &'a NodeInfo>)
 /// the app's floor as read and the live nodes of the app. A gated format
 /// needs both halves: the floor at or above the version that introduced
 /// it (the node that was stopped when the gate opened), and every live
-/// node announcing its words (a node that started while the floor was
-/// written, and a capability a node's configuration withholds). A format
-/// without a gate is written as it is.
+/// node able to read it (a node that started while the floor was
+/// written, and a capability a node's configuration withholds). The
+/// second half is the format's words and, for a format newer than the
+/// first floor, the live nodes' versions too: a format gated on the floor
+/// alone has no word to keep it from a live older node. A format without
+/// a gate is written as it is.
 ///
 /// # Errors
 /// What blocks, naming the nodes.
@@ -421,6 +449,22 @@ pub fn gate<'a>(
             needs: format.since,
             floor,
         });
+    }
+    // Formats that exist in 0.8.1 keep their live words alone.
+    if format.since > floor::ABSENT {
+        let nodes: Vec<String> = live
+            .clone()
+            .into_iter()
+            .filter(|n| Minor::of_node_version(&n.version).is_none_or(|v| v < format.since))
+            .map(|n| format!("{} ({})", n.id, n.version))
+            .collect();
+        if !nodes.is_empty() {
+            return Err(Blocked::OlderNodes {
+                format: format.name,
+                needs: format.since,
+                nodes,
+            });
+        }
     }
     for word in words {
         let nodes = without(&[word], live.clone());
@@ -441,7 +485,7 @@ pub fn gate<'a>(
 /// floor, and not beside a live node outside its range.
 ///
 /// # Errors
-/// Why not, in one sentence.
+/// Why not, and which `wasmkeep` may write instead.
 pub fn writer<'a>(
     this: Minor,
     floor: Result<Option<Minor>, floor::Unknown>,
@@ -457,7 +501,8 @@ pub fn writer<'a>(
         Ok(Some(floor)) if floor > this => {
             return Err(format!(
                 "this `wasmkeep` is older than the cluster: this app's upgrade was finalized at \
-                 {floor} and this is {this}; use a `wasmkeep` of {floor} or later"
+                 {floor} and this is {this}. Use a `wasmkeep` of {floor} or later, within one \
+                 minor version of every live node"
             ));
         }
         Ok(_) => {}
@@ -466,7 +511,11 @@ pub fn writer<'a>(
     if outside.is_empty() {
         Ok(())
     } else {
-        Err(outside.join("; "))
+        Err(format!(
+            "{}. Use a `wasmkeep` within one minor version of every live node, and not older \
+             than the app's upgrade floor",
+            outside.join("; ")
+        ))
     }
 }
 
@@ -526,6 +575,25 @@ pub struct NodeVersion {
     pub minor: Option<Minor>,
     /// Whether its heartbeat is live.
     pub live: bool,
+    /// Its node lease's state; `None` for a heartbeat from before node
+    /// leases.
+    pub lease: Option<crate::node_lease::NodeState>,
+}
+
+impl NodeVersion {
+    /// Whether its lease says its process stopped: `released` (a clean
+    /// stop) or `fenced`. A lease still `live` but stale proves nothing:
+    /// its node may be partitioned or slow, and still act.
+    pub fn stopped(&self) -> bool {
+        use crate::node_lease::NodeState;
+        matches!(self.lease, Some(NodeState::Released | NodeState::Fenced))
+    }
+
+    /// Whether it runs below `target`, or names a version that does not
+    /// parse.
+    fn older_than(&self, target: Minor) -> bool {
+        self.minor.is_none_or(|v| v < target)
+    }
 }
 
 /// One app's upgrade, as read ([`assess`]).
@@ -600,6 +668,7 @@ pub fn assess(
             version: n.version.clone(),
             minor: Minor::of_node_version(&n.version),
             live: is_live(n, now_ms, horizon_ms),
+            lease: n.lease,
         })
         .collect();
     let floor = floor.map_err(|e| e.len);
@@ -624,6 +693,14 @@ pub fn assess(
     let mut blocks: Vec<String> = unparsed.iter().map(|n| n.id.clone()).collect();
     if let Some(newest) = newest {
         blocks.extend(below(newest).iter().map(|n| n.id.clone()));
+        // An older lease that is stale but neither released nor fenced
+        // blocks too: it is not proof of a stop.
+        blocks.extend(
+            nodes
+                .iter()
+                .filter(|n| !n.live && !n.stopped() && n.older_than(newest))
+                .map(|n| n.id.clone()),
+        );
     }
     blocks.sort();
     let (state, detail) = match (floor, minors.as_slice()) {
@@ -735,6 +812,22 @@ pub enum FinalizeRefusal {
         /// The nodes, each with its version.
         nodes: String,
     },
+    /// An older node is not live, but its lease was neither released
+    /// nor fenced: stale is not stopped.
+    #[error(
+        "nodes older than {target} are not live, but their lease was never released or fenced: \
+         {nodes}. A stale lease is not proof of a stop (the node may be cut off or slow, and \
+         still act): run `wasmkeep cluster fence <id>` for each ({ids}), then finalize. For a \
+         heartbeat from before node leases, stop the node and use `wasmkeep cluster forget <id>`"
+    )]
+    OlderNotStopped {
+        /// The version that asked.
+        target: Minor,
+        /// The nodes, each with its version.
+        nodes: String,
+        /// Their ids, to fence.
+        ids: String,
+    },
     /// No node of the app is live.
     #[error("no node of this app is live: there is nothing to finalize")]
     NoLiveNode,
@@ -760,7 +853,9 @@ pub enum Finalize {
 
 /// Steps 1 to 3 of `finalize` (section 4), from what was read: the floor
 /// already at `target` passes at once (the command is idempotent);
-/// otherwise every live node of the app must run `target`.
+/// otherwise every live node of the app must run `target`, and every
+/// older node must have stopped for sure: its lease `released` or
+/// `fenced`, not merely stale.
 ///
 /// # Errors
 /// The precondition that fails, naming the nodes.
@@ -796,6 +891,22 @@ pub fn finalize_check(target: Minor, status: &AppUpgrade) -> Result<Finalize, Fi
         return Err(FinalizeRefusal::OlderLive {
             target,
             nodes: named(&older),
+        });
+    }
+    let stale: Vec<&NodeVersion> = status
+        .nodes
+        .iter()
+        .filter(|n| !n.live && !n.stopped() && n.older_than(target))
+        .collect();
+    if !stale.is_empty() {
+        return Err(FinalizeRefusal::OlderNotStopped {
+            target,
+            nodes: named(&stale),
+            ids: stale
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         });
     }
     if live.is_empty() {
@@ -934,13 +1045,15 @@ pub async fn finalize_write<B: Bucket + Directory>(
 /// What the listing after a finalize found (section 4, steps 5 and 6).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Confirmed {
-    /// Live nodes below the floor: each passed its floor reads before the
-    /// floor was written, or has had no answer on its second read and
+    /// Nodes below the floor that are live, or whose lease is stale but
+    /// neither released nor fenced: each passed its floor reads before
+    /// the floor was written, or has had no answer on its second read and
     /// keeps checking. An error: the floor stays, formats that need it
-    /// stay refused while such a node is live, and it must be stopped.
+    /// stay refused while such a node is live, and it must be stopped (or
+    /// fenced).
     pub late: Vec<NodeVersion>,
-    /// Registered nodes that are not live and name an older version. Not
-    /// an error: such a node stops at its next start.
+    /// Registered nodes of an older version whose lease is released or
+    /// fenced. Not an error: such a node stops at its next start.
     pub stopped_older: Vec<NodeVersion>,
 }
 
@@ -960,19 +1073,19 @@ pub async fn finalize_confirm<B: Bucket + Directory>(
     horizon_ms: u64,
 ) -> Result<Confirmed, BucketError> {
     let status = read_status(bucket, tenant, app, now_ms, horizon_ms).await?;
-    let older = |n: &&NodeVersion| n.minor.is_none_or(|v| v < target);
+    let older = |n: &&NodeVersion| n.older_than(target);
     Ok(Confirmed {
         late: status
             .nodes
             .iter()
-            .filter(|n| n.live)
+            .filter(|n| n.live || !n.stopped())
             .filter(older)
             .cloned()
             .collect(),
         stopped_older: status
             .nodes
             .iter()
-            .filter(|n| !n.live)
+            .filter(|n| !n.live && n.stopped())
             .filter(older)
             .cloned()
             .collect(),
@@ -1011,6 +1124,21 @@ impl Listed {
                 .unread
                 .iter()
                 .any(|(key, _)| key != &format!("{NODES_PREFIX}{but}"))
+    }
+
+    /// [`Self::registered`] for the node `id` of minor version `this`
+    /// that is starting: its own earlier lease is left out only when it
+    /// names `this` version or a later one. One that names an older
+    /// version (or none that parses) is the app's own past: a node
+    /// restarted in place on a newer binary is not the first node of a
+    /// new app.
+    pub fn registered_at_start(&self, app: &str, id: &str, this: Minor) -> bool {
+        self.registered(app, id)
+            || self.nodes.iter().any(|n| {
+                n.id == id
+                    && serves(n, app)
+                    && Minor::of_node_version(&n.version).is_none_or(|v| v < this)
+            })
     }
 
     /// The objects of `self` that do not decode and that `earlier` held
@@ -1056,34 +1184,95 @@ pub async fn list_nodes<D: Directory>(directory: &D) -> Result<Listed, BucketErr
     Ok(listed)
 }
 
+/// Who creates a fresh app's floor ([`born_finalized`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstWriter<'a> {
+    /// A starting node, by its id: an app served without a deploy, or
+    /// one whose first deploy wrote no floor.
+    Node(&'a str),
+    /// The app's first deploy.
+    Deploy,
+}
+
 /// What [`born_finalized`] found.
 #[cfg(feature = "object-store")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Born {
-    /// The app held nothing: its floor was created at the writer's
-    /// version.
+    /// The app held nothing: its floor was created at this version.
     Created(Minor),
+    /// The floor was created at this version, and the listing after the
+    /// create shows these nodes of the app below it, live or not stopped
+    /// for sure: each started between the listing and the create. As
+    /// after a finalize, the floor stays and each must be stopped.
+    Late {
+        /// The floor created.
+        floor: Minor,
+        /// The nodes, each with its version.
+        nodes: String,
+    },
     /// The app has a floor already (or another writer created it first).
     HasFloor,
-    /// The app is not fresh, for this reason: nothing written.
+    /// Nothing written, for this reason: the app is not fresh, or no
+    /// floor may be chosen for it yet.
     NotFresh(&'static str),
 }
 
-/// A fresh app is born finalized (ADR 0043, section 3): the first writer
-/// into an app that holds nothing creates its floor at its own minor
-/// version `this`, by conditional create, so a new app needs no
-/// `finalize` before its first gated deploy.
+/// The floor the first deploy of a fresh app creates (ADR 0043, section
+/// 3), from the minor version of the `wasmkeep` that deploys and the live
+/// nodes under the bucket prefix, of every app (a new app has no node of
+/// its own yet, and the nodes that will serve it are most likely those
+/// that serve the others). `None`: no floor is written, and the app
+/// stays on the floor that no record means until a `finalize`.
 ///
-/// "Holds nothing" is all of: no floor record, no node registered for the
-/// app (`node`, the id of a starting node, left out; an object under
-/// `nodes/` that does not decode counts as one), no deploy (neither
-/// `apps/<tenant>/<app>/current` nor the tombstone `deleted` beside it)
-/// and nothing under `state/<tenant>/<app>/`. "No node registered" alone
-/// is not proof: an app whose node leases were all removed with `cluster
-/// forget` still has its deploy and its state, and creating its floor
-/// would end the way back without a `finalize`. Secrets set before an
-/// app's first deploy, or uploads of a deploy that never finished, do not
-/// make it an app that ran.
+/// - No live node under the prefix: the CLI's own version.
+/// - A live node whose version does not parse: none.
+/// - Otherwise the lower of the CLI's version and the lowest live
+///   version, so no live node is shut out of the new app; none when that
+///   is not above what no record already means.
+pub fn deploy_floor<'a>(
+    cli: Minor,
+    live_on_prefix: impl IntoIterator<Item = &'a NodeInfo>,
+) -> Option<Minor> {
+    let mut lowest = None;
+    for node in live_on_prefix {
+        let minor = Minor::of_node_version(&node.version)?;
+        lowest = Some(lowest.map_or(minor, |l: Minor| l.min(minor)));
+    }
+    match lowest {
+        None => Some(cli),
+        Some(lowest) => Some(cli.min(lowest)).filter(|floor| *floor > floor::ABSENT),
+    }
+}
+
+/// A fresh app is born finalized (ADR 0043, section 3): the first writer
+/// into an app that never ran creates its floor, by conditional create,
+/// so a new app needs no `finalize` before its first gated deploy. `this`
+/// is the writer's minor version; a heartbeat is live for `horizon_ms`
+/// at `now_ms`.
+///
+/// An app never ran when it has no floor record, no registered node, no
+/// tombstone and nothing under `state/<tenant>/<app>/`.
+///
+/// - **No registered node.** An object under `nodes/` that does not
+///   decode counts as one. A starting node leaves its own earlier lease
+///   out only if that lease names its own version or a later one
+///   ([`Listed::registered_at_start`]).
+/// - **A deploy** (`apps/<tenant>/<app>/current`) makes the app one that
+///   ran for the deploy that writes it, which is then not the first. A
+///   starting node ignores it: with `serve --app` a node always starts
+///   after a deploy, and the deploy may have written no floor
+///   ([`deploy_floor`]). An app with a deploy, no state and no other
+///   registered node has nothing a node of the version before could
+///   lose.
+/// - "No node registered" alone is not proof: an app whose node leases
+///   were all removed with `cluster forget` still has its state, and
+///   creating its floor would end the way back without a `finalize`.
+/// - Secrets set before the first deploy, or the uploads of a deploy
+///   that never finished, do not make an app one that ran.
+///
+/// A starting node creates the floor at its own version. A deploy
+/// creates the one [`deploy_floor`] gives. After the create the nodes are
+/// listed again ([`Born::Late`]).
 ///
 /// # Errors
 /// The bucket did not answer: nothing is concluded, and the caller goes
@@ -1093,36 +1282,91 @@ pub async fn born_finalized(
     bucket: &crate::object_store::ObjectStoreBucket,
     tenant: &str,
     app: &str,
-    node: Option<&str>,
+    by: FirstWriter<'_>,
     this: Minor,
+    now_ms: u64,
+    horizon_ms: u64,
 ) -> Result<Born, BucketError> {
     let key = floor::relative_key(tenant, app);
     if bucket.get(&key).await?.is_some() {
         return Ok(Born::HasFloor);
     }
     let served = format!("{tenant}/{app}");
-    if list_nodes(bucket)
-        .await?
-        .registered(&served, node.unwrap_or_default())
-    {
+    let listed = list_nodes(bucket).await?;
+    let registered = match by {
+        FirstWriter::Node(id) => listed.registered_at_start(&served, id, this),
+        FirstWriter::Deploy => listed.registered(&served, ""),
+    };
+    if registered {
         return Ok(Born::NotFresh("a node is registered for it"));
     }
-    for deployed in ["current", "deleted"] {
-        if bucket
-            .get(&format!("apps/{served}/{deployed}"))
+    if bucket
+        .get(&format!("apps/{served}/deleted"))
+        .await?
+        .is_some()
+    {
+        return Ok(Born::NotFresh("it was deleted"));
+    }
+    if by == FirstWriter::Deploy
+        && bucket
+            .get(&format!("apps/{served}/current"))
             .await?
             .is_some()
-        {
-            return Ok(Born::NotFresh("it has a deploy"));
-        }
+    {
+        return Ok(Born::NotFresh("it has a deploy"));
     }
     if bucket.any_key(&format!("state/{served}")).await? {
         return Ok(Born::NotFresh("it has state"));
     }
-    match bucket.create(&key, floor::encode(this)).await {
-        Ok(_) => Ok(Born::Created(this)),
-        Err(BucketError::Conflict) => Ok(Born::HasFloor),
-        Err(e) => Err(e),
+    let target = match by {
+        FirstWriter::Node(_) => this,
+        FirstWriter::Deploy => {
+            let live = listed
+                .nodes
+                .iter()
+                .filter(|n| is_live(n, now_ms, horizon_ms));
+            match deploy_floor(this, live) {
+                Some(floor) => floor,
+                None => {
+                    return Ok(Born::NotFresh(
+                        "the live nodes under the prefix run a version at or below the floor \
+                         that no record means, or one that does not parse",
+                    ));
+                }
+            }
+        }
+    };
+    match bucket.create(&key, floor::encode(target)).await {
+        Ok(_) => {}
+        Err(BucketError::Conflict) => return Ok(Born::HasFloor),
+        Err(e) => return Err(e),
+    }
+    // As `finalize` lists again after its write: a node of the app that
+    // started between the listing above and the create never saw the
+    // floor.
+    let own = match by {
+        FirstWriter::Node(id) => id,
+        FirstWriter::Deploy => "",
+    };
+    let again = assess(
+        &served,
+        Ok(Some(target)),
+        &list_nodes(bucket).await?.nodes,
+        now_ms,
+        horizon_ms,
+    );
+    let late: Vec<&NodeVersion> = again
+        .nodes
+        .iter()
+        .filter(|n| n.id != own && (n.live || !n.stopped()) && n.older_than(target))
+        .collect();
+    if late.is_empty() {
+        Ok(Born::Created(target))
+    } else {
+        Ok(Born::Late {
+            floor: target,
+            nodes: named(&late),
+        })
     }
 }
 

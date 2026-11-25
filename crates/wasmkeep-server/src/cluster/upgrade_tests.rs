@@ -195,14 +195,16 @@ async fn a_floor_below_the_previous_version_stops_the_start() {
 
 /// Section 3: a fresh app is born finalized at its first node's version,
 /// and a node of the version before then stops at the floor. An app that
-/// only looks new is not: with a deploy, with state, or with a registered
-/// node, its floor is left to `finalize` ("Not settled" 8, as decided:
-/// the app whose node leases were all removed with `cluster forget`).
+/// only looks new is not: with state or with a registered node, its floor
+/// is left to `finalize` ("Not settled" 8, as decided: the app whose node
+/// leases were all removed with `cluster forget`). A deploy alone does not
+/// make it one that ran: with `serve --app` a node always starts after
+/// one, and the deploy may have written no floor.
 #[tokio::test]
 async fn a_fresh_app_is_born_finalized_and_a_forgotten_one_is_not() {
     let fresh = store();
     let forgotten_state = store();
-    let forgotten_deploy = store();
+    let deployed = store();
     let registered = store();
     let put = async |store: &Arc<dyn ObjectStore>, key: &str| {
         store
@@ -211,7 +213,7 @@ async fn a_fresh_app_is_born_finalized_and_a_forgotten_one_is_not() {
             .unwrap();
     };
     put(&forgotten_state, "state/t/default/owners/room/lobby").await;
-    put(&forgotten_deploy, "apps/t/default/current").await;
+    put(&deployed, "apps/t/default/current").await;
     lease_of(&registered, "gone", "t/default", "0.8.1", "released").await;
     // Another app's state, deploy and node change nothing for this one.
     put(&fresh, "state/t/blog/owners/room/lobby").await;
@@ -221,7 +223,7 @@ async fn a_fresh_app_is_born_finalized_and_a_forgotten_one_is_not() {
     let nodes = [
         node_at("a", "0.9.0", &fresh),
         node_at("a", "0.9.0", &forgotten_state),
-        node_at("a", "0.9.0", &forgotten_deploy),
+        node_at("a", "0.9.0", &deployed),
         node_at("a", "0.9.0", &registered),
     ];
     for node in &nodes {
@@ -232,9 +234,9 @@ async fn a_fresh_app_is_born_finalized_and_a_forgotten_one_is_not() {
         store_body(&fresh, "formats/t/default/floor").await,
         b"wasmkeep-floor 1\n0.9\n"
     );
+    assert_eq!(floor_of(&deployed).await, Some(v(0, 9)), "a deploy alone");
     for (what, store) in [
         ("state", &forgotten_state),
-        ("a deploy", &forgotten_deploy),
         ("a registered node", &registered),
     ] {
         assert_eq!(floor_of(store).await, None, "an app with {what}");
@@ -255,6 +257,48 @@ async fn a_fresh_app_is_born_finalized_and_a_forgotten_one_is_not() {
     let second = node_at("c", "0.10.0", &fresh);
     second.identity().await.unwrap();
     assert_eq!(floor_of(&fresh).await, Some(v(0, 9)));
+}
+
+/// Section 3: a single node restarted in place on a newer binary is not
+/// the first node of a new app. Its own earlier lease names the version
+/// it ran: from 0.8.1 to 0.9 it creates no floor (the way back stays open
+/// until `finalize`), and from 0.8.1 to 0.10 it is refused, the upgrade
+/// to 0.9 never having been finalized. Restarted on its own version, its
+/// earlier lease is only its own.
+#[tokio::test]
+async fn a_node_restarted_in_place_on_a_newer_binary_creates_no_floor() {
+    let one_step = store();
+    lease_of(&one_step, "a", "t/default", "0.8.1", "released").await;
+    let two_steps = store();
+    lease_of(&two_steps, "a", "t/default", "0.8.1", "released").await;
+    let same = store();
+    lease_of(&same, "a", "t/default", "0.9.0", "released").await;
+    let nine = node_at("a", "0.9.2", &one_step);
+    let ten = node_at("a", "0.10.0", &two_steps);
+    let again = node_at("a", "0.9.2", &same);
+
+    nine.identity().await.unwrap();
+    assert_eq!(floor_of(&one_step).await, None);
+    let why = ten.identity().await.unwrap_err();
+    assert!(
+        why.contains("never finalized") && why.contains("this binary is 0.10"),
+        "{why}"
+    );
+    assert_eq!(floor_of(&two_steps).await, None);
+    again.identity().await.unwrap();
+    assert_eq!(floor_of(&same).await, Some(v(0, 9)));
+}
+
+/// A node whose version has no minor version to compare is never judged
+/// by a guess: it refuses to start, before any lease write.
+#[tokio::test]
+async fn a_version_with_no_minor_version_refuses_to_start() {
+    let store = store();
+    let a = node_at("a", "nine", &store);
+    let why = a.identity().await.unwrap_err();
+    assert!(why.contains("has no minor version"), "{why}");
+    assert!(!exists(&store, "nodes/a").await, "no lease written");
+    assert_eq!(floor_of(&store).await, None);
 }
 
 async fn store_body(store: &Arc<dyn ObjectStore>, key: &str) -> Vec<u8> {

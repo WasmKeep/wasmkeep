@@ -67,14 +67,15 @@ pub(crate) fn run(args: &AppFormatArgs) -> anyhow::Result<()> {
         .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
     // The writer itself (ADR 0043, sections 3 and 5): not a `wasmkeep`
     // older than the app's upgrade floor.
-    rt.block_on(wasmkeep_server::apps::Readers::read(
+    let readers = rt.block_on(wasmkeep_server::apps::Readers::read(
         std::sync::Arc::clone(&store),
         &prefix,
         tenant,
         app,
-    ))?
-    .writer(wasmkeep_cluster::upgrade::this_minor())
-    .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
+    ))?;
+    wasmkeep_cluster::upgrade::this_minor()
+        .and_then(|this| readers.writer(this))
+        .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
     rt.block_on(write_enabled(&store, &key))
         .map_err(|e| anyhow::anyhow!("{tenant}/{app}: {e}"))?;
     println!(

@@ -166,21 +166,52 @@ impl AppRef {
     }
 
     /// A fresh app is born finalized (ADR 0043, section 3): the first
-    /// deploy into an app that holds nothing (no floor, no registered
-    /// node, no deploy, no state) creates its upgrade floor at this
-    /// build's minor version, so a new app needs no `finalize` before its
-    /// first gated deploy. Called once the deploy is accepted (a refused
-    /// or cancelled one writes nothing) and before it writes anything of
-    /// the app.
+    /// deploy of an app that never ran (no floor, no registered node, no
+    /// deploy, no state) creates its upgrade floor, so a new app needs no
+    /// `finalize` before its first gated deploy. The floor is the lower
+    /// of this build's minor version and the lowest version live under
+    /// the bucket prefix, so no live node is shut out of the new app, and
+    /// none is written when that is not above what no record means
+    /// ([`upgrade::deploy_floor`]). Called once the deploy is accepted (a
+    /// refused or cancelled one writes nothing) and before it writes
+    /// anything of the app.
+    ///
+    /// # Errors
+    /// The bucket did not answer, or the listing after the create shows
+    /// an older node of the app that started meanwhile: the floor stays,
+    /// and the deploy writes nothing else.
     pub(super) async fn born_finalized(&self) -> Result<(), DeployError> {
         let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
             Arc::clone(&self.store),
             self.prefix.clone(),
         );
-        upgrade::born_finalized(&keys, &self.tenant, &self.app, None, upgrade::this_minor())
-            .await
-            .map(drop)
-            .map_err(bucket)
+        let this = upgrade::this_minor().map_err(DeployError::Refused)?;
+        let horizon = crate::heartbeat_horizon_ms(
+            crate::DEFAULT_HEARTBEAT,
+            &crate::LeaseConfig::default_safe(),
+        );
+        let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+        let born = upgrade::born_finalized(
+            &keys,
+            &self.tenant,
+            &self.app,
+            upgrade::FirstWriter::Deploy,
+            this,
+            now,
+            horizon,
+        )
+        .await
+        .map_err(bucket)?;
+        match born {
+            upgrade::Born::Late { floor, nodes } => Err(DeployError::Refused(format!(
+                "{}: this deploy created the app's upgrade floor at {floor}, and the listing \
+                 after it shows older nodes of the app that started meanwhile: {nodes}. The \
+                 floor stays and nothing else was written: stop each of them (or `wasmkeep \
+                 cluster fence` it), then deploy again",
+                self.name()
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// What a deploy checks before it writes (ADR 0022): no migration in
@@ -248,8 +279,8 @@ impl AppRef {
             }
             Err(blocked) => return Err(DeployError::Refused(format!("{app}: {blocked}"))),
         }
-        readers
-            .writer(upgrade::this_minor())
+        upgrade::this_minor()
+            .and_then(|this| readers.writer(this))
             .map_err(|why| DeployError::Refused(format!("{app}: {why}")))
     }
 

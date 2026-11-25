@@ -245,8 +245,9 @@ fn readers(
 /// app's upgrade floor, or beside a live node outside this version's
 /// range (ADR 0043, sections 3 and 5).
 fn check_writer(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<()> {
-    readers(bucket, tenant, app)?
-        .writer(wasmkeep_cluster::upgrade::this_minor())
+    let readers = readers(bucket, tenant, app)?;
+    wasmkeep_cluster::upgrade::this_minor()
+        .and_then(|this| readers.writer(this))
         .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))
 }
 

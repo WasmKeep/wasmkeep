@@ -36,10 +36,13 @@ fn patch(minor: Minor) -> String {
 
 #[test]
 fn this_build_has_a_minor_version() {
-    assert_eq!(Minor::of_node_version(crate::VERSION), Some(this_minor()));
+    assert_eq!(
+        Minor::of_node_version(crate::VERSION),
+        Some(this_minor().unwrap())
+    );
     assert_eq!(
         Minor::of_version(env!("CARGO_PKG_VERSION")),
-        Some(this_minor())
+        Some(this_minor().unwrap())
     );
 }
 
@@ -48,7 +51,7 @@ fn this_build_has_a_minor_version() {
 /// this build's version and for others, so the next version bump keeps it.
 #[test]
 fn a_version_runs_beside_the_one_before_and_the_one_after() {
-    for this in [this_minor(), v(0, 9), v(0, 10), v(1, 3)] {
+    for this in [this_minor().unwrap(), v(0, 9), v(0, 10), v(1, 3)] {
         let at = |minor: u32| patch(v(this.major, minor));
         for (other, ok) in [
             (at(this.minor - 2), false),
@@ -160,6 +163,34 @@ fn a_gate_needs_the_floor_and_every_live_word() {
             }
         }
     }
+    // A format gated on the floor alone has no word to keep it from a
+    // live older node (one that started while the floor was written): its
+    // version does. One whose version does not parse blocks too.
+    let floor_only = Format {
+        name: "wasmkeep-next 2",
+        since: v(0, 9),
+        rule: Rule::Gate(&[]),
+        unknown: "",
+    };
+    let late = node("late", "0.8.1", "live", "take front place");
+    let odd = node("odd", "nine", "live", "take front place");
+    assert_eq!(gate(&floor_only, Ok(Some(v(0, 9))), &all[..]), Ok(()));
+    let blocked = gate(&floor_only, Ok(Some(v(0, 9))), [&with, &late, &odd]).unwrap_err();
+    assert_eq!(
+        blocked,
+        Blocked::OlderNodes {
+            format: "wasmkeep-next 2",
+            needs: v(0, 9),
+            nodes: vec!["late (0.8.1)".to_owned(), "odd (nine)".to_owned()],
+        }
+    );
+    assert!(blocked.to_string().contains("late (0.8.1)"), "{blocked}");
+    // The same for a format with words: the older node is named for its
+    // version before its words.
+    assert!(matches!(
+        gate(&new, Ok(Some(v(0, 9))), [&with, &late]),
+        Err(Blocked::OlderNodes { .. })
+    ));
     // An unreadable floor: nothing gated is written.
     assert_eq!(
         gate(&new, Err(Unknown { len: 7 }), &all[..]),
@@ -234,6 +265,21 @@ fn a_writer_older_than_the_cluster_is_refused() {
     assert!(why.contains("unreadable (3 bytes)"), "{why}");
     let why = writer(v(0, 11), Ok(Some(v(0, 9))), &nodes).unwrap_err();
     assert!(why.contains("node `a` runs `0.9.0`"), "{why}");
+    // Each refusal says which `wasmkeep` may write instead.
+    assert!(
+        why.ends_with(
+            "Use a `wasmkeep` within one minor version of every live node, and not older than \
+             the app's upgrade floor"
+        ),
+        "{why}"
+    );
+    let why = writer(v(0, 8), Ok(Some(v(0, 9))), &nodes).unwrap_err();
+    assert!(
+        why.ends_with(
+            "Use a `wasmkeep` of 0.9 or later, within one minor version of every live node"
+        ),
+        "{why}"
+    );
 }
 
 fn status(floor: Result<Option<Minor>, Unknown>, nodes: &[NodeInfo]) -> AppUpgrade {
@@ -391,6 +437,52 @@ fn finalize_is_refused_for_each_precondition() {
         check(v(0, 9), Ok(None), &[node("gone", "0.8.1", "released", "")]),
         Err(FinalizeRefusal::NoLiveNode)
     );
+    // An older lease still `live` but stale is not a stopped node: it
+    // may be cut off or slow, and still act. Refused, naming the fence;
+    // fenced or released, it is stopped for sure.
+    let stale = |state: &str| {
+        let mut n = node("cut", "0.8.1", state, "take");
+        n.written_at_ms = NOW - 3_600_000;
+        n
+    };
+    let refused = check(v(0, 9), Ok(None), &[a9.clone(), stale("live")]).unwrap_err();
+    assert_eq!(
+        refused,
+        FinalizeRefusal::OlderNotStopped {
+            target: v(0, 9),
+            nodes: "cut (0.8.1)".to_owned(),
+            ids: "cut".to_owned(),
+        }
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("run `wasmkeep cluster fence <id>` for each (cut)"),
+        "{refused}"
+    );
+    let s = status(Ok(None), &[a9.clone(), stale("live")]);
+    assert_eq!(s.state, State::FinalizePending);
+    assert_eq!(s.blocks, ["cut"], "it blocks the finalize all the same");
+    for stopped in ["fenced", "released"] {
+        assert_eq!(
+            check(v(0, 9), Ok(None), &[a9.clone(), stale(stopped)]),
+            Ok(Finalize::Raise(None, v(0, 9))),
+            "{stopped}"
+        );
+    }
+    // A stale heartbeat from before node leases cannot be fenced: it
+    // blocks too, and the message says what to do.
+    let mut old_format = NodeInfo::decode(
+        format!(
+            "wasmkeep-node 2\nold\nhttp://old\n0.3.9\n{}\nacme/shop\n",
+            NOW - 3_600_000
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    old_format.app = "acme/shop".to_owned();
+    let refused = check(v(0, 9), Ok(None), &[a9.clone(), old_format]).unwrap_err();
+    assert!(refused.to_string().contains("cluster forget"), "{refused}");
     // The floor above this CLI, and an unreadable one.
     assert_eq!(
         check(v(0, 9), Ok(Some(v(0, 10))), &both),
@@ -435,6 +527,18 @@ fn an_unread_node_object_rewritten_between_listings_is_running() {
         unread: Vec::new(),
     };
     assert!(!own.registered("acme/shop", "a"), "its own lease left out");
+    // At a start, its own earlier lease is left out only at its own
+    // version or a later one: restarted in place on a newer binary, the
+    // node is not the first node of a new app.
+    assert!(!own.registered_at_start("acme/shop", "a", v(0, 9)));
+    assert!(!own.registered_at_start("acme/shop", "a", v(0, 8)));
+    assert!(own.registered_at_start("acme/shop", "a", v(0, 10)));
+    assert!(own.registered_at_start("acme/shop", "b", v(0, 9)));
+    let odd = Listed {
+        nodes: vec![live("a", "nine")],
+        unread: Vec::new(),
+    };
+    assert!(odd.registered_at_start("acme/shop", "a", v(0, 9)));
     assert!(!own.registered("acme/blog", "b"), "another app's node");
 }
 
@@ -544,8 +648,16 @@ mod bucket {
         assert!(seen.late.is_empty());
     }
 
-    /// Section 3: an app that holds nothing is born finalized at its
-    /// first writer's version; a second writer finds the floor.
+    async fn born(
+        b: &ObjectStoreBucket,
+        by: FirstWriter<'_>,
+        this: Minor,
+    ) -> Result<Born, crate::lease::BucketError> {
+        born_finalized(b, "acme", "shop", by, this, NOW, HORIZON).await
+    }
+
+    /// Section 3: an app that never ran is born finalized at its first
+    /// node's version; a second writer finds the floor.
     #[tokio::test]
     async fn a_fresh_app_is_born_finalized() {
         let b = bucket();
@@ -559,11 +671,13 @@ mod bucket {
         b.put_body("apps/acme/shop2/current", b"v 1 3\n".to_vec())
             .await
             .unwrap();
-        // Secrets set before the first deploy, and the uploads of a
-        // deploy that never finished: the app never ran.
+        // Secrets set before the first deploy, the uploads of a deploy
+        // that never finished, and for a node the deploy itself: with
+        // `serve --app` a node always starts after one.
         for key in [
             "apps/acme/shop/secrets/current",
             "apps/acme/shop/0123456789abcdef/manifest",
+            "apps/acme/shop/current",
         ] {
             b.put_body(key, b"x".to_vec()).await.unwrap();
         }
@@ -571,12 +685,12 @@ mod bucket {
             .await
             .unwrap();
         assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("a"), v(0, 9)).await,
+            born(&b, FirstWriter::Node("a"), v(0, 9)).await,
             Ok(Born::Created(v(0, 9)))
         );
         assert_eq!(floor_of(&b).await, Some(v(0, 9)));
         assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("b"), v(0, 10)).await,
+            born(&b, FirstWriter::Node("b"), v(0, 10)).await,
             Ok(Born::HasFloor)
         );
         assert_eq!(floor_of(&b).await, Some(v(0, 9)), "never raised here");
@@ -584,43 +698,61 @@ mod bucket {
 
     /// ADR 0043, "Not settled" 8, as decided: "no node registered" is not
     /// proof of a fresh app. One whose node leases were all removed with
-    /// `cluster forget` still has its deploy or its state, and gets no
-    /// floor: its way back ends only with a `finalize`.
+    /// `cluster forget` still has its state, and gets no floor: its way
+    /// back ends only with a `finalize`. Nor is a node restarted in place
+    /// on a newer binary the first node of a new app.
     #[tokio::test]
     async fn a_forgotten_app_is_not_born_finalized() {
         for (key, why) in [
-            ("apps/acme/shop/current", "it has a deploy"),
-            ("apps/acme/shop/deleted", "it has a deploy"),
+            ("apps/acme/shop/deleted", "it was deleted"),
             ("state/acme/shop/owners/room/lobby", "it has state"),
             (
                 "state/acme/shop/actors/room/lobby/wal/0000000000000001",
                 "it has state",
             ),
         ] {
-            let b = bucket();
-            b.put_body(key, b"x".to_vec()).await.unwrap();
-            assert_eq!(
-                born_finalized(&b, "acme", "shop", Some("a"), v(0, 9)).await,
-                Ok(Born::NotFresh(why)),
-                "{key}"
-            );
-            assert_eq!(floor_of(&b).await, None, "{key}");
+            for by in [FirstWriter::Node("a"), FirstWriter::Deploy] {
+                let b = bucket();
+                b.put_body(key, b"x".to_vec()).await.unwrap();
+                assert_eq!(
+                    born(&b, by, v(0, 9)).await,
+                    Ok(Born::NotFresh(why)),
+                    "{key} {by:?}"
+                );
+                assert_eq!(floor_of(&b).await, None, "{key}");
+            }
         }
-        // A registered node, live or not, and its own id left out.
+        // A deploy: the app ran, for a deploy; a node ignores it.
+        let b = bucket();
+        b.put_body("apps/acme/shop/current", b"x".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            born(&b, FirstWriter::Deploy, v(0, 9)).await,
+            Ok(Born::NotFresh("it has a deploy"))
+        );
+        // A registered node, live or not.
         let b = bucket();
         put(&b, "a", "0.8.1", "released").await;
+        for by in [FirstWriter::Node("b"), FirstWriter::Deploy] {
+            assert_eq!(
+                born(&b, by, v(0, 9)).await,
+                Ok(Born::NotFresh("a node is registered for it"))
+            );
+        }
+        // Its own earlier lease at an older version: restarted in place
+        // from 0.8.1 to 0.9, it creates no floor.
         assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("b"), v(0, 9)).await,
+            born(&b, FirstWriter::Node("a"), v(0, 9)).await,
             Ok(Born::NotFresh("a node is registered for it"))
         );
+        assert_eq!(floor_of(&b).await, None);
+        // At its own version, its earlier lease is only its own.
+        let b = bucket();
+        put(&b, "a", "0.9.1", "released").await;
         assert_eq!(
-            born_finalized(&b, "acme", "shop", None, v(0, 9)).await,
-            Ok(Born::NotFresh("a node is registered for it"))
-        );
-        assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("a"), v(0, 9)).await,
-            Ok(Born::Created(v(0, 9))),
-            "a node restarting into an app with nothing but its own old lease"
+            born(&b, FirstWriter::Node("a"), v(0, 9)).await,
+            Ok(Born::Created(v(0, 9)))
         );
         // An object under nodes/ that does not decode: it cannot be shown
         // to belong to another app.
@@ -629,7 +761,7 @@ mod bucket {
             .await
             .unwrap();
         assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("a"), v(0, 9)).await,
+            born(&b, FirstWriter::Node("a"), v(0, 9)).await,
             Ok(Born::NotFresh("a node is registered for it"))
         );
         // An operator's fence over no object names no node.
@@ -641,9 +773,83 @@ mod bucket {
         };
         b.put_body("nodes/f", fence.encode()).await.unwrap();
         assert_eq!(
-            born_finalized(&b, "acme", "shop", Some("a"), v(0, 9)).await,
+            born(&b, FirstWriter::Node("a"), v(0, 9)).await,
             Ok(Born::Created(v(0, 9)))
         );
+    }
+
+    /// Section 3: the first deploy of a fresh app must not shut the
+    /// prefix's live nodes out of it. It creates the lower of its own
+    /// version and the lowest live version under the prefix (of every
+    /// app: the new app has no node yet), and nothing when that is not
+    /// above what no record means or a live version does not parse. A
+    /// node that starts later creates the floor the deploy left out.
+    #[tokio::test]
+    async fn a_first_deploy_never_shuts_out_the_live_nodes() {
+        let lower = async |cli: Minor, versions: &[&str]| {
+            let b = bucket();
+            for (i, version) in versions.iter().enumerate() {
+                b.put_body(
+                    &format!("nodes/n{i}"),
+                    node_body_of("acme/blog", &format!("n{i}"), version, "live", "take"),
+                )
+                .await
+                .unwrap();
+            }
+            let got = born(&b, FirstWriter::Deploy, cli).await.unwrap();
+            (got, floor_of(&b).await, b)
+        };
+        // No node live under the prefix: the CLI's own version.
+        let (got, floor, _) = lower(v(0, 9), &[]).await;
+        assert_eq!((got, floor), (Born::Created(v(0, 9)), Some(v(0, 9))));
+        // Nodes one minor version behind the CLI: their version.
+        let (got, floor, _) = lower(v(0, 10), &["0.9.0", "0.10.0", "0.9.3"]).await;
+        assert_eq!((got, floor), (Born::Created(v(0, 9)), Some(v(0, 9))));
+        // Nodes ahead of the CLI: the CLI's.
+        let (got, floor, _) = lower(v(0, 9), &["0.10.0"]).await;
+        assert_eq!((got, floor), (Born::Created(v(0, 9)), Some(v(0, 9))));
+        // Nodes of 0.8.1 under a 0.9 CLI: 0.8 is what no record means,
+        // so nothing is written, and those nodes start into the new app.
+        let (got, floor, b) = lower(v(0, 9), &["0.9.0", "0.8.1"]).await;
+        assert!(matches!(got, Born::NotFresh(_)), "{got:?}");
+        assert_eq!(floor, None);
+        // The deploy lands; the first node of the app, of 0.9, then
+        // creates the floor the deploy left out, whatever the deploy.
+        b.put_body("apps/acme/shop/current", b"x".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            born(&b, FirstWriter::Node("s1"), v(0, 9)).await,
+            Ok(Born::Created(v(0, 9)))
+        );
+        // A live version that does not parse: nothing.
+        let (got, floor, _) = lower(v(0, 10), &["0.9.0", "nine"]).await;
+        assert!(matches!(got, Born::NotFresh(_)), "{got:?}");
+        assert_eq!(floor, None);
+        // A stopped node of an old version is not live: it does not count.
+        let b = bucket();
+        b.put_body(
+            "nodes/gone",
+            node_body_of("acme/blog", "gone", "0.8.1", "released", "take"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            born(&b, FirstWriter::Deploy, v(0, 9)).await,
+            Ok(Born::Created(v(0, 9)))
+        );
+
+        // The rule alone.
+        let at = |version: &str| live("n", version);
+        assert_eq!(deploy_floor(v(0, 8), []), Some(v(0, 8)));
+        assert_eq!(deploy_floor(v(0, 8), [&at("0.8.1")]), None);
+        assert_eq!(deploy_floor(v(0, 9), [&at("0.8.1")]), None);
+        assert_eq!(
+            deploy_floor(v(0, 11), [&at("0.10.0"), &at("0.9.0")]),
+            Some(v(0, 9))
+        );
+        assert_eq!(deploy_floor(v(0, 9), [&at("0.10.0")]), Some(v(0, 9)));
+        assert_eq!(deploy_floor(v(0, 10), [&at("0.10.0"), &at("")]), None);
     }
 }
 
@@ -799,7 +1005,11 @@ fn every_format_constant_has_a_row_in_the_gate_table() {
         );
         // No format is newer than this build, and its words are ones a
         // node can announce.
-        assert!(row.since <= this_minor().max(v(0, 9)), "{}", row.name);
+        assert!(
+            row.since <= this_minor().unwrap().max(v(0, 9)),
+            "{}",
+            row.name
+        );
         if let Rule::Gate(words) = row.rule {
             for word in words {
                 assert!(

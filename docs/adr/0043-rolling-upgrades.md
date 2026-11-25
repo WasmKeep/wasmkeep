@@ -420,31 +420,61 @@ conditional create. Without this, every new cluster would need a
 `finalize` before its first gated deploy. A `0.8.1` node started into
 such an app then stops at its first read.
 
-"Holds nothing" is all four of: no floor record; no node registered for
-the app (a starting node leaves its own id out; an object under `nodes/`
-that does not decode counts as a registered node, since it cannot be
-shown to belong to another app); no deploy (neither
-`apps/<tenant>/<app>/current` nor the tombstone `deleted` beside it);
-nothing under `state/<tenant>/<app>/`. "No node registered" alone is not
-proof: an app whose node leases were all removed with `cluster forget`
-still has its deploy or its state, gets no floor, and keeps its way back
-until a `finalize`. Secrets set before an app's first deploy, and the
-uploads of a deploy that never finished, do not make it an app that ran.
-Any doubt writes nothing: a listing that fails, or a create that loses
-to another writer.
+An app never ran when it has no floor record, no registered node, no
+tombstone and nothing under `state/<tenant>/<app>/`:
+
+- **No registered node.** An object under `nodes/` that does not decode
+  counts as one, since it cannot be shown to belong to another app. A
+  starting node leaves its own earlier lease out only when that lease
+  names its own minor version or a later one. A single node restarted in
+  place from `0.8.1` on `0.9` is not the first node of a new app: it
+  creates no floor, and restarted on `0.10` it is refused, the upgrade
+  to `0.9` never having been finalized.
+- "No node registered" alone is not proof: an app whose node leases were
+  all removed with `cluster forget` still has its state, gets no floor,
+  and keeps its way back until a `finalize`.
+- Secrets set before an app's first deploy, and the uploads of a deploy
+  that never finished, do not make it an app that ran.
+- Any doubt writes nothing: a listing that fails, or a create that loses
+  to another writer.
 
 There are two such writers, because with `serve --app` a node waits for
 the app's first deploy and so never sees an app without one:
 
-- **a starting node**, at its first read of the floor, for an app served
-  without a deploy;
-- **the first deploy** into an app (no `current`), once it is accepted
-  and before it writes anything of the app, at the minor version of the
-  `wasmkeep` that deploys. A deploy that is refused or cancelled writes
-  no floor.
+- **The first deploy** of an app (no `current`), once it is accepted and
+  before it writes anything of the app. A deploy that is refused or
+  cancelled writes no floor. It must not shut the cluster's nodes out of
+  the new app, and a new app has no node of its own to ask. So it reads
+  the live nodes under the bucket prefix, of every app, and takes L,
+  their lowest minor version:
+  - no node live under the prefix: the floor is the minor version of the
+    `wasmkeep` that deploys;
+  - a live node whose version does not parse: no floor is written;
+  - otherwise F is the lower of the CLI's version and L. F at or below
+    `0.8` (what no record means) writes nothing; above it, the floor is
+    created at F.
+- **A starting node**, at its first read of the floor, at its own minor
+  version. For a node, a deploy does not make the app one that ran: the
+  deploy may have written no floor (the rule above), and an app with a
+  deploy, no state and no other registered node has nothing a node of
+  the version before could lose. So the first node of an app whose
+  deploy wrote no floor creates it, and no later node finds an app with
+  registered nodes and no floor that was never upgraded. (Without this,
+  a node of N+1 starting there would be told its app was "never
+  finalized".) What an operator gives up: for an app that has a deploy,
+  no state, and whose node leases were all forgotten, the first node of
+  the new version ends the way back.
+
+**Both writers list the nodes again after the create**, as `finalize`
+does after its write. A node of the app below the new floor that is live
+then (or whose lease is stale without a release or a fence) started
+between the listing and the create and never saw the floor. The floor
+stays. The deploy fails naming the node, having written nothing else;
+the starting node does not start, naming it. No wait is needed before
+this listing: a node whose first lease write had not landed reads the
+floor again once it has, and stops itself.
 
 The deploy is a writer this record did not have when it was accepted.
-Its consequence is "Not settled" 9.
 
 ### 4. `wasmkeep cluster upgrade status|finalize`
 
@@ -496,7 +526,11 @@ one named):
 2. The target is the CLI's own minor version. Refused when a live node
    is on a newer one ("finalize with that version's `wasmkeep`").
 3. Refused while any live node of the app is on an older minor version,
-   naming each. Refused with no live node: there is nothing to finalize.
+   naming each. Refused too while an older node's lease is stale but
+   neither `released` nor `fenced`: a stale lease is not proof of a stop
+   (the node may be cut off or slow, and still act), so the message
+   names `wasmkeep cluster fence <id>`. Refused with no live node: there
+   is nothing to finalize.
 4. Writes the floor by conditional write. A lost race is read again.
 5. Waits one start check (a lease's ttl plus grace, plus a heartbeat
    horizon) and lists again. A `0.8.1` node that was starting meanwhile
@@ -507,8 +541,10 @@ one named):
    gated formats remain refused while that node is live (the second half
    of every gate), and the node must be stopped. This second listing is
    what closes the race section 3 leaves open; it is not optional.
-6. Prints the registered nodes that are not live and still name an older
-   version. They are not an error: such a node stops at its next start.
+6. Prints the registered nodes whose lease is released or fenced and
+   still name an older version. They are not an error: such a node stops
+   at its next start. An older lease that is stale without either is
+   reported with the live ones, as an error.
 
 Without `--yes` it prints what it would do and exits 2. There is no
 `--force` and no way back.
@@ -817,9 +853,11 @@ only writer), `crates/wasmkeep-server/src/apps/readers.rs` (`Readers`),
 Decided while building:
 
 1. **The born-finalized condition** (was "Not settled" 8): no floor, no
-   registered node, no deploy (`current` or a tombstone) and nothing
-   under `state/` for the app; written by a starting node and by the
-   first deploy (section 3).
+   registered node, no tombstone and nothing under `state/` for the app;
+   written by the first deploy, at the lower of its version and the
+   lowest live version under the prefix, and by a starting node, which
+   ignores a deploy; both list the nodes again after the create (section
+   3).
 2. **The node that keeps checking its floor** (was "Not settled" 7) has
    no state of its own before the floor is above it, and is `node below
    the floor` after (section 4).
@@ -835,6 +873,11 @@ Decided while building:
 
 Not built by that change:
 
+- **`0.x` to `1.0` cannot be a rolling upgrade under this rule.** A
+  version runs only beside the minor versions next to it in its own
+  major version, and the floor from below has no "previous minor" across
+  a major version. `1.0` decides its own rule (section 1, "Not
+  included").
 - **No format is behind the floor yet.** Manifest 8 and the word `apart`
   (section 2) are the next item. The floor half of `gate` is tested with
   a made-up format; every format `0.8.1` writes passes it by
@@ -845,7 +888,8 @@ Not built by that change:
 - **Writes with no gated format** (`cluster drain`, `fence`, `forget`,
   `actor delete` and `move`, `backup create`) do not run the writer's
   check; a whole-app restore and an actor restore check their words, not
-  the floor.
+  the floor. `secrets rotate-key` has none either, on purpose: it stays
+  usable during an upgrade, and writes the format `0.8.1` reads.
 - Sections 6 (removals), 7 (nothing to build: `0.9` sends as `0.8.1`)
   and 8 (the mixed-version check as proof).
 
@@ -877,10 +921,30 @@ Not built by that change:
    once the floor is above it.
 8. *Settled when built* (section 3, "born finalized"): "no other node
    registered" is not proof of a fresh app, so the condition also needs
-   no deploy and no state under the app.
-9. **A fresh app deployed by a newer `wasmkeep` than its nodes.** The
-   first deploy creates the floor at the CLI's minor version; nodes one
-   minor version older then refuse to start into that app, with the
-   floor's message. Deploy a new app with the `wasmkeep` of the oldest
-   node, or upgrade the nodes first. Whether the deploy should use the
-   lowest live version under the prefix instead was not designed.
+   no state and no tombstone under the app.
+9. *Settled in review* (section 3): a fresh app deployed by a newer
+   `wasmkeep` than its nodes. The first deploy creates the floor no
+   higher than the lowest live version under the prefix, and nothing
+   when that is `0.8`.
+10. **No finalize without a live node.** After an upgrade done by
+    stopping every node, `finalize` is refused until a node is live
+    again. `0.9.x` must ship an offline path before `0.10`: a finalize
+    accepted when every registered lease of the app is released or
+    fenced and names the target version or a later one.
+11. **An object under `nodes/` that does not decode** is never removed
+    by a command: `cluster forget` reads only what it can decode. It
+    holds every start back by a lease's ttl plus grace and keeps its
+    prefix's apps from being born finalized, until it is deleted from
+    the bucket by hand.
+12. **An unreadable floor record** has no repair command. Every node of
+    the app refuses to start and every writer refuses to write until
+    the object is rewritten by hand with the exact body of section 3 (or
+    deleted, which reads as `0.8`). `app delete --force` passes it.
+13. **`secrets rotate-key`** runs no writer's check (see "Built"); the
+    other `secrets` writes do.
+14. **A node of N-1 and a node of N+1 starting at the same moment**
+    beside N can both pass the skew check, each listing before the
+    other's first lease write. Each then sees the other as a live node
+    outside its range only while running, which `cluster status` warns
+    about and which stops neither. Low: an upgrade moves one node at a
+    time.

@@ -305,7 +305,10 @@ impl Cluster {
         use wasmkeep_cluster::app_format::floor;
         let name = floor::key_of(&self.root);
         let key = object_store::path::Path::from(name.as_str());
-        let this = self.own_minor;
+        let this = match &self.own_minor {
+            Ok(this) => *this,
+            Err(why) => return FloorRead::Refused(why.clone()),
+        };
         let read = tokio::time::timeout(self.lease_attempt, async {
             match self.store.get(&key).await {
                 Ok(got) => got.bytes().await.map(Some),
@@ -364,25 +367,48 @@ impl Cluster {
 
     /// Creates the floor of an app that holds nothing, at this node's
     /// minor version; the floor in force after (`None`: still none). Any
-    /// doubt writes nothing and the node starts as before: a registered
-    /// node, a deploy, state, or a bucket that did not answer. `Err`: the
-    /// app has a floor after all (another writer created it), to read.
+    /// doubt writes nothing and the node starts as before: another
+    /// registered node, this node's own earlier lease at an older
+    /// version, state, a tombstone, or a bucket that did not answer. A
+    /// deploy is not a doubt (see
+    /// [`wasmkeep_cluster::upgrade::born_finalized`]). `Err`: the app has
+    /// a floor after all (another writer created it), to read.
+    ///
+    /// The nodes are listed again after the create. An older node of the
+    /// app found then started between the listing and the create: the
+    /// floor stays, and this node does not start beside it
+    /// ([`Self::version_guard`] reports it).
     async fn born_finalized(
         &self,
     ) -> Result<Option<wasmkeep_cluster::app_format::floor::Minor>, ()> {
-        use wasmkeep_cluster::upgrade::{Born, born_finalized};
+        use wasmkeep_cluster::upgrade::{Born, FirstWriter, born_finalized};
+        let Ok(this) = self.own_minor.clone() else {
+            return Ok(None);
+        };
         let born = tokio::time::timeout(
             self.lease_attempt.saturating_mul(2),
             born_finalized(
                 &self.control_keys,
                 self.root.tenant(),
                 self.root.app(),
-                Some(&self.node_id),
-                self.own_minor,
+                FirstWriter::Node(&self.node_id),
+                this,
+                now_ms(),
+                self.heartbeat_horizon_ms,
             ),
         )
         .await;
         match born {
+            Ok(Ok(Born::Late { floor, nodes })) => {
+                let why = format!(
+                    "this node created its app's upgrade floor at {floor}, and the listing after \
+                     it shows older nodes of the app that started meanwhile: {nodes}. The floor \
+                     stays: stop each of them (or `wasmkeep cluster fence` it), then start this \
+                     node again"
+                );
+                *self.born_late.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+                Ok(Some(floor))
+            }
             Ok(Ok(Born::Created(floor))) => {
                 tracing::info!(
                     %floor,
@@ -432,7 +458,10 @@ impl Cluster {
                 && n.lease.is_some()
                 && wasmkeep_cluster::membership::is_live(n, now, self.heartbeat_horizon_ms)
         });
-        let outside = wasmkeep_cluster::upgrade::skew(self.own_minor, live);
+        let outside = match &self.own_minor {
+            Ok(this) => wasmkeep_cluster::upgrade::skew(*this, live),
+            Err(why) => vec![why.clone()],
+        };
         (!outside.is_empty()).then(|| outside.join("; "))
     }
 
@@ -449,13 +478,24 @@ impl Cluster {
         &self,
         floor: Option<wasmkeep_cluster::app_format::floor::Minor>,
     ) -> Result<(wasmkeep_cluster::upgrade::Listed, tokio::time::Instant), String> {
+        let this = self.own_minor.clone()?;
+        let born_late = self
+            .born_late
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(why) = born_late {
+            return Err(why);
+        }
         let first = self.list_for_start().await;
         if let Some(why) = self.skewed(&first) {
             return Err(why);
         }
+        // This node's own earlier lease counts when it names an older
+        // version: a node restarted in place on a newer binary.
         let served = format!("{}/{}", self.root.tenant(), self.root.app());
-        let registered = first.registered(&served, &self.node_id);
-        wasmkeep_cluster::upgrade::floor_from_below(floor, self.own_minor, registered)?;
+        let registered = first.registered_at_start(&served, &self.node_id, this);
+        wasmkeep_cluster::upgrade::floor_from_below(floor, this, registered)?;
         Ok((first, tokio::time::Instant::now()))
     }
 
@@ -495,6 +535,8 @@ impl Cluster {
                  this version ({}) runs only beside the one before and the one after",
                 rewritten.join("`, `"),
                 self.own_minor
+                    .as_ref()
+                    .map_or_else(String::clone, ToString::to_string)
             )
         })
     }

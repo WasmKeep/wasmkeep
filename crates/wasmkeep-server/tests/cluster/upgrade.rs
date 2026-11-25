@@ -59,7 +59,7 @@ fn batched() -> Changes {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_older_node_holds_back_the_finalize_and_a_gated_deploy() {
-    let this = upgrade::this_minor();
+    let this = upgrade::this_minor().unwrap();
     let before = this.previous().unwrap();
     let previous = format!("{before}.0");
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -230,5 +230,142 @@ async fn an_older_node_holds_back_the_finalize_and_a_gated_deploy() {
     assert_eq!(
         send(a.addr, "POST", "/actor/counter/x", "").await.status,
         200
+    );
+}
+
+/// A bucket that, when the floor of `default/default` is created, first
+/// lets a node of an older version land its lease: the node that started
+/// between the listing and the create of a born-finalized app.
+#[derive(Debug)]
+struct LateStarter {
+    inner: Arc<dyn ObjectStore>,
+    lease: Vec<u8>,
+}
+
+impl std::fmt::Display for LateStarter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LateStarter({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LateStarter {
+    async fn put_opts(
+        &self,
+        p: &object_store::path::Path,
+        b: object_store::PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if p.as_ref() == "formats/default/default/floor" {
+            self.inner
+                .put(&"nodes/late".into(), self.lease.clone().into())
+                .await?;
+        }
+        self.inner.put_opts(p, b, o).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(p, o).await
+    }
+    async fn get_opts(
+        &self,
+        p: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(p, o).await
+    }
+    fn delete_stream(
+        &self,
+        p: futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(p)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, o).await
+    }
+}
+
+/// ADR 0043, section 3: the writer of a fresh app's floor lists the nodes
+/// again after the create, as `finalize` does. A node of an older version
+/// whose lease landed between the listing and the create never saw the
+/// floor: the first deploy fails naming it (the floor stays, nothing of
+/// the app is written), and a node that created the floor does not start
+/// beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_node_starting_while_a_fresh_apps_floor_is_created_is_reported() {
+    let previous = format!("{}.0", upgrade::this_minor().unwrap().previous().unwrap());
+    let lease = format!(
+        "wasmkeep-node 3\nlive beef\n{}\nlate\nhttp://127.0.0.1:9\n{previous}\ndefault/default\n\n\nserving\n\ntake front\n",
+        now_ms() + 60_000
+    )
+    .into_bytes();
+    let late_store = || -> (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let outer: Arc<dyn ObjectStore> = Arc::new(LateStarter {
+            inner: Arc::clone(&inner),
+            lease: lease.clone(),
+        });
+        (inner, outer)
+    };
+
+    // The first deploy of the app.
+    let (inner, outer) = late_store();
+    let app = AppRef::new(Arc::clone(&outer), "", "default", "default");
+    let e = app
+        .deploy_changes(
+            &deploy_runtime(),
+            Changes {
+                classes: Some(vec![("c".to_owned(), counter_wasm().to_vec())]),
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, DeployError::Refused(why)
+            if why.contains(&format!("late ({previous})")) && why.contains("started meanwhile")),
+        "{e}"
+    );
+    assert!(floor_record(&inner).await.is_some(), "the floor stays");
+    assert!(app.current().await.unwrap().is_none(), "nothing deployed");
+
+    // The first node of an app served without a deploy.
+    let (inner, outer) = late_store();
+    let dir = tempfile::tempdir().unwrap();
+    let a = node("a", dir.path(), &outer, Duration::from_secs(60)).await;
+    let why = a.service.node_id_checked().await.unwrap_err();
+    assert!(
+        why.contains(&format!("late ({previous})")) && why.contains("started meanwhile"),
+        "{why}"
+    );
+    assert!(floor_record(&inner).await.is_some(), "the floor stays");
+    assert!(
+        matches!(
+            inner.head(&"nodes/a".into()).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
+        "no lease written"
     );
 }

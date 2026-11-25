@@ -446,7 +446,13 @@ pub(crate) struct Cluster {
     root: StateRoot,
     /// This node's minor version (ADR 0043): what the app's upgrade floor
     /// and the other nodes' versions are compared with at start.
-    own_minor: wasmkeep_cluster::app_format::floor::Minor,
+    /// `Err`, with why, for a version that has none: such a node does
+    /// not start (nothing is judged by a guess).
+    own_minor: Result<wasmkeep_cluster::app_format::floor::Minor, String>,
+    /// Set when this node created its app's floor and the listing after
+    /// the create showed an older node of the app: why this node must
+    /// not start (ADR 0043, section 3).
+    born_late: std::sync::Mutex<Option<String>>,
     /// How long after its due time an alarm counts as abandoned: a lease
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
@@ -808,15 +814,19 @@ impl Cluster {
             Some(version) => membership.with_version(version.clone()),
             None => membership,
         };
-        // A version with no minor version to compare (never this build's)
-        // is judged as the oldest that reads the floor.
+        // A version with no minor version to compare is never guessed:
+        // the node refuses to start at its first read of the floor.
         let own_minor =
             config
                 .version
                 .as_deref()
                 .map_or_else(wasmkeep_cluster::upgrade::this_minor, |v| {
-                    wasmkeep_cluster::app_format::floor::Minor::of_version(v)
-                        .unwrap_or(wasmkeep_cluster::app_format::floor::ABSENT)
+                    wasmkeep_cluster::app_format::floor::Minor::of_version(v).ok_or_else(|| {
+                        format!(
+                            "this node's version {v} has no minor version to check the app's \
+                             upgrade floor against"
+                        )
+                    })
                 });
         // Random per runtime, published in every heartbeat (a second
         // process writing this id shows another one), so never the seed of
@@ -899,6 +909,7 @@ impl Cluster {
             store,
             root: StateRoot::new(&config.prefix, root.tenant(), root.app()),
             own_minor,
+            born_late: std::sync::Mutex::new(None),
             alarm_overdue: Duration::from_millis(
                 config
                     .lease
