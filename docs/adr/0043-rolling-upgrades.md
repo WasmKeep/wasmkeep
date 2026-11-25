@@ -275,7 +275,7 @@ format it really writes behind the gate, or the gate ships untested
 | Restore fence, `restored` | Presence; `restored` compared byte for byte | Still a fence | Extend the journal freely; `restored`'s body is frozen |
 | Actor-restore request | `wasmkeep-restore 1`, strict | The node writes a refusal and deletes the request | Gate (`actor-restore` today) |
 | Drain and control intents | Empty bodies; key shape | **Key shape: skipped silently**, never expired | **Frozen** |
-| Backup run | JSON, `"format":1` | CLI only: `verify` and `restore` refuse; unknown fields ignored | Not a cluster format. A newer CLI reads older runs; an older CLI refuses newer ones |
+| Backup run | JSON, `"format":1`, or `2` for a run that carries an app's floor | CLI only: `verify` and `restore` refuse; unknown fields ignored | Not a cluster format. A newer CLI reads older runs; an older CLI refuses newer ones. What an older CLI must not drop in silence gets a new number, written only for a run that has it (section 3, "A restore") |
 | Change feed state | Local files and a binding string | CLI only: a different binding refuses the poll | Not a cluster format |
 | Node call | `wasmkeep-call v4` and seven signed headers | A changed signed set does not verify: the call is refused | **Frozen for `0.9`** (section 7) |
 | Sender of a hop | `wasmkeep-sender v1`, bound to the hop's MAC | Does not verify: refused where the sender is checked | **Frozen for `0.9`** |
@@ -315,7 +315,9 @@ is the one test of "every node announces these words" under it. Writers
 reach both through `apps::Readers`, which reads an app's floor and live
 nodes once: the deploy and the rollback (the manifest's row), `app
 delete` (the tombstone's row), `secrets` (the `_front` scope, among the
-nodes that read secrets), a whole-app restore, an actor restore and `app
+nodes that read secrets), a whole-app restore (every manifest it writes,
+on the floor it leaves: section 3, "A restore"; and its fence's word
+among the registered nodes), an actor restore and `app
 format --enable` (registered nodes, offline ones included), and a
 process that serves several apps (`multi-app`, over the whole prefix).
 It replaced the per-word functions in `apps/readers.rs`
@@ -348,10 +350,10 @@ write exactly what `0.8.1` reads, and adds the writer and the readers of
   not write, with a message naming the key and its length.
 - **Written by conditional writes only** (create when absent, replace
   only the version read), and only upward. Nothing lowers or deletes it.
-- **Outside `state/` and `apps/`.** `app delete`, `deploy --recreate`,
-  a whole-app restore, a backup and `cluster migrate` never list or
-  touch `formats/`. So the floor survives a delete and recreate, and it
-  is not carried by a backup (see "Consequences").
+- **Outside `state/` and `apps/`.** `app delete`, `deploy --recreate`
+  and `cluster migrate` never list or touch `formats/`. So the floor
+  survives a delete and recreate. A backup reads it and a whole-app
+  restore may raise it, never anything else ("A restore", below).
 
 **What `0.8.1` does, as shipped.** In the tree at the `v0.8.1` tag:
 
@@ -489,6 +491,99 @@ this listing: a node whose first lease write had not landed reads the
 floor again once it has, and stops itself.
 
 The deploy is a writer this record did not have when it was accepted.
+
+**A restore.** Decided on 2026-11-25; it closes "Not settled" 4. The
+whole-app restore was the one writer of `current` and of manifests
+outside the gate, and a backup did not carry the floor.
+
+- **A backup carries the floor.** `backup create` reads the app's floor
+  record after its deploy (the floor is only raised, so what it reads is
+  never below what the manifests it just read needed) and stores it in
+  the app's record of the run, `"floor":"0.9"`, under the run's digests.
+  An unreadable record fails the backup. An app without a record has no
+  such field.
+- **Only such a run is format 2.** A `wasmkeep` of `0.8` ignores fields
+  it does not know and would restore the app without its floor. It
+  refuses any format but 1 ("unknown or inconsistent backup format"),
+  so a run in which an app carries a floor says 2. `0.8.1` then refuses
+  to verify or restore it, and also to `create` into an archive whose
+  latest run is one or to `prune` an archive that keeps one, since both
+  load those runs. A run without a floor stays format 1, and `0.8.1`
+  reads it as before. A newer `wasmkeep` reads both, and refuses a run
+  whose number and field disagree.
+- **The restored app's floor is the higher of the target's and the
+  backup's.** A floor is only ever raised, across a restore too: the
+  state and the deploy in the backup were written under the backup's
+  floor, and are not served below it. The restore raises the target's
+  record to the backup's when that is higher (conditional create, or
+  replace of the version read), and writes nothing when the target's is
+  that already. So a restore in the prefix the backup came from changes
+  nothing: its floor is the backup's or was raised since. This holds
+  with `--deploy keep` too: the floor goes with the state.
+- **Never above the `wasmkeep` that restores, and never below the
+  backup's floor.** A `wasmkeep` older than the backup's floor is
+  refused before it writes anything.
+- **The floor is the app's own**, as everywhere else: the gate, the
+  writer's check and `finalize` look at the app's nodes, and `finalize`
+  raises one app's floor beside older nodes of another. So the restore
+  raises the floor whatever the nodes of other apps under the target
+  prefix run, and warns, naming those that are live and older: they
+  keep serving their apps and cannot start into this one. (A process
+  that serves several apps registers one node per app, so a heartbeat
+  names one app.) The first version of this rule refused instead; that
+  made one app's restore depend on another app's upgrade.
+- **The app's own older nodes, before the write.** When the floor has
+  to be raised, the restore first lists the app's registered nodes, as
+  `finalize` does. An older one that is live or not stopped for sure (a
+  lease neither released nor fenced for a ttl plus grace, or a
+  heartbeat from before node leases) refuses the restore before any
+  write, naming it: fence it, or forget the old heartbeat. Those
+  stopped for sure are named in what the restore prints; they cannot
+  come back on their version.
+- **A backup without a floor** (made by `0.8`, or of an app never
+  finalized) restores as before and writes none. If it holds a manifest
+  in a format behind the floor (the record was missing when the run was
+  made), the gate applies on the target's floor; without one, on the
+  floor a first deploy would create, which the restore then creates, and
+  only for a target app that is new (no deploy, no registered node). An
+  app that is not new is finalized by `finalize`, not by a restore.
+- **Every manifest the restore writes goes through the gate**: the
+  current version's and each kept one's, by the same path as a deploy
+  and a rollback (`AppRef::check_restore`, on `Readers::gate`), on the
+  floor the restore leaves, with the writer's own check. With `--deploy
+  keep` it writes none.
+- **Order.** The whole check runs before the restore writes anything in
+  the target (after its own check that no node of the app is live), and
+  again under its lock. The floor is written after the fence, the quiet
+  wait and the undo backup of a restore in place, and before any state
+  is removed or copied. That step runs on every run, a resume in any
+  later phase included: the write (which finds the floor when it is
+  there), then the nodes listed again whenever the app has a floor above
+  `0.8`, as after a first deploy's create, then the gate on the floor
+  the target now has. An older node of the app that is live or not
+  stopped for sure fails the restore there, and on every rerun until it
+  is fenced: the floor stays. `--abort` leaves the floor, as a refused
+  deploy leaves the one it created; it does not bring back a lower one
+  for the app's own stopped nodes.
+- **What it gives up.** A restore in place from a backup with a higher
+  floor than the target's ends the target's way back without a
+  `finalize`, with no node of the app live: the offline finalize of
+  "Not settled" 10, for this one case. And an archive that holds a
+  format 2 run needs `0.9` for every backup command: a `0.8.1` `create`
+  refused there has already written its run's `started` object, which
+  holds `prune` back for 24 hours, and a refused `0.8.1` `restore` has
+  left its archive pin. Backup jobs are upgraded before the first `0.9`
+  backup of a finalized app; `create` says when an archive crosses that
+  line. An undo run crosses it too: an in-place restore of a format 1
+  run into an app that has a floor writes a format 2 undo run.
+
+Tests: `upgrade::tests` (the rule alone, and the write with its second
+listing), the backup tests of `wasmkeep-cli` (the run's format, a format 8
+app into an empty prefix, beside older nodes of another app, an older
+node of the app not stopped for sure, `--deploy keep`, a backup without
+a floor, the higher floor kept, a rerun's listing, the undo run's format,
+and the floor written before the app at every failed write), and `tests/cluster/restore.rs` (a restored app on
+which a node of `0.8` stops at the floor and a node of `0.9` serves).
 
 ### 4. `wasmkeep cluster upgrade status|finalize`
 
@@ -831,12 +926,11 @@ page says.
   The upgrading page says so in its first paragraph.
 - **The node file is part of going back.** A key added in `0.9` stops a
   `0.8.1` binary. The upgrading page lists the keys to remove first.
-- **A backup does not carry the floor**, nor the recorded-head setting.
-  A whole-app restore in place keeps the target's floor. A restore into
-  another prefix creates state with no floor, and a `0.8.1` node could
-  start there on formats it refuses; the restore command should write
-  the floor of the version that restores. That is a change to the
-  restore, not designed here.
+- **A backup carries the floor** (section 3, "A restore"), not the
+  recorded-head setting (`app format --enable` is run again after a
+  restore into another prefix). A whole-app restore leaves the higher of
+  the target's floor and the backup's. A run that carries a floor is one
+  a `wasmkeep` of `0.8` refuses, so backup jobs are upgraded first.
 - `app delete` and `deploy --recreate` keep the floor. An app recreated
   after a finalize stays finalized.
 - The frozen rows are a constraint on later records: the node lease's
@@ -912,8 +1006,9 @@ Not built by that change:
 - **Writes with no gated format** (`cluster drain`, `fence`,
   `actor delete` and `move`, `backup create`; `forget` too, which asks
   the gate only for its mark, below) do not run the writer's
-  check; a whole-app restore and an actor restore check their words, not
-  the floor. `secrets rotate-key` has none either, on purpose: it stays
+  check; an actor restore checks its word, not the floor. (A whole-app
+  restore went through the gate later: section 3, "A restore".)
+  `secrets rotate-key` has none either, on purpose: it stays
   usable during an upgrade, and writes the format `0.8.1` reads.
 - Sections 6 (removals), 7 (nothing to build: `0.9` sends as `0.8.1`)
   and 8 (the mixed-version check as proof).
@@ -1156,13 +1251,11 @@ node-lease simulation was run again over the changed module.
 3. *Settled by reading* (section 6): a serving `0.8.1` node of one app
    sends a forward with no proof while its cluster secret is not
    loaded, and when the client's address is unknown. The branch stays.
-4. **A restore into another prefix** and the floor ("Consequences").
-   A whole-app restore writes `current` and the manifest outside the
-   gate and copies no floor. So an app on manifest 8 restored into
-   another prefix has no floor there, and a `0.8.1` node started there
-   passes the floor check and then fails closed on the manifest it
-   cannot read. **To fix before the `0.9.0` release:** the restore goes
-   through the gate and creates the floor.
+4. *Settled on 2026-11-25* (section 3, "A restore"): a restore into
+   another prefix. A backup carries the app's floor, and a whole-app
+   restore checks every manifest it writes through the gate and leaves
+   the higher of the target's floor and the backup's, before anything
+   else of the app.
 5. **Rows of the gate table read once** (history content, alarm index,
    restore fence, control intents) and four items on the wire read only
    in comments: the take call, the socket hand-off relay, the placed

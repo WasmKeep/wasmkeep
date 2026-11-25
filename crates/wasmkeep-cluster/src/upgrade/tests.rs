@@ -953,6 +953,169 @@ mod bucket {
         assert_eq!(deploy_floor(v(0, 9), [&at("0.10.0")]), Some(v(0, 9)));
         assert_eq!(deploy_floor(v(0, 10), [&at("0.10.0"), &at("")]), None);
     }
+
+    /// Section 3, "A restore": the target ends on the higher of its floor
+    /// and the backup's, whatever the nodes of other apps under the
+    /// prefix run, and never from a `wasmkeep` older than the backup's
+    /// floor; a backup without a floor writes one only for a manifest
+    /// that needs it, as a first deploy would.
+    #[test]
+    fn a_restore_keeps_the_higher_floor_and_is_never_below_the_backups() {
+        use RestoreFloor::{CreateIfNew, Keep, Raise};
+        let at = |version: &str| live("n", version);
+        let eight = manifest_format(8).unwrap();
+        let none: [&NodeInfo; 0] = [];
+        let plan = |this, existing, archived, needs, live: &[&NodeInfo]| {
+            restore_floor(this, Ok(existing), archived, needs, live.iter().copied())
+        };
+        // No floor anywhere, nothing that needs one: as before 0.9.
+        assert_eq!(plan(v(0, 9), None, None, None, &none), Ok(Keep));
+        assert_eq!(
+            plan(
+                v(0, 9),
+                None,
+                None,
+                Some(manifest_format(7).unwrap()),
+                &none
+            ),
+            Ok(Keep)
+        );
+        assert_eq!(plan(v(0, 9), None, None, None, &[&at("0.8.1")]), Ok(Keep));
+        // The backup's floor, whatever the restoring version above it.
+        for this in [v(0, 9), v(0, 10)] {
+            assert_eq!(
+                plan(this, None, Some(v(0, 9)), Some(eight), &none),
+                Ok(Raise(v(0, 9)))
+            );
+        }
+        assert_eq!(
+            plan(v(0, 9), Some(v(0, 8)), Some(v(0, 9)), None, &[&at("0.9.3")]),
+            Ok(Raise(v(0, 9)))
+        );
+        // The higher of the two: the target's is kept when it is.
+        for existing in [v(0, 9), v(0, 10)] {
+            assert_eq!(
+                plan(
+                    v(0, 10),
+                    Some(existing),
+                    Some(v(0, 9)),
+                    Some(eight),
+                    &[&at("0.8.1")]
+                ),
+                Ok(Keep),
+                "nothing to write, so no live node is asked"
+            );
+        }
+        // The floor is the app's: raised whatever the nodes of other apps
+        // under the prefix run. Those it keeps out of the app are named.
+        let blog =
+            NodeInfo::decode(&node_body_of("acme/blog", "x", "0.8.1", "live", "take")).unwrap();
+        let junk =
+            NodeInfo::decode(&node_body_of("acme/blog", "y", "junk", "live", "take")).unwrap();
+        let own = at("0.8.1");
+        let new =
+            NodeInfo::decode(&node_body_of("acme/blog", "z", "0.9.0", "live", "take")).unwrap();
+        assert_eq!(
+            plan(v(0, 9), None, Some(v(0, 9)), None, &[&blog, &junk]),
+            Ok(Raise(v(0, 9)))
+        );
+        assert_eq!(
+            shut_out(v(0, 9), "acme/shop", [&blog, &junk, &own, &new]),
+            ["x (acme/blog, 0.8.1)", "y (acme/blog, junk)"]
+        );
+        // Never above the `wasmkeep` that restores.
+        let e = plan(v(0, 8), None, Some(v(0, 9)), None, &none).unwrap_err();
+        assert!(e.contains("older than the app in the backup"), "{e}");
+        // No floor in the backup, and a manifest that needs one.
+        assert_eq!(
+            plan(v(0, 9), None, None, Some(eight), &none),
+            Ok(CreateIfNew(v(0, 9)))
+        );
+        assert_eq!(
+            plan(v(0, 10), None, None, Some(eight), &[&at("0.9.0")]),
+            Ok(CreateIfNew(v(0, 9)))
+        );
+        assert_eq!(
+            plan(v(0, 9), Some(v(0, 9)), None, Some(eight), &none),
+            Ok(Keep)
+        );
+        let e = plan(v(0, 9), None, None, Some(eight), &[&at("0.8.1")]).unwrap_err();
+        assert!(e.contains("n (acme/shop, 0.8.1)"), "{e}");
+        let e = plan(v(0, 8), None, None, Some(eight), &none).unwrap_err();
+        assert!(e.contains("this `wasmkeep` is 0.8"), "{e}");
+        // A floor that exists and is too low is not the restore's to raise.
+        let e = plan(v(0, 9), Some(v(0, 8)), None, Some(eight), &none).unwrap_err();
+        assert!(e.contains("cluster upgrade finalize"), "{e}");
+        // Unreadable: nothing is planned.
+        let e = restore_floor(
+            v(0, 9),
+            Err(floor::Unknown { len: 3 }),
+            Some(v(0, 9)),
+            None,
+            none,
+        )
+        .unwrap_err();
+        assert!(e.contains("unreadable (3 bytes)"), "{e}");
+    }
+
+    /// The restore's write: conditional and only upward. Its listing,
+    /// before and after: the app's older nodes, those not stopped for
+    /// sure apart from those that are.
+    #[tokio::test]
+    async fn a_restore_raises_the_floor_and_lists_the_apps_older_nodes() {
+        let b = bucket();
+        let raise = async |to| restore_raise(&b, "acme", "shop", to).await;
+        let older = async |floor| {
+            older_nodes(&b, "acme/shop", floor, "", NOW, HORIZON)
+                .await
+                .unwrap()
+        };
+        put(&b, "gone", "0.8.1", "released").await;
+        b.put_body(
+            "nodes/x",
+            node_body_of("acme/blog", "x", "0.8.1", "live", "take"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            older(v(0, 9)).await,
+            Older {
+                not_stopped: None,
+                stopped: Some("gone (0.8.1)".to_owned()),
+            },
+            "another app's node is not this app's"
+        );
+        assert_eq!(raise(v(0, 9)).await, Ok(()));
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
+        // Never lowered.
+        assert_eq!(raise(v(0, 8)).await, Ok(()));
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
+        // An older node of the app that started meanwhile, and one whose
+        // heartbeat is from before node leases: neither stopped for sure.
+        put(&b, "late", "0.9.2", "live").await;
+        b.put_body(
+            "nodes/old",
+            b"wasmkeep-node 2\nold\nhttp://old\n0.7.0\n1\nacme/shop\n".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raise(v(0, 10)).await, Ok(()));
+        let found = older(v(0, 10)).await;
+        let named = found.not_stopped.unwrap();
+        assert!(
+            named.contains("late (0.9.2)") && named.contains("old (0.7.0)"),
+            "{named}"
+        );
+        assert_eq!(found.stopped.as_deref(), Some("gone (0.8.1)"));
+        // Unreadable: refused.
+        b.put_body("formats/acme/shop/floor", b"9\n".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            raise(v(0, 11)).await,
+            Err(floor::RaiseError::Unreadable { len: 2, .. })
+        ));
+    }
 }
 
 /// Every `.rs` file under `crates/`, with its path.

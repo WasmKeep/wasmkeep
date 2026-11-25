@@ -40,6 +40,17 @@ pub(super) async fn app_node_following(
     data: &Path,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<(Node, tokio::task::JoinHandle<()>), DeployError> {
+    app_node_following_as(id, data, store, None).await
+}
+
+/// [`app_node_following`], the node standing for `node_version` when given
+/// (as `ClusterConfig::version` lets a test say), not this build's.
+pub(super) async fn app_node_following_as(
+    id: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    node_version: Option<&str>,
+) -> Result<(Node, tokio::task::JoinHandle<()>), DeployError> {
     let app = app_ref(store);
     app.prepare_local(&wasmkeep_server::local_app_dir(data, TENANT, APP))
         .await?;
@@ -67,6 +78,7 @@ pub(super) async fn app_node_following(
     cluster.failover_wait = Some(Duration::ZERO);
     cluster.app = format!("{TENANT}/{APP}");
     cluster.follows_app = true;
+    cluster.version = node_version.map(str::to_owned);
     config.cluster = Some(cluster);
     let cluster_port = cluster_listener(&mut config).await;
     let service = ActorService::new(runtime, config, classes).unwrap();

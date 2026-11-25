@@ -61,6 +61,12 @@ The text under a version's heading is its GitHub release text
   `finalize`. A deploy never sets the floor above the lowest version
   live under the bucket prefix, and a node restarted in place on a
   newer version creates none.
+- **A backup carries the app's upgrade floor, and a restore keeps it.**
+  `backup create` stores the floor of an app that has one. A whole-app
+  restore leaves the higher of the target's floor and the backup's,
+  written before any state or deploy, so a node of an older version
+  started on the restored app stops at the floor
+  ([backup and restore](docs/deploy/backup-and-restore.md#the-upgrade-floor-and-the-deploys-format)).
 
 ### Changed
 
@@ -71,6 +77,24 @@ The text under a version's heading is its GitHub release text
   the app's floor record is unreadable. Each refusal says which
   `wasmkeep` may write: one within one minor version of every live
   node, and not older than the floor.
+- **A whole-app restore is checked like a deploy** (ADR 0043). Every
+  version it installs goes through the deploy's gate, on the floor the
+  restore leaves, before anything is written. It is refused from a
+  `wasmkeep` older than the floor, and, when it has to raise the floor,
+  while an older node of the app is registered and not stopped for
+  sure (fence it, or forget a heartbeat from before node leases). It
+  warns, naming them, when live nodes of other apps under the prefix
+  are older than the floor: they cannot serve the restored app.
+- **A backup run that carries a floor is backup format 2. Upgrade
+  backup jobs to 0.9 before the first 0.9 backup of a finalized app.**
+  A `wasmkeep` of 0.8 refuses such a run (`unknown or inconsistent
+  backup format`) instead of restoring the app without its floor: for
+  `backup verify` and `restore`, and for `create` and `prune` on an
+  archive whose latest or kept run is one. A refused 0.8 `create`
+  leaves a `runs/<id>/started` object that blocks `prune` for 24 hours;
+  [backup and restore](docs/deploy/backup-and-restore.md#online-archives)
+  says how to clear it. `create` says when an archive starts to need
+  0.9. A run in which no app has a floor stays format 1.
 - One check now answers "does every live node announce this word" for
   every writer, the CLI included. The messages are unchanged.
 - **`wasmkeep cluster forget` no longer deletes the lease of a node

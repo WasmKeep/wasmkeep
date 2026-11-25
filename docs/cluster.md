@@ -1780,7 +1780,10 @@ page says; these are the commands it uses.
   the first deploy of an app that never ran (no deploy, no state, no
   registered node), or its first node. A deploy never sets the floor
   above the lowest version live under the bucket prefix, so the nodes
-  that run the other apps can start into the new one.
+  that run the other apps can start into the new one. A backup carries
+  the floor, and a whole-app restore leaves the higher of the target's
+  and the backup's
+  ([backup and restore](deploy/backup-and-restore.md#the-upgrade-floor-and-the-deploys-format)).
 - **`wasmkeep cluster upgrade status`** shows, per app, each node's
   version, the floor, and one state: `one version`, `mixed`, `finalize
   pending` (every live node runs the new version, the floor is still the

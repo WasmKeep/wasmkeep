@@ -183,6 +183,11 @@ async fn app_nodes(store: &Store, prefix: &str, served: &str) -> anyhow::Result<
     for (id, meta) in list_bounded(store, &root).await? {
         let body = read(store, meta.location.as_ref(), META_MAX).await?;
         let node = NodeInfo::decode(&body).filter(|node| node.id == id);
+        // The mark of a `cluster forget` under way: no node, of no app.
+        // Read as an unknown one it would force the long quiet wait.
+        if wasmkeep_cluster::node_lease::forgotten(&body).is_some() {
+            continue;
+        }
         let relevant = match &node {
             // Its app is unknown: it may be this one.
             None => {
@@ -639,12 +644,49 @@ pub(super) async fn execute_settled(
             }
         }
     }
+    // ADR 0043, section 3, "A restore": the floor the restore leaves in the
+    // target, and every manifest it will write through the same gate as a
+    // deploy, before anything is written.
+    let archived_floor = archived_floor(app)?;
+    let mut manifests = Vec::new();
+    if choice == DeployChoice::Backup {
+        for object in array(app, "objects")? {
+            let tail = text(object, "key")?
+                .strip_prefix(&source_app)
+                .context("app object outside app")?;
+            if tail.split('/').count() == 2 && tail.ends_with("/manifest") {
+                manifests.push(
+                    apps::Manifest::parse(std::str::from_utf8(&blob(archive, ap, object).await?)?)
+                        .with_context(|| format!("invalid manifest {tail} in backup"))?,
+                );
+            }
+        }
+    }
+    let gated = apps::AppRef::new(Arc::clone(target), tp, &args.app.0, &args.app.1);
+    let gated = match args.writer {
+        Some(minor) => gated.as_version(minor),
+        None => gated,
+    };
     let undoing = existing.is_some()
         && journal["before_restore"].as_str() == Some(id.as_str())
         && journal["run"] != id;
     let binding = json!({"run":id,"root":digest(&root),"from":args.from,"bucket":args.bucket,
         "app":name,"in_place":args.in_place,"deploy":format!("{choice:?}")});
+    // The app's own nodes first: "stop them" comes before what the gate
+    // would say of them.
     nodes(args, target, tp).await?;
+    let floor_note = |check: &apps::RestoreCheck| -> Option<String> {
+        let floor = check.raise?;
+        let mut kept_out = check.shut_out.clone();
+        kept_out.extend(check.left_behind.clone());
+        (!kept_out.is_empty()).then(|| format!(
+            "these nodes run a version older than {floor} and cannot serve {name}: {}. Start it on {floor} or later",
+            kept_out.join(", ")))
+    };
+    let checked = gated.check_restore(archived_floor, &manifests).await?;
+    if let (Some(floor), Some(note)) = (checked.raise, floor_note(&checked)) {
+        eprintln!("WARNING: this restore sets the upgrade floor of {name} to {floor}; {note}.");
+    }
     if existing.is_some() {
         ensure!(
             journal["binding"] == binding
@@ -666,6 +708,7 @@ pub(super) async fn execute_settled(
     let (lock_version, lock_nonce) = acquire_lock(target, &lock, &binding).await?;
     let result = async {
         nodes(args, target, tp).await?;
+        gated.check_restore(archived_floor, &manifests).await?;
         ensure!(optional(target, &fence).await? == existing, "restore changed while acquiring lock; retry");
         if existing.is_none() {
             ensure!(args.in_place || list_bounded(target, &state).await?.is_empty(),
@@ -787,6 +830,19 @@ pub(super) async fn execute_settled(
             journal["seeds"] = json!(seeds);
             journal["phase"] = json!(if args.in_place { "clear" } else { "copy" });
             save_journal(target, &fence, &journal).await?;
+        }
+        // The floor, after the undo backup and before anything of the app's
+        // state or deploy is removed or written: raised only. On every run,
+        // a resume in clear or copy included: the nodes are listed again
+        // after it, then the gate runs on the floor the target now has.
+        // `--abort` leaves the floor.
+        let checked = gated.check_restore(archived_floor, &manifests).await?;
+        gated.settle_restored_floor(checked.raise).await?;
+        if let Some(floor) = checked.raise {
+            println!("Upgrade floor of {name} set to {floor}: no node of an older version starts for it.{}",
+                floor_note(&checked).map(|note| format!(" So {note}.")).unwrap_or_default());
+            ensure!(gated.check_restore(archived_floor, &manifests).await?.raise.is_none(),
+                "the upgrade floor of {name} changed while it was written; run the restore again");
         }
         if journal["phase"] == "clear" {
             nodes(args, target, tp).await?;
