@@ -9,39 +9,47 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+**0.9 is upgraded one node at a time: a cluster moves from 0.8.1 to 0.9.0
+without stopping as a whole, and one command ends the upgrade.** A node
+refuses to start beside a version it cannot run with, each app has an
+upgrade floor, and `wasmkeep cluster upgrade finalize` raises it once
+every node runs the new version. Until then any node may go back to 0.8.1
+and nothing 0.8.1 cannot read is written; after it there is no way back.
+What 0.9.0 adds to the bucket waits for the finalize: a deploy with
+`apart-from` or `spread` for your own class names, and the mark that
+keeps `cluster forget` from deleting the lease of a node that just
+started. Also new are `wasmkeep
+cluster verify`, which checks that a bucket is whole and never writes,
+and optional traces over OTLP. `wasmkeep cluster migrate` is removed, with
+three forms only nodes older than 0.6.0 sent: 0.8.1 is the last version
+that carries them. A backup of a finalized app needs 0.9 to be read, so
+upgrade backup jobs with the cluster. The steps, and what is not built
+yet, are in [upgrading to 0.9.0](docs/deploy/upgrading-to-0.9.md). Still
+a **pre-alpha pre-release**.
+
 ### Added
 
-- **Traces** (ADR 0044, first slice): optional OTLP/HTTP export
-  (`--otlp-endpoint`) of spans for requests, fronts, actor events and
-  their bucket requests. Off by default.
 - **`wasmkeep cluster upgrade status` and `finalize`** (ADR 0043).
   `status` shows each node's version, each app's upgrade floor and the
   state of its upgrade. `finalize --yes` ends an upgrade: it raises the
   app's floor to the new version once every live node runs it, and is
   refused, naming them, while a live node is older, or while an older
   node's lease is stale without a release or a fence (run `wasmkeep
-  cluster fence` first). After it, no node of an older version starts. `cluster status` shows the floor and
-  `finalize pending` in one line per app.
-- **`wasmkeep cluster verify`** checks that a bucket is whole. It only
-  reads: no write is ever sent. Per app it checks `current`, the
-  manifest and each component's digest. Per actor it checks that a
-  restore plan exists from a snapshot through every segment to the
-  head, that the ownership record decodes, and, in an app that records
-  heads, that the recorded head is reached. It also checks alarm index
-  entries, file records, node leases and the upgrade floor, and counts
-  the per-actor lease markers left. `--deep` reads every history object
-  and checks its checksums. `--app`, `--actor` and `--sample N` narrow
-  it; `--json` is for scripts. It prints objects read, requests and
-  time, and exits with 1 naming the key of each problem. What the
-  bucket refused to give is listed apart and exits with 2: no verdict.
-  It is not
-  `backup verify` (a backup's own contents) nor `cluster diagnose`
-  (what the bucket's API does).
-  [Verifying a bucket](docs/cluster.md#verifying-a-bucket).
+  cluster fence` first). After it, no node of an older version starts.
+  `cluster status` shows the floor and `finalize pending` in one line
+  per app
+  ([upgrading WasmKeep](docs/cluster-upgrades.md#versions-the-upgrade-floor-and-finalize)).
 - **A node refuses to start beside a version it cannot run with.** A
   node of minor version N starts only while every live node of its app
   runs N-1, N or N+1, and names the node that stops it. It also refuses
   an app whose previous upgrade was never finalized.
+- **A new app is born finalized.** The first deploy of an app that
+  never ran, or the first node of an app served without a deploy,
+  creates its upgrade floor at its own version. An app that already has
+  a deploy, state or a registered node keeps the floor it has until
+  `finalize`. A deploy never sets the floor above the lowest version
+  live under the bucket prefix, and a node restarted in place on a
+  newer version creates none.
 - **`apart-from` and `spread` for your own class names.** Placement
   keeps a room and its pusher on different nodes and spreads a room's
   edges, for classes named `room`, `pusher` and `edge`. A class in
@@ -54,19 +62,31 @@ The text under a version's heading is its GitHub release text
   version keeps the format nodes of 0.8.1 read
   ([project file](docs/project-file.md#front-and-classes),
   [ADR 0041, amendment](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names)).
-- **A new app is born finalized.** The first deploy of an app that
-  never ran, or the first node of an app served without a deploy,
-  creates its upgrade floor at its own version. An app that already has
-  a deploy, state or a registered node keeps the floor it has until
-  `finalize`. A deploy never sets the floor above the lowest version
-  live under the bucket prefix, and a node restarted in place on a
-  newer version creates none.
 - **A backup carries the app's upgrade floor, and a restore keeps it.**
   `backup create` stores the floor of an app that has one. A whole-app
   restore leaves the higher of the target's floor and the backup's,
   written before any state or deploy, so a node of an older version
   started on the restored app stops at the floor
   ([backup and restore](docs/deploy/backup-and-restore.md#the-upgrade-floor-and-the-deploys-format)).
+- **`wasmkeep cluster verify`** checks that a bucket is whole. It only
+  reads: no write is ever sent. Per app it checks `current`, the
+  manifest and each component's digest. Per actor it checks that a
+  restore plan exists from a snapshot through every segment to the
+  head, that the ownership record decodes, and, in an app that records
+  heads, that the recorded head is reached. It also checks alarm index
+  entries, file records, node leases and the upgrade floor, and counts
+  the per-actor lease markers left. `--deep` reads every history object
+  and checks its checksums. `--app`, `--actor` and `--sample N` narrow
+  it; `--json` is for scripts. It prints objects read, requests and
+  time, and exits with 1 naming the key of each problem. What the
+  bucket refused to give is listed apart and exits with 2: no verdict.
+  It is not `backup verify` (a backup's own contents) nor `cluster
+  diagnose` (what the bucket's API does)
+  ([verifying a bucket](docs/cluster-operations.md#verifying-a-bucket)).
+- **Traces** (ADR 0044, first slice): optional OTLP/HTTP export
+  (`--otlp-endpoint`) of spans for requests, fronts, actor events and
+  their bucket requests. Off by default
+  ([monitoring](docs/monitoring.md#traces)).
 
 ### Changed
 
@@ -76,7 +96,9 @@ The text under a version's heading is its GitHub release text
   `--force`) and `app format --enable`. A deploy is also refused while
   the app's floor record is unreadable. Each refusal says which
   `wasmkeep` may write: one within one minor version of every live
-  node, and not older than the floor.
+  node, and not older than the floor. One check now answers "does every
+  live node announce this word" for every writer, the CLI included; the
+  messages are unchanged.
 - **A whole-app restore is checked like a deploy** (ADR 0043). Every
   version it installs goes through the deploy's gate, on the floor the
   restore leaves, before anything is written. It is refused from a
@@ -95,8 +117,6 @@ The text under a version's heading is its GitHub release text
   [backup and restore](docs/deploy/backup-and-restore.md#online-archives)
   says how to clear it. `create` says when an archive starts to need
   0.9. A run in which no app has a floor stays format 1.
-- One check now answers "does every live node announce this word" for
-  every writer, the CLI included. The messages are unchanged.
 - **`wasmkeep cluster forget` no longer deletes the lease of a node
   that just started under the same id**, once the app's upgrade to 0.9
   is finalized. It replaces the released lease with a mark, by a write
@@ -105,30 +125,16 @@ The text under a version's heading is its GitHub release text
   the command stopped between its two steps, the node does not start
   after 60 s and says to run the command again; `cluster status` names
   such a mark, and so does `cluster verify`, as a `note:` line (`notes`
-  in `--json`) that changes neither its verdict nor its exit code; it
-  reported the mark as a problem. A node whose start check was watching a released lease
-  that is removed now checks its node id again and starts, where it
-  stopped with `this node's lease object was deleted`. Before the
-  finalize the command deletes as it did, and says so
+  in `--json`) that changes neither its verdict nor its exit code. A
+  node whose start check was watching a released lease that is removed
+  now checks its node id again and starts, where it stopped with `this
+  node's lease object was deleted`. Before the finalize the command
+  deletes as it did, and says so
   ([cluster](docs/cluster.md#how-it-works),
   [ADR 0043](docs/adr/0043-rolling-upgrades.md#built-the-removals-and-the-mark-of-cluster-forget)).
 
-### Fixed
-
-- A restore's read of a history object, and an upload's read-back,
-  keep no more of a body than the size its answer declared, and read
-  again one that goes past it or ends short of it (a read-back takes a
-  longer one for other bytes at once). A long body was read without a
-  bound, and a short one was taken as the object.
-
 ### Removed
 
-- **Nodes no longer accept what only versions before 0.6.0 sent.** A
-  signed call, or a forward's proof, that names no sender is refused
-  with 503. The forward proof's older form of the client address is not
-  read. A hello answered 404 counts as failed and is sent again. Nodes
-  of 0.8.1 send none of these, so an upgrade from 0.8.1 is not affected
-  ([ADR 0038, amendment](docs/adr/0038-several-apps-per-process.md#amendment-2026-11-25-the-older-forms-are-no-longer-accepted)).
 - **`wasmkeep cluster migrate` is removed** (ADR 0022), with
   `--rollback` and `--remove-old`. A cluster older than 0.4.0 upgrades
   through 0.8.x first: pin the 0.8.1 binary, migrate with it, then
@@ -139,6 +145,12 @@ The text under a version's heading is its GitHub release text
   cluster is still on 0.8.1, before upgrading: 0.9.0 cannot remove them.
   Nodes and commands still refuse a tenant left in the old layout, or a
   prefix a 0.8.x migration holds, and now say to use 0.8.1.
+- **Nodes no longer accept what only versions before 0.6.0 sent.** A
+  signed call, or a forward's proof, that names no sender is refused
+  with 503. The forward proof's older form of the client address is not
+  read. A hello answered 404 counts as failed and is sent again. Nodes
+  of 0.8.1 send none of these, so an upgrade from 0.8.1 is not affected
+  ([ADR 0038, amendment](docs/adr/0038-several-apps-per-process.md#amendment-2026-11-25-the-older-forms-are-no-longer-accepted)).
 
 ### Fixed
 
@@ -159,6 +171,11 @@ The text under a version's heading is its GitHub release text
   continues from it
   ([ADR 0042](docs/adr/0042-compacting-an-idle-actors-history.md), "As
   built: a release retried in the background").
+- **A restore's read of a history object, and an upload's read-back,
+  are bounded.** They keep no more of a body than the size its answer
+  declared, and read again one that goes past it or ends short of it (a
+  read-back takes a longer one for other bytes at once). A long body
+  was read without a bound, and a short one was taken as the object.
 
 ## 0.8.1
 
