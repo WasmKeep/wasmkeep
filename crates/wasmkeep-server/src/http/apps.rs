@@ -205,6 +205,19 @@ impl AppTable {
         self.serve(i, req).await
     }
 
+    /// The running app a hop names, if it names one this process serves.
+    pub(crate) fn app_of_hop(&self, headers: &hyper::HeaderMap) -> Option<App> {
+        let mut names = headers.get_all(crate::cluster::APP).iter();
+        let (Some(name), None) = (names.next(), names.next()) else {
+            return None;
+        };
+        let i = *name.to_str().ok().and_then(|n| self.by_name.get(n))?;
+        match self.slots[i].get() {
+            SlotState::Running(app) => Some(app),
+            SlotState::Starting | SlotState::Deleted => None,
+        }
+    }
+
     async fn serve(&self, i: usize, req: Request<Incoming>) -> Response<HyperOutgoingBody> {
         match self.slots[i].get() {
             SlotState::Running(app) => app.route(req).await,

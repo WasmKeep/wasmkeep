@@ -803,6 +803,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_trace: false,
             process: None,
         }
     }

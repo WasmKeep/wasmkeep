@@ -39,6 +39,7 @@ pub(super) fn peer(app: &str) -> Peer {
         can_blobs: true,
         instance: None,
         can_place: false,
+        traces: false,
         seen: None,
     }
 }
@@ -477,6 +478,7 @@ async fn a_live_node_without_multi_app_makes_several_apps_not_ready() {
         can_multi_app: multi,
         can_place: false,
         can_apart: false,
+        can_trace: false,
         process: None,
     };
     b.note_multi_app(&[n("a", true), n("old", false)]);

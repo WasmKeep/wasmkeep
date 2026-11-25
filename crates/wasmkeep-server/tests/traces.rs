@@ -199,9 +199,25 @@ async fn traces_http_event_bucket_and_off() {
         .iter()
         .find(|s| s.name == "front")
         .expect("front span");
+    // A local call: its `call` span under the front, its event under that,
+    // and no hop.
+    let call = spans
+        .iter()
+        .find(|s| s.name == "call" && s.parent_span_id == front.span_context.span_id())
+        .expect("front's call");
+    let attribute = |key: &str| {
+        call.attributes
+            .iter()
+            .find(|a| a.key.as_str() == key)
+            .map(|a| a.value.to_string())
+    };
+    assert_eq!(attribute("remote").as_deref(), Some("false"));
+    assert_eq!(attribute("status").as_deref(), Some("200"));
+    assert_eq!(attribute("outcome").as_deref(), Some("answered"));
+    assert!(spans.iter().all(|s| s.name != "hop"));
     let called = spans
         .iter()
-        .find(|s| s.name == "event" && s.parent_span_id == front.span_context.span_id())
+        .find(|s| s.name == "event" && s.parent_span_id == call.span_context.span_id())
         .expect("front's local call event");
     assert!(via_front.contains(&format!(
         "00-{}-{}-01",

@@ -129,6 +129,12 @@ pub struct NodeInfo {
     /// that writes one is refused while a live node lacks it. `false` from
     /// nodes that predate it.
     pub can_apart: bool,
+    /// It has tracing on, so every hop it sends carries a `traceparent` it
+    /// set itself, or none (heartbeat line 11, `traces`, ADR 0044, section
+    /// 4): only such a sender's sampled flag is followed. `false` from
+    /// nodes that predate it and from a process with tracing off, whose
+    /// hops carry whatever a client or a guest put there.
+    pub can_trace: bool,
     /// The process that runs it (heartbeat line 11, `process=<id>`, ADR
     /// 0038): the node ids of one process share its address and
     /// certificate. `None` from nodes that predate it or name none.
@@ -481,6 +487,7 @@ impl NodeInfo {
             can_multi_app: words.can_multi_app,
             can_place: words.can_place,
             can_apart: words.can_apart,
+            can_trace: words.can_trace,
             process: words.process,
             instance: lease.instance,
             lease: Some(lease.state),
@@ -493,7 +500,7 @@ impl NodeInfo {
     /// The capability words this node announces on line 11, in order
     /// (`take`, `front`, `handoff`, `ends`, `flush`, `rate_limits`, `restore`,
     /// `actor-restore`, `recorded-head`, `multi-app`, `assets`, `blobs`,
-    /// `place`, `apart`). Readers ignore words they do not
+    /// `place`, `apart`, `traces`). Readers ignore words they do not
     /// know.
     pub fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
@@ -511,6 +518,7 @@ impl NodeInfo {
             (self.can_blobs, "blobs"),
             (self.can_place, "place"),
             (self.can_apart, "apart"),
+            (self.can_trace, "traces"),
         ]
         .into_iter()
         .filter_map(|(has, word)| has.then_some(word))
@@ -555,6 +563,7 @@ impl NodeInfo {
             can_multi_app: words.contains(&"multi-app"),
             can_place: words.contains(&"place"),
             can_apart: words.contains(&"apart"),
+            can_trace: words.contains(&"traces"),
             process: words.iter().find_map(|w| {
                 let id = w.strip_prefix("process=")?;
                 validate_node_id(id).is_ok().then(|| id.to_owned())
@@ -657,6 +666,8 @@ pub struct Membership<D, C> {
     load_source: std::sync::OnceLock<LoadFn>,
     /// Published on line 11 as `place` (ADR 0041, section 9).
     place: bool,
+    /// Published on line 11 as `traces` (ADR 0044, section 4).
+    traces: bool,
     /// A heartbeat older than this (plus `max_skew_ms`) means the node is gone.
     ttl_ms: u64,
     max_skew_ms: u64,
@@ -689,6 +700,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             load: std::sync::Mutex::new(None),
             load_source: std::sync::OnceLock::new(),
             place: false,
+            traces: false,
             ttl_ms,
             max_skew_ms,
         })
@@ -722,6 +734,14 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     #[must_use]
     pub fn with_place(mut self, place: bool) -> Self {
         self.place = place;
+        self
+    }
+
+    /// Announces `traces` on line 11 (ADR 0044, section 4): this node has
+    /// tracing on and sets `traceparent` itself on the hops it sends.
+    #[must_use]
+    pub fn with_traces(mut self, traces: bool) -> Self {
+        self.traces = traces;
         self
     }
 
@@ -844,6 +864,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_multi_app: true,
             can_place: self.place,
             can_apart: true,
+            can_trace: self.traces,
             process: self.process.clone(),
             instance: self.instance.clone(),
             lease: None,
@@ -1199,6 +1220,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_trace: false,
             process: None,
         };
         mem.0.borrow_mut().insert("nodes/x".into(), forged.encode());
@@ -1246,6 +1268,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_trace: false,
             process: None,
         };
         assert_eq!(NodeInfo::decode(&info.encode()), Some(info));
@@ -1329,6 +1352,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_trace: false,
             process: None,
         }
     }
@@ -1713,6 +1737,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_trace: false,
             process: None,
         })
     }
@@ -2192,6 +2217,7 @@ mod tests {
             load: Some(load),
             can_place: true,
             can_apart: true,
+            can_trace: false,
             ..loaded_node()
         };
         let body = format3(&node, NodeState::Live, "beef");
@@ -2236,6 +2262,16 @@ mod tests {
         assert!(!NodeInfo::words(Some("take place")).can_apart);
         assert!(node.capabilities().any(|w| w == "place"));
         assert!(!loaded_node().capabilities().any(|w| w == "place"));
+        // `traces` likewise: announced only with tracing on, last on the
+        // line, and unknown to a reader that predates it.
+        assert!(NodeInfo::words(Some("take traces")).can_trace);
+        assert!(!NodeInfo::words(Some("take apart")).can_trace);
+        let traced = NodeInfo {
+            can_trace: true,
+            ..loaded_node()
+        };
+        assert_eq!(traced.capabilities().last(), Some("traces"));
+        assert!(!loaded_node().announces("traces"));
     }
 
     #[test]

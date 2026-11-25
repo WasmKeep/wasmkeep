@@ -826,9 +826,8 @@ This measures work; it is not a successful default-budget test.
 Tracing is off by default. `wasmkeep serve --otlp-endpoint http://collector:4318`
 exports OTLP over HTTP with protobuf to the collector's standard traces path. `--trace-sample 0.01`
 (the default) samples one percent at random of everything that starts a
-trace on a node: a request received on the public port or the cluster
-port (a hop from another node included, for now), an alarm, and each
-socket message or close. The
+trace on a node: a request from outside, an alarm, and each socket
+message or close. The
 matching node-file settings are `[process]` `otlp-endpoint`, `trace-sample`
 and `trace-trust-incoming`. Collector credentials belong in
 `OTEL_EXPORTER_OTLP_HEADERS`, not the node file.
@@ -836,7 +835,10 @@ and `trace-trust-incoming`. Collector credentials belong in
 An incoming `traceparent` keeps its trace id. Its sampled flag is ignored
 unless `--trace-trust-incoming` is set; with that flag both sampled and
 unsampled decisions are honoured. Use it only behind a proxy whose sampling
-you control. Guests receive their event or front context as an ordinary
+you control: the decision a node takes from a client this way travels with
+the trace, so one node run with the flag passes a client's sampled flag
+on to every node the request reaches, whether or not they have the flag.
+Guests receive their event or front context as an ordinary
 `traceparent` header, unless adding it would take the client's part of
 the request head past the head limits (64 KiB, 100 fields): the request
 then goes on as the client sent it. On `actors.call` the host sets the
@@ -848,14 +850,20 @@ and their bucket requests. Background maintenance is not traced. Attributes
 include actor names but no request paths, query strings, headers, bodies or
 bucket keys; a method outside the standard ones reads `other`.
 
-**Across nodes, not yet.** A forwarded request carries no context from the
-node that received it, and each node draws its own sample: the owner's
-spans are a trace of their own (or join the client's trace id, if it sent
-one). An `actors.call` to another node does carry the caller's trace id,
-but the receiving node still draws its own sample unless it runs with
-`--trace-trust-incoming`. A trace through several nodes can therefore be
-partial. Hop spans and following the first node's decision are the next
-slice of [ADR 0044](adr/0044-traces.md#3-on-a-hop).
+**Across nodes.** A request that crosses nodes is one trace. Each
+`actors.call` has a `call` span, and each request a node sends to another
+(a forward, a relayed WebSocket upgrade, a call, a placed request, an
+alarm hand-off or a take made inside a trace) has a `hop` span naming
+both nodes; the receiving node's `request` span is its child. The first
+node of a trace decides whether it is sampled and the others follow, so
+a sampled trace has its spans from every node and an unsampled one has
+none anywhere. A node follows only nodes that have tracing on too (they
+say so in their heartbeat): run every node with the same tracing
+settings. With tracing on at some nodes only, or beside a node of 0.8.1
+during an upgrade, traces stop or split at those nodes. A forward whose
+head has no room for the header (see above) starts a new trace at the
+owner. Nothing about a hop's signature changes
+([ADR 0044](adr/0044-traces.md#3-on-a-hop)).
 
 Export uses a bounded queue of 2,048 spans, batches of up to 256, a two-second
 export timeout and a three-second shutdown flush. A slow collector never

@@ -54,6 +54,7 @@ async fn receiver(refuse: bool, secret: bool) -> Arc<Cluster> {
         can_blobs: true,
         instance: None,
         can_place: false,
+        traces: false,
         seen: None,
     };
     *c.peers.write().unwrap() = HashMap::from([
@@ -312,12 +313,14 @@ async fn a_hop_without_its_own_verdict_is_checked_where_read() {
     let mut other = request(hop("valid"));
     other.extensions_mut().insert(CheckedHop {
         by: "another runtime".into(),
+        on_cluster_port: false,
         hop: HopCheck::Outside,
     });
     assert!(b.signed_hop(&other).unwrap().is_some());
     let mut junk = request(hop("bad"));
     junk.extensions_mut().insert(CheckedHop {
         by: "another runtime".into(),
+        on_cluster_port: false,
         hop: match b.check_hop(&hyper::Method::POST, PATH, &hop("valid"), false) {
             HopCheck::Signed(s) => HopCheck::Signed(s),
             other => panic!("{other:?}"),
@@ -465,3 +468,154 @@ refuse=true secret=false cluster_port=false sender-unbound: internal=false refus
 refuse=true secret=false cluster_port=false sender-other-app: internal=false refused=None bad=0 burnt=false\n\
 refuse=true secret=false cluster_port=false sender-not-live: internal=false refused=None bad=0 burnt=false\n\
 ";
+
+/// Whose sampled flag a node follows (ADR 0044, section 4): a hop's that
+/// authenticates as a node's, when that node announces `traces`. A node
+/// that does not (tracing off, or a version before 0.9) passes on the
+/// `traceparent` a client or a guest sent, under a signature or a proof
+/// that checks all the same: its flag is not followed.
+#[tokio::test]
+async fn a_hop_is_followed_only_from_a_node_that_traces() {
+    const CLIENT: &str = "00-feedfacefeedfacefeedfacefeedface-feedfacefeedface-01";
+    let traces = |c: &Cluster, on: bool| {
+        for peer in c.peers.write().unwrap().values_mut() {
+            peer.traces = on;
+        }
+    };
+    let b = receiver(false, true).await;
+    // A signed call from `a`, which does not announce the word.
+    assert!(!b.traced_sender(&mut request(hop("valid")), None));
+    traces(&b, true);
+    // It does now. The signature is checked once: the router's judgement
+    // after it reads the verdict.
+    let before = verified();
+    let mut call = request(hop("valid"));
+    assert!(b.traced_sender(&mut call, None));
+    assert_eq!(b.judge_hop(&mut call), None);
+    assert!(b.signed_hop(&call).unwrap().is_some());
+    assert_eq!(verified() - before, 1);
+    // The verdict is the public port's: on the cluster port, which judges
+    // a signature differently, it is not read. Judged again there (the
+    // sender is not this connection's, which the listener checks; the
+    // signature itself holds), and what is kept is then that port's.
+    let mut moved = request(hop("valid"));
+    assert!(b.traced_sender(&mut moved, None));
+    moved
+        .extensions_mut()
+        .insert(ArrivedOnClusterPort(crate::http::ClusterPeer::for_test(
+            [7; 32],
+            Arc::new(crate::cluster_tls::pinning::PinSet::default()),
+        )));
+    let at = verified();
+    let _ = b.judge_hop(&mut moved);
+    assert_eq!(
+        verified() - at,
+        1,
+        "a plain-port verdict read on the cluster port"
+    );
+    assert!(
+        moved
+            .extensions()
+            .get::<CheckedHop>()
+            .unwrap()
+            .on_cluster_port
+    );
+    let _ = b.signed_hop(&moved);
+    assert_eq!(verified() - at, 1);
+    // A refused hop stays refused after it, and is no node's.
+    let mut forged = request(hop("sender-unbound"));
+    assert!(!b.traced_sender(&mut forged, None));
+    assert!(b.judge_hop(&mut forged).is_some());
+    // Nothing that does not authenticate as a live node of this app's. A
+    // sender not listed is taken over plain HTTP, and announces nothing.
+    for kind in [
+        "absent",
+        "bad",
+        "no-sender",
+        "sender-twice",
+        "sender-unbound",
+        "sender-other-app",
+        "sender-not-live",
+    ] {
+        assert!(!b.traced_sender(&mut request(hop(kind)), None), "{kind}");
+    }
+    // No secret loaded: nothing checks.
+    let cold = receiver(false, false).await;
+    traces(&cold, true);
+    assert!(!cold.traced_sender(&mut request(hop("valid")), None));
+    // In refuse mode a signed call on the public port is from outside.
+    let refusing = receiver(true, true).await;
+    traces(&refusing, true);
+    assert!(!refusing.traced_sender(&mut request(hop("valid")), None));
+
+    // A forward: its proof, from `a`, over the `traceparent` it carries.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(
+            &StorePath::from(SECRET_KEY),
+            SECRET.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let mut config = ClusterConfig::new("a", "http://a", store);
+    config.heartbeat = Duration::from_secs(3_600);
+    config.lease = LeaseConfig::new(10_800_000, 5_000, 2_000, 1_000).unwrap();
+    let a = Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap();
+    a.load_secret().await;
+    let forward = || async {
+        let mut req = request(hyper::HeaderMap::new());
+        req.headers_mut()
+            .insert("traceparent", CLIENT.parse().unwrap());
+        req.headers_mut().insert(APP, "t/default".parse().unwrap());
+        req.extensions_mut()
+            .insert(crate::http::PeerAddress("192.0.2.1:1234".parse().unwrap()));
+        a.sign_admission("b", PATH, &mut req).await.unwrap();
+        req
+    };
+    assert!(b.traced_sender(&mut forward().await, None));
+    assert!(!refusing.traced_sender(&mut forward().await, None));
+    // The header changed after the proof: the proof fails, and the forward
+    // is a client's request (ADR 0043, section 7).
+    let mut changed = forward().await;
+    changed.headers_mut().insert(
+        "traceparent",
+        "00-feedfacefeedfacefeedfacefeedface-feedfacefeedface-00"
+            .parse()
+            .unwrap(),
+    );
+    assert!(b.admission_checked(&changed).is_none());
+    assert!(!b.traced_sender(&mut changed, None));
+    // No proof (no secret loaded at the sender): from outside.
+    let mut bare = request(hyper::HeaderMap::new());
+    bare.headers_mut()
+        .insert("traceparent", CLIENT.parse().unwrap());
+    bare.headers_mut().insert(FORWARDED, "1".parse().unwrap());
+    assert!(!b.traced_sender(&mut bare, None));
+    // `a` stops announcing the word: its proof still checks, and its
+    // forward carries whatever the client sent.
+    traces(&b, false);
+    let mut passed_on = forward().await;
+    assert!(b.admission_checked(&passed_on).is_some());
+    assert!(!b.traced_sender(&mut passed_on, None));
+
+    // On the cluster port the connection authenticates: the sender a hop
+    // names must publish the certificate presented, and announce the word.
+    let pins = Arc::new(crate::cluster_tls::pinning::PinSet::default());
+    let (ka, kx) = (
+        crate::cluster_tls::pinning::Identity::generate("a", "a.test").unwrap(),
+        crate::cluster_tls::pinning::Identity::generate("x", "x.test").unwrap(),
+    );
+    let until = now_ms() + 60_000;
+    pins.replace([("a", &[ka.pin()][..], until), ("x", &[kx.pin()][..], until)]);
+    let on_a = crate::http::ClusterPeer::for_test(ka.pin(), Arc::clone(&pins));
+    let on_x = crate::http::ClusterPeer::for_test(kx.pin(), Arc::clone(&pins));
+    traces(&refusing, false);
+    assert!(!refusing.traced_sender(&mut request(hop("valid")), Some(&on_a)));
+    traces(&refusing, true);
+    traces(&b, true);
+    assert!(refusing.traced_sender(&mut request(hop("valid")), Some(&on_a)));
+    // `a` named over another node's connection, no sender, or two.
+    assert!(!refusing.traced_sender(&mut request(hop("valid")), Some(&on_x)));
+    assert!(!refusing.traced_sender(&mut request(hop("no-sender")), Some(&on_a)));
+    assert!(!refusing.traced_sender(&mut request(hop("sender-twice")), Some(&on_a)));
+}

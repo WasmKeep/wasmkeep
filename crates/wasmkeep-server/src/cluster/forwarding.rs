@@ -470,14 +470,17 @@ impl Cluster {
 
     /// What every forward does before it is sent (to `owner`): never a
     /// second hop, the owner's address and the original path, the
-    /// connection headers dropped, the forwarded mark, the app and the
-    /// proof (ADR 0038), counted, and the target checked. The base it goes
-    /// to, or the answer that sends nothing.
+    /// connection headers dropped, the forwarded mark, the app, the trace
+    /// context (ADR 0044, section 3) and then the proof (ADR 0038),
+    /// counted, and the target checked. The base it goes to and the
+    /// forward's `hop` span (`kind`: what it is called there), or the
+    /// answer that sends nothing.
     pub(crate) async fn prepare_forward<B>(
         &self,
         owner: &str,
+        kind: &'static str,
         req: &mut Request<B>,
-    ) -> Result<String, Box<Response<HyperOutgoingBody>>> {
+    ) -> Result<(String, crate::traces::Span), Box<Response<HyperOutgoingBody>>> {
         if never_forward(req) {
             // Two nodes disagree about who owns the actor (a lease is
             // changing hands). Do not bounce; let the client retry.
@@ -521,6 +524,12 @@ impl Cluster {
             Ok(app) => req.headers_mut().insert(APP, app),
             Err(_) => return Err(Box::new(unavailable("cannot forward this request\n"))),
         };
+        // This node's `hop` span as the forward's `traceparent`, replacing
+        // the client's or added if the head has room (ADR 0044, section
+        // 3): set here, on the request as it is sent, because the proof
+        // below hashes every header of the client's, this one included.
+        // Changed after, the proof would fail at the owner.
+        let hop = crate::traces::hop(kind, &self.node_id, owner, req);
         if self.sign_admission(owner, &path, req).await.is_err() {
             return Err(Box::new(unavailable(
                 "cannot authenticate ingress admission; retry\n",
@@ -535,7 +544,7 @@ impl Cluster {
                 "the actor's node is not reachable; retry\n",
             )));
         }
-        Ok(base)
+        Ok((base, hop))
     }
 
     /// Forwards a request for an actor to the node that owns it: a
@@ -547,19 +556,23 @@ impl Cluster {
         owner: &str,
         mut req: Request<B>,
     ) -> Response<HyperOutgoingBody> {
-        let base = match self.prepare_forward(owner, &mut req).await {
-            Ok(base) => base,
+        let (base, mut hop) = match self.prepare_forward(owner, "forward", &mut req).await {
+            Ok(prepared) => prepared,
             Err(response) => return *response,
         };
         let client = B::client(&self.clients());
         match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
             // The owner answered, so it read the request: it may have run.
-            Ok(Ok(response)) => self
-                .trusted_response(&base, owner, response)
-                .unwrap_or_else(|| {
-                    tracing::warn!(owner, "forwarding: the node is no longer trusted");
-                    outcome_unknown("the actor's node is no longer trusted")
-                }),
+            Ok(Ok(response)) => {
+                // The hop ends at the owner's answer; its body streams on.
+                hop.answered(Some(response.status()));
+                drop(hop);
+                self.trusted_response(&base, owner, response)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(owner, "forwarding: the node is no longer trusted");
+                        outcome_unknown("the actor's node is no longer trusted")
+                    })
+            }
             // Every failure before an answer, none sent again from here:
             // a connection that could not be opened, a request the client
             // handed back unsent on a new connection, and a request

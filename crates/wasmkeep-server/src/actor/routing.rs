@@ -236,6 +236,40 @@ impl ServiceInner {
             return Err(CallError::TooLarge);
         }
 
+        // One `call` span per call, in the calling event's or front's
+        // trace (ADR 0044, section 1); the call's `traceparent` is set
+        // inside it.
+        let mut span = crate::traces::call(target.class(), target.name());
+        let traced = span.recording();
+        let answer = span
+            .run(self.call_traced(caller, chain, target, request, limit, budget))
+            .await;
+        if traced {
+            match &answer {
+                Ok(response) => {
+                    span.attribute("status", i64::from(response.status));
+                    span.attribute("outcome", "answered");
+                }
+                Err(CallError::Timeout) => span.attribute("outcome", "timeout"),
+                Err(_) => span.attribute("outcome", "failed"),
+            }
+        }
+        answer
+    }
+
+    async fn call_traced(
+        self: Arc<Self>,
+        caller: &Caller,
+        chain: &Chain,
+        target: ActorAddress,
+        request: CallRequest,
+        limit: Duration,
+        budget: &BodyBudget,
+    ) -> Result<CallResponse, CallError> {
+        let me = match caller {
+            Caller::Actor(me) => Some(me),
+            Caller::Front => None,
+        };
         let head = request.method.eq_ignore_ascii_case("HEAD");
         let mut req = build_request(caller, &target, request)?;
         // The host's `traceparent`, before the call runs here or leaves the
@@ -478,6 +512,10 @@ fn copy_request(
     *copy.uri_mut() = req.uri().clone();
     *copy.version_mut() = req.version();
     *copy.headers_mut() = req.headers().clone();
+    // The call's trace context: the event it runs as here is the call's.
+    if let Some(context) = req.extensions().get::<crate::traces::Trace>() {
+        copy.extensions_mut().insert(*context);
+    }
     copy
 }
 

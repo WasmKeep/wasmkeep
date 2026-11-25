@@ -1,7 +1,11 @@
 //! Request tracing (ADR 0044). Context is copied across task boundaries;
 //! the task-local scope is only a convenience inside a single polled future.
-//! TODO(ADR 0044 section 3, On a hop): authenticated sampling, call/hop
-//! spans and propagation before admission signing, subject to head limits.
+//!
+//! On a hop (ADR 0044, sections 3 and 4): the sending node sets
+//! `traceparent` to its `hop` span before the hop is signed, within the
+//! head limits, and the receiving node follows the sampled flag of a hop
+//! that authenticates as a node's with tracing on. Nothing of it is
+//! signed, and no header of the host's range is added.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -140,8 +144,14 @@ impl Trace {
     }
 }
 
-fn edge(value: Option<&str>, ratio: f64, trust: bool) -> Trace {
-    let incoming = value.and_then(Trace::parse);
+/// The context a request starts with. `follow`: the incoming sampled flag
+/// decides, in both directions (the operator trusts what arrives, or a
+/// node with tracing on sent it: [`request`]); otherwise this node draws.
+#[cfg(test)]
+fn edge(value: Option<&str>, ratio: f64, follow: bool) -> Trace {
+    edge_from(value.and_then(Trace::parse), ratio, follow)
+}
+fn edge_from(incoming: Option<Trace>, ratio: f64, trust: bool) -> Trace {
     // OS randomness, independent of the client-controlled trace id.
     let mut bytes = [0; 8];
     let random =
@@ -214,8 +224,8 @@ pub(crate) struct Span {
     context: Option<Trace>,
     span: Option<Box<opentelemetry_sdk::trace::Span>>,
     /// Written once, when the span ends: the last value set wins, so a
-    /// span never carries two `outcome` attributes.
-    outcome: Option<opentelemetry::Value>,
+    /// span never carries two of an attribute in [`LAST_WINS`].
+    late: Vec<KeyValue>,
 }
 impl Span {
     fn new(t: Option<&Tracing>, name: &'static str, parent: Option<Trace>) -> Self {
@@ -223,7 +233,7 @@ impl Span {
             return Self {
                 context: None,
                 span: None,
-                outcome: None,
+                late: Vec::new(),
             };
         }
         Self::at(t, name, parent, std::time::SystemTime::now())
@@ -238,14 +248,14 @@ impl Span {
             return Self {
                 context: None,
                 span: None,
-                outcome: None,
+                late: Vec::new(),
             };
         };
-        let mut context = parent.unwrap_or_else(|| edge(None, t.ratio, false));
+        let mut context = parent.unwrap_or_else(|| edge_from(None, t.ratio, false));
         let span = if context.sampled {
             let kind = match name {
                 "request" => opentelemetry::trace::SpanKind::Server,
-                "bucket" => opentelemetry::trace::SpanKind::Client,
+                "bucket" | "hop" => opentelemetry::trace::SpanKind::Client,
                 _ => opentelemetry::trace::SpanKind::Internal,
             };
             let span = t
@@ -264,11 +274,18 @@ impl Span {
         Self {
             context: Some(context),
             span,
-            outcome: None,
+            late: Vec::new(),
         }
     }
     pub(crate) fn child(name: &'static str) -> Self {
         Self::new(TRACING.get(), name, current())
+    }
+    /// A span inside the trace the running code is in, and nothing when it
+    /// is in none: work that belongs to no request or event (a sweep, a
+    /// drain, a move) starts no trace of its own.
+    fn inside(name: &'static str) -> Self {
+        let parent = current();
+        Self::new(TRACING.get().filter(|_| parent.is_some()), name, parent)
     }
     pub(crate) fn recording(&self) -> bool {
         self.span.is_some()
@@ -287,8 +304,9 @@ impl Span {
         }
     }
     fn set(&mut self, attribute: KeyValue) {
-        if attribute.key.as_str() == OUTCOME {
-            self.outcome = Some(attribute.value);
+        if LAST_WINS.contains(&attribute.key.as_str()) {
+            self.late.retain(|a| a.key != attribute.key);
+            self.late.push(attribute);
         } else if let Some(span) = &mut self.span {
             span.set_attribute(attribute);
         }
@@ -304,17 +322,18 @@ impl Span {
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(s) = &mut self.span {
-            if let Some(outcome) = self.outcome.take() {
-                s.set_attribute(KeyValue::new(OUTCOME, outcome));
+            for attribute in self.late.drain(..) {
+                s.set_attribute(attribute);
             }
             s.end();
         }
     }
 }
 
-/// The one attribute a span sets more than once (a default, then what
+/// The attributes a span sets more than once (a default, then what
 /// happened): kept aside and written when the span ends.
 const OUTCOME: &str = "outcome";
+const LAST_WINS: [&str; 5] = [OUTCOME, "remote", "resent", "status", "carried"];
 
 /// The request methods a span names; any other token a client sends is
 /// `other`, so the attribute is never the client's text.
@@ -337,8 +356,17 @@ fn method_name(method: &http::Method) -> &'static str {
 /// head stays within the head limits with it (ADR 0044, section 3,
 /// condition 2: the bytes and the field count a node takes from a client).
 /// Otherwise the request goes on unchanged.
-fn set_guest_header<B>(req: &mut http::Request<B>, context: Trace) {
+fn set_guest_header<B>(req: &mut http::Request<B>, context: Trace) -> bool {
+    set_header_within(req, context, 0)
+}
+
+/// [`set_guest_header`], the head measured `discount` bytes smaller than
+/// [`crate::http::client_head`] counts it (see [`hop`]). Whether it was
+/// set. A value that takes no more room than the ones it replaces always
+/// fits: the head was within the limits when it arrived.
+fn set_header_within<B>(req: &mut http::Request<B>, context: Trace, discount: usize) -> bool {
     let (bytes, count) = crate::http::client_head(req);
+    let bytes = bytes.saturating_sub(discount);
     let (had_bytes, had) = req
         .headers()
         .get_all(TRACEPARENT)
@@ -347,12 +375,16 @@ fn set_guest_header<B>(req: &mut http::Request<B>, context: Trace) {
             (bytes + TRACEPARENT.len() + v.len() + 4, count + 1)
         });
     let value = context.header();
-    let fits = bytes - had_bytes + TRACEPARENT.len() + value.len() + 4
-        <= crate::http::MAX_REQUEST_HEAD_BYTES
-        && count - had < crate::http::MAX_REQUEST_HEADERS;
-    if fits && let Ok(value) = value.parse() {
+    let own = TRACEPARENT.len() + value.len() + 4;
+    let fits = (had > 0 && own <= had_bytes)
+        || (bytes - had_bytes + own <= crate::http::MAX_REQUEST_HEAD_BYTES
+            && count - had < crate::http::MAX_REQUEST_HEADERS);
+    let set = fits.then(|| value.parse().ok()).flatten();
+    if let Some(value) = set {
         req.headers_mut().insert(TRACEPARENT, value);
+        return true;
     }
+    false
 }
 
 const TRACEPARENT: &str = "traceparent";
@@ -393,16 +425,151 @@ fn call_header<B>(req: &mut http::Request<B>, context: Option<Trace>) {
     }
 }
 
-pub(crate) fn request<B>(req: &mut http::Request<B>) -> Span {
-    let Some(t) = TRACING.get() else {
+/// The `call` span of one `actors.call`, in the calling event's (or
+/// front's) trace: local or to another node, one per entry of a batch.
+pub(crate) fn call(class: &str, actor: &str) -> Span {
+    let mut span = Span::inside("call");
+    if span.recording() {
+        span.attribute("class", class.to_owned());
+        span.attribute("actor", actor.to_owned());
+        span.attribute("remote", false);
+    }
+    span
+}
+
+/// The `hop` span of a request `node` sends to `peer` (a forward, a
+/// relayed upgrade, a node's call, a hand-off, a take, a placed request),
+/// and its context as the request's `traceparent` (ADR 0044, section 3).
+///
+/// Called before the hop is signed: a forward's proof hashes the header as
+/// it hashes every header of the client's, so it must be in place first; a
+/// call's signature does not cover it. The header is set only if the
+/// client's part of the head stays within the head limits with it
+/// ([`set_guest_header`]), measured as the receiver will count it: a
+/// forward's URI is already the peer's address here, which the receiver
+/// reads as the `Host` header the request carries, so the address is not
+/// counted a second time. Otherwise the request goes on without one and
+/// the receiver starts a trace of its own. With tracing off nothing is
+/// made and the request is not touched.
+///
+/// A node with tracing on announces it, and its peers then follow the
+/// flag of what it sends ([`request`]). So every hop it sends carries its
+/// own `traceparent` or none, never a client's or a guest's: whenever the
+/// hop's is not set (no room for it, or outside any trace: a sweep, a
+/// drain, a move), a `traceparent` already on the request is removed.
+pub(crate) fn hop<B>(
+    kind: &'static str,
+    node: &str,
+    peer: &str,
+    req: &mut http::Request<B>,
+) -> Span {
+    hop_in(TRACING.get(), current(), kind, node, peer, req)
+}
+fn hop_in<B>(
+    t: Option<&Tracing>,
+    parent: Option<Trace>,
+    kind: &'static str,
+    node: &str,
+    peer: &str,
+    req: &mut http::Request<B>,
+) -> Span {
+    let mut span = Span::new(t.filter(|_| parent.is_some()), "hop", parent);
+    if span.recording() {
+        span.attribute("kind", kind);
+        span.attribute("node", node.to_owned());
+        span.attribute("peer", peer.to_owned());
+        span.attribute("resent", false);
+        span.attribute(OUTCOME, "failed");
+    }
+    span.carry(t.is_some(), req);
+    span
+}
+
+impl Span {
+    /// Puts this hop's context on `req` as it is sent, by [`hop`]'s
+    /// rules: within the head limits as the receiver counts them, and
+    /// with tracing on (`on`) this node's own header or none. `carried`
+    /// says whether the header went out on the request sent last.
+    fn carry<B>(&mut self, on: bool, req: &mut http::Request<B>) {
+        // The address, when the receiver will read it from `Host` instead.
+        let discount = match req.uri().authority() {
+            Some(authority) if req.headers().contains_key(http::header::HOST) => {
+                authority.as_str().len() + 8
+            }
+            _ => 0,
+        };
+        let carried = self
+            .context
+            .is_some_and(|context| set_header_within(req, context, discount));
+        if on && !carried {
+            // Its own or none: never one this node did not set.
+            req.headers_mut().remove(TRACEPARENT);
+        }
+        self.attribute("carried", carried);
+    }
+
+    /// The same hop sent a second time, on a request built again: the
+    /// header by the same rules as the first send, and `resent`.
+    pub(crate) fn resend<B>(&mut self, req: &mut http::Request<B>) {
+        self.resend_in(TRACING.get().is_some(), req);
+    }
+    fn resend_in<B>(&mut self, on: bool, req: &mut http::Request<B>) {
+        self.carry(on, req);
+        self.attribute("resent", true);
+    }
+}
+
+impl Span {
+    /// What a hop's answer was: its status, or that none came.
+    pub(crate) fn answered(&mut self, status: Option<http::StatusCode>) {
+        if self.recording() {
+            match status {
+                Some(status) => {
+                    self.attribute("status", i64::from(status.as_u16()));
+                    self.attribute(OUTCOME, "answered");
+                }
+                None => self.attribute(OUTCOME, "failed"),
+            }
+        }
+    }
+}
+
+/// The `request` span of a request this node received, and the context
+/// the rest of it runs in.
+///
+/// The sampled decision (ADR 0044, section 4): the incoming flag is
+/// followed, in both directions, when the operator trusts what arrives
+/// (`--trace-trust-incoming`), or when `from_tracing_node` says the
+/// request is a hop that authenticates as a node's and that node has
+/// tracing on, so the header is that node's and the first node of the
+/// trace decided. It is asked only when there is a flag to follow and
+/// nothing else settles it. Otherwise this node draws at its ratio: a
+/// request from outside, a forward with no proof, a hop with no header
+/// (the sender had no room for it), and a hop from a node that does not
+/// set the header itself (tracing off, or a version before 0.9), which
+/// passes on whatever a client or a guest sent.
+pub(crate) fn request<B>(
+    req: &mut http::Request<B>,
+    from_tracing_node: impl FnOnce(&mut http::Request<B>) -> bool,
+) -> Span {
+    request_in(TRACING.get(), req, from_tracing_node)
+}
+fn request_in<B>(
+    t: Option<&Tracing>,
+    req: &mut http::Request<B>,
+    from_tracing_node: impl FnOnce(&mut http::Request<B>) -> bool,
+) -> Span {
+    let Some(t) = t else {
         return Span::new(None, "request", None);
     };
-    let parent = Some(edge(
-        req.headers().get(TRACEPARENT).and_then(|h| h.to_str().ok()),
-        t.ratio,
-        t.trust,
-    ));
-    let mut span = Span::new(TRACING.get(), "request", parent);
+    let incoming = req
+        .headers()
+        .get(TRACEPARENT)
+        .and_then(|h| h.to_str().ok())
+        .and_then(Trace::parse);
+    let follow = incoming.is_some() && (t.trust || from_tracing_node(req));
+    let parent = Some(edge_from(incoming, t.ratio, follow));
+    let mut span = Span::new(Some(t), "request", parent);
     span.attribute("method", method_name(req.method()));
     if let Some(c) = span.context {
         req.extensions_mut().insert(c);
@@ -527,10 +694,396 @@ macro_rules! trace_error {
 }
 pub(crate) use trace_error as error;
 
+/// A context for this crate's tests of what a hop carries.
+#[cfg(test)]
+pub(crate) fn test_context(sampled: bool) -> Trace {
+    Trace {
+        trace: TraceId::from(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef_u128),
+        parent: SpanId::from(0x1234_5678_90ab_cdef_u64),
+        sampled,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn tracing(ratio: f64, trust: bool) -> (Tracing, Memory) {
+        let memory = Memory::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(memory.clone())
+            .build();
+        let t = Tracing {
+            tracer: provider.tracer("test"),
+            provider,
+            ratio,
+            trust,
+        };
+        (t, memory)
+    }
+
+    /// The sampled decision of a request a node receives (ADR 0044,
+    /// section 4), by who sent it, the trust flag, the ratio and the flag.
+    #[test]
+    fn traces_a_hop_from_a_tracing_node_decides_and_nothing_else_does() {
+        // (from a tracing node, trust, ratio, header) -> sampled
+        for (node, trust, ratio, header, sampled) in [
+            // A hop from a node with tracing on: its flag, whatever the
+            // ratio here, with or without the trust flag.
+            (true, false, 0.0, Some(YES), true),
+            (true, false, 1.0, Some(NO), false),
+            (true, true, 0.0, Some(YES), true),
+            (true, true, 1.0, Some(NO), false),
+            // Anything else (a client, a forward with no proof, a hop from
+            // a node that passes on what it got): this node draws.
+            (false, false, 0.0, Some(YES), false),
+            (false, false, 1.0, Some(NO), true),
+            // ...unless the operator trusts what arrives.
+            (false, true, 0.0, Some(YES), true),
+            (false, true, 1.0, Some(NO), false),
+            // No header, or one that does not parse: nothing to follow,
+            // from a node or not.
+            (true, false, 1.0, None, true),
+            (true, false, 0.0, None, false),
+            (true, true, 0.0, Some("bad"), false),
+            (true, false, 1.0, Some("bad"), true),
+        ] {
+            let (t, _) = tracing(ratio, trust);
+            let mut req = http::Request::builder();
+            if let Some(header) = header {
+                req = req.header("traceparent", header);
+            }
+            let mut req = req.body(()).unwrap();
+            let span = request_in(Some(&t), &mut req, |_| node);
+            let context = span.context.unwrap();
+            assert_eq!(
+                (context.sampled, span.recording()),
+                (sampled, sampled),
+                "{node} {trust} {ratio} {header:?}"
+            );
+            // The trace id is continued either way.
+            if header == Some(YES) || header == Some(NO) {
+                assert_eq!(context.trace, Trace::parse(YES).unwrap().trace);
+            }
+        }
+        // The sender is asked only when a flag is there to follow and the
+        // trust flag does not settle it: no signature is checked for a
+        // request with no header.
+        let asked = std::cell::Cell::new(0);
+        let ask = |_: &mut http::Request<()>| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let (t, _) = tracing(1.0, false);
+        let mut none = http::Request::new(());
+        let _ = request_in(Some(&t), &mut none, ask);
+        let mut bad = http::Request::builder()
+            .header("traceparent", "bad")
+            .body(())
+            .unwrap();
+        let _ = request_in(Some(&t), &mut bad, ask);
+        let (trusting, _) = tracing(1.0, true);
+        let mut yes = http::Request::builder()
+            .header("traceparent", YES)
+            .body(())
+            .unwrap();
+        let _ = request_in(Some(&trusting), &mut yes, ask);
+        assert_eq!(asked.get(), 0);
+        let _ = request_in(Some(&t), &mut yes, ask);
+        assert_eq!(asked.get(), 1);
+        // Off: not asked, nothing made.
+        let off = request_in(None, &mut yes, ask);
+        assert!(off.context.is_none() && asked.get() == 1);
+    }
+
+    /// What a hop carries (ADR 0044, section 3): the sending node's `hop`
+    /// span, in the trace it is sent from, with that trace's decision.
+    #[test]
+    fn traces_a_hop_carries_its_own_span_or_nothing() {
+        let (t, memory) = tracing(0.0, false);
+        let client = "00-feedfacefeedfacefeedfacefeedface-feedfacefeedface-01";
+        let request = |header: Option<&str>| {
+            let mut req = http::Request::builder();
+            if let Some(header) = header {
+                req = req.header("traceparent", header);
+            }
+            req.body(()).unwrap()
+        };
+        // In a sampled trace: a span, a child of the sender's context, and
+        // its id in the header, replacing a client's.
+        let parent = test_context(true);
+        for sent in [None, Some(client)] {
+            let mut req = request(sent);
+            let hop = hop_in(Some(&t), Some(parent), "forward", "a", "b", &mut req);
+            let context = hop.context.unwrap();
+            assert!(hop.recording());
+            assert_eq!(context.trace, parent.trace);
+            assert_ne!(context.parent, parent.parent);
+            assert_eq!(req.headers()["traceparent"], context.header().as_str());
+            assert_eq!(req.headers().get_all("traceparent").iter().count(), 1);
+            assert!(context.header().ends_with("-01"));
+        }
+        let spans = std::mem::take(&mut *memory.0.lock().unwrap());
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            assert_eq!(span.name, "hop");
+            assert_eq!(span.parent_span_id, parent.parent);
+            let attribute = |key: &str| {
+                span.attributes
+                    .iter()
+                    .find(|a| a.key.as_str() == key)
+                    .map(|a| a.value.as_str().into_owned())
+            };
+            assert_eq!(attribute("kind").as_deref(), Some("forward"));
+            assert_eq!(attribute("node").as_deref(), Some("a"));
+            assert_eq!(attribute("peer").as_deref(), Some("b"));
+            assert_eq!(attribute("outcome").as_deref(), Some("failed"));
+        }
+        // In an unsampled trace: the context goes on, flag off, so the
+        // receiver makes no span either; no span is made here.
+        let mut req = request(Some(client));
+        let hop = hop_in(
+            Some(&t),
+            Some(test_context(false)),
+            "call",
+            "a",
+            "b",
+            &mut req,
+        );
+        assert!(!hop.recording());
+        let value = req.headers()["traceparent"].to_str().unwrap().to_owned();
+        assert!(
+            value.starts_with("00-1234567890abcdef1234567890abcdef-") && value.ends_with("-00")
+        );
+        drop(hop);
+        // In no trace (a sweep, a drain): no span, and no header: a node
+        // with tracing on never passes on a `traceparent` it did not set.
+        let mut req = request(Some(client));
+        let hop = hop_in(Some(&t), None, "take", "a", "b", &mut req);
+        assert!(hop.context.is_none());
+        assert!(req.headers().get("traceparent").is_none());
+        drop(hop);
+        assert!(memory.0.lock().unwrap().is_empty());
+        // Tracing off: the request is not touched, whatever it carries.
+        let mut req = request(Some(client));
+        let hop = hop_in(None, None, "forward", "a", "b", &mut req);
+        assert!(hop.context.is_none());
+        assert_eq!(req.headers()["traceparent"], client);
+        let mut req = request(None);
+        let _ = hop_in(None, Some(parent), "forward", "a", "b", &mut req);
+        assert!(req.headers().is_empty());
+    }
+
+    /// The head limits on a hop (ADR 0044, section 3, condition 2): the
+    /// header is added only if the client's part of the head stays within
+    /// them, and a client's header that parses is always replaced.
+    #[test]
+    fn traces_a_hop_adds_its_header_only_within_the_head_limits() {
+        let (t, _) = tracing(1.0, false);
+        let parent = Some(test_context(true));
+        let full = |traceparent: Option<&str>| {
+            let mut req = http::Request::builder();
+            let own = usize::from(traceparent.is_some());
+            if let Some(value) = traceparent {
+                req = req.header("traceparent", value);
+            }
+            for i in own..crate::http::MAX_REQUEST_HEADERS {
+                req = req.header(format!("x-h{i}"), "v");
+            }
+            // The host's own headers do not count in the client's part.
+            req.header("x-wasmkeep-forwarded", "1").body(()).unwrap()
+        };
+        // At the field count with no header of the client's: unchanged,
+        // and the hop says it carried nothing.
+        let mut req = full(None);
+        let before = req.headers().clone();
+        let hop = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+        assert!(hop.recording());
+        assert_eq!(req.headers(), &before);
+        // At the field count with the client's own: replaced.
+        let mut req = full(Some(NO));
+        let hop = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+        assert_eq!(
+            req.headers()["traceparent"],
+            hop.context.unwrap().header().as_str()
+        );
+        assert_eq!(
+            crate::http::client_head(&req).1,
+            crate::http::MAX_REQUEST_HEADERS
+        );
+        // At the byte limit exactly, the client's header one that parses
+        // (version 00, or a later version's longer form): replaced, and
+        // the head no larger than it was.
+        let later = format!("{}-more", YES.replacen("00-", "01-", 1));
+        for client in [YES, later.as_str()] {
+            let mut req = http::Request::builder()
+                .header("traceparent", client)
+                .body(())
+                .unwrap();
+            let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+            req.headers_mut()
+                .insert("x-big", "a".repeat(room - 9).parse().unwrap());
+            let before = crate::http::client_head(&req).0;
+            assert_eq!(before, crate::http::MAX_REQUEST_HEAD_BYTES);
+            let hop = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+            assert_eq!(
+                req.headers()["traceparent"],
+                hop.context.unwrap().header().as_str()
+            );
+            assert!(crate::http::client_head(&req).0 <= before);
+        }
+        // As a forward is when its hop is made: the URI already the
+        // peer's address, the client's `Host` still there, and a head
+        // that was at the limit when it arrived. The address is not
+        // counted twice: the client's header is replaced, never passed on.
+        for client in [YES, later.as_str()] {
+            let mut req = http::Request::builder()
+                .uri("/actor/room/a?q=1")
+                .header("host", "app.test")
+                .header("traceparent", client)
+                .body(())
+                .unwrap();
+            let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+            req.headers_mut()
+                .insert("x-big", "a".repeat(room - 9).parse().unwrap());
+            assert_eq!(
+                crate::http::client_head(&req).0,
+                crate::http::MAX_REQUEST_HEAD_BYTES
+            );
+            *req.uri_mut() = "https://node-b.cluster.internal:7443/actor/room/a?q=1"
+                .parse()
+                .unwrap();
+            let hop = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+            assert_eq!(
+                req.headers()["traceparent"],
+                hop.context.unwrap().header().as_str()
+            );
+        }
+        // With no header of the client's, the same head has no room: none
+        // is added. One byte less in it, and there is room, measured as
+        // the owner counts it (the `Host` header, not the address too).
+        for (spare, added) in [(69, false), (70, true)] {
+            let mut req = http::Request::builder()
+                .uri("/actor/room/a?q=1")
+                .header("host", "app.test")
+                .body(())
+                .unwrap();
+            let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+            req.headers_mut()
+                .insert("x-big", "a".repeat(room - 9 - spare).parse().unwrap());
+            *req.uri_mut() = "https://node-b.cluster.internal:7443/actor/room/a?q=1"
+                .parse()
+                .unwrap();
+            let _ = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+            assert_eq!(req.headers().contains_key("traceparent"), added, "{spare}");
+        }
+        // A client's header that does not parse, shorter than the host's,
+        // in a head with no room for the host's: removed, not passed on.
+        let mut req = http::Request::builder()
+            .header("traceparent", "x")
+            .body(())
+            .unwrap();
+        let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+        req.headers_mut()
+            .insert("x-big", "a".repeat(room - 9).parse().unwrap());
+        let _ = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+        assert!(req.headers().get("traceparent").is_none());
+        // At the byte limit with none of the client's: unchanged.
+        let mut req = http::Request::new(());
+        let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+        req.headers_mut()
+            .insert("x-big", "a".repeat(room - 9 - 60).parse().unwrap());
+        let _ = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+        assert!(req.headers().get("traceparent").is_none());
+        // One byte of room more than it needs: added.
+        let mut req = http::Request::new(());
+        let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&req).0;
+        req.headers_mut().insert(
+            "x-big",
+            "a".repeat(room - 9 - (11 + 55 + 4)).parse().unwrap(),
+        );
+        let _ = hop_in(Some(&t), parent, "forward", "a", "b", &mut req);
+        assert!(req.headers().get("traceparent").is_some());
+        assert_eq!(
+            crate::http::client_head(&req).0,
+            crate::http::MAX_REQUEST_HEAD_BYTES
+        );
+    }
+
+    /// `remote`, `resent` and `status` are set as a default and then as
+    /// what happened, like `outcome`: one of each on the span.
+    #[test]
+    fn traces_a_hop_writes_each_changing_attribute_once() {
+        let (t, memory) = tracing(1.0, false);
+        let mut req = http::Request::new(());
+        let mut hop = hop_in(
+            Some(&t),
+            Some(test_context(true)),
+            "call",
+            "a",
+            "b",
+            &mut req,
+        );
+        let sent = req.headers()["traceparent"].clone();
+        // Sent again on a request built again (a relayed upgrade): the
+        // same header by the same rules, replacing a client's.
+        let mut again = http::Request::builder()
+            .header("traceparent", NO)
+            .body(())
+            .unwrap();
+        hop.resend_in(true, &mut again);
+        assert_eq!(again.headers()["traceparent"], sent);
+        hop.answered(None);
+        hop.answered(Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        hop.answered(Some(http::StatusCode::OK));
+        drop(hop);
+        // A second send with no room for the header: the client's does
+        // not go on, and the hop says the header did not go out.
+        let mut first = http::Request::new(());
+        let mut hop = hop_in(
+            Some(&t),
+            Some(test_context(true)),
+            "upgrade",
+            "a",
+            "b",
+            &mut first,
+        );
+        let mut full = http::Request::builder().header("traceparent", "x");
+        for i in 1..crate::http::MAX_REQUEST_HEADERS {
+            full = full.header(format!("x-h{i}"), "v");
+        }
+        let mut full = full.body(()).unwrap();
+        let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&full).0;
+        full.headers_mut()
+            .insert("x-h1", "a".repeat(room).parse().unwrap());
+        hop.resend_in(true, &mut full);
+        assert!(full.headers().get("traceparent").is_none());
+        drop(hop);
+        let spans = memory.0.lock().unwrap();
+        let values = |key: &str| -> Vec<String> {
+            spans[0]
+                .attributes
+                .iter()
+                .filter(|a| a.key.as_str() == key)
+                .map(|a| a.value.to_string())
+                .collect()
+        };
+        assert_eq!(values("resent"), ["true"]);
+        assert_eq!(values("status"), ["200"]);
+        assert_eq!(values("outcome"), ["answered"]);
+        assert_eq!(values("carried"), ["true"]);
+        let values = |key: &str| -> Vec<String> {
+            spans[1]
+                .attributes
+                .iter()
+                .filter(|a| a.key.as_str() == key)
+                .map(|a| a.value.to_string())
+                .collect()
+        };
+        assert_eq!(values("resent"), ["true"]);
+        assert_eq!(values("carried"), ["false"]);
+    }
     const YES: &str = "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01";
     const NO: &str = "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00";
 

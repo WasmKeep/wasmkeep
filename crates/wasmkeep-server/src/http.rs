@@ -75,6 +75,11 @@ pub const READY_PATH: &str = "/_wasmkeep/ready";
 
 impl App {
     async fn route(&self, mut req: Request<Incoming>) -> Response<HyperOutgoingBody> {
+        if crate::traces::recording()
+            && let Some(node) = self.actors.as_ref().and_then(ActorService::traced_node)
+        {
+            crate::traces::attribute("node", node.to_owned());
+        }
         if req.uri().path().starts_with("/_wasmkeep/") {
             let get = matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD);
             return match req.uri().path() {
@@ -714,6 +719,18 @@ pub(crate) enum Served {
 }
 
 impl Served {
+    /// Whether `req` is a hop from a node with tracing on (ADR 0044,
+    /// section 4; `Cluster::traced_sender`), judged by the app it is for.
+    /// With several apps, every request on the public port is a client's.
+    fn traced_sender<B>(&self, req: &mut Request<B>, peer: Option<&ClusterPeer>) -> bool {
+        let app = match self {
+            Self::One(app) => Some(app.clone()),
+            Self::Table(t) => peer.and_then(|_| t.app_of_hop(req.headers())),
+        };
+        app.and_then(|app| app.actors)
+            .is_some_and(|actors| actors.traced_sender(req, peer))
+    }
+
     /// The apps running now.
     fn running(&self) -> Vec<App> {
         match self {
@@ -945,7 +962,12 @@ async fn serve_connection<I>(
     let service = service_fn(move |mut req: Request<Incoming>| {
         let (app, cluster, first) = (app.clone(), cluster.clone(), Arc::clone(&first));
         async move {
-            let mut trace = crate::traces::request(&mut req);
+            // Whose sampled flag is followed: a hop's from a node with
+            // tracing on (ADR 0044, section 4), on this port a live peer's.
+            let mut trace = crate::traces::request(&mut req, |req| match &cluster {
+                Some(peer) => peer.is_live() && app.traced_sender(req, Some(peer)),
+                None => app.traced_sender(req, None),
+            });
             let result = trace
                 .run(async move {
                     let (bytes, count) = client_head(&req);

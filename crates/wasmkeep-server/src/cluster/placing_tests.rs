@@ -40,6 +40,7 @@ fn peer(place: bool, seen: Option<Load>, written_at: u64) -> Peer {
         can_blobs: true,
         instance: Some("beef".into()),
         can_place: place,
+        traces: false,
         seen: seen.map(|load| Seen {
             load,
             beat: (Some("beef".into()), written_at),

@@ -83,9 +83,13 @@ a **pre-alpha pre-release**.
   It is not `backup verify` (a backup's own contents) nor `cluster
   diagnose` (what the bucket's API does)
   ([verifying a bucket](docs/cluster-operations.md#verifying-a-bucket)).
-- **Traces** (ADR 0044, first slice): optional OTLP/HTTP export
-  (`--otlp-endpoint`) of spans for requests, fronts, actor events and
-  their bucket requests. Off by default
+- **Traces** (ADR 0044): optional OTLP/HTTP export (`--otlp-endpoint`)
+  of spans for requests, fronts, actor events, `actors.call`, hops
+  between nodes and bucket requests. A request that crosses nodes is one
+  trace: the first node decides whether it is sampled and the others
+  follow it, when they have tracing on too. Run every node with the same
+  tracing settings. Off by default; with it off nothing changes on the
+  wire. Hops are signed as in 0.8.1
   ([monitoring](docs/monitoring.md#traces)).
 
 ### Changed
