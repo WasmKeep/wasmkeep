@@ -108,10 +108,13 @@ pub(crate) enum HopCheck {
 /// (unique to each runtime, where the node id is shared by every app of a
 /// process), for that runtime's handlers after it
 /// ([`Cluster::signed_hop`]). Set by the host only: a request's extensions
-/// never come from the wire.
+/// never come from the wire. The verdict is for the port it was judged
+/// on (`on_cluster_port`): the two ports judge a signature differently,
+/// so a verdict is read only for a request on the same one.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedHop {
     pub(super) by: String,
+    pub(super) on_cluster_port: bool,
     pub(super) hop: HopCheck,
 }
 
@@ -772,16 +775,17 @@ impl Cluster {
     /// id). `Ok(None)`: a client's request. `Err`: a hop refused, answered
     /// with [`hop_refusal`], never served as a client's.
     pub(crate) fn signed_hop<B>(&self, req: &Request<B>) -> Result<Option<Signed>, &'static str> {
-        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
-            && *by == self.instance
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
+        if let Some(checked) = req.extensions().get::<CheckedHop>()
+            && checked.by == self.instance
+            && checked.on_cluster_port == on_cluster_port
         {
-            return match hop {
+            return match &checked.hop {
                 HopCheck::Signed(signed) => Ok(Some(signed.clone())),
                 HopCheck::Refused(why) => Err(why),
                 HopCheck::Outside => Ok(None),
             };
         }
-        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
         match self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port) {
             HopCheck::Signed(signed) => Ok(Some(signed)),
             HopCheck::Refused(why) => {
@@ -816,17 +820,20 @@ impl Cluster {
     /// why it must be refused with 503 rather than served as a client's
     /// request, if it must.
     pub(crate) fn judge_hop<B>(&self, req: &mut Request<B>) -> Option<&'static str> {
+        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
         // Judged already (for the trace's sampled flag, on a port where
         // that needs the signature: [`Self::traced_sender`]): once is all.
-        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
-            && *by == self.instance
+        // Only a verdict made by this runtime for this port is read; any
+        // other is judged again here and replaced.
+        if let Some(checked) = req.extensions().get::<CheckedHop>()
+            && checked.by == self.instance
+            && checked.on_cluster_port == on_cluster_port
         {
-            return match hop {
+            return match &checked.hop {
                 HopCheck::Refused(why) => Some(*why),
                 HopCheck::Signed(_) | HopCheck::Outside => None,
             };
         }
-        let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
         let hop = self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port);
         let refused = match &hop {
             HopCheck::Refused(why) => Some(*why),
@@ -834,6 +841,7 @@ impl Cluster {
         };
         req.extensions_mut().insert(CheckedHop {
             by: self.instance.clone(),
+            on_cluster_port,
             hop,
         });
         refused

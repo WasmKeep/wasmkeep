@@ -333,7 +333,7 @@ impl Drop for Span {
 /// The attributes a span sets more than once (a default, then what
 /// happened): kept aside and written when the span ends.
 const OUTCOME: &str = "outcome";
-const LAST_WINS: [&str; 4] = [OUTCOME, "remote", "resent", "status"];
+const LAST_WINS: [&str; 5] = [OUTCOME, "remote", "resent", "status", "carried"];
 
 /// The request methods a span names; any other token a client sends is
 /// `other`, so the attribute is never the client's text.
@@ -481,22 +481,42 @@ fn hop_in<B>(
         span.attribute("resent", false);
         span.attribute(OUTCOME, "failed");
     }
-    // The address, when the receiver will read it from `Host` instead.
-    let discount = match req.uri().authority() {
-        Some(authority) if req.headers().contains_key(http::header::HOST) => {
-            authority.as_str().len() + 8
-        }
-        _ => 0,
-    };
-    let carried = span
-        .context
-        .is_some_and(|context| set_header_within(req, context, discount));
-    if t.is_some() && !carried {
-        // Its own or none: never one this node did not set.
-        req.headers_mut().remove(TRACEPARENT);
-    }
-    span.attribute("carried", carried);
+    span.carry(t.is_some(), req);
     span
+}
+
+impl Span {
+    /// Puts this hop's context on `req` as it is sent, by [`hop`]'s
+    /// rules: within the head limits as the receiver counts them, and
+    /// with tracing on (`on`) this node's own header or none. `carried`
+    /// says whether the header went out on the request sent last.
+    fn carry<B>(&mut self, on: bool, req: &mut http::Request<B>) {
+        // The address, when the receiver will read it from `Host` instead.
+        let discount = match req.uri().authority() {
+            Some(authority) if req.headers().contains_key(http::header::HOST) => {
+                authority.as_str().len() + 8
+            }
+            _ => 0,
+        };
+        let carried = self
+            .context
+            .is_some_and(|context| set_header_within(req, context, discount));
+        if on && !carried {
+            // Its own or none: never one this node did not set.
+            req.headers_mut().remove(TRACEPARENT);
+        }
+        self.attribute("carried", carried);
+    }
+
+    /// The same hop sent a second time, on a request built again: the
+    /// header by the same rules as the first send, and `resent`.
+    pub(crate) fn resend<B>(&mut self, req: &mut http::Request<B>) {
+        self.resend_in(TRACING.get().is_some(), req);
+    }
+    fn resend_in<B>(&mut self, on: bool, req: &mut http::Request<B>) {
+        self.carry(on, req);
+        self.attribute("resent", true);
+    }
 }
 
 impl Span {
@@ -1005,10 +1025,40 @@ mod tests {
             "b",
             &mut req,
         );
-        hop.attribute("resent", true);
+        let sent = req.headers()["traceparent"].clone();
+        // Sent again on a request built again (a relayed upgrade): the
+        // same header by the same rules, replacing a client's.
+        let mut again = http::Request::builder()
+            .header("traceparent", NO)
+            .body(())
+            .unwrap();
+        hop.resend_in(true, &mut again);
+        assert_eq!(again.headers()["traceparent"], sent);
         hop.answered(None);
         hop.answered(Some(http::StatusCode::SERVICE_UNAVAILABLE));
         hop.answered(Some(http::StatusCode::OK));
+        drop(hop);
+        // A second send with no room for the header: the client's does
+        // not go on, and the hop says the header did not go out.
+        let mut first = http::Request::new(());
+        let mut hop = hop_in(
+            Some(&t),
+            Some(test_context(true)),
+            "upgrade",
+            "a",
+            "b",
+            &mut first,
+        );
+        let mut full = http::Request::builder().header("traceparent", "x");
+        for i in 1..crate::http::MAX_REQUEST_HEADERS {
+            full = full.header(format!("x-h{i}"), "v");
+        }
+        let mut full = full.body(()).unwrap();
+        let room = crate::http::MAX_REQUEST_HEAD_BYTES - crate::http::client_head(&full).0;
+        full.headers_mut()
+            .insert("x-h1", "a".repeat(room).parse().unwrap());
+        hop.resend_in(true, &mut full);
+        assert!(full.headers().get("traceparent").is_none());
         drop(hop);
         let spans = memory.0.lock().unwrap();
         let values = |key: &str| -> Vec<String> {
@@ -1023,6 +1073,16 @@ mod tests {
         assert_eq!(values("status"), ["200"]);
         assert_eq!(values("outcome"), ["answered"]);
         assert_eq!(values("carried"), ["true"]);
+        let values = |key: &str| -> Vec<String> {
+            spans[1]
+                .attributes
+                .iter()
+                .filter(|a| a.key.as_str() == key)
+                .map(|a| a.value.to_string())
+                .collect()
+        };
+        assert_eq!(values("resent"), ["true"]);
+        assert_eq!(values("carried"), ["false"]);
     }
     const YES: &str = "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01";
     const NO: &str = "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00";

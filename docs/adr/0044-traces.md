@@ -581,3 +581,12 @@ replaced by what happened; it is written once, when the span ends.
    the exporter's own thread and runtime.
 8. **Whether the actor name belongs in attributes** for every operator.
    A switch to leave it out is cheap and was not designed.
+9. **A replayed call over plain HTTP** costs one `request` span each
+   time: the flag is followed before the replay records are read
+   (`admission_replayed` could be consulted first).
+10. **A forward over plain HTTP is verified twice** when its flag is
+    followed and the app has rate limits: once for the flag, once for
+    admission.
+11. **No end-to-end case of a sender without the word.** The unit tests
+    cover it; a tracing phase in the mixed-version check is to cover it
+    before `0.9.0`.

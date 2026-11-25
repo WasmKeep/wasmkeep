@@ -485,6 +485,19 @@ async fn a_streamed_forward_sends_these_bytes() {
     check_forward(&captured.take(), &base, GOLDEN_FORWARD);
 }
 
+/// The spans a test's tracer made.
+#[derive(Debug, Clone, Default)]
+struct Spans(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+impl opentelemetry_sdk::trace::SpanExporter for Spans {
+    async fn export(
+        &self,
+        spans: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.lock().unwrap().extend(spans);
+        Ok(())
+    }
+}
+
 /// The `traceparent` a traced hop carried in `raw`: this node's `hop`
 /// span in the trace of [`crate::traces::test_context`], sampled. And
 /// `raw` without that line.
@@ -523,7 +536,10 @@ fn traced(raw: &str) -> (String, String) {
 ///   captured.
 #[tokio::test]
 async fn a_traced_call_and_forward_add_one_header_and_sign_as_before() {
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let spans = Spans::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(spans.clone())
+        .build();
     let _guard = crate::traces::install(provider, 1.0, false).unwrap();
     let context = Some(crate::traces::test_context(true));
 
@@ -593,6 +609,78 @@ async fn a_traced_call_and_forward_add_one_header_and_sign_as_before() {
         redact(&without, &base, None).replace(&hash, &plain),
         GOLDEN_FORWARD,
         "{raw}"
+    );
+
+    // An alarm hand-off and a take sent inside a trace are hops of it
+    // too: signed as every call, one header more.
+    for kind in ["hand_off", "take"] {
+        let (base, captured) = recorder().await;
+        let me = sender(&base).await;
+        let marker = if kind == "take" { TAKE } else { ALARM_HANDOFF };
+        crate::traces::scope(context, async {
+            if kind == "take" {
+                assert_eq!(me.take("owner", &target).await, TakeAnswer::Held);
+            } else {
+                me.hand_off_alarm("owner", &target, 1_700_000_000_000)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+        let raw = captured.take();
+        traced(&raw);
+        let (ts, nonce, hash, mac) = fields(header(&raw, INTERNAL));
+        let msg = format!(
+            "wasmkeep-call v4\n{ts}\n{nonce}\nowner\nPOST\n/actor/room/a%20b/\n{hash}\n\
+             {marker}:1\n\
+             x-wasmkeep-app:t/default\n"
+        );
+        assert_eq!(mac, hmac_hex(SECRET, &msg), "{kind}");
+        // Outside any trace (a drain, a sweep, a move): no header.
+        let (base, captured) = recorder().await;
+        let me = sender(&base).await;
+        if kind == "take" {
+            assert_eq!(me.take("owner", &target).await, TakeAnswer::Held);
+        } else {
+            me.hand_off_alarm("owner", &target, 1_700_000_000_000)
+                .await
+                .unwrap();
+        }
+        assert!(!captured.take().contains("traceparent"), "{kind}");
+    }
+    // One hop span for each hop sent inside the trace, and none for the
+    // others.
+    let hops: Vec<(String, String)> = spans
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.name == "hop")
+        .map(|s| {
+            let attribute = |key: &str| {
+                s.attributes
+                    .iter()
+                    .find(|a| a.key.as_str() == key)
+                    .map(|a| a.value.to_string())
+                    .unwrap_or_default()
+            };
+            assert_eq!(
+                (attribute("node"), attribute("peer"), attribute("status")),
+                ("me".into(), "owner".into(), "200".into())
+            );
+            assert_eq!(s.parent_span_id.to_string(), "1234567890abcdef");
+            (attribute("kind"), attribute("carried"))
+        })
+        .collect();
+    let carried = |kind: &str| (kind.to_owned(), "true".to_owned());
+    assert_eq!(
+        hops,
+        [
+            carried("call"),
+            carried("forward"),
+            carried("hand_off"),
+            carried("take")
+        ]
     );
 
     // Outside any trace (a sweep's hand-off, a move's take): nothing is

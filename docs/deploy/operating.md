@@ -215,13 +215,15 @@ keys `otlp-endpoint`, `trace-sample` and `trace-trust-incoming` of the
 node file) only after the finalize, or remove them before a node goes
 back to 0.8.1, which does not know them.
 
-**What starts a trace.** A request received on the public port or the
-cluster port, an alarm, and each socket message or close. With
+**What starts a trace.** A request from outside, an alarm, and each
+socket message or close. With
 `--trace-sample 0.01`, one in a hundred of them is sampled, at random. A client's
 `traceparent` keeps its trace id; its sampled flag is honoured only with
-`--trace-trust-incoming`.
+`--trace-trust-incoming`. That decision travels with the trace: a node
+run with the flag passes a client's sampled flag on to every node the
+request reaches.
 
-**What a trace holds.** Four kinds of span, all under the service name
+**What a trace holds.** Six kinds of span, all under the service name
 `wasmkeep`, with the node's id as `service.instance.id`:
 
 | Span | What it is | Attributes worth reading |
@@ -229,6 +231,8 @@ cluster port, an alarm, and each socket message or close. With
 | `request` | One HTTP request as the node received it | `method`, `route` (`front`, `actor`, `asset`, `file_link`), `status` |
 | `front` | The app's front running for that request | `cpu_seconds`, `outcome` |
 | `event` | One actor event | `tenant`, `app`, `node`, `class`, `actor`, `kind` (`request`, `call`, `alarm`, `socket_open`, `socket_message`, `socket_close`), `woken`, `mailbox_wait_seconds`, `cpu_seconds`, `outcome` |
+| `call` | One `actors.call`, in the event or front that made it | `class`, `actor`, `remote` (a request for it left the node), `status`, `outcome` |
+| `hop` | One request this node sent to another: a forward, a relayed WebSocket upgrade, a call, a placed request | `kind`, `node`, `peer`, `status`, `outcome`, `resent`, `carried` |
 | `bucket` | One bucket request made while handling it | `operation` (`get`, `put`, `list`, `delete`, ...), `family` (`wal`, `snapshot`, `owners`, `alarms`, ...), `outcome` |
 
 Spans carry actor names, and no request path, query string, header, body
@@ -256,23 +260,19 @@ actor that answered slowly, and read down the tree:
 Warnings and errors a node logs about a sampled request carry the
 trace's id, as `trace_id`.
 
-**What is not there yet.** A trace does not follow a request from node to
-node:
+**Across nodes.** A request that crosses nodes is one trace: under each
+`hop` span is the `request` span of the node it went to, and that node's
+events and bucket requests under it. The node that starts a trace
+decides whether it is sampled and the others follow, so a sampled trace
+has its spans from every node. Two things to know:
 
-- a forwarded request carries no context from the node that received
-  it. The owner's spans are a trace of their own, or join the client's
-  trace id if the client sent one;
-- an `actors.call` to another node carries the caller's trace id, but
-  the receiving node draws its own sample unless it runs with
-  `--trace-trust-incoming`;
-- there is no span for the hop itself, and background work (renewals,
-  sweeps, compaction) is not traced.
+- a node follows only nodes that have tracing on too. Run every node
+  with the same tracing settings; with tracing on at some nodes only, or
+  beside a 0.8.1 node during an upgrade, traces stop or split there;
+- background work (renewals, sweeps, compaction, a drain's or a move's
+  own requests to other nodes) is not traced.
 
-So a trace through several nodes can be partial. To follow one request
-across nodes today, send a `traceparent` from the client, run the nodes
-with `--trace-trust-incoming` behind a proxy whose sampling you control,
-and search the collector for that trace id. Hop spans are the next slice of
-[ADR 0044](../adr/0044-traces.md#3-on-a-hop).
+The rules are in [ADR 0044](../adr/0044-traces.md#3-on-a-hop).
 
 **Is the export healthy?** Watch
 `wasmkeep_trace_spans_dropped_total` and

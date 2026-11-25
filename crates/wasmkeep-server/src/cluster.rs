@@ -1425,10 +1425,7 @@ impl Cluster {
             }
             // Before the proof, which hashes it (ADR 0044, section 3).
             match &mut hop {
-                Some(hop) => {
-                    hop.inject(&mut out);
-                    hop.attribute("resent", true);
-                }
+                Some(hop) => hop.resend(&mut out),
                 None => {
                     hop = Some(crate::traces::hop(
                         "upgrade",

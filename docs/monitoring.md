@@ -835,7 +835,10 @@ and `trace-trust-incoming`. Collector credentials belong in
 An incoming `traceparent` keeps its trace id. Its sampled flag is ignored
 unless `--trace-trust-incoming` is set; with that flag both sampled and
 unsampled decisions are honoured. Use it only behind a proxy whose sampling
-you control. Guests receive their event or front context as an ordinary
+you control: the decision a node takes from a client this way travels with
+the trace, so one node run with the flag passes a client's sampled flag
+on to every node the request reaches, whether or not they have the flag.
+Guests receive their event or front context as an ordinary
 `traceparent` header, unless adding it would take the client's part of
 the request head past the head limits (64 KiB, 100 fields): the request
 then goes on as the client sent it. On `actors.call` the host sets the

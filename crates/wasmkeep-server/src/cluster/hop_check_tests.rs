@@ -313,12 +313,14 @@ async fn a_hop_without_its_own_verdict_is_checked_where_read() {
     let mut other = request(hop("valid"));
     other.extensions_mut().insert(CheckedHop {
         by: "another runtime".into(),
+        on_cluster_port: false,
         hop: HopCheck::Outside,
     });
     assert!(b.signed_hop(&other).unwrap().is_some());
     let mut junk = request(hop("bad"));
     junk.extensions_mut().insert(CheckedHop {
         by: "another runtime".into(),
+        on_cluster_port: false,
         hop: match b.check_hop(&hyper::Method::POST, PATH, &hop("valid"), false) {
             HopCheck::Signed(s) => HopCheck::Signed(s),
             other => panic!("{other:?}"),
@@ -492,6 +494,34 @@ async fn a_hop_is_followed_only_from_a_node_that_traces() {
     assert_eq!(b.judge_hop(&mut call), None);
     assert!(b.signed_hop(&call).unwrap().is_some());
     assert_eq!(verified() - before, 1);
+    // The verdict is the public port's: on the cluster port, which judges
+    // a signature differently, it is not read. Judged again there (the
+    // sender is not this connection's, which the listener checks; the
+    // signature itself holds), and what is kept is then that port's.
+    let mut moved = request(hop("valid"));
+    assert!(b.traced_sender(&mut moved, None));
+    moved
+        .extensions_mut()
+        .insert(ArrivedOnClusterPort(crate::http::ClusterPeer::for_test(
+            [7; 32],
+            Arc::new(crate::cluster_tls::pinning::PinSet::default()),
+        )));
+    let at = verified();
+    let _ = b.judge_hop(&mut moved);
+    assert_eq!(
+        verified() - at,
+        1,
+        "a plain-port verdict read on the cluster port"
+    );
+    assert!(
+        moved
+            .extensions()
+            .get::<CheckedHop>()
+            .unwrap()
+            .on_cluster_port
+    );
+    let _ = b.signed_hop(&moved);
+    assert_eq!(verified() - at, 1);
     // A refused hop stays refused after it, and is no node's.
     let mut forged = request(hop("sender-unbound"));
     assert!(!b.traced_sender(&mut forged, None));
