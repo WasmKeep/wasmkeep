@@ -157,7 +157,7 @@ pub struct ClusterConfig {
     /// Whether plain HTTP between nodes is still used (ADR 0011, phase B).
     /// [`ClusterPlaintext::Refuse`] needs [`ClusterConfig::cluster_tls`].
     pub cluster_plaintext: ClusterPlaintext,
-    /// Whether the tenant's bucket state was migrated by `cluster migrate`
+    /// Whether the tenant's bucket state was migrated by a 0.8.x `cluster migrate`
     /// (`cluster/migrated/<tenant>` exists, as the start check found; ADR
     /// 0022). Only then are the node's local databases of the layout
     /// before 0.4.0 put aside, the bucket being their truth; otherwise

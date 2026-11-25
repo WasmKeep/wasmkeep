@@ -275,6 +275,7 @@ fn apps_of_a_tenant_share_a_prefix_and_old_currents_are_refused() {
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("wasmkeep cluster migrate --bucket"), "{err}");
+    assert!(err.contains("0.8.1"), "{err}");
 
     // A migration in progress: deploys and starts refused.
     put(&bucket, &format!("{prefix}/cluster/migration"), "lock\n");

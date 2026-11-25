@@ -9,6 +9,18 @@ A bucket prefix that holds actor state is migrated once, offline, by
 `wasmkeep cluster migrate`. A node, `deploy` or `actor move` of 0.4.0
 refuses a tenant that was not migrated, and prints the command to run.
 
+> **`cluster migrate` was removed in 0.9.0.** A cluster older than 0.4.0
+> upgrades through 0.8.x first. Pin the 0.8.1 binary (the last release
+> with the command), run every `wasmkeep cluster migrate` step of this
+> page with it, and upgrade the cluster to 0.8.1, doing what the upgrade
+> pages from [0.5](upgrading-to-0.5.md) to [0.8](upgrading-to-0.8.md)
+> ask on the way. Then upgrade to 0.9.0.
+> A node, `deploy` or `actor move` of 0.9.0 refuses a tenant still in
+> the layout before 0.4.0, and a prefix a 0.8.x migration holds, and says
+> to migrate with 0.8.1. A prefix migrated earlier needs nothing: 0.9.0
+> still reads its commits and the tombstones over the old ownership
+> records.
+
 This page is the whole procedure, from the backup to removing the old
 keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
 `leases/` or `alarms/` folder) needs none of it: upgrade the nodes.
@@ -47,7 +59,8 @@ keys. A bucket prefix with no actor state yet (no `actors/`, `owners/`,
    ([how](backup-and-restore.md#with-the-cluster-stopped-restorable)).
    Keep that copy until step 11 is done.
 
-4. **Install 0.4.0** on every machine, without starting it.
+4. **Install 0.4.0** (from 0.9.0 on: 0.8.1) on every machine, without
+   starting it.
 
 5. **Dry run**:
 

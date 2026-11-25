@@ -330,23 +330,6 @@ Usage: `wasmkeep cluster forget [OPTIONS] --bucket <BUCKET> <NODE>`
 | `<NODE>  The node's id` | |  |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
 
-#### `wasmkeep cluster migrate`
-
-Move the actor state of a bucket prefix written by a version before 0.4.0 into each app's own root, once, while every node is stopped (ADR 0022).
-
-Usage: `wasmkeep cluster migrate [OPTIONS] --bucket <BUCKET>`
-
-| Flag or argument | Default | Meaning |
-|---|---|---|
-| `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
-| `--apply` |  | Migrate, or with --remove-old delete (without it: a dry run, which writes nothing) |
-| `--rollback` |  | Undo a migration, while no node of any version has started since (after that, it is one-way) |
-| `--remove-old` |  | Once the app answers on this version: list (with --apply, delete) the copies a migration left in the layout before 0.4.0, for every migrated tenant. |
-| `--forgo-rollback` |  | With --remove-old: delete even though the rollback would still work (no node has started since the migration), giving it up |
-| `--history-retention-secs <HISTORY_RETENTION_SECS>` | `3600` | With --remove-old: old-layout history younger than this is kept for a later run, as garbage collection keeps it. |
-| `--heir <TENANT/APP>` |  | The app of a tenant that inherits the classes no single app deploys (a class two apps deploy, or one no app deploys in a tenant with several apps), as TENANT/APP. |
-| `--concurrency <CONCURRENCY>` | `32` | Bucket requests in flight at once |
-
 #### `wasmkeep cluster diagnose`
 
 Check that a bucket does what WasmKeep needs from it: conditional creates and replaces, reads and listings that follow writes and deletes, large objects, last-modified times and the clock.

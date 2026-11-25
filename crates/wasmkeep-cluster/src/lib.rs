@@ -45,9 +45,9 @@ pub mod failover;
 pub mod hold_cell;
 pub mod holds;
 pub mod lease;
+pub mod legacy_layout;
 pub mod local_heads;
 pub mod membership;
-pub mod migrate;
 pub mod node_lease;
 #[cfg(feature = "object-store")]
 pub mod object_store;
@@ -56,5 +56,6 @@ pub mod recorded_head;
 pub mod replication;
 pub mod restore_fence;
 pub mod state_root;
+pub mod store;
 
 pub mod actor_restore;

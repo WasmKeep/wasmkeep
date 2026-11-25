@@ -90,10 +90,10 @@ mod golden_trace;
 #[path = "idle_pass.rs"]
 mod idle_pass;
 mod ingress_limits;
+#[path = "legacy_layout.rs"]
+mod legacy_layout;
 #[path = "listings.rs"]
 mod listings;
-#[path = "migrate.rs"]
-mod migrate;
 #[path = "node_leases.rs"]
 mod node_leases;
 #[path = "placement.rs"]

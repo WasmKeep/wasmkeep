@@ -18,8 +18,8 @@ use clap::Args;
 use futures_util::future::join_all;
 use wasmkeep_cluster::bucket_check::{CheckError, check_conditional_writes};
 use wasmkeep_cluster::lease::{Bucket, BucketError, LeaseConfig, Version};
-use wasmkeep_cluster::migrate::Store;
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
+use wasmkeep_cluster::store::Store;
 
 #[derive(Debug, Args)]
 pub(crate) struct DiagnoseArgs {
@@ -1785,7 +1785,7 @@ mod tests {
 
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
-    use wasmkeep_cluster::migrate::ObjectMeta;
+    use wasmkeep_cluster::store::ObjectMeta;
 
     use super::*;
 

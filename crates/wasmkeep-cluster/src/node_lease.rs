@@ -1202,8 +1202,9 @@ fn checked(record: &OwnerRecord) -> Result<Vec<u8>, AcquireError> {
 }
 
 /// What an ownership key holds: a record of either version, or the
-/// migration tombstone ([`crate::migrate::TOMBSTONE_HEADER`]), which is
-/// dispatched first and is never an unknown ownership version.
+/// migration tombstone ([`crate::legacy_layout::TOMBSTONE_HEADER`]), which
+/// is dispatched first and is never an unknown ownership version. Buckets
+/// a 0.8.x `cluster migrate` migrated keep their tombstones for good.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerObject {
     /// An ownership record.
@@ -1221,13 +1222,13 @@ pub enum OwnerObject {
 impl OwnerObject {
     /// Parses what an ownership key holds; `None` if unreadable.
     pub fn decode(body: &[u8]) -> Option<Self> {
-        if let Some(to) = crate::migrate::tombstone_target(body) {
+        if let Some(to) = crate::legacy_layout::tombstone_target(body) {
             return Some(Self::Tombstone {
                 to: to.to_owned(),
-                unowned: crate::migrate::is_unowned(body),
+                unowned: crate::legacy_layout::is_unowned(body),
             });
         }
-        if body.starts_with(crate::migrate::TOMBSTONE_HEADER.as_bytes()) {
+        if body.starts_with(crate::legacy_layout::TOMBSTONE_HEADER.as_bytes()) {
             return None;
         }
         OwnerRecord::decode(body).map(Self::Record)
@@ -3530,7 +3531,7 @@ mod tests {
             Err(AcquireError::FormatMismatch)
         );
         // A tombstone stays unreadable as a record: never acquired.
-        mem.overwrite("owners/x", Some(&crate::migrate::tombstone("p2/")));
+        mem.overwrite("owners/x", Some(&crate::legacy_layout::tombstone("p2/")));
         assert_eq!(
             run(a.acquire("owners/x", || true, async || Ok(1))),
             Err(AcquireError::Corrupt)

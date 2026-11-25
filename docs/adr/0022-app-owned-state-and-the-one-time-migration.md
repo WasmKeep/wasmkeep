@@ -2,9 +2,10 @@
 
 - Status: accepted; built in 0.4.0: the layout
   (`crates/wasmkeep-cluster/src/state_root.rs`),
-  `cluster migrate` with `--remove-old` (`crates/wasmkeep-cluster/src/migrate.rs`,
-  `crates/wasmkeep-cli/src/migrate_cmd.rs`; `sim/tests/madsim_migrate.rs`,
-  `crates/wasmkeep-server/tests/cluster/migrate.rs`), the start checks and
+  `cluster migrate` with `--remove-old` (removed in 0.9.0, see the
+  amendment below; what stays is in
+  `crates/wasmkeep-cluster/src/legacy_layout.rs` and
+  `crates/wasmkeep-server/tests/cluster/legacy_layout.rs`), the start checks and
   local moves (`crates/wasmkeep-server/src/local_layout.rs`), the implicit
   app and the app between nodes (`crates/wasmkeep-server/src/cluster/forwarding.rs`,
   `wrong_app`), and two apps of one tenant on one prefix
@@ -270,3 +271,19 @@ old binary fails instead of starting empty.
 - **Fencing live nodes from migrate.** A fenced node under a service
   manager restarts, and a wrong `--bucket` would fence production. It
   refuses live nodes instead.
+
+## Amendment of 2026-11-25: the migration is removed
+
+0.9.0 removes `wasmkeep cluster migrate` (and `--rollback` and
+`--remove-old`), its protocol and its simulation. A cluster older than
+0.4.0 upgrades through 0.8.x first: the 0.8.1 binary migrates it, as
+above. 0.9.0 keeps what a migration leaves in the bucket for good, in
+`crates/wasmkeep-cluster/src/legacy_layout.rs`:
+
+- An ownership key holding a tombstone still decodes as one, never as a
+  record or an unknown version: migrated tenants keep their tombstones.
+- The start check is unchanged: a 0.8.x run's lock refuses every tenant,
+  a commit lets the tenant start (and puts old local databases aside),
+  and bare keys without a commit refuse it. Both refusals now say to use
+  the 0.8.1 binary.
+- The `current` token `3` still marks a rooted app.

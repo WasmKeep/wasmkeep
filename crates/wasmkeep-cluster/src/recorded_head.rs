@@ -419,8 +419,8 @@ mod tests {
     /// `unowned` form, and is never a record.
     #[test]
     fn tombstones_are_dispatched_before_records() {
-        let owned = crate::migrate::tombstone("p2/");
-        let unowned = crate::migrate::tombstone_unowned("p2/");
+        let owned = crate::legacy_layout::tombstone("p2/");
+        let unowned = crate::legacy_layout::tombstone_unowned("p2/");
         assert_eq!(
             OwnerObject::decode(&owned),
             Some(OwnerObject::Tombstone {

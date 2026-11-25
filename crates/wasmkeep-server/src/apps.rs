@@ -85,7 +85,7 @@ pub enum DeployError {
     #[error("another deploy changed the app at the same time; retry")]
     Conflict,
     /// The bucket prefix is being migrated, or holds the tenant's actor
-    /// state in the layout before 0.4.0 (ADR 0022): run `cluster migrate`.
+    /// state in the layout before 0.4.0 (ADR 0022): migrate with 0.8.x.
     #[error("{0}")]
     Layout(String),
     /// Nothing is deployed yet, or there is nothing to roll back to.
@@ -792,8 +792,8 @@ impl AppRef {
 }
 
 /// The third token of `current` once the app's state is under its root
-/// (ADR 0022); `wasmkeep_cluster::migrate` writes it too.
-pub const ROOTED_TOKEN: &str = wasmkeep_cluster::migrate::ROOTED_TOKEN;
+/// (ADR 0022); a 0.8.x `cluster migrate` wrote it too.
+pub const ROOTED_TOKEN: &str = wasmkeep_cluster::legacy_layout::ROOTED_TOKEN;
 
 /// What a deploy or rollback made current, and what changed.
 #[derive(Debug, Clone)]

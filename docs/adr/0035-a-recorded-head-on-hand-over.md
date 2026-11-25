@@ -562,7 +562,7 @@ explicitly gives up this guarantee. Never delete records, strip fields or
 lower generations to make an old binary start. Component rollback does
 not roll back the app's ownership format setting.
 
-The `wasmkeep-owner moved` marker in `migrate.rs` is **not** an unknown
+The `wasmkeep-owner moved` marker (`legacy_layout.rs` since 0.9.0) is **not** an unknown
 ownership version. Dispatch that header to the migration-tombstone reader
 before v1/v2 decoding, retaining the target and optional `unowned` form.
 It stays non-acquirable at the old location; conversion must not turn it

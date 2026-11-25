@@ -17,7 +17,6 @@ mod deploy;
 mod dev;
 mod dev_project;
 mod diagnose;
-mod migrate_cmd;
 mod new_cmd;
 mod node_file;
 mod project;
@@ -741,15 +740,6 @@ fn main() -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
             std::process::exit(code);
         }
-        Command::Cluster(ClusterCommand::Migrate(args)) => {
-            let code = migrate_cmd::run(&args)?;
-            if code != 0 {
-                use std::io::Write as _;
-                let _ = std::io::stdout().flush();
-                std::process::exit(code);
-            }
-            Ok(())
-        }
         Command::Backup(args) => backup::run(&args),
         Command::Feed(args) => wasmkeep_cli::feed::run(&args),
         Command::Actor(ActorCommand::History(args)) => actor_read::history(&args),
@@ -864,8 +854,10 @@ fn require_rooted(
     anyhow::ensure!(
         current.rooted,
         "{tenant}/{name} was last deployed by a version before 0.4.0: if this bucket prefix \
-         was not migrated yet, run `wasmkeep cluster migrate --bucket {bucket}` (with --apply); \
-         if it was, deploy {tenant}/{name} once with this version. Then start this node"
+         was not migrated yet, stop every node and migrate it with the 0.8.1 binary \
+         (`wasmkeep cluster migrate --bucket {bucket}`, then --apply; this version has no \
+         `cluster migrate`, removed in 0.9.0); if it was, deploy {tenant}/{name} once with \
+         this version. Then start this node"
     );
     Ok(())
 }
@@ -1015,8 +1007,8 @@ fn parse_writes(s: &str) -> Result<(String, wasmkeep_server::apps::Writes), Stri
 }
 
 /// Opens `s3://BUCKET[/PREFIX]`, configured from the AWS_* environment,
-/// for a command that writes: refused while `cluster migrate` holds the
-/// prefix (ADR 0022). Only reads.
+/// for a command that writes: refused while a 0.8.x `cluster migrate`
+/// holds the prefix (ADR 0022). Only reads.
 pub(crate) fn open_bucket(
     url: &str,
 ) -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)> {
@@ -1046,7 +1038,7 @@ fn on_own_thread<T: Send>(check: impl std::future::Future<Output = T> + Send) ->
     })
 }
 
-/// Refuses a bucket prefix that `cluster migrate` holds.
+/// Refuses a bucket prefix that a 0.8.x `cluster migrate` holds.
 fn refuse_locked(
     url: &str,
     store: &std::sync::Arc<dyn object_store::ObjectStore>,
@@ -1057,12 +1049,13 @@ fn refuse_locked(
         std::sync::Arc::clone(store),
         prefix,
     );
-    let found = on_own_thread(async { bucket.get(wasmkeep_cluster::migrate::LOCK_KEY).await });
+    let found =
+        on_own_thread(async { bucket.get(wasmkeep_cluster::legacy_layout::LOCK_KEY).await });
     match found {
         Some(Ok(None)) => Ok(()),
         Some(Ok(Some(_))) => anyhow::bail!(
             "bucket {url}: {}",
-            wasmkeep_cluster::migrate::StartRefusal::InProgress
+            wasmkeep_cluster::legacy_layout::StartRefusal::InProgress
         ),
         // Fail closed, as the layout check does: a migration may hold it.
         Some(Err(e)) => anyhow::bail!("bucket {url}: checking for a migration in progress: {e}"),
@@ -1083,7 +1076,9 @@ pub(crate) fn check_layout(
         std::sync::Arc::clone(store),
         prefix,
     );
-    match on_own_thread(wasmkeep_cluster::migrate::start_check(&bucket, tenant)) {
+    match on_own_thread(wasmkeep_cluster::legacy_layout::start_check(
+        &bucket, tenant,
+    )) {
         None => anyhow::bail!("bucket {url}: no answer while checking its layout"),
         Some(Err(e)) => Err(anyhow::anyhow!(
             "bucket {url}: {}",
