@@ -3082,6 +3082,42 @@ async fn a_heartbeat_naming_no_app_makes_the_listing_prove_nothing() {
     );
 }
 
+/// The mark `cluster forget` leaves at `nodes/<id>` is not a node: unlike
+/// an object that does not decode, it does not make the listing prove
+/// nothing, and the restore does not wait for it.
+#[tokio::test(start_paused = true)]
+async fn a_forget_mark_is_no_node_and_does_not_force_the_long_quiet_wait() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let now = u64::try_from(super::now_ms().unwrap()).unwrap();
+    let marked = AgedNodes::store(chrono::Duration::hours(1));
+    put(
+        &marked,
+        "nodes/n1",
+        wasmkeep_cluster::node_lease::encode_forgotten(now - 3_600_000),
+        false,
+    )
+    .await
+    .unwrap();
+    let waited = timed_restore(&f, &id, &marked).await;
+    assert!(waited < std::time::Duration::from_secs(1), "{waited:?}");
+    // Anything else that does not decode still does.
+    let junk = AgedNodes::store(chrono::Duration::hours(1));
+    put(
+        &junk,
+        "nodes/n1",
+        b"wasmkeep-node-forgotten 2\n1\n".to_vec(),
+        false,
+    )
+    .await
+    .unwrap();
+    let waited = timed_restore(&f, &id, &junk).await;
+    assert!(
+        waited >= wasmkeep_server::apps::LATE_WRITES - std::time::Duration::from_secs(1),
+        "{waited:?}"
+    );
+}
+
 /// A node of the app that keeps writing its lease through the quiet wait
 /// (here unconditionally, over the restore's fence) is still acting: the
 /// restore waits again from its newest write, then refuses.

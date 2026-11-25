@@ -183,7 +183,11 @@ async fn app_nodes(store: &Store, prefix: &str, served: &str) -> anyhow::Result<
     for (id, meta) in list_bounded(store, &root).await? {
         let body = read(store, meta.location.as_ref(), META_MAX).await?;
         let node = NodeInfo::decode(&body).filter(|node| node.id == id);
-        // TODO: skip the mark `cluster forget` leaves at `nodes/<id>` (`node_lease::forgotten`), once it exists: it is no node, and must not force the long quiet wait.
+        // The mark of a `cluster forget` under way: no node, of no app.
+        // Read as an unknown one it would force the long quiet wait.
+        if wasmkeep_cluster::node_lease::forgotten(&body).is_some() {
+            continue;
+        }
         let relevant = match &node {
             // Its app is unknown: it may be this one.
             None => {
