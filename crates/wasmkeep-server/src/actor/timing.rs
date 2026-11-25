@@ -47,6 +47,7 @@ pub(super) enum Delivered {
 const DELIVERED: [&str; 4] = ["ran", "stale", "duplicate", "deferred"];
 
 pub(super) struct Timing {
+    pub(super) mailbox_wait_nanos: AtomicU64,
     histograms: [Arc<Histogram>; 7],
     stale_hints: Arc<AtomicU64>,
     deliveries: [Arc<AtomicU64>; 4],
@@ -60,6 +61,7 @@ pub(super) struct Timing {
 impl Timing {
     pub(super) fn new(app: &str, class: &str) -> Arc<Self> {
         Arc::new(Self {
+            mailbox_wait_nanos: AtomicU64::new(0),
             histograms: NAMES.map(|work| {
                 METRICS
                     .mailbox_host_work_seconds

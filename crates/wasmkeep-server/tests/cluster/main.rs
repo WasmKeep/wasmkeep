@@ -118,6 +118,8 @@ mod snapshots;
 mod spread;
 #[path = "supervisor.rs"]
 mod supervisor;
+#[path = "traces.rs"]
+mod traces;
 #[path = "two_apps.rs"]
 mod two_apps;
 #[path = "websockets.rs"]

@@ -36,6 +36,7 @@ pub mod settle;
 mod shares;
 mod socket_limits;
 mod supervisor;
+pub mod traces;
 mod websocket;
 pub use guest_tables::{MAX_GUEST_FIELDS_BYTES, MAX_GUEST_RESOURCES};
 pub use socket_limits::{SocketBudget, SocketLimits};

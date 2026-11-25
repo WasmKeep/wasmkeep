@@ -21,7 +21,7 @@ pub(crate) struct NodeFile {
 }
 
 /// `[process]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Process {
     /// The process identity, `[a-z0-9-]` (published from a later version).
     pub(crate) id: Option<String>,
@@ -34,6 +34,9 @@ pub(crate) struct Process {
     /// off for every app of the process, as `serve --no-idle-compaction`
     /// does; `None`: on.
     pub(crate) idle_compaction: Option<bool>,
+    pub(crate) otlp_endpoint: Option<String>,
+    pub(crate) trace_sample: Option<f64>,
+    pub(crate) trace_trust_incoming: Option<bool>,
 }
 
 /// `[listen]`: the three listeners, and the addresses peers use.
@@ -105,7 +108,15 @@ pub(crate) fn parse(text: &str, path: &Path) -> Result<NodeFile, String> {
 
 /// The top-level tables, and the keys of each.
 const TOP: &[&str] = &["process", "listen", "limits", "app"];
-const PROCESS: &[&str] = &["id", "data-dir", "placement", "idle-compaction"];
+const PROCESS: &[&str] = &[
+    "id",
+    "data-dir",
+    "placement",
+    "idle-compaction",
+    "otlp-endpoint",
+    "trace-sample",
+    "trace-trust-incoming",
+];
 const LISTEN: &[&str] = &[
     "public",
     "public-advertise",
@@ -166,6 +177,23 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
 
     if let Some(t) = table(&src, root, "process")? {
         known_keys(&src, t, "[process]", PROCESS)?;
+        file.process.otlp_endpoint =
+            string_at(&src, t, "otlp-endpoint", "[process]")?.map(|(s, _)| s);
+        if let Some((key, value)) = get(t, "trace-sample") {
+            let number = match value.get_ref() {
+                DeValue::Float(v) => v.as_str().parse::<f64>().ok(),
+                DeValue::Integer(v) => v.as_str().parse::<f64>().ok(),
+                _ => None,
+            };
+            let Some(ratio) = number.filter(|r| r.is_finite() && (0.0..=1.0).contains(r)) else {
+                return src.err(key.span(), "[process] trace-sample must be between 0 and 1");
+            };
+            file.process.trace_sample = Some(ratio);
+        }
+        if get(t, "trace-trust-incoming").is_some() {
+            file.process.trace_trust_incoming =
+                Some(boolean(&src, t, "trace-trust-incoming", "[process]")?);
+        }
         if let Some((id, span)) = string_at(&src, t, "id", "[process]")? {
             if wasmkeep_cluster::membership::validate_node_id(&id).is_err() {
                 return src.err(
@@ -753,6 +781,9 @@ impl NodeFile {
                 data_dir: Some(args.data_dir.clone()),
                 placement: args.no_placement.then_some(false),
                 idle_compaction: args.no_idle_compaction.then_some(false),
+                otlp_endpoint: args.otlp_endpoint.clone(),
+                trace_sample: Some(args.trace_sample),
+                trace_trust_incoming: Some(args.trace_trust_incoming),
             },
             listen: Listen {
                 public: Some(args.listen),
@@ -831,7 +862,20 @@ impl NodeFile {
     }
 
     /// [`Self::apply_to`] for the entry `a`.
+    pub(crate) fn apply_traces(&self, args: &mut crate::ServeArgs) {
+        if let Some(endpoint) = &self.process.otlp_endpoint {
+            args.otlp_endpoint = Some(endpoint.clone());
+        }
+        if let Some(ratio) = self.process.trace_sample {
+            args.trace_sample = ratio;
+        }
+        if let Some(trust) = self.process.trace_trust_incoming {
+            args.trace_trust_incoming = trust;
+        }
+    }
+
     fn apply_app(&self, a: &AppEntry, args: &mut crate::ServeArgs) -> anyhow::Result<()> {
+        self.apply_traces(args);
         args.app = Some((a.tenant.clone(), a.name.clone()));
         args.node_id.clone_from(&a.node_id);
         // The process's switch, for each of its apps (ADR 0041).

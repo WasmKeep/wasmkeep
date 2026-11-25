@@ -63,7 +63,13 @@ fn count(operation: &str, status: &str, took: Duration) {
 }
 
 /// Counts and times the call that began at `started`.
-fn record<T>(operation: &str, started: Instant, result: Result<T>) -> Result<T> {
+fn record<T>(
+    operation: &str,
+    started: Instant,
+    mut trace: crate::traces::Span,
+    result: Result<T>,
+) -> Result<T> {
+    trace.attribute("outcome", status(&result));
     count(operation, status(&result), started.elapsed());
     result
 }
@@ -71,15 +77,17 @@ fn record<T>(operation: &str, started: Instant, result: Result<T>) -> Result<T> 
 /// Counts a listing once: as an error at its first failed item, otherwise
 /// as ok when it ends or is dropped.
 fn counted_listing<T: Send + 'static>(
+    trace: crate::traces::Span,
     stream: BoxStream<'static, Result<T>>,
 ) -> BoxStream<'static, Result<T>> {
-    struct Once(Option<&'static str>, Instant);
+    struct Once(Option<&'static str>, Instant, crate::traces::Span);
     impl Drop for Once {
         fn drop(&mut self) {
+            self.2.attribute("outcome", self.0.unwrap_or("ok"));
             count("list", self.0.unwrap_or("ok"), self.1.elapsed());
         }
     }
-    let mut once = Once(None, Instant::now());
+    let mut once = Once(None, Instant::now(), trace);
     stream
         .map(move |item| {
             if once.0.is_none()
@@ -105,6 +113,7 @@ impl ObjectStore for Counted {
         record(
             "put",
             started,
+            crate::traces::bucket("put", location.as_ref()),
             self.inner.put_opts(location, payload, opts).await,
         )
     }
@@ -118,6 +127,7 @@ impl ObjectStore for Counted {
         record(
             "multipart",
             started,
+            crate::traces::bucket("multipart", location.as_ref()),
             self.inner.put_multipart_opts(location, opts).await,
         )
     }
@@ -128,6 +138,7 @@ impl ObjectStore for Counted {
         record(
             operation,
             started,
+            crate::traces::bucket(operation, location.as_ref()),
             self.inner.get_opts(location, options).await,
         )
     }
@@ -137,6 +148,7 @@ impl ObjectStore for Counted {
         record(
             "get",
             started,
+            crate::traces::bucket("get", location.as_ref()),
             self.inner.get_ranges(location, ranges).await,
         )
     }
@@ -148,17 +160,25 @@ impl ObjectStore for Counted {
         // Each item is timed from the one before it (the first from the
         // call), so a batched delete's time is shared out, not repeated.
         let mut last = Instant::now();
+        let context = crate::traces::current();
         self.inner
             .delete_stream(locations)
             .map(move |r| {
                 let started = std::mem::replace(&mut last, Instant::now());
-                record("delete", started, r)
+                crate::traces::with_context(context, || {
+                    let key = r.as_ref().map_or("", |p| p.as_ref());
+                    let trace = crate::traces::bucket_delete(started, key);
+                    record("delete", started, trace, r)
+                })
             })
             .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        counted_listing(self.inner.list(prefix))
+        counted_listing(
+            crate::traces::bucket("list", prefix.map_or("", |p| p.as_ref())),
+            self.inner.list(prefix),
+        )
     }
 
     fn list_with_offset(
@@ -166,7 +186,10 @@ impl ObjectStore for Counted {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        counted_listing(self.inner.list_with_offset(prefix, offset))
+        counted_listing(
+            crate::traces::bucket("list", prefix.map_or("", |p| p.as_ref())),
+            self.inner.list_with_offset(prefix, offset),
+        )
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -174,6 +197,7 @@ impl ObjectStore for Counted {
         record(
             "list",
             started,
+            crate::traces::bucket("list", prefix.map_or("", |p| p.as_ref())),
             self.inner.list_with_delimiter(prefix).await,
         )
     }
@@ -183,6 +207,7 @@ impl ObjectStore for Counted {
         record(
             "copy",
             started,
+            crate::traces::bucket("copy", from.as_ref()),
             self.inner.copy_opts(from, to, options).await,
         )
     }
@@ -192,6 +217,7 @@ impl ObjectStore for Counted {
         record(
             "rename",
             started,
+            crate::traces::bucket("rename", from.as_ref()),
             self.inner.rename_opts(from, to, options).await,
         )
     }

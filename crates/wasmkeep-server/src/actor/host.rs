@@ -499,8 +499,11 @@ impl ActorHost {
             .take()
             .ok_or_else(|| wasmtime::format_err!("actor database unavailable"))?;
         let (result, received) = oneshot::channel();
+        // Captures may start an upload from this blocking worker. Carry the
+        // initiating event explicitly; Tokio task locals do not cross it.
+        let context = crate::traces::current();
         self.pending_db = Some(tokio::task::spawn_blocking(move || {
-            let out = f(&mut db);
+            let out = crate::traces::with_context(context, || f(&mut db));
             let _ = result.send(out);
             db
         }));

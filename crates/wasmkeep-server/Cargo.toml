@@ -10,6 +10,14 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Pin projection for allocation-free tracing scopes. Already in the graph through Tokio.
+pin-project-lite = "=0.2.17"
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+# The trace exporter's own HTTP client (no redirects, no proxy from the
+# environment). Already in the graph for the bucket client.
+reqwest.workspace = true
 # Private, automatically cleaned export scratch directories.
 tempfile.workspace = true
 rustix.workspace = true

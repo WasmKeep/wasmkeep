@@ -36,6 +36,13 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_guest_log_lines_total` | counter | none | Lines guests printed that reached the node's log. |
 | `wasmkeep_guest_log_dropped_total` | counter | none | Lines guests printed that were dropped over the line rate. |
 
+## Traces
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `wasmkeep_trace_spans_dropped_total` | counter | none | Completed spans dropped when the bounded export queue cannot accept them. |
+| `wasmkeep_trace_exports_total` | counter | `outcome` (`ok`, `error`) | Export batches that succeeded or failed, including timeouts. |
+
 ## Sockets and admission
 
 | Metric | Type | Labels | Meaning |

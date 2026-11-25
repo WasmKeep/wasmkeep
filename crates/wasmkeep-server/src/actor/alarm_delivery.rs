@@ -19,6 +19,27 @@ impl ActorState {
     /// `apart`: nobody held the actor at the route read and no node handed
     /// this alarm here ([`Self::ensure_owner_with`]).
     pub(super) async fn alarm(&mut self, hint: u64, swept: bool, apart: bool) {
+        let mut trace = crate::traces::Span::child("event");
+        if trace.recording() {
+            trace.attribute("tenant", self.address.tenant().to_owned());
+            trace.attribute("app", self.app_name.to_string());
+            if let Some(cluster) = &self.cluster {
+                trace.attribute("node", cluster.node_id.clone());
+            }
+            trace.attribute("class", self.address.class().to_owned());
+            trace.attribute("actor", self.address.name().to_owned());
+            trace.attribute("kind", "alarm");
+            trace.attribute("woken", self.live.is_none());
+            trace.attribute(
+                "mailbox_wait_seconds",
+                self.timing
+                    .mailbox_wait_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1e9,
+            );
+            trace.attribute("outcome", "not_run");
+        }
+        trace.run(async {
         self.chain = Arc::from(Vec::new());
         // The event runs on the class it takes now (ADR 0013).
         if let Err(e) = self.refresh_class() {
@@ -149,7 +170,7 @@ impl ActorState {
             return;
         }
         if let Err(e) = self.ensure_ready().await {
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "alarm: actor not ready");
+            crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), error = %e, "alarm: actor not ready");
             self.timing.delivered(Delivered::Deferred);
             self.retry_alarm().await;
             return;
@@ -308,7 +329,7 @@ impl ActorState {
                     Err(cut) => format!("on-alarm {cut}"),
                     Ok(Ok(Ok(()))) => unreachable!("handled above"),
                 };
-                tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %reason, "alarm will be retried");
+                crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), %reason, "alarm will be retried");
                 // The retry is the committed alarm, moved later with backoff:
                 // it survives hibernation and moves, and the index (which
                 // mirrors the committed alarm) lists the retry time, so no
@@ -344,6 +365,8 @@ impl ActorState {
                 self.clear_stale_hint(stale_hint, named).await;
             }
         }
+
+        }).await
     }
 
     /// The lease generation of this actor's hold, `None` without one (a
@@ -647,7 +670,7 @@ impl ActorState {
             return;
         };
         if !alarm_index::may_delete(&stale, generation) {
-            tracing::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?stale, generation, "not removing an alarm entry from a newer owner");
+            crate::traces::warn!(app = %crate::logging::named(&self.app_name), actor = %crate::logging::actor(&self.address), ?stale, generation, "not removing an alarm entry from a newer owner");
             return;
         }
         if let Err(e) = cluster.delete_alarm_entry(&self.address, &stale).await {
@@ -1029,7 +1052,7 @@ pub(super) async fn sweep_alarms(
             Err(e) => {
                 cursor = None;
                 wait = period;
-                tracing::warn!(error = %e, "alarm sweep: listing the index failed");
+                crate::traces::warn!(error = %e, "alarm sweep: listing the index failed");
             }
         }
     }
