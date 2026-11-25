@@ -20,7 +20,8 @@ its [upgrading page](docs/deploy/upgrading-to-0.9.md)).
    an operator, an idle actor's history compacted even when its node
    restarted, and one bucket write less when an actor is first created.
 2. **The second rolling upgrade** (M): `0.9` to `0.10` one node at a
-   time, proved as the first was.
+   time, proved as the first was, with a room's edges rebalanced after a
+   node rejoins, so that the latency goal is met after the upgrade.
 3. **A measured envelope** (M): what three small nodes and a real bucket
    carry, as one table with its workload and limits.
 4. **A write acknowledged once another node holds it**: measured and

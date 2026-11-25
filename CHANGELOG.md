@@ -201,6 +201,15 @@ a **pre-alpha pre-release**.
   read-back takes a longer one for other bytes at once). A long body
   was read without a bound, and a short one was taken as the object.
 
+### Known limits
+
+- **Edges are not rebalanced after a rolling upgrade.** After an upgrade
+  one node at a time under load, a big room's edges stay on the nodes
+  upgraded first, and the latency goal after the upgrade was not met.
+  Stopping every node is recommended for 0.9.0; rebalancing is planned
+  for 0.10.0
+  ([measured](docs/deploy/upgrading-to-0.9.md#measured)).
+
 ## 0.8.1
 
 **0.8 settled: a security fix, the follow-ups 0.8.0 left open, and no

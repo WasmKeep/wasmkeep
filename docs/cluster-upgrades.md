@@ -9,10 +9,14 @@ upgrading page of the release you move to says
 [0.8.0](deploy/upgrading-to-0.8.md), [0.9.0](deploy/upgrading-to-0.9.md)):
 it is the rule for that release, and this page does not override it.
 
-- **From 0.8.1 to 0.9.0: one node at a time**, then `wasmkeep cluster
-  upgrade finalize`. The steps are in
-  [upgrading to 0.9.0](deploy/upgrading-to-0.9.md); the commands and what
-  they check are [below](#versions-the-upgrade-floor-and-finalize).
+- **From 0.8.1 to 0.9.0: stop every node, then start them all on
+  0.9.0** (recommended), or one node at a time, which is supported and
+  safe for data; then `wasmkeep cluster upgrade finalize`. Stopping is
+  recommended because a rolling upgrade under load is not yet proven to
+  meet the latency goal and leaves a big room's edges unbalanced until
+  0.10.0 ([measured](deploy/upgrading-to-0.9.md#measured)). The steps
+  are in [upgrading to 0.9.0](deploy/upgrading-to-0.9.md); the commands
+  and what they check are [below](#versions-the-upgrade-floor-and-finalize).
 - **Every other pair: stop every node, upgrade them all, start them
   all**, unless that release's page names the pair as one that can be
   upgraded one node at a time
@@ -61,7 +65,10 @@ page says; these are the checks and the commands it uses.
   refused, naming them, while a live node of the app is older. After the
   write it waits about 25 s and lists the nodes again; an older node live
   then is reported as an error and must be stopped. Without `--yes` it
-  prints what it would do.
+  prints what it would do. Without `--app` it raises the floor of every
+  app that has a live node, and exits with 1 if any app has no live
+  node, even after raising the others: finalize the live ones with
+  `--app`, or remove the leftover leases with `wasmkeep cluster forget`.
 
 ```sh
 wasmkeep cluster upgrade status --bucket s3://wasmkeep-demo
