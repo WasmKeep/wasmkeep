@@ -67,25 +67,72 @@ on a workstation, alone (nothing heavy beside it: it times node starts and
 deliveries), and never in pull request CI or in `check.sh`:
 
 ```bash
-./scripts/mixed-version.sh            # from the previous release, v0.8.0 by default
-./scripts/mixed-version.sh v0.8.0     # or OLD_VERSION=v0.8.0
+./scripts/mixed-version.sh            # from the previous release, v0.8.1 by default
+./scripts/mixed-version.sh v0.8.1     # or OLD_VERSION=v0.8.1
 ```
 
-The old version must be 0.8.0 or later: the checks of rooms and pushers
-kept apart need it on both sides.
+The old version must be 0.8.1 or later, the last release of the minor
+version before the checkout's: it reads the upgrade floor, and the gate
+and the returning node are checked against it
+([ADR 0043, section 8](adr/0043-rolling-upgrades.md#8-how-the-mixed-version-check-becomes-the-proof)).
 
 It starts three nodes of the old release (downloaded with `gh` and checked
 against its `SHA256SUMS` and a SHA-256 pinned in the script) on a local
-moto bucket, deploys a test app with rooms and their pushers, moves one
-node at a time to the binary built from the checkout (drain, stop, swap,
-start, undrain), then moves one back. A version without a pinned SHA-256
-is refused unless `OLD_SHA256` gives it.
+moto bucket, deploys a test app with rooms and their pushers, and moves
+one node at a time to the binary built from the checkout (drain, stop,
+swap, start, undrain). A version without a pinned SHA-256 is refused
+unless `OLD_SHA256` gives it.
 
 After each step it checks durable writes, `actors.call` between every pair
 of nodes, alarms, secrets, env files, WebSocket room delivery, and
 `cluster status` from both versions' CLIs. While the cluster is mixed, both
-CLIs run `deploy` and `secrets set`. Four paths have checks of their own,
-each failing when it could not be brought about:
+CLIs run `deploy`, `secrets set`, `cluster drain` and `backup create`. Then,
+every phase counting in the exit status:
+
+- **Back and forward.** One node returns to the old release and goes up
+  again, with the same checks, before anything is finalized.
+- **The gate.** A deploy of a `wasmkeep.toml` with `apart-from` and
+  `spread` (deploy manifest 8) is refused while a node of the old release
+  is live, and so is `cluster upgrade finalize`, which names that node.
+  With every node new the deploy is still refused, naming the floor. After
+  `cluster upgrade finalize` it is accepted, and a class kept apart from
+  another wakes on another node.
+- **The returning old node.** After the finalize, a node of the old
+  release is started: it stops itself on the app's upgrade floor, which it
+  names. With the gated format written it is started again, and stops on
+  the manifest it cannot read (a node of 0.8.1 reads the current manifest
+  before the floor). Neither time does it answer a request, and the
+  counter goes on through the others.
+- **Tracing.** Two new nodes export to a collector the script runs
+  (`scripts/mixed-version/otlp-sink.mjs`), with `--trace-sample 0`. A
+  client's sampled `traceparent` forwarded by the node of the old release
+  is not followed and nothing is exported for it; through a new node with
+  `--trace-trust-incoming` it is followed on both nodes; and the old
+  node's guest receives a tracing node's header as any other
+  ([ADR 0044, section 4](adr/0044-traces.md#4-sampling)).
+- **The old CLI on the finalized cluster.** `cluster status`, `secrets
+  set`, `cluster drain`, `backup create` and `deploy`: each works, and what
+  it wrote is read by the new nodes, or it is refused with a message and
+  changes nothing. `backup create` into an archive that holds a run with
+  the app's floor (backup format 2) must be refused.
+
+**The new side's version.** Only a `wasmkeep` of the next minor version
+writes a gated format or finalizes, and a build of the checkout reports
+the workspace version, which is bumped in the release's pull request.
+While the workspace version still has the old release's minor version, the
+script builds the new side as the next one (0.9.0 beside v0.8.1): the
+cargo feature `test-version` of `wasmkeep-cluster` with
+`WASMKEEP_TEST_VERSION` in the build's environment, read by its `build.rs`
+alone. That binary reports `0.9.0+test.<commit>` and is built into
+`target/mixed-version/build`, never `target/release`. No release build sets
+the feature, without it the variable is ignored, and nothing changes the
+version of a built binary. Once the workspace version is ahead of the old
+release, the script uses the plain release build and overrides nothing:
+that is the run a tag waits for. `NEW_VERSION=<x.y.z>` asks for the
+override whatever the workspace says.
+
+Four paths of the upgrade have checks of their own, each failing when it
+could not be brought about:
 
 - **The start floor.** No client sees a failure from a node's start. The
   calls the started node refuses as signed before its start are counted. On
@@ -104,7 +151,7 @@ each failing when it could not be brought about:
 
 It writes `target/mixed-version/report.txt`, ending with a table of
 passes, failures and seconds for each step. It exits with 1 if any check
-failed, the move back included. The same run as an ignored test:
+failed, in any phase. The same run as an ignored test:
 `WASMKEEP_MIXED_VERSION=1 cargo nextest run -p wasmkeep-cli --test
 mixed_version --run-ignored only --no-capture`.
 

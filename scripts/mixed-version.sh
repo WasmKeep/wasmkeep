@@ -1,16 +1,49 @@
 #!/usr/bin/env bash
 # The mixed-version check (a gate before tagging a release, docs/releasing.md):
 # three nodes on this machine, against moto as the tutorials and the S3
-# suites run it, start on a published release (OLD_VERSION, v0.8.0 by
+# suites run it, start on a published release (OLD_VERSION, v0.8.1 by
 # default), then move one node at a time to the binary built from this
-# checkout (drain, stop, swap, start, wait for ready and `cluster status`),
-# and finally move one node back to the old release. After each step it
-# checks, through every node: the durable counter keeps every acknowledged
-# write, `actors.call` works between every pair of nodes (and so between
-# versions, both ways), alarms armed before the step fire once, secrets and
-# env files are readable, WebSocket room clients receive every acknowledged
-# publish, live or after catching up, and both versions' `cluster status`
-# agree. While the cluster is mixed, both CLIs deploy and seal secrets.
+# checkout (drain, stop, swap, start, wait for ready and `cluster status`).
+# After each step it checks, through every node: the durable counter keeps
+# every acknowledged write, `actors.call` works between every pair of nodes
+# (and so between versions, both ways), alarms armed before the step fire
+# once, secrets and env files are readable, WebSocket room clients receive
+# every acknowledged publish, live or after catching up, and both versions'
+# `cluster status` agree. While the cluster is mixed, both CLIs deploy,
+# seal secrets, drain a node and make a backup.
+#
+# From 0.9.0 it is the proof of ADR 0043 (section 8), and goes on:
+# - back and forward: one node returns to the old release and goes up
+#   again, with the same checks, before anything is finalized;
+# - the gate: a deploy that needs the new format (a wasmkeep.toml with
+#   `apart-from` and `spread`, deploy manifest 8) is refused while a node
+#   of the old release is live, and `cluster upgrade finalize` is refused
+#   naming that node; with every node new it is still refused, naming the
+#   floor; after `cluster upgrade finalize` it is accepted, and placement
+#   follows the keys;
+# - the returning old node: after the finalize a node of the old release
+#   started again stops itself on the upgrade floor, which it names; once
+#   the gated format is written it stops on the manifest it cannot read.
+#   Neither time does it answer a request, and the counter goes on
+#   through the others;
+# - tracing (ADR 0044): two new nodes export to a collector this script
+#   runs, with --trace-sample 0. A client's `traceparent ...-01` forwarded
+#   by a node of the old release is not followed; through a new node that
+#   trusts it, it is, on both nodes;
+# - CLI skew: the old CLI against the finalized cluster (`deploy`,
+#   `secrets set`, `cluster status`, `cluster drain`, `backup create`):
+#   each works and is read rightly, or is refused and changes nothing.
+#
+# The new side's version. A gated format is written only by a `wasmkeep`
+# of the next minor version, and a build of this checkout reports the
+# workspace version. While that is still the old release's minor version,
+# the new side is built with the test-only feature `test-version` of
+# wasmkeep-cluster and WASMKEEP_TEST_VERSION (see its build.rs) as the
+# next minor version (0.9.0 beside v0.8.1), into its own target directory,
+# and reports `0.9.0+test.<commit>`. Once the workspace version is ahead
+# of OLD_VERSION, the plain release build is used and nothing is
+# overridden. NEW_VERSION=<x.y.z> asks for the override whatever the
+# workspace says.
 #
 # Four paths are checked as PASS or FAIL lines, each failing when its
 # precondition was not reached:
@@ -41,17 +74,20 @@
 # MIXED_VERSION_KEEP=1. Nodes and moto are stopped by the PIDs this script
 # started, never by name.
 #
-# Exit status: 0 when every check passed, the move back included; 1 when
+# Exit status: 0 when every check passed, in every phase; 1 when
 # one failed; 2 when the old version cannot be used (no pinned SHA-256).
 #
 # Usage: scripts/mixed-version.sh [OLD_VERSION]
-#   OLD_VERSION (argument or variable, default v0.8.0): the release the
+#   OLD_VERSION (argument or variable, default v0.8.1): the release the
 #   nodes start on. A version without a SHA-256 pinned below is refused
 #   unless OLD_SHA256 gives the hash of its Linux x86_64 archive (from the
 #   release's SHA256SUMS).
+#   NEW_VERSION (unset): the version the new side is built to report (the
+#   test-only override above); by default only while this checkout's
+#   minor version is OLD_VERSION's.
 #   MIXED_VERSION_PORT_BASE (default 18100): client ports BASE+1..3,
-#   cluster ports BASE+11..13, metrics BASE+21..23, moto BASE+50, and
-#   BASE+60 for the env file probe.
+#   cluster ports BASE+11..13, metrics BASE+21..23, moto BASE+50,
+#   BASE+60 for the env file probe and BASE+70 for the trace collector.
 #   MIXED_VERSION_IDLE_SECS (default 15): the nodes' --idle-timeout-secs,
 #   short so that a room and its pusher leave memory within a minute.
 set -euo pipefail
@@ -63,8 +99,9 @@ root=$PWD
 declare -A PINNED_SHA256=(
   [v0.7.0]=3dda0dfebc23428fff34779515b83bae38327923ffb7755b7a3c97872e5b469b
   [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
+  [v0.8.1]=88f7a35dd5e96306f5ef51c0987d9cf7d3f55b7601fb5e8fa8b43a77e6bdf6ac
 )
-OLD_VERSION=${1:-${OLD_VERSION:-v0.8.0}}
+OLD_VERSION=${1:-${OLD_VERSION:-v0.8.1}}
 [[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }
 old_short=${OLD_VERSION#v}
 OLD_ASSET=wasmkeep-$old_short-x86_64-unknown-linux-gnu.tar.gz
@@ -99,7 +136,8 @@ for n in "${NODES[@]}"; do
   port[$n]=$((base + i)); cport[$n]=$((base + 10 + i)); mport[$n]=$((base + 20 + i)); i=$((i + 1))
 done
 moto_port=$((base + 50))
-for p in "${port[@]}" "${cport[@]}" "${mport[@]}" "$moto_port" $((base + 60)); do
+sink_port=$((base + 70))
+for p in "${port[@]}" "${cport[@]}" "${mport[@]}" "$moto_port" $((base + 60)) "$sink_port"; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
     echo "port $p is in use: set MIXED_VERSION_PORT_BASE" >&2; exit 1
   fi
@@ -140,11 +178,36 @@ fi
 # Checked on every run, a cached archive included: the pin is the gate's.
 echo "$OLD_SHA256  $old_dir/$OLD_ASSET" | sha256sum --strict --quiet -c - \
   || { echo "$old_dir/$OLD_ASSET does not match the pinned SHA-256" >&2; exit 2; }
-cargo build --release --locked -p wasmkeep-cli
-new_bin=$root/target/release/wasmkeep
+# The new side: this checkout's release build, or, while the workspace
+# version has the old release's minor version, the same build reporting
+# the next one (the test-only feature, in a target directory of its own so
+# that target/release never holds a binary with another version's name).
+minor_of() { local v=${1%%[-+]*}; echo "${v%.*}"; }
+workspace_version=$(sed -n '/^\[workspace.package\]/,/^\[[a-z]/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+[ -n "$workspace_version" ] || { echo "no workspace version in Cargo.toml" >&2; exit 1; }
+if [ -z "${NEW_VERSION:-}" ] && [ "$(minor_of "$workspace_version")" = "$(minor_of "$old_short")" ]; then
+  old_minor_number=$(minor_of "$old_short"); old_minor_number=${old_minor_number#*.}
+  NEW_VERSION=${old_short%%.*}.$((old_minor_number + 1)).0
+fi
+if [ -n "${NEW_VERSION:-}" ]; then
+  [[ $NEW_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "NEW_VERSION '$NEW_VERSION' is not X.Y.Z" >&2; exit 2; }
+  WASMKEEP_TEST_VERSION=$NEW_VERSION cargo build --release --locked -p wasmkeep-cli \
+    --features wasmkeep-cluster/test-version --target-dir "$mv_dir/build"
+  new_bin=$mv_dir/build/release/wasmkeep
+else
+  cargo build --release --locked -p wasmkeep-cli
+  new_bin=$root/target/release/wasmkeep
+fi
 old_label=$("$old_bin" --version | cut -d' ' -f2)
 new_label=$("$new_bin" --version | cut -d' ' -f2)
 [ "$old_label" != "$new_label" ] || { echo "both binaries report $old_label" >&2; exit 1; }
+new_minor=$(minor_of "$new_label")
+old_minor=$(minor_of "$old_label")
+[ "$new_minor" != "$old_minor" ] || {
+  echo "both binaries are $old_minor: nothing is gated between them (NEW_VERSION sets the new side's)" >&2; exit 1; }
+if [ -n "${NEW_VERSION:-}" ]; then
+  case $new_label in "$NEW_VERSION"+test*) ;; *) echo "the new side reports $new_label, not $NEW_VERSION+test" >&2; exit 1 ;; esac
+fi
 label() { if [ "$1" = "$old_bin" ]; then echo "$old_short"; else echo "new"; fi; }
 
 # ---------------------------------------------------------------- guests
@@ -186,10 +249,10 @@ test_actor=$root/crates/wasmkeep-server/tests/guests/test-actor/$rel/test_actor.
 # ---------------------------------------------------------------- the run
 rm -rf "$run"; mkdir -p "$run"; chmod 700 "$run"
 : > "$report"
-moto_pid=; clients_pid=; small_pid=; probe_pid=; bg_pid=
+moto_pid=; clients_pid=; small_pid=; probe_pid=; bg_pid=; sink_pid=
 cleanup() {
   local n
-  for p in $probe_pid $bg_pid $clients_pid $small_pid; do kill "$p" 2>/dev/null || true; done
+  for p in $probe_pid $bg_pid $clients_pid $small_pid $sink_pid; do kill "$p" 2>/dev/null || true; done
   for n in "${NODES[@]}"; do
     [ -z "${pid[$n]:-}" ] || kill -9 "${pid[$n]}" 2>/dev/null || true
   done
@@ -216,6 +279,18 @@ for k in $(seq 1 120); do
   sleep 1
 done
 curl -sf -X PUT -H 'Content-Length: 0' "http://127.0.0.1:$moto_port/mixed-version" >/dev/null
+# Where both CLIs' `backup create` write.
+curl -sf -X PUT -H 'Content-Length: 0' "http://127.0.0.1:$moto_port/mixed-version-backup" >/dev/null
+BACKUP=s3://mixed-version-backup
+
+# The trace collector (ADR 0044): what each node exports, one file a node.
+node scripts/mixed-version/otlp-sink.mjs "$run/otlp" "$sink_port" > "$run/otlp-sink.log" 2>&1 &
+sink_pid=$!
+for k in $(seq 1 50); do
+  curl -sf -o /dev/null "http://127.0.0.1:$sink_port/" && break
+  kill -0 "$sink_pid" 2>/dev/null && [ "$k" -lt 50 ] || { cat "$run/otlp-sink.log" >&2; exit 1; }
+  sleep 0.2
+done
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
   AWS_ENDPOINT=http://127.0.0.1:$moto_port AWS_ALLOW_HTTP=true
 
@@ -233,16 +308,25 @@ new() { "$new_bin" "$@"; }
 # front's), so that a few dozen wake-ups put it past placement's floor (a
 # fifth of its capacity): the apart refusal needs a sender that places.
 declare -A extra=([a]="" [b]="--max-instances 200" [c]="")
+# What a node of this checkout runs with besides: tracing on a and b, to
+# the collector above, with no trace sampled by a draw (--trace-sample 0),
+# so that a span exported is one whose flag was followed. Node a trusts the
+# flag a client sends; b does not; c has tracing off.
+declare -A extra_new=(
+  [a]="--otlp-endpoint http://127.0.0.1:$sink_port/a --trace-sample 0 --trace-trust-incoming"
+  [b]="--otlp-endpoint http://127.0.0.1:$sink_port/b --trace-sample 0"
+  [c]="")
 start_node() { # start_node ID BINARY
-  local n=$1 b=$2
+  local n=$1 b=$2 more=""
+  [ "$b" != "$new_bin" ] || more=${extra_new[$n]}
   mkdir -p "$run/$n/data" "$run/$n/cache"; chmod 700 "$run/$n" "$run/$n/data" "$run/$n/cache"
   echo "=== $(date -u +%T) start $(label "$b") ($("$b" --version))" >> "$run/$n.log"
-  # shellcheck disable=SC2086 # extra holds whole flags
+  # shellcheck disable=SC2086 # extra and more hold whole flags
   "$b" serve --app "$APP" --bucket "$BUCKET" --node-id "$n" \
     --data-dir "$run/$n/data" --cache-dir "$run/$n/cache" \
     --listen "127.0.0.1:${port[$n]}" --advertise "http://127.0.0.1:${port[$n]}" \
     --cluster-listen "127.0.0.1:${cport[$n]}" --cluster-advertise "https://127.0.0.1:${cport[$n]}" \
-    --metrics-listen "127.0.0.1:${mport[$n]}" --idle-timeout-secs "$idle_secs" ${extra[$n]} \
+    --metrics-listen "127.0.0.1:${mport[$n]}" --idle-timeout-secs "$idle_secs" ${extra[$n]} $more \
     --env "t=$run/etc/t.env" --secrets-key "$run/etc/secrets.key" \
     >> "$run/$n.log" 2>&1 &
   pid[$n]=$!; bin[$n]=$b
@@ -342,15 +426,40 @@ declare -A fired  # alarms armed: actor -> fired count expected
 published=0       # the room's highest acknowledged number
 declare -A sealed # secrets sealed during the run: name -> "value|which CLI"
 
-# `cluster status` from both CLIs: three live, each node serving on the
-# version it runs.
+# Runs a command, keeping what it printed in $run/NAME.txt: its exit
+# status in RC, its output on one line in OUT.
+run_cli() { # run_cli NAME COMMAND...
+  local name=$1; shift
+  "$@" > "$run/$name.txt" 2>&1 < /dev/null; RC=$?
+  OUT=$(tr '\n' ' ' < "$run/$name.txt" | tr -s ' ' | cut -c1-700)
+  # A refusal is a message and an exit status, never a crash.
+  if grep -q 'panicked at' "$run/$name.txt" || [ "$RC" -ge 126 ]; then
+    fail "$name: the command crashed (exit $RC): $OUT"
+  fi
+}
+# The app's current version and its manifest format, as "VERSION FORMAT".
+current() {
+  status_json | jq -r --arg a "$APP" '.apps[] | select(.app == $a) | "\(.version) \(.manifest_format)"' 2>/dev/null
+}
+# The app's upgrade, as `cluster upgrade status` reads it: "STATE|FLOOR IN FORCE|BLOCKS".
+upgrade_state() {
+  new cluster upgrade status --bucket "$BUCKET" --app "$APP" --json 2>/dev/null \
+    | jq -r '.apps[0] | "\(.state)|\(.floor_in_force)|\(.blocks | join(","))"' 2>/dev/null
+}
+# The capability words a live node announces.
+words() { status_json | jq -r --arg n "$1" '.nodes[] | select(.id == $n and .live) | .words | join(" ")' 2>/dev/null; }
+
+# `cluster status` from both CLIs (the new one alone once the upgrade is
+# finalized: the old CLI is then judged in its own step): three live, each
+# node serving on the version it runs.
+status_clis="new old"
 check_status() {
   local cli out
-  for cli in new old; do
+  for cli in $status_clis; do
     out=$("$cli" cluster status --bucket "$BUCKET" 2>&1 || true)
     printf '%s\n' "$out" > "$run/status-$cli-cli-$step.txt"
     local live who
-    who="$( [ $cli = new ] && echo "new CLI" || echo "$old_short CLI")"
+    who="$( [ "$cli" = new ] && echo "new CLI" || echo "$old_short CLI")"
     live=$(printf '%s\n' "$out" | grep -Eo '^[0-9]+ of [0-9]+ nodes live' || true)
     if [ "$live" = "3 of 3 nodes live" ]; then pass "cluster status ($who): $live"
     else fail "cluster status ($who): '${live:-no summary}'"; fi
@@ -371,9 +480,10 @@ check_status() {
   done
 }
 
-check_counter() {
-  local n
-  for n in "${NODES[@]}"; do
+check_counter() { # check_counter [ID...]: through these nodes, all without
+  local n nodes=("$@")
+  [ $# -gt 0 ] || nodes=("${NODES[@]}")
+  for n in "${nodes[@]}"; do
     req_retry 20 POST "$n" /actor/t/ctr/durable
     if [ "$RS" = 200 ] && [ "$RB" = $((ctr + 1)) ]; then
       ctr=$RB; pass "counter: POST via $n ($(label "${bin[$n]}")) -> $RB on ${RNODE}"
@@ -382,7 +492,7 @@ check_counter() {
       ctr=$RB
     else fail "counter: POST via $n: $RS $RB"; fi
   done
-  for n in "${NODES[@]}"; do
+  for n in "${nodes[@]}"; do
     req_retry 20 GET "$n" /actor/t/ctr/durable
     if [ "$RS" = 200 ] && [ "$RB" = "$ctr" ]; then pass "counter: GET via $n -> $RB"
     else fail "counter: GET via $n: $RS '$RB', expected $ctr"; fi
@@ -815,6 +925,191 @@ drain_room() { # drain_room ID
   retries
 }
 
+# ---------------------------------------------------------------- the gate
+# The app as a project file, the whole of it as the last deploy with flags
+# left it (the file is the whole truth: a class or a rule it does not name
+# is removed), without the keys, or with them: `fan` kept apart from
+# `feed`, and `leaf` spread. With the keys the version is manifest format
+# 8, the first format behind the upgrade floor (ADR 0043, section 2).
+project_file() { # project_file DIR KEYS (0 or 1)
+  local apart="" spread=""
+  [ "$2" = 0 ] || { apart='apart-from = "feed"'; spread='spread = true'; }
+  mkdir -p "$1"
+  cat > "$1/wasmkeep.toml" <<EOF
+[app]
+tenant = "${APP%/*}"
+name = "${APP#*/}"
+
+[front]
+component = "$old_front"
+
+[classes.t]
+component = "$test_actor"
+access = "open"
+config = "$run/etc/t.config"
+
+[classes.feed]
+component = "$test_actor"
+access = "open"
+
+[classes.fan]
+component = "$test_actor"
+access = "open"
+$apart
+
+[classes.leaf]
+component = "$test_actor"
+access = "open"
+$spread
+
+[classes.room]
+component = "$new_room"
+
+[classes.pusher]
+component = "$new_room"
+access = "open"
+writes = "batched"
+
+[classes.edge]
+component = "$new_room"
+
+[classes.directory]
+component = "$new_room"
+
+[classes.relay]
+component = "$new_room"
+EOF
+}
+# A deploy of the file with the keys, which must be refused and change
+# nothing: its message in OUT.
+gated_refused() { # gated_refused NAME
+  local before after
+  before=$(current)
+  run_cli "$1" new deploy --project "$run/project/keys" --bucket "$BUCKET" --yes
+  after=$(current)
+  if [ "$RC" != 0 ] && [ -n "$before" ] && [ "$after" = "$before" ]; then
+    pass "a deploy with apart-from and spread is refused on a cluster of $(versions), nothing deployed: $OUT"
+  else
+    fail "a deploy with apart-from and spread on a cluster of $(versions): exit $RC, current '$before' -> '$after': $OUT"
+  fi
+}
+# feed/NAME then fan/NAME, each woken by a request through node R: where
+# each ran, in FEED_ON and FAN_ON.
+pair_wake() { # pair_wake NAME R
+  req_retry 20 GET "$2" "/actor/feed/$1/fired"; FEED_ON=$RNODE
+  req_retry 20 GET "$2" "/actor/fan/$1/fired"; FAN_ON=$RNODE
+}
+
+# ---------------------------------------------------------------- tracing
+# A W3C `traceparent` a client sends for a new trace: TP, its trace id in
+# TID and its parent id in TSPAN.
+traceparent() { # traceparent FLAGS (01: asks to be sampled)
+  TID=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  TSPAN=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  TP="00-$TID-$TSPAN-$1"
+}
+# Whether node N exported a span of trace ID: a span carries its trace id
+# as 16 raw bytes, and the collector keeps each export in hex.
+exported() { grep -q "$2" "$run/otlp/$1.hex" 2>/dev/null; }
+wait_exported() { # wait_exported N ID SECS
+  local deadline=$((SECONDS + $3))
+  until exported "$1" "$2"; do
+    [ $SECONDS -lt $deadline ] || return 1
+    sleep 0.5
+  done
+}
+# The `traceparent` the guest of t/ACTOR received, asked through node N
+# with the client's TP: in RB, the node that ran it in RNODE.
+header_seen() { # header_seen N ACTOR
+  req_retry 20 GET "$1" "/actor/t/$2/header?name=traceparent" -H "traceparent: $TP"
+}
+
+# ---------------------------------------------------------------- CLI skew
+# One CLI drains a node and puts it back, the new CLI reading the state.
+drain_by() { # drain_by CLI ID
+  local who; if [ "$1" = old ]; then who=$old_short; else who=new; fi
+  run_cli "drain-$1-$2-$step" "$1" cluster drain "$2" --bucket "$BUCKET"
+  if [ "$RC" = 0 ] && wait_state "$2" drained 90; then
+    pass "$who CLI cluster drain $2 ($(label "${bin[$2]}")) on a cluster of $(versions)"
+  else fail "$who CLI cluster drain $2 ($(label "${bin[$2]}")): exit $RC: $OUT"; fi
+  run_cli "undrain-$1-$2-$step" "$1" cluster undrain "$2" --bucket "$BUCKET"
+  if [ "$RC" = 0 ] && wait_state "$2" serving 60; then
+    pass "$who CLI cluster undrain $2 ($(label "${bin[$2]}"))"
+  else fail "$who CLI cluster undrain $2 ($(label "${bin[$2]}")): exit $RC: $OUT"; fi
+}
+# `backup create` of the app by one CLI into an archive.
+backup_by() { # backup_by CLI ARCHIVE NAME
+  run_cli "$3" "$1" backup create --bucket "$BUCKET" --to "$BACKUP/$2" --app "$APP"
+}
+# A command of the old CLI on the finalized cluster that either works or
+# is refused: 0 when it worked. A refusal passes here, with its message;
+# what a command that worked wrote is checked by the caller.
+old_cli_refused() { # old_cli_refused WHAT (after run_cli)
+  [ "$RC" != 0 ] || return 1
+  if [ -n "$OUT" ]; then pass "$old_short CLI $1 on the finalized cluster: refused (exit $RC): $OUT"
+  else fail "$old_short CLI $1 on the finalized cluster: exit $RC and no message"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- the returning old node
+# Node c is stopped and started on the old release, which must never serve,
+# and the counter goes on through a and b; then c comes back on the new
+# version. With FLOOR 1 the old node must stop itself naming the app's
+# upgrade floor (the manifest is still one it reads, so the floor is what
+# stops it); with 0 it must stop itself or never be ready, whatever it
+# says (a node of 0.8.1 reads the current manifest before the floor, and
+# stops on a manifest of format 8 as one it cannot read).
+old_node_returns() { # old_node_returns WHEN FLOOR
+  log "---- step $step: node c new -> $old_short $1, which must not serve"
+  if ! new cluster drain c --bucket "$BUCKET" >/dev/null; then fail "drain c refused"; fi
+  wait_state c drained 90 || true
+  stop_node c
+  new cluster undrain c --bucket "$BUCKET" --force >/dev/null 2>&1 || fail "undrain c refused"
+  log_from=$(( $(wc -l < "$run/c.log") + 1 ))
+  t0=$SECONDS
+  start_node c "$old_bin"
+  answered=""; old_rc=""
+  while [ $((SECONDS - t0)) -lt 60 ]; do
+    for path in /_wasmkeep/ready /actor/t/ctr/durable; do
+      code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port[c]}$path" || true)
+      [ "$code" != 200 ] || answered="$answered $path@$((SECONDS - t0))s"
+    done
+    if ! kill -0 "${pid[c]}" 2>/dev/null; then wait "${pid[c]}" 2>/dev/null; old_rc=$?; break; fi
+    sleep 0.5
+  done
+  old_secs=$((SECONDS - t0))
+  old_said=$(tail -n +"$log_from" "$run/c.log" | grep -i 'floor' | head -1 | cut -c1-400)
+  if [ -z "$answered" ]; then pass "the $old_short node, started $1, was never ready and answered no request in $old_secs s"
+  else fail "the $old_short node answered 200 $1:$answered"; fi
+  if [ -n "$old_rc" ] && [ "$old_rc" != 0 ]; then
+    pass "the $old_short node stopped itself after $old_secs s (exit $old_rc): ${old_said:-$(tail -n 2 "$run/c.log" | tr '\n' ' ' | cut -c1-400)}"
+    if [ "$2" = 1 ]; then
+      if [ -n "$old_said" ]; then pass "the $old_short node stopped on the app's upgrade floor, which it names"
+      else fail "the $old_short node stopped without naming the upgrade floor: $(tail -n +"$log_from" "$run/c.log" | tail -n 3 | tr '\n' ' ' | cut -c1-400)"; fi
+    fi
+    pid[c]=
+  elif [ -n "$old_rc" ]; then
+    fail "the $old_short node exited with 0 after $old_secs s: $(tail -n 2 "$run/c.log" | tr '\n' ' ' | cut -c1-400)"
+    pid[c]=
+  elif [ "$2" = 1 ]; then
+    fail "the $old_short node did not stop on the floor: still running, not ready, after $old_secs s: ${old_said:-$(tail -n 2 "$run/c.log" | tr '\n' ' ' | cut -c1-400)}"
+  else
+    note "the $old_short node was still running, not ready, after $old_secs s: ${old_said:-$(tail -n 2 "$run/c.log" | tr '\n' ' ' | cut -c1-400)}"
+  fi
+  # The counter goes on through the others, with the old node there or gone.
+  check_counter a b
+  note "cluster status: $(new cluster status --bucket "$BUCKET" 2>&1 | grep -E '^[0-9]+ of [0-9]+ nodes live' || true); c: $(new cluster status --bucket "$BUCKET" 2>&1 | awk '$1 == "c"' | tr -s ' ' | cut -c1-160)"
+  up=$(upgrade_state)
+  if [[ $up == *"|$new_minor|"* ]]; then pass "the floor is still $new_minor ($up)"
+  else fail "the floor after the $old_short node's start: '$up'"; fi
+  [ -z "${pid[c]}" ] || stop_node c
+  # Node c back on the new version.
+  t0=$SECONDS
+  start_node c "$new_bin"
+  if wait_ready c 150; then pass "node c (new) ready $((SECONDS - t0))s after its start"; fi
+  wait_state c serving 60 || true
+}
+
 # ---------------------------------------------------------------- 0. all old
 # From here on a failed command is a check's to report, not a reason to stop.
 set +e
@@ -846,8 +1141,11 @@ fi
 # The pusher class is open to outside requests (its guest answers 403 to
 # them): the apart refusal needs a placed wake-up of it, and only a
 # request from outside is placed.
+# feed, fan and leaf are the gate's: a room, its pusher and an edge under
+# the app's own names, which only `apart-from` and `spread` place.
+own=(--actor "feed=$test_actor" --actor "fan=$test_actor" --actor "leaf=$test_actor")
 old deploy --no-project --app "$APP" --bucket "$BUCKET" \
-  --actor "t=$test_actor" \
+  --actor "t=$test_actor" "${own[@]}" \
   --actor "room=$old_room" --actor "pusher=$old_room" --actor "edge=$old_room" \
   --actor "directory=$old_room" --actor "relay=$old_room" --front "$old_front" \
   --access room=internal --access pusher=open --access edge=internal \
@@ -909,7 +1207,7 @@ begin upgrade-a; swap a "$new_bin" || exit 1
 # Each seals a secret, read on every node by every later step.
 begin cli-skew
 if new deploy --no-project --app "$APP" --bucket "$BUCKET" \
-  --actor "t=$test_actor" \
+  --actor "t=$test_actor" "${own[@]}" \
   --actor "room=$old_room" --actor "pusher=$new_room" --actor "edge=$old_room" \
   --actor "directory=$old_room" --actor "relay=$old_room" \
   > "$run/deploy-2.txt" 2>&1; then
@@ -918,13 +1216,23 @@ else fail "new CLI deploy: $(tr '\n' ' ' < "$run/deploy-2.txt")"; fi
 seal new MV_SECRET2 new-sealed
 printf 'MV_CONFIG=from-old-cli\n' > "$run/etc/t.config"
 if old deploy --no-project --app "$APP" --bucket "$BUCKET" \
-  --actor "t=$test_actor" \
+  --actor "t=$test_actor" "${own[@]}" \
   --actor "room=$old_room" --actor "pusher=$new_room" --actor "edge=$old_room" \
   --actor "directory=$old_room" --actor "relay=$old_room" --config "t=$run/etc/t.config" \
   > "$run/deploy-3.txt" 2>&1; then
   pass "$old_short CLI deploy on a cluster of $(versions): $(tail -n 1 "$run/deploy-3.txt")"
 else fail "$old_short CLI deploy: $(tr '\n' ' ' < "$run/deploy-3.txt")"; fi
 seal old MV_SECRET3 old-sealed
+# Each CLI drains a node of the other version, and puts it back.
+drain_by old a
+drain_by new c
+# Each CLI makes a backup of the app, into an archive of its own.
+backup_by new new backup-new-mixed
+if [ "$RC" = 0 ]; then pass "new CLI backup create on a cluster of $(versions): $(tail -n 1 "$run/backup-new-mixed.txt")"
+else fail "new CLI backup create on a cluster of $(versions): exit $RC: $OUT"; fi
+backup_by old old backup-old-mixed
+if [ "$RC" = 0 ]; then pass "$old_short CLI backup create on a cluster of $(versions): $(tail -n 1 "$run/backup-old-mixed.txt")"
+else fail "$old_short CLI backup create on a cluster of $(versions): exit $RC: $OUT"; fi
 sleep 8
 for n in "${NODES[@]}"; do
   req_retry 20 GET "$n" "/actor/t/at-$n/env?name=MV_CONFIG"
@@ -974,7 +1282,7 @@ begin upgrade-b; swap b "$new_bin" || exit 1
 # Every room class from this checkout's SDK (the front stays the old one).
 begin room-new-sdk
 if new deploy --no-project --app "$APP" --bucket "$BUCKET" \
-  --actor "t=$test_actor" \
+  --actor "t=$test_actor" "${own[@]}" \
   --actor "room=$new_room" --actor "pusher=$new_room" --actor "edge=$new_room" \
   --actor "directory=$new_room" --actor "relay=$new_room" \
   > "$run/deploy-4.txt" 2>&1; then
@@ -993,6 +1301,104 @@ apart_sent c
 apart_refused c
 check_placement
 
+# ---------------------------------------------------------------- the gate, one old node live
+# a and b new, c on the old release: nothing behind the floor is written.
+phase=gate
+begin "gate-beside-$old_short"
+project_file "$run/project/plain" 0
+project_file "$run/project/keys" 1
+# The file without the keys is the app as it is: accepted beside the old
+# node, in a format it reads.
+run_cli deploy-file-plain new deploy --project "$run/project/plain" --bucket "$BUCKET" --yes
+if [ "$RC" = 0 ]; then pass "new CLI deploy from the project file, without the keys, on a cluster of $(versions): $(tail -n 1 "$run/deploy-file-plain.txt")"
+else fail "new CLI deploy from the project file, without the keys: exit $RC: $OUT"; fi
+note "the plan of the project file's first deploy: $(grep -v '^ *$' "$run/deploy-file-plain.txt" | head -12 | tr '\n' '|' | cut -c1-600)"
+sleep 8
+check_counter
+gated_refused deploy-keys-mixed
+gate_names=""
+case $OUT in *"c ($old_label"*) gate_names="the deploy's refusal" ;; esac
+case $OUT in *"$new_minor"*) pass "the refusal names the version the format needs ($new_minor)" ;;
+  *) fail "the refusal does not name $new_minor: $OUT" ;; esac
+# What the refusal sends the operator to: refused too, naming the node.
+run_cli finalize-mixed new cluster upgrade finalize --bucket "$BUCKET" --app "$APP" --yes
+if [ "$RC" != 0 ] && [[ $OUT == *"c ($old_label"* ]]; then
+  pass "cluster upgrade finalize beside a live $old_short node is refused, naming it (exit $RC): $OUT"
+  gate_names=${gate_names:+$gate_names and }"the refusal of \`cluster upgrade finalize\`"
+else fail "cluster upgrade finalize beside a live $old_short node: exit $RC: $OUT"; fi
+if [ -n "$gate_names" ]; then pass "node c ($old_label) is named by $gate_names"
+else fail "nothing names node c ($old_label) as what blocks the gated deploy"; fi
+up=$(upgrade_state)
+if [[ $up == "mixed|$old_minor|"* ]]; then pass "cluster upgrade status: mixed, floor $old_minor ($up)"
+else fail "cluster upgrade status on a cluster of $(versions): '$up' (want mixed, floor $old_minor)"; fi
+
+# ---------------------------------------------------------------- tracing, one old node live
+# ADR 0044, section 4 and "Not settled", 11: a node follows the sampled
+# flag of a hop only from a node that announces `traces`, which sets the
+# header itself. A node of the old release passes on what a client sent.
+# With --trace-sample 0 no node samples by a draw, so a span exported is a
+# flag followed.
+phase=traces
+begin traces
+traces_ready=1
+for n in a b; do
+  w=$(words "$n")
+  if [[ " $w " == *" traces "* ]]; then pass "node $n (new, tracing on) announces \`traces\`"
+  else fail "node $n (new, started with --otlp-endpoint) does not announce \`traces\`: '$w'"; traces_ready=0; fi
+done
+w=$(words c)
+if [ "${bin[c]}" = "$old_bin" ] && [[ " $w " != *" traces "* ]]; then pass "node c ($old_short) does not announce \`traces\`"
+else fail "node c is not a live $old_short node without \`traces\`: $(label "${bin[c]}"), '$w'"; traces_ready=0; fi
+pin_actor tr-b b || traces_ready=0
+pin_actor tr-c c || traces_ready=0
+hex16='[0-9a-f]{16}'
+# 1. Asking to be sampled, through the old node, to an actor on b: c
+#    forwards it with the client's header. b continues the trace and does
+#    not follow the flag: its guest sees the flag off.
+traceparent 01; id_old=$TID
+header_seen c tr-b
+if [ "$RS" = 200 ] && [ "$RNODE" = b ] && [[ $RB =~ ^00-$id_old-$hex16-00$ ]]; then
+  pass "a client's sampled traceparent forwarded by c ($old_short) is not followed on b: its guest received $RB"
+else fail "a client's sampled traceparent forwarded by c ($old_short) to b: $RS on '${RNODE}', the guest received '$RB' (want 00-$id_old-<span>-00)"; fi
+# 2. The same from outside, straight to b, which does not trust it.
+traceparent 01; id_out=$TID
+header_seen b tr-b
+if [ "$RS" = 200 ] && [ "$RNODE" = b ] && [[ $RB =~ ^00-$id_out-$hex16-00$ ]]; then
+  pass "a client's sampled traceparent sent to b (no --trace-trust-incoming) is not followed: its guest received $RB"
+else fail "a client's sampled traceparent sent to b: $RS on '${RNODE}', the guest received '$RB' (want 00-$id_out-<span>-00)"; fi
+# 3. The same through a, which trusts it: a samples, and b follows a's hop.
+traceparent 01; id_new=$TID
+header_seen a tr-b
+if [ "$RS" = 200 ] && [ "$RNODE" = b ] && [[ $RB =~ ^00-$id_new-$hex16-01$ ]]; then
+  pass "the same through a (new, --trace-trust-incoming) is followed on b: its guest received $RB"
+else fail "a client's sampled traceparent through a to b: $RS on '${RNODE}', the guest received '$RB' (want 00-$id_new-<span>-01)"; fi
+followed=1
+for n in a b; do
+  if wait_exported "$n" "$id_new" 20; then pass "node $n exported spans of the trace that came through a ($id_new)"
+  else fail "node $n exported no span of the trace that came through a ($id_new) within 20 s"; followed=0; fi
+done
+# b's exporter has delivered since: what it did not send by now, it never made.
+sleep 3
+leaked=""
+for n in a b; do
+  for id in "$id_old" "$id_out"; do ! exported "$n" "$id" || leaked="$leaked $n:$id"; done
+done
+if [ $traces_ready = 1 ] && [ $followed = 1 ] && [ -z "$leaked" ]; then
+  pass "no span exported for the trace forwarded by c ($old_short) nor for the one sent straight to b (the collector had b's spans of the followed trace by then)"
+elif [ -n "$leaked" ]; then fail "spans exported for a trace whose flag must not be followed:$leaked"
+else fail "not shown that the flag forwarded by c is not followed: b exported nothing at all, or the nodes were not as the check needs"; fi
+# 4. ADR 0043, section 8, 7: a hop from a tracing node to the old one
+#    passes, and the old node's guest receives the hop's header as any
+#    other: a's, in the client's trace, sampled.
+traceparent 01; id_wire=$TID
+header_seen a tr-c
+if [ "$RS" = 200 ] && [ "$RNODE" = c ] && [[ $RB =~ ^00-$id_wire-$hex16-01$ ]] && [ "$RB" != "$TP" ]; then
+  pass "a forward from a (tracing) to c ($old_short) passes, and c's guest received a's traceparent as an ordinary header: $RB"
+else fail "a forward from a (tracing) to c ($old_short): $RS on '${RNODE}', the guest received '$RB' (the client sent $TP)"; fi
+note "the collector: $(cat "$run/otlp/a.hex" 2>/dev/null | wc -l) exports from a, $(cat "$run/otlp/b.hex" 2>/dev/null | wc -l) from b"
+check_calls
+
+phase=upgrade
 begin upgrade-c; swap c "$new_bin" || exit 1
 
 # The old version's database, now on a new node.
@@ -1010,10 +1416,157 @@ else fail "$old_short database on new: $RS $RB"; fi
 
 upgrade_secs=$((SECONDS - started_at))
 
-# ---------------------------------------------------------------- downgrade
-# Gating like the rest: one node back to the old release.
-phase=downgrade
+# ---------------------------------------------------------------- back and forward
+# Before anything is finalized, one node back to the old release and up
+# again: gating like the rest.
+phase=back
 begin downgrade-c; swap c "$old_bin"
+begin upgrade-c-again; swap c "$new_bin" || exit 1
+
+# ---------------------------------------------------------------- the gate, every node new
+phase=gate
+begin gate-before-finalize
+up=$(upgrade_state)
+if [[ $up == "finalize pending|$old_minor|"* ]]; then pass "cluster upgrade status: finalize pending, floor $old_minor ($up)"
+else fail "cluster upgrade status with every node new: '$up' (want finalize pending, floor $old_minor)"; fi
+gated_refused deploy-keys-unfinalized
+if [[ $OUT == *"upgrade floor is $old_minor"* ]] && [[ $OUT == *"cluster upgrade finalize"* ]]; then
+  pass "with every node new the refusal names the floor ($old_minor) and \`cluster upgrade finalize\`"
+else fail "with every node new the refusal does not name the floor $old_minor and finalize: $OUT"; fi
+# Without the keys a fan wakes beside its feed: the control of what the
+# keys change.
+beside=""
+for k in 1 2 3 4; do
+  pair_wake "plain-$k" a
+  if [ "$FEED_ON" = a ] && [ "$FAN_ON" = a ]; then beside="plain-$k"; break; fi
+  note "without the keys: feed/plain-$k woke on '$FEED_ON', fan/plain-$k on '$FAN_ON'"
+done
+if [ -n "$beside" ]; then pass "without the keys, fan/$beside woke on a, beside feed/$beside"
+else fail "without the keys, no fan woke on a beside its feed in 4 pairs"; fi
+
+begin finalize
+run_cli finalize-dry new cluster upgrade finalize --bucket "$BUCKET" --app "$APP"
+if [ "$RC" = 2 ] && [[ $(upgrade_state) == "finalize pending|$old_minor|"* ]]; then
+  pass "cluster upgrade finalize without --yes writes nothing (exit 2): $OUT"
+else fail "cluster upgrade finalize without --yes: exit $RC, then '$(upgrade_state)': $OUT"; fi
+run_cli finalize new cluster upgrade finalize --bucket "$BUCKET" --app "$APP" --yes
+if [ "$RC" = 0 ]; then pass "cluster upgrade finalize (exit 0): $OUT"
+else fail "cluster upgrade finalize with every node new: exit $RC: $OUT"; fi
+finalized=0
+up=$(upgrade_state)
+if [[ $up == "one version|$new_minor|"* ]]; then pass "cluster upgrade status: one version, floor $new_minor ($up)"; finalized=1
+else fail "cluster upgrade status after the finalize: '$up' (want one version, floor $new_minor)"; fi
+# The old CLI is judged in its own step from here on.
+status_clis=new
+
+# The floor is raised and nothing behind it is written yet: a node of the
+# old release reads every manifest, and must stop on the floor alone.
+phase=old-node
+begin "returning-$old_short-floor"
+old_node_returns "after the finalize, before the gated deploy" 1
+check_all
+retries
+
+phase=gate
+begin gated-deploy
+gated=0
+before=$(current)
+run_cli deploy-keys new deploy --project "$run/project/keys" --bucket "$BUCKET" --yes
+after=$(current)
+if [ $finalized = 1 ] && [ "$RC" = 0 ] && [ "${after#* }" = 8 ] && [ "$after" != "$before" ]; then
+  pass "after the finalize the same deploy is accepted, in manifest format 8: $(tail -n 1 "$run/deploy-keys.txt")"; gated=1
+else fail "the deploy with apart-from and spread after the finalize: exit $RC, current '$before' -> '$after': $OUT"; fi
+note "the plan of the gated deploy: $(grep -v '^ *$' "$run/deploy-keys.txt" | head -12 | tr '\n' '|' | cut -c1-600)"
+sleep 8
+# Placement follows the keys: a fan no longer wakes beside its feed.
+sent_before=$(metric a wasmkeep_placement_apart_total 'outcome="sent"')
+apart=0; together=""
+for k in 1 2 3 4; do
+  pair_wake "kept-$k" a
+  if [ "$FEED_ON" != a ]; then note "with the keys: feed/kept-$k woke on '$FEED_ON', not a"; continue; fi
+  if [ -n "$FAN_ON" ] && [ "$FAN_ON" != a ] && [ "$(holder "fan/kept-$k")" = "$FAN_ON" ]; then apart=$((apart + 1))
+  else together="$together fan/kept-$k@'$FAN_ON'"; fi
+done
+sent_after=$(metric a wasmkeep_placement_apart_total 'outcome="sent"')
+if [ $gated = 1 ] && [ $apart -gt 0 ] && [ -z "$together" ] && [ "$sent_after" -gt "$sent_before" ]; then
+  pass "placement follows the keys: $apart fans woken through a, which held their feeds, ran on another node (a's apart wake-ups sent on: $sent_before -> $sent_after)"
+else fail "placement after the gated deploy: $apart fans apart from their feed on a; beside it:${together:- none}; a's sent $sent_before -> $sent_after"; fi
+check_all
+retries
+
+# ---------------------------------------------------------------- the returning old node, again
+# The gated format is written: the same, on a manifest it cannot read.
+phase=old-node
+begin "returning-$old_short-format"
+old_node_returns "after the gated deploy" 0
+check_all
+retries
+
+# ---------------------------------------------------------------- the old CLI, finalized cluster
+# ADR 0043, section 8, 8: each command works, and what it wrote is read
+# rightly by the new nodes, or it is refused with a message and changes
+# nothing. The deploy comes last: it may replace the gated version.
+phase="cli-skew"
+begin "cli-$old_short-finalized"
+run_cli old-status old cluster status --bucket "$BUCKET"
+if ! old_cli_refused "cluster status"; then
+  if grep -q '^3 of 3 nodes live' "$run/old-status.txt"; then pass "$old_short CLI cluster status on the finalized cluster: 3 of 3 nodes live"
+  else fail "$old_short CLI cluster status on the finalized cluster: exit 0 without the three live nodes: $OUT"; fi
+fi
+printf 'old-finalized\n' > "$run/secret-4.in"
+old secrets set --app "$APP" --bucket "$BUCKET" --key "$run/etc/secrets.key" --class t MV_SECRET4 \
+  < "$run/secret-4.in" > "$run/old-secrets.txt" 2>&1; RC=$?
+OUT=$(tr '\n' ' ' < "$run/old-secrets.txt" | tr -s ' ' | cut -c1-700)
+if ! old_cli_refused "secrets set"; then
+  pass "$old_short CLI secrets set MV_SECRET4 on the finalized cluster"; sealed[MV_SECRET4]="old-finalized|$old_short"
+  sleep 8
+fi
+check_sealed
+run_cli old-drain old cluster drain b --bucket "$BUCKET"
+if old_cli_refused "cluster drain"; then
+  wait_state b serving 10 || true
+else
+  if wait_state b drained 90; then pass "$old_short CLI cluster drain b on the finalized cluster"; fi
+  run_cli old-undrain old cluster undrain b --bucket "$BUCKET"
+  if [ "$RC" = 0 ] && wait_state b serving 60; then pass "$old_short CLI cluster undrain b"
+  else
+    fail "$old_short CLI cluster undrain b: exit $RC: $OUT"
+    new cluster undrain b --bucket "$BUCKET" >/dev/null 2>&1; wait_state b serving 60 || true
+  fi
+fi
+# A backup by the new CLI now carries the app's floor (run format 2).
+# The old CLI must refuse that archive; its own, it may still write.
+backup_by new new backup-new-finalized
+if [ "$RC" = 0 ] && grep -q 'backup format 2' "$run/backup-new-finalized.txt"; then
+  pass "new CLI backup create after the finalize: a run of backup format 2 in the archive of the mixed run"
+  backup_by old new backup-old-format2
+  if [ "$RC" != 0 ] && [ -n "$OUT" ]; then pass "$old_short CLI backup create into the archive holding a format 2 run is refused (exit $RC): $OUT"
+  else fail "$old_short CLI backup create into the archive holding a format 2 run: exit $RC: $OUT"; fi
+else fail "new CLI backup create after the finalize: exit $RC, no run of backup format 2 to try the $old_short CLI on: $OUT"; fi
+backup_by old old backup-old-finalized
+if ! old_cli_refused "backup create (its own archive)"; then
+  pass "$old_short CLI backup create of the finalized app into its own archive: $(tail -n 1 "$run/backup-old-finalized.txt")"
+fi
+before=$(current)
+run_cli old-deploy old deploy --no-project --app "$APP" --bucket "$BUCKET" \
+  --actor "t=$test_actor" "${own[@]}" \
+  --actor "room=$new_room" --actor "pusher=$new_room" --actor "edge=$new_room" \
+  --actor "directory=$new_room" --actor "relay=$new_room"
+after=$(current)
+if old_cli_refused "deploy"; then
+  if [ "$after" = "$before" ]; then pass "the refused deploy changed nothing (current $after)"
+  else fail "the $old_short CLI's refused deploy changed the current version: '$before' -> '$after'"; fi
+else
+  note "$old_short CLI deploy on the finalized cluster was accepted: current '$before' -> '$after'; the checks below read it"
+  sleep 8
+fi
+check_status
+check_counter
+check_calls
+check_secrets
+publish 2
+check_room "after the $old_short CLI's commands"
+retries
 
 begin end
 # Every alarm armed in the run, read again: still exactly one run each.
