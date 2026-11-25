@@ -455,13 +455,18 @@ impl Cluster {
         req.headers_mut().remove(PLACED);
         req.headers_mut()
             .insert(PLACED, hyper::header::HeaderValue::from(fill));
-        let base = match self.prepare_forward(node, &mut req).await {
-            Ok(base) => base,
+        let (base, mut hop) = match self.prepare_forward(node, "placed", &mut req).await {
+            Ok(prepared) => prepared,
             // Nothing sent: no address, not trusted, or no proof.
             Err(_) => return Hop::Unsent,
         };
         let client = self.clients().call.clone();
-        match tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await {
+        let answer = tokio::time::timeout(FORWARD_TIMEOUT, client.request(req)).await;
+        if let Ok(Ok(response)) = &answer {
+            hop.answered(Some(response.status()));
+        }
+        drop(hop);
+        match answer {
             Ok(Ok(response)) => match self.trusted_response(&base, node, response) {
                 Some(r) if is_placed_refusal(&r) => refusal(&r),
                 Some(r) => Hop::Answered(r),
@@ -496,7 +501,12 @@ impl Cluster {
         req.headers_mut().remove(PLACED);
         req.headers_mut()
             .insert(PLACED, hyper::header::HeaderValue::from(fill));
-        match self.call_once(node, target, chain, req).await {
+        let mut hop = crate::traces::hop("placed", &self.node_id, node, &mut req);
+        crate::traces::attribute("remote", true);
+        let answer = self.call_once(node, target, chain, req).await;
+        hop.answered(answer.as_ref().ok().map(Response::status));
+        drop(hop);
+        match answer {
             Ok(r) if is_placed_refusal(&r) => refusal(&r),
             Ok(r) => Hop::Answered(r),
             Err(CallFailure::HandshakeRefused) => Hop::Unsent,

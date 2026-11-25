@@ -378,9 +378,14 @@ impl ActorService {
         let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
         let inner = Arc::clone(&self.inner);
         let opening = address.clone();
+        // The open runs in the request's trace (ADR 0044): its context is
+        // carried into the task by hand, for the open only. The socket's
+        // later events start traces of their own.
+        let context = crate::traces::current();
         tokio::spawn(async move {
             let permit = Arc::new(permit);
-            let accepted = match inner.accept_socket(opening.clone(), path, opener).await {
+            let accepting = inner.accept_socket(opening.clone(), path, opener);
+            let accepted = match crate::traces::scope(context, accepting).await {
                 Ok(accepted) => accepted,
                 Err(e) => {
                     let _ = opened_tx.send(Err(NotOpened::Open(e)));

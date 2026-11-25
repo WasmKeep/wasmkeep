@@ -647,6 +647,9 @@ pub(crate) struct Peer {
     /// It may receive a placed wake-up (heartbeat line 11, `place`, ADR
     /// 0041, section 9).
     pub(crate) can_place: bool,
+    /// It has tracing on and sets `traceparent` itself on the hops it
+    /// sends (heartbeat line 11, `traces`, ADR 0044, section 4).
+    pub(crate) traces: bool,
     /// Its heartbeat's load, and when this node first saw that heartbeat
     /// (ADR 0041, section 3); `None` from a node without a load line.
     pub(crate) seen: Option<Seen>,
@@ -709,6 +712,7 @@ impl Peer {
             can_blobs: node.can_blobs,
             instance: node.instance.clone(),
             can_place: node.can_place,
+            traces: node.can_trace,
             seen: node.load.map(|load| Seen {
                 load,
                 beat: (node.instance.clone(), node.written_at_ms),
@@ -809,7 +813,9 @@ impl Cluster {
         .map_err(invalid_id)?
         .with_app(serves)
         .with_reads_secrets(config.reads_secrets)
-        .with_place(config.placement);
+        .with_place(config.placement)
+        // Tracing is set for the process before any node of it starts.
+        .with_traces(crate::traces::enabled());
         let membership = match &config.version {
             Some(version) => membership.with_version(version.clone()),
             None => membership,
@@ -1375,6 +1381,9 @@ impl Cluster {
         // Sent at most twice: the upgrade has no body, so it can be built
         // again, and it is sent again only when the owner never read it.
         let mut first = true;
+        // One hop span for the upgrade, whichever send is answered: until
+        // the owner's answer, not for as long as the socket is relayed.
+        let mut hop: Option<crate::traces::Span> = None;
         let (base, revocation, response) = loop {
             let Some(base) = self.address_of(owner) else {
                 return unavailable("the actor's node is not reachable; retry\n");
@@ -1413,6 +1422,21 @@ impl Cluster {
             }
             if req.extensions().get::<IngressCharged>().is_some() {
                 out.extensions_mut().insert(IngressCharged);
+            }
+            // Before the proof, which hashes it (ADR 0044, section 3).
+            match &mut hop {
+                Some(hop) => {
+                    hop.inject(&mut out);
+                    hop.attribute("resent", true);
+                }
+                None => {
+                    hop = Some(crate::traces::hop(
+                        "upgrade",
+                        &self.node_id,
+                        owner,
+                        &mut out,
+                    ));
+                }
             }
             if self.sign_admission(owner, &path, &mut out).await.is_err() {
                 return unavailable("cannot authenticate ingress admission; retry\n");
@@ -1455,6 +1479,9 @@ impl Cluster {
                 Err(_) => return unavailable("the actor's node did not answer in time; retry\n"),
             }
         };
+        if let Some(mut hop) = hop {
+            hop.answered(Some(response.status()));
+        }
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             // The owner refused (or it moved again): pass its answer on,
             // checked like any answer from a peer.
@@ -1770,9 +1797,15 @@ impl Cluster {
             Ok(collected) => collected.to_bytes(),
             Err(never) => match never {},
         };
+        let mut req = Request::from_parts(parts, http_body_util::Full::new(body.clone()));
+        // One hop span for the call, sent once or twice; its context is
+        // the call's `traceparent` on both sends (ADR 0044, section 3).
+        let mut hop = crate::traces::hop("call", &self.node_id, owner, &mut req);
+        crate::traces::attribute("remote", true);
+        let (parts, _) = req.into_parts();
         let again = Request::from_parts(parts.clone(), http_body_util::Full::new(body.clone()));
         let req = Request::from_parts(parts, http_body_util::Full::new(body));
-        match self.call_once(owner, target, chain, req).await {
+        let answer = match self.call_once(owner, target, chain, req).await {
             Err(CallFailure::HandshakeRefused) => {
                 tracing::info!(
                     owner,
@@ -1783,12 +1816,15 @@ impl Cluster {
                 if !self.heartbeat_lands_then_two_periods().await {
                     return Err(CallFailure::HandshakeRefused.message(owner));
                 }
+                hop.attribute("resent", true);
                 self.call_once(owner, target, chain, again)
                     .await
                     .map_err(|e| e.message(owner))
             }
             other => other.map_err(|e| e.message(owner)),
-        }
+        };
+        hop.answered(answer.as_ref().ok().map(Response::status));
+        answer
     }
 
     /// Waits for this node's next heartbeat to reach the bucket (at most
@@ -1894,6 +1930,10 @@ impl Cluster {
                 alarm_handoff_body(address.tenant(), at),
             )))
             .map_err(|e| HandOffError::Failed(e.to_string()))?;
+        let mut req = req;
+        // Inside the alarm's event when one hands it off; a drain's or a
+        // sweep's hand-off is in no trace and carries nothing.
+        let mut hop = crate::traces::hop("hand_off", &self.node_id, peer, &mut req);
         let response = match tokio::time::timeout(
             HAND_OFF_TIMEOUT,
             // Once: a refused handshake is not waited out on the alarm path.
@@ -1913,6 +1953,7 @@ impl Cluster {
                 )));
             }
         };
+        hop.answered(Some(response.status()));
         match response.status() {
             StatusCode::OK => Ok(()),
             // Not this peer's actor (another tenant, or a class it does
@@ -1938,10 +1979,13 @@ impl Cluster {
             .body(http_body_util::Full::new(bytes::Bytes::from(take_body(
                 address.tenant(),
             ))));
-        let req = match req {
+        let mut req = match req {
             Ok(req) => req,
             Err(e) => return TakeAnswer::Failed(e.to_string()),
         };
+        // A move is in no trace (it carries nothing); a take asked inside
+        // a request's is its hop.
+        let mut hop = crate::traces::hop("take", &self.node_id, peer, &mut req);
         let response = match tokio::time::timeout(TAKE_TIMEOUT, async {
             self.call_once(peer, address, &[], req)
                 .await
@@ -1953,6 +1997,7 @@ impl Cluster {
             Ok(Err(e)) => return TakeAnswer::Failed(e),
             Err(_) => return TakeAnswer::Failed(format!("node {peer} did not answer in time")),
         };
+        hop.answered(Some(response.status()));
         match response.status() {
             StatusCode::OK => TakeAnswer::Held,
             StatusCode::CONFLICT => {

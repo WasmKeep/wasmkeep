@@ -816,6 +816,16 @@ impl Cluster {
     /// why it must be refused with 503 rather than served as a client's
     /// request, if it must.
     pub(crate) fn judge_hop<B>(&self, req: &mut Request<B>) -> Option<&'static str> {
+        // Judged already (for the trace's sampled flag, on a port where
+        // that needs the signature: [`Self::traced_sender`]): once is all.
+        if let Some(CheckedHop { by, hop }) = req.extensions().get::<CheckedHop>()
+            && *by == self.instance
+        {
+            return match hop {
+                HopCheck::Refused(why) => Some(*why),
+                HopCheck::Signed(_) | HopCheck::Outside => None,
+            };
+        }
         let on_cluster_port = req.extensions().get::<ArrivedOnClusterPort>().is_some();
         let hop = self.check_hop(req.method(), hop_path(req), req.headers(), on_cluster_port);
         let refused = match &hop {
@@ -827,6 +837,73 @@ impl Cluster {
             hop,
         });
         refused
+    }
+
+    /// Whether `req` is a hop whose `traceparent` is its sender's own (ADR
+    /// 0044, section 4): it authenticates as a node's, and that node
+    /// announces `traces`, so it set the header itself from its own
+    /// decision. Then, and only then, the receiver follows the header's
+    /// sampled flag.
+    ///
+    /// What authenticates it, by where it arrived:
+    /// - on the cluster port (`peer`), the connection: mutual TLS with a
+    ///   pinned certificate, which the sender the hop names must publish;
+    /// - elsewhere (plain HTTP between nodes, `accept` mode), a node
+    ///   call's signature, judged here once for the hop
+    ///   ([`Self::judge_hop`], whose verdict the router then reads), or a
+    ///   forward's proof ([`Self::admission_checked`], which spends
+    ///   nothing). On the public port in refuse mode neither checks, and
+    ///   the request is from outside.
+    ///
+    /// A hop from a node that does not announce the word (tracing off
+    /// there, or a version before 0.9) authenticates all the same, but its
+    /// `traceparent` is whatever a client or a guest sent: its flag is not
+    /// followed. The check is made before the replay records are read: a
+    /// signature that verifies decides the flag even if the request is
+    /// then refused as a replay, which costs one `request` span.
+    pub(crate) fn traced_sender<B>(
+        &self,
+        req: &mut Request<B>,
+        peer: Option<&crate::http::ClusterPeer>,
+    ) -> bool {
+        let sender = match peer {
+            Some(peer) => {
+                let mut named = req.headers().get_all(SENDER).iter();
+                match (named.next(), named.next()) {
+                    (Some(value), None) => value
+                        .to_str()
+                        .ok()
+                        .and_then(sender_named)
+                        .filter(|node| peer.publishes(node))
+                        .map(str::to_owned),
+                    _ => None,
+                }
+            }
+            None if req.headers().contains_key(INTERNAL) => {
+                self.judge_hop(req);
+                match req.extensions().get::<CheckedHop>() {
+                    Some(CheckedHop {
+                        hop: HopCheck::Signed(signed),
+                        ..
+                    }) => signed.sender.clone(),
+                    _ => None,
+                }
+            }
+            None if req.headers().contains_key(ADMITTED) => {
+                self.admission_checked(req).and_then(|(s, _)| s.sender)
+            }
+            None => None,
+        };
+        sender.is_some_and(|sender| self.peer_traces(&sender))
+    }
+
+    /// Whether the live peer `id` announces `traces`: it has tracing on.
+    pub(crate) fn peer_traces(&self, id: &str) -> bool {
+        self.peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .is_some_and(|p| p.traces)
     }
 
     /// The sender a signed hop names, checked (ADR 0038, section 5): bound

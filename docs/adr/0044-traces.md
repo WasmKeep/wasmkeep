@@ -1,11 +1,13 @@
 # 0044. Traces
 
-- Status: accepted (2026-11-25); the first slice is built (the context,
-  the exporter, and the `request`, `front`, `event` and `bucket` spans on
-  one node). The `call` and `hop` spans and section 3 are not built. The
-  exporter of section 5 is the choice: its size and dependency checks
-  were measured on the building branch and the size accepted there; the
-  load test is still to run.
+- Status: accepted (2026-11-25); built in two slices: the context, the
+  exporter and the `request`, `front`, `event` and `bucket` spans on one
+  node, then the `call` and `hop` spans, the context on a hop (section
+  3) and sampling across nodes (section 4, amended while building: the
+  heartbeat word `traces`). The exporter of section 5 is the choice: its
+  size and dependency checks were measured on the building branch and
+  the size accepted there; the load test is still to run, on the `0.9.0`
+  fleet (no bench in the repository starts nodes with an exporter).
 - Milestone: `0.9.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: ADR 0011 (the cluster port), ADR 0023 (the front; the
   `x-wasmkeep-` range is the host's), ADR 0025 (several calls at once),
@@ -13,7 +15,8 @@
   hop), [ADR 0043](0043-rolling-upgrades.md) (the wire rule for hops,
   the node file and going back)
 - Changes no interface: no WIT change, no bucket format, no signed
-  header
+  header. One heartbeat word, `traces`, which a reader that predates it
+  ignores (ADR 0043, the heartbeat's later lines)
 
 ## Context
 
@@ -64,8 +67,8 @@ the host. Six kinds of span, all made by the host:
 | `request` | The node that receives an HTTP request, on the public or the cluster port (`http.rs`) | Method, status, what it was routed to (front, actor, asset, file link), duration |
 | `front` | Around one run of the front (`front.rs`) | Wall time, CPU time, outcome |
 | `event` | Around one handler run on an actor (the event path): a request, a call, an alarm, a socket open, message or close | Class, actor, kind, time waited in the mailbox, CPU time, whether the actor was woken, outcome |
-| `call` | In the calling event, around one `actors.call`, local or to another node (`actor/routing.rs`, `cluster.rs`); one per entry of a batch (ADR 0025) | Target class and actor, whether it left the node, status |
-| `hop` | On the sending node, around a forward or a node's call (`cluster/forwarding.rs`) | Target node, kind (forward, call, hand-off, placed), status, whether it was sent again |
+| `call` | In the calling event or front, around one `actors.call`, local or to another node (`actor/routing.rs`); one per entry of a batch (ADR 0025) | Target class and actor, whether a request for it left the node (`remote`: true also for a placed call a peer refused and this node then ran), status, outcome (`answered`, `failed`, `timeout`) |
+| `hop` | On the sending node, around one request to another node, from the moment it is prepared to the peer's answer (`cluster/forwarding.rs`, `cluster.rs`, `cluster/placing.rs`) | This node and the target node (`node`, `peer`), kind (`forward`, `upgrade`, `call`, `placed`, `hand_off`, `take`), status, outcome (`answered`, `failed`), whether it was sent again (`resent`), whether the header had room (`carried`) |
 | `bucket` | In the counting wrapper, one per bucket request made inside a sampled span | Operation, outcome, key family (`wal`, `snapshot`, `owners`, `nodes`, ...), duration |
 
 The request this record is tested by (a front on node a, an actor on b
@@ -97,7 +100,13 @@ child of the event that started the flight, and the other events carry
 an attribute saying their write was batched. See "Not settled".
 
 **An event without a request** (an alarm, a socket message, a close)
-starts a trace of its own.
+starts a trace of its own. A socket's open is an event of the upgrade's
+request, on the owner, across a relay too.
+
+**A hop outside any trace makes no span.** A drain's or a sweep's alarm
+hand-off and a move's take belong to no request or event: they carry no
+context, and the node that receives one draws for it as for any request.
+An alarm handed off from inside its own event is that event's hop.
 
 **Not traced:** heartbeats and lease renewals, collection, sweeps, the
 idle pass, deploy following. They belong to no request; metrics cover
@@ -141,11 +150,9 @@ only if the client's part of the head stays within the head limits with
 it (the rule of section 3, condition 2); otherwise the guest receives the
 request as the client sent it.
 
-**In the first slice.** All of the above holds on one node. A call that
-leaves the node carries the host's `traceparent` (the calling event's or
-front's context, the guest's value replaced), with no `call` or `hop`
-span yet. A forward carries nothing from the node that received it: the
-client's header, if any, goes on unchanged, as with tracing off.
+**Across nodes.** The header a call or a forward carries to another node
+names the sending node's `hop` span (section 3), so the guest there sees
+its own event's context, in the same trace.
 
 ### 3. On a hop
 
@@ -154,23 +161,60 @@ host's range. This is ADR 0043's wire rule: a `0.9` node sends hops as
 `0.8.1` does, and a header outside the range may be added under three
 conditions, each met here.
 
-1. **Before the proof.** On a forward, the sending node sets
-   `traceparent` (parent: its `hop` span) before `sign_admission`
-   computes the proof, since the proof hashes it. On a node's call the
-   order does not matter; it is set at the same point for one code
-   path.
+1. **Before the proof.** On a forward (a relayed upgrade and a placed
+   request included), the sending node sets `traceparent` (parent: its
+   `hop` span) before `sign_admission` computes the proof, since the
+   proof hashes it. On a node's call the order does not matter; it is
+   set before the call is signed all the same.
 2. **Within the head limits.** A forward gains a header only when the
-   client sent none: about 70 bytes and one field. The node adds it
-   only if the client's head stays within the head limits with it;
-   otherwise the request goes on unchanged and the owner starts a trace
-   of its own. Replacing a client's value changes no size.
+   client sent none: 70 bytes and one field. The node adds it only if
+   the client's part of the head stays within the head limits with it,
+   measured as the owner will count it (the forward's URI is the owner's
+   address by then; the owner reads the client's `Host` instead, so the
+   address is not counted too). Otherwise the request goes on without
+   one and the owner starts a trace of its own (the `hop` span says
+   `carried: false`). A value that takes no more room than the client's
+   always replaces it: the head was within the limits when it arrived.
 3. **Safe for a guest to see.** It is: that is section 2.
 
-**Beside a node of the previous version.** A `0.8.1` node verifies the
-hop as before and passes the header to its guest. It makes no span, and
-its own calls do not carry the context on unless its guest copies the
-header, so a trace through an old node shows a gap or splits in two.
-That is accepted for the length of an upgrade.
+**What is signed, and why the header need not be.** The signed message
+of a node's call is what `0.8.1` signs, byte for byte: `traceparent` is
+in no line of it, so the MAC is the same with and without the header. A
+forward's proof is computed as `0.8.1` computes it, same grammar, same
+key, same hash of the client's headers; `traceparent` is one of those
+headers, as it already is when a client sends one. Neither is checked to
+authorize anything: who called, the chain, the app, the markers and the
+client's identity are the signed fields, and none of them reads the
+header. A forged or altered `traceparent` on a hop can attach a request
+to another trace, start a new one, or change the sampled flag, and
+nothing else. On a forward it cannot even do that without the proof
+failing, which makes the request a client's.
+
+**A node with tracing on sends its own header or none.** It announces
+the heartbeat word `traces` (section 4), and its peers then follow the
+flag on what it sends. So no hop of such a node carries a client's or a
+guest's `traceparent`: inside a trace the header is replaced by the
+hop's, and whenever the hop's is not set (no room for it, or outside any
+trace) a header already there is removed. This is the one case where a
+client's header does not go on as sent: a client's value that does not
+parse, shorter than the host's, in a head with no room for the host's.
+
+**The same bytes otherwise.** With tracing on, a call and a forward are
+the requests `0.8.1` sends plus that one header line (a test compares
+them with the bytes captured from the release before). With tracing
+off, nothing is added, removed or read.
+
+**Beside a node of the previous version.** Read in the code at the
+`v0.8.1` tag: its `identity_headers` and its `signature` are the ones
+above, so it verifies the hop as before; it removes only the
+`x-wasmkeep-` range from what a guest receives, so it passes
+`traceparent` to its guest as any header (the name appears nowhere in
+its source); it counts the header in the client's part of the head, as
+this version does when it decides whether to add it; and it ignores a
+heartbeat word it does not know. It makes no span, and its own calls do
+not carry the context on unless its guest copies the header, so a trace
+through an old node shows a gap or splits in two. What it sends is not
+followed (section 4). That is accepted for the length of an upgrade.
 
 ### 4. Sampling
 
@@ -191,26 +235,56 @@ the header's sampled flag.
   export volume. With it, the incoming flag decides in both directions
   (a `01` is sampled, a `00` is not); it is for a node behind a proxy
   the operator controls that already samples.
-- **On a hop that authenticates as a node's**, the flag is followed:
-  the first node decided. That means a node's call whose signature
-  checked, a forward whose proof checked, or anything on the cluster
-  port with TLS. A forward with no proof (plain HTTP, no secret loaded)
-  is treated as a request from outside.
+- **On a hop that authenticates as a node's, from a node that announces
+  `traces`**, the flag is followed, in both directions, with or without
+  `--trace-trust-incoming`: the first node decided. Authenticates means
+  a node's call whose signature checked, a forward whose proof checked,
+  or, on the cluster port, the TLS connection of the node the hop names
+  as its sender. A forward with no proof (plain HTTP, no secret loaded)
+  is treated as a request from outside, as is a signed request on the
+  public port in refuse mode.
+- **The word `traces`** (heartbeat line 11) is announced by a node with
+  tracing on. Added while building: authentication alone says who sent
+  the hop, not who wrote the header. A node with tracing off, or of
+  `0.8.1`, passes a client's `traceparent` through a forward whose proof
+  still checks, and a guest's through a signed call. Following those
+  flags would let a client or a guest turn sampling on at the next node.
+  A node announcing the word sets the header itself or sends none
+  (section 3), so its flag is its own decision. From any other node the
+  flag is ignored and the receiver draws, as for a request from outside.
+  A node that turns tracing on is followed once its peers have listed
+  its next heartbeat; until then traces through it can be in pieces.
+  The other way, a node restarted with tracing off, or put back on
+  `0.8.1`, under the same id is still followed until its peers list its
+  next heartbeat (one period, plus their listing): for that long a
+  client's flag sent through it decides at the next node. Accepted: it
+  is a restart's length, and what it costs is spans.
+- **A hop with no header** (no room in the head, or sent outside any
+  trace) starts a trace at the receiver, which draws.
 - **An unsampled trace costs a context, not spans.** The node keeps the
   three values (trace id, a parent id, the flag) to pass on, creates no
   span object and exports nothing.
 
-**In the first slice** a hop is not yet told from a request from
-outside: every request a node receives, on either port, is drawn at that
-node's ratio, or follows the incoming flag under
-`--trace-trust-incoming`. A trace that crosses nodes can be sampled on
-one and not on the next. No client and no guest gains anything by it:
-without the trust flag nothing they send decides.
+So a sampled trace is whole across the nodes it crosses, and an
+unsampled one makes no span on any of them. Every node should run with
+the same tracing settings; with tracing on at some nodes only, traces
+stop or split at the others and nothing else follows.
+
+**When the decision is made.** The `request` span starts before the
+router runs, so the receiving node checks the hop first, and only when
+there is a flag to follow: on the cluster port it reads the sender the
+hop names against the connection's certificate; elsewhere it judges the
+call's signature (once: the router then reads that verdict) or checks
+the forward's proof (which spends nothing). The check comes before the
+replay records are read. A replayed call whose signature still verifies
+therefore gets its flag followed and is then refused: one `request`
+span, in `accept` mode only.
 
 A call's signature does not cover `traceparent`. On plain HTTP between
 nodes (`accept` mode), someone on that network path could flip the flag
-or the id. They can already read every request there; what they gain is
-sampling. With TLS between nodes the question does not arise.
+or the id of a call, or replay one within its minute. They can already
+read every request there; what they gain is sampling. With TLS between
+nodes the question does not arise.
 
 **A trace id chosen by a client can be reused** across requests. With
 the default ratio one in a hundred of them is sampled, and they share a
@@ -349,7 +423,12 @@ How each part of the check came out:
   matters later. That was not measured.
 - **Load: open.** The comparison with tracing off and at the default
   ratio has not been run. The exporter is not final until it passes; the
-  log-line fallback applies if it fails.
+  log-line fallback applies if it fails. Looked at again when hops were
+  built: the benches in the repository (`bench/cluster.sh`,
+  `bench/room.sh`) start their nodes themselves, with no way to pass an
+  exporter's endpoint and no collector to send to, and the run this
+  record names is the three-node room load on a real bucket. It is left
+  to the `0.9.0` fleet run.
 
 The exporter uses asynchronous `reqwest` on a thread and a
 current-thread runtime of its own, with no `blocking` feature. Its
@@ -429,6 +508,11 @@ replaced by what happened; it is written once, when the span ends.
 
 - Three operator settings (`--otlp-endpoint`, `--trace-sample`,
   `--trace-trust-incoming`), each also a node-file key, and two metrics.
+- One heartbeat word, `traces`, from a node with tracing on. It gates
+  nothing: it says whose `traceparent` a hop carries.
+- With tracing on, a client's `traceparent` no longer reaches the guest
+  of a forwarded request as sent: the trace id is kept, the parent is
+  the host's.
 - A guest sees a `traceparent` it did not see before when tracing is on
   and the client sent none. An app that rejects unknown headers would
   notice; none of the SDKs do.
@@ -453,15 +537,22 @@ replaced by what happened; it is written once, when the span ends.
   only what the guest set.
 - **Sampling.** An outside `01` is not sampled without the trust flag
   beyond the ratio, and is with it; a `00` with the trust flag is not;
-  a hop whose proof checked is followed; a forward with no proof is
-  treated as outside.
-- **Hop.** A forward with an added `traceparent` verifies at the owner;
-  a head at the limit is forwarded unchanged; a hop to and from a node
-  of the previous version passes (ADR 0043, the mixed-version check).
-- **One trace, three nodes.** A cluster test with a collector stub: a
-  request through a front on a to an actor on b that calls an actor on
-  c gives one trace id, spans from three nodes, the parents of section
-  1 and one bucket write under the last event.
+  a hop whose signature or proof checked, from a node announcing
+  `traces`, is followed, and from any other node is not; a forward with
+  no proof is treated as outside. At a ratio between 0 and 1, every
+  trace through two or three nodes has all its spans or none.
+- **Hop.** A forward with an added `traceparent` verifies at the owner,
+  and one changed after the proof does not; a head at the limit is
+  forwarded unchanged; a call and a forward with tracing on are the
+  bytes captured from the release before plus one header line, the
+  call's MAC over the same message; a hop to and from a node of the
+  previous version passes (ADR 0043, the mixed-version check: its
+  tracing phase is not written yet).
+- **One trace, three nodes.** A cluster test with an exporter in
+  memory, plain and over TLS: a request through a front on a to an
+  actor on b that calls an actor on c gives one trace id, spans from
+  three nodes, the parents of section 1 and one bucket write under the
+  last event. A forward and a relayed upgrade likewise, on two nodes.
 - **Back-pressure.** A collector that does not answer: requests are
   served at the same latency, the drop counter moves, the process stops
   within its bound.

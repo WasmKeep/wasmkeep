@@ -45,6 +45,13 @@ fn a_v4_signature_signs_these_bytes() {
     for (name, value) in [
         ("x-wasmkeep-placed", "1"),
         ("x-other", "unsigned"),
+        // Outside the signed set, as any header outside the host's range
+        // (ADR 0044, section 3): the MAC below is the one captured
+        // without it.
+        (
+            "traceparent",
+            "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01",
+        ),
         ("x-wasmkeep-app", "t/default"),
         ("x-wasmkeep-chain", "t/room/one"),
         ("x-wasmkeep-caller", "t/room/caller"),
@@ -209,6 +216,7 @@ async fn sender(base: &str) -> Arc<Cluster> {
             can_blobs: true,
             instance: None,
             can_place: false,
+            traces: false,
             seen: None,
         },
     )]);
@@ -475,6 +483,147 @@ async fn a_streamed_forward_sends_these_bytes() {
     client.read_exact(&mut answer).await.unwrap();
     assert_eq!(&answer, b"HTTP/1.1 200");
     check_forward(&captured.take(), &base, GOLDEN_FORWARD);
+}
+
+/// The `traceparent` a traced hop carried in `raw`: this node's `hop`
+/// span in the trace of [`crate::traces::test_context`], sampled. And
+/// `raw` without that line.
+fn traced(raw: &str) -> (String, String) {
+    let value = header(raw, "traceparent").to_owned();
+    let context = crate::traces::test_context(true);
+    let (trace, parent) = (
+        "00-1234567890abcdef1234567890abcdef-",
+        "1234567890abcdef-01",
+    );
+    assert!(
+        value.len() == 55 && value.starts_with(trace) && value.ends_with("-01"),
+        "{value}"
+    );
+    assert!(
+        !value.ends_with(parent),
+        "{value}: the hop span's id, not {context:?}"
+    );
+    let line = format!("traceparent: {value}\r\n");
+    assert_eq!(raw.matches("traceparent").count(), 1, "{raw}");
+    (value, raw.replace(&line, ""))
+}
+
+/// With tracing on, a call and a forward sent inside a sampled trace
+/// (ADR 0044, section 3; ADR 0043, section 7): what is on the wire is
+/// what 0.8.1 sends, byte for byte, and one header outside the host's
+/// range.
+///
+/// - A call: its signature is over the same message, the header in no
+///   line of it; without the `traceparent` line the request is the one
+///   captured from the release before.
+/// - A forward: the proof's grammar, key and message are the same, and
+///   its hash of the client's headers now lists `traceparent` among them,
+///   as it does for a client that sent one to 0.8.1. Without the line, and
+///   with the hash of the two other headers, the request is the one
+///   captured.
+#[tokio::test]
+async fn a_traced_call_and_forward_add_one_header_and_sign_as_before() {
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let _guard = crate::traces::install(provider, 1.0, false).unwrap();
+    let context = Some(crate::traces::test_context(true));
+
+    let (base, captured) = recorder().await;
+    let me = sender(&base).await;
+    let target = ActorAddress::new("t", "room", "a b").unwrap();
+    let chain = [
+        ActorAddress::new("t", "room", "one").unwrap(),
+        ActorAddress::new("t", "room", "caller").unwrap(),
+    ];
+    let req = Request::post("/inner?x=1")
+        .header("x-guest", "kept")
+        .header(CALLER, "t/room/caller")
+        .header(CHAIN, "stale")
+        .body(http_body_util::Full::new(bytes::Bytes::from_static(
+            b"payload",
+        )))
+        .unwrap();
+    let response = crate::traces::scope(context, me.call("owner", &target, &chain, req))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = captured.take();
+    let (_, without) = traced(&raw);
+    let (ts, nonce, hash, mac) = fields(header(&raw, INTERNAL));
+    assert_eq!(hash, body_sha256(b"payload"));
+    let msg = format!(
+        "wasmkeep-call v4\n{ts}\n{nonce}\nowner\nPOST\n/actor/room/a%20b/inner?x=1\n{hash}\n\
+         x-wasmkeep-caller:t/room/caller\n\
+         x-wasmkeep-chain:t/room/one\n\
+         x-wasmkeep-chain:t/room/caller\n\
+         x-wasmkeep-app:t/default\n"
+    );
+    assert_eq!(mac, hmac_hex(SECRET, &msg));
+    assert_eq!(redact(&without, &base, Some(&nonce)), GOLDEN_CALL, "{raw}");
+
+    let (base, captured) = recorder().await;
+    let me = sender(&base).await;
+    let req = forwarded(http_body_util::Full::new(bytes::Bytes::from_static(
+        b"payload",
+    )));
+    let response = crate::traces::scope(context, me.forward("owner", req)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = captured.take();
+    let (value, without) = traced(&raw);
+    let (ts, nonce, hash, mac) = fields(header(&raw, ADMITTED));
+    assert_eq!(nonce, "000000000000000000000ffffc0000201");
+    // The client's identity, as 0.8.1 hashes it: every header outside the
+    // range, sorted, `name\0value\0`, the node's `traceparent` among them.
+    assert_eq!(
+        hash,
+        body_sha256(
+            format!("accept\0text/plain\0traceparent\0{value}\0x-client-id\0alice\0").as_bytes()
+        )
+    );
+    let msg = format!(
+        "wasmkeep-call v4\n{ts}\n{nonce}\nowner\nPOST\n/actor/room/a%20b/inner?q=1\n{hash}\n\
+         x-wasmkeep-caller:t/room/forged\n\
+         x-wasmkeep-app:t/default\n"
+    );
+    assert_eq!(
+        mac,
+        hmac_hex(&format!("wasmkeep-ingress-identity-v2:{SECRET}"), &msg)
+    );
+    let plain = body_sha256(b"accept\0text/plain\0x-client-id\0alice\0");
+    assert_eq!(
+        redact(&without, &base, None).replace(&hash, &plain),
+        GOLDEN_FORWARD,
+        "{raw}"
+    );
+
+    // Outside any trace (a sweep's hand-off, a move's take): nothing is
+    // added, and a client's header does not go on either.
+    let (base, captured) = recorder().await;
+    let me = sender(&base).await;
+    let mut req = forwarded(http_body_util::Full::new(bytes::Bytes::from_static(
+        b"payload",
+    )));
+    req.headers_mut().insert(
+        "traceparent",
+        "00-feedfacefeedfacefeedfacefeedface-feedfacefeedface-01"
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(me.forward("owner", req).await.status(), StatusCode::OK);
+    let raw = captured.take();
+    assert!(!raw.contains("traceparent"), "{raw}");
+    let (_, _, hash, _) = fields(header(&raw, ADMITTED));
+    assert_eq!(hash, plain);
+    // The same lines as captured; removing a header moves the others.
+    let lines = |head: &str| {
+        let mut lines: Vec<String> = head.split("\r\n").map(str::to_owned).collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(
+        lines(&redact(&raw, &base, None)),
+        lines(GOLDEN_FORWARD),
+        "{raw}"
+    );
 }
 
 /// Captured from the release before.

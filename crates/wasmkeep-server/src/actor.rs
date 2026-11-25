@@ -1026,6 +1026,25 @@ impl ActorService {
         self.inner.cluster.as_ref()?.judge_hop(req)
     }
 
+    /// Whether `req` is a hop from a node with tracing on, whose sampled
+    /// flag is followed (`Cluster::traced_sender`). `peer`: the connection
+    /// it arrived on, on the cluster port.
+    pub(crate) fn traced_sender<B>(
+        &self,
+        req: &mut hyper::Request<B>,
+        peer: Option<&crate::http::ClusterPeer>,
+    ) -> bool {
+        self.inner
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.traced_sender(req, peer))
+    }
+
+    /// This node's id, when it is in a cluster.
+    pub(crate) fn traced_node(&self) -> Option<&str> {
+        self.inner.cluster.as_ref().map(|c| c.node_id.as_str())
+    }
+
     /// Whether every actor has ended, its resources closed, within `limit`.
     pub async fn drained(&self, limit: Duration) -> bool {
         self.inner.mailboxes.drained(limit).await

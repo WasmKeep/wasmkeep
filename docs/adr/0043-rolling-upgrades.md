@@ -43,7 +43,8 @@ The pieces of a rolling upgrade exist, built one feature at a time:
   `wasmkeep-node 3`) carries a line of words (`take`, `front`, `handoff`,
   `ends`, `flush`, `rate_limits`, `restore`, `actor-restore`,
   `recorded-head`, `multi-app`, `assets`, `blobs`, `place`, and
-  `apart` from `0.9`). A reader
+  `apart` from `0.9`; `traces`, from a `0.9` node with tracing on, gates
+  nothing, ADR 0044). A reader
   ignores words it does not know (`NodeInfo::words`, `membership.rs`).
 - **Writers that read them.** A deploy refuses a manifest a live node of
   the app could not read (`check_readers` and `check_imports`,
