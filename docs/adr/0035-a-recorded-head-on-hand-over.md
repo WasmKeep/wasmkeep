@@ -354,7 +354,7 @@ For missing visibility, use this schedule:
   permit waits and backoffs. An attempt counts when started, even if a
   page or proof read never completes. Stop on the first exhausted bound.
 - Apply an outer deadline to the entire listing stream, not merely each
-  page. Today's `list_sized` has a five-second idle rule and continues
+  page. Today's `list_sized` (`list_listed` since 0.9.0) has a five-second idle rule and continues
   indefinitely while pages arrive; retain its idle/error retries only
   inside the remaining outer time. Cancel the stream at the deadline
   even if it is still making progress. Sleeps and proof-read requests

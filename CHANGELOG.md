@@ -46,6 +46,14 @@ The text under a version's heading is its GitHub release text
 - One check now answers "does every live node announce this word" for
   every writer, the CLI included. The messages are unchanged.
 
+### Fixed
+
+- A restore's read of a history object, and an upload's read-back,
+  keep no more of a body than the size its answer declared, and read
+  again one that goes past it or ends short of it (a read-back takes a
+  longer one for other bytes at once). A long body was read without a
+  bound, and a short one was taken as the object.
+
 ### Removed
 
 - **`wasmkeep cluster migrate` is removed** (ADR 0022), with

@@ -105,30 +105,12 @@ impl Collector {
     }
 
     /// The prefix, listed once: each key relative to it, with the exact
-    /// location and last-modified time the listing returned. As in `list`:
-    /// compared in the store's encoding, and the deletes use the exact
+    /// location and last-modified time the listing returned. A restore's
+    /// lister ([`list_listed`]) without an idle limit: one attempt, which
+    /// waits as long as the bucket takes; the deletes use the exact
     /// locations listed.
     async fn list(&self) -> Result<Vec<(String, object_store::ObjectMeta)>, ReplicaError> {
-        use futures_util::TryStreamExt;
-        let base = StorePath::from(self.prefix.trim_end_matches('/'));
-        let encoded = format!("{}/", base.as_ref());
-        let metas: Vec<object_store::ObjectMeta> = self
-            .store
-            .list(Some(&base))
-            .try_collect()
-            .await
-            .map_err(|e| ReplicaError::Bucket(e.to_string()))?;
-        Ok(metas
-            .into_iter()
-            .filter_map(|m| {
-                let rel = m
-                    .location
-                    .as_ref()
-                    .strip_prefix(encoded.as_str())?
-                    .to_owned();
-                Some((rel, m))
-            })
-            .collect())
+        list_listed(&self.store, &self.prefix, None).await
     }
 
     /// Deletes the listed objects `gone` names that are older than

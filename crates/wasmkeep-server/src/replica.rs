@@ -29,6 +29,7 @@ use wasmkeep_storage::wal::Changes;
 use crate::cluster::{Cluster, LeaseView};
 
 mod batched;
+mod bucket;
 pub(crate) use batched::{
     AlarmIndex, BudgetPermit, NODE_UPLOAD_BYTES, Stop, UploadBudget, stopped,
 };

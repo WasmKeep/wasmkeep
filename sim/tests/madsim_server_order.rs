@@ -412,7 +412,7 @@ async fn restore_within(
     ctx.linked.store(false, Ordering::SeqCst);
     let latency = rng.lock().unwrap().below(20);
     sleep(Duration::from_millis(1 + latency)).await;
-    // `list_sized`, then `Listing::from_keys` (`restore_within`).
+    // `list_listed`, then `Listing::from_keys` (`restore_within`).
     let keys = ctx.mem.list();
     let listing = Listing::from_keys(keys.iter().map(String::as_str));
     // `plan_restore`; a missing link with a known floor is relisted.
