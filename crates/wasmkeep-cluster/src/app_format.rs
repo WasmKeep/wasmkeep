@@ -64,12 +64,15 @@ pub fn decode(body: Option<&[u8]>) -> Result<AppFormat, Unknown> {
 /// and again right after it: a floor above the binary's own minor version
 /// stops the start, a missing record starts as before, and
 /// a body this version cannot read refuses to start (as an unreadable
-/// format setting refuses service). Nothing writes it before 0.9.0, whose
-/// `wasmkeep cluster upgrade finalize` writes it once every node runs the
-/// new minor version, so a node of an older version that was offline
-/// meanwhile cannot come back.
+/// format setting refuses service). Nothing writes it before 0.9.0. From
+/// then on [`floor::raise`] is its only writer ([ADR 0043], section 3):
+/// `wasmkeep cluster upgrade finalize` calls it once every live node runs
+/// the new minor version, so a node of an older version that was offline
+/// meanwhile cannot come back, and so does the first writer into an app
+/// that holds nothing ([`crate::upgrade::born_finalized`]).
 ///
 /// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+/// [ADR 0043]: ../../../docs/adr/0043-rolling-upgrades.md
 pub mod floor {
     /// The record's first line.
     pub const HEADER: &str = "wasmkeep-floor 1";
@@ -99,6 +102,129 @@ pub mod floor {
                 minor: number(parts.next()?)?,
             })
         }
+
+        /// The minor version a node's heartbeat names (ADR 0043, section
+        /// 5): `<major>.<minor>.<patch>`, three decimal numbers, then
+        /// nothing, or `+` or `-` and anything. Stricter than
+        /// [`Self::of_version`], and equal to it on every line this one
+        /// accepts.
+        pub fn of_node_version(line: &str) -> Option<Self> {
+            let core = line.split(['-', '+']).next()?;
+            let mut parts = core.split('.');
+            let found = Self {
+                major: number(parts.next()?)?,
+                minor: number(parts.next()?)?,
+            };
+            number(parts.next()?)?;
+            parts.next().is_none().then_some(found)
+        }
+
+        /// The minor version before this one in the same major version, if
+        /// any (`0.9` gives `0.8`; `1.0` gives none).
+        pub fn previous(self) -> Option<Self> {
+            Some(Self {
+                major: self.major,
+                minor: self.minor.checked_sub(1)?,
+            })
+        }
+
+        /// The next minor version in the same major version.
+        pub fn next(self) -> Self {
+            Self {
+                major: self.major,
+                minor: self.minor.saturating_add(1),
+            }
+        }
+    }
+
+    /// What a missing record reads as: `0.8`, the last version without a
+    /// floor.
+    pub const ABSENT: Minor = Minor { major: 0, minor: 8 };
+
+    /// The floor in force: the record's, or [`ABSENT`] without one.
+    pub fn in_force(floor: Option<Minor>) -> Minor {
+        floor.unwrap_or(ABSENT)
+    }
+
+    /// The record's key relative to the bucket prefix: what a
+    /// [`crate::lease::Bucket`] that already carries the prefix is given.
+    pub fn relative_key(tenant: &str, app: &str) -> String {
+        key("", tenant, app)
+    }
+
+    /// What [`raise`] did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Raised {
+        /// There was no record: created at the floor asked.
+        Created,
+        /// Replaced the record, which named this lower floor.
+        Replaced(Minor),
+        /// The record already names this floor, at or above the one asked:
+        /// left as it is.
+        Kept(Minor),
+    }
+
+    /// Why [`raise`] wrote nothing.
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    pub enum RaiseError {
+        /// The record holds something this version cannot read.
+        #[error("the app's upgrade floor `{key}` is unreadable ({len} bytes); nothing written")]
+        Unreadable {
+            /// The record's key.
+            key: String,
+            /// Its length.
+            len: usize,
+        },
+        /// The bucket did not answer, or other writers kept winning.
+        #[error("writing the app's upgrade floor: {0}")]
+        Bucket(String),
+    }
+
+    /// Raises the floor at `key` to `to`: the record's only writer (ADR
+    /// 0043, section 3). By conditional writes only (create when absent,
+    /// replace only the version read) and only upward: a record at or
+    /// above `to` is kept, and nothing lowers or deletes one. A lost race
+    /// is read again.
+    ///
+    /// # Errors
+    /// The record is unreadable (fail closed), or the bucket did not
+    /// answer.
+    pub async fn raise<B: crate::lease::Bucket>(
+        bucket: &B,
+        key: &str,
+        to: Minor,
+    ) -> Result<Raised, RaiseError> {
+        use crate::lease::BucketError;
+        let failed = |e: BucketError| RaiseError::Bucket(e.to_string());
+        // Every lost race means another writer landed: a few are plenty.
+        for _ in 0..8 {
+            let read = bucket.get(key).await.map_err(failed)?;
+            let found = decode(read.as_ref().map(|(body, _)| body.as_slice())).map_err(|e| {
+                RaiseError::Unreadable {
+                    key: key.to_owned(),
+                    len: e.len,
+                }
+            })?;
+            let written = match (found, &read) {
+                (Some(floor), _) if floor >= to => return Ok(Raised::Kept(floor)),
+                (Some(floor), Some((_, version))) => bucket
+                    .replace(key, encode(to), version)
+                    .await
+                    .map(|_| Raised::Replaced(floor)),
+                _ => bucket
+                    .create(key, encode(to))
+                    .await
+                    .map(|_| Raised::Created),
+            };
+            match written {
+                Ok(raised) => return Ok(raised),
+                Err(BucketError::Conflict) => {}
+                Err(e) => return Err(failed(e)),
+            }
+        }
+        Err(RaiseError::Bucket(
+            "other writers changed it on every try".to_owned(),
+        ))
     }
 
     /// A decimal number without leading zeros or a sign.
@@ -230,6 +356,145 @@ mod tests {
             "ordered as numbers"
         );
         assert!(allows(Some(m(1, 0)), m(0, 12)).is_err());
+    }
+
+    /// What `0.8.1` reads, byte for byte: the body its decoder accepts for
+    /// a floor of 0.9. A change to the encoder fails this.
+    const FLOOR_0_9_AS_0_8_1_READS_IT: &[u8] = b"wasmkeep-floor 1\n0.9\n";
+
+    /// The floor's writer (ADR 0043, section 3): created when absent,
+    /// replaced only upward, never lowered, and nothing written over a
+    /// body it cannot read.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn the_floor_is_only_raised() {
+        use crate::lease::Bucket as _;
+        use floor::{Minor, RaiseError, Raised, raise};
+        let m = |major, minor| Minor { major, minor };
+        let bucket = crate::object_store::ObjectStoreBucket::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "wk",
+        );
+        let key = floor::relative_key("acme", "shop");
+        assert_eq!(key, "formats/acme/shop/floor");
+        let body = async || bucket.get(&key).await.unwrap().map(|(body, _)| body);
+        assert_eq!(raise(&bucket, &key, m(0, 9)).await, Ok(Raised::Created));
+        assert_eq!(body().await.as_deref(), Some(FLOOR_0_9_AS_0_8_1_READS_IT));
+        // Idempotent, and never downward.
+        assert_eq!(
+            raise(&bucket, &key, m(0, 9)).await,
+            Ok(Raised::Kept(m(0, 9)))
+        );
+        assert_eq!(
+            raise(&bucket, &key, m(0, 8)).await,
+            Ok(Raised::Kept(m(0, 9)))
+        );
+        assert_eq!(body().await.as_deref(), Some(FLOOR_0_9_AS_0_8_1_READS_IT));
+        assert_eq!(
+            raise(&bucket, &key, m(0, 10)).await,
+            Ok(Raised::Replaced(m(0, 9)))
+        );
+        assert_eq!(body().await, Some(floor::encode(m(0, 10))));
+        // Unreadable: fail closed, the body left as it is.
+        let (_, version) = bucket.get(&key).await.unwrap().unwrap();
+        bucket
+            .replace(&key, b"wasmkeep-floor 2\n0.9\n".to_vec(), &version)
+            .await
+            .unwrap();
+        assert_eq!(
+            raise(&bucket, &key, m(0, 11)).await,
+            Err(RaiseError::Unreadable {
+                key: key.clone(),
+                len: 21
+            })
+        );
+        assert_eq!(
+            body().await.as_deref(),
+            Some(&b"wasmkeep-floor 2\n0.9\n"[..])
+        );
+    }
+
+    /// A lost race is read again: a floor another writer created first is
+    /// kept if it is high enough, and raised over if not.
+    #[tokio::test]
+    async fn a_lost_race_for_the_floor_is_read_again() {
+        use crate::lease::{Bucket, BucketError, Version};
+        use floor::{Minor, Raised, raise};
+        use std::sync::Mutex;
+        /// One object; the first read answers "absent" although `rival`
+        /// is already there, as a read just before the rival's write.
+        #[derive(Debug)]
+        struct Racy {
+            body: Mutex<(Vec<u8>, u64)>,
+            stale_reads: Mutex<u32>,
+        }
+        impl Bucket for Racy {
+            async fn get(&self, _: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+                let mut stale = self.stale_reads.lock().unwrap();
+                if *stale > 0 {
+                    *stale -= 1;
+                    return Ok(None);
+                }
+                let (body, n) = self.body.lock().unwrap().clone();
+                Ok(Some((body, Version(n.to_string()))))
+            }
+            async fn create(&self, _: &str, _: Vec<u8>) -> Result<Version, BucketError> {
+                Err(BucketError::Conflict)
+            }
+            async fn replace(
+                &self,
+                _: &str,
+                body: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BucketError> {
+                let mut held = self.body.lock().unwrap();
+                if expected.0 != held.1.to_string() {
+                    return Err(BucketError::Conflict);
+                }
+                *held = (body, held.1 + 1);
+                Ok(Version(held.1.to_string()))
+            }
+        }
+        let m = |major, minor| Minor { major, minor };
+        for (rival, want) in [
+            (m(0, 9), Raised::Kept(m(0, 9))),
+            (m(0, 8), Raised::Replaced(m(0, 8))),
+        ] {
+            let bucket = Racy {
+                body: Mutex::new((floor::encode(rival), 1)),
+                stale_reads: Mutex::new(1),
+            };
+            assert_eq!(raise(&bucket, "k", m(0, 9)).await, Ok(want));
+            assert_eq!(bucket.body.lock().unwrap().0, floor::encode(m(0, 9)));
+        }
+    }
+
+    /// A node's version line (ADR 0043, section 5): three numbers, then
+    /// build or pre-release text. It agrees with the parse `0.8.1` applies
+    /// to its own version wherever it accepts.
+    #[test]
+    fn a_nodes_version_line_is_three_numbers() {
+        use floor::Minor;
+        let m = |major, minor| Minor { major, minor };
+        for (line, want) in [
+            ("0.8.1", m(0, 8)),
+            ("0.9.0+0a1b2c3d4e5f", m(0, 9)),
+            ("0.10.0-rc.1", m(0, 10)),
+            ("1.2.3+build.7", m(1, 2)),
+        ] {
+            assert_eq!(Minor::of_node_version(line), Some(want), "{line}");
+            assert_eq!(Minor::of_version(line), Some(want), "{line}");
+        }
+        for line in [
+            "", "1", "0.9", "0.9.x", "0.09.1", "0.9.1.2", "v0.9.1", "0.9.+a",
+        ] {
+            assert_eq!(Minor::of_node_version(line), None, "{line:?}");
+        }
+        assert_eq!(m(0, 9).previous(), Some(m(0, 8)));
+        assert_eq!(m(1, 0).previous(), None);
+        assert_eq!(m(0, 9).next(), m(0, 10));
+        assert_eq!(floor::in_force(None), m(0, 8));
+        assert_eq!(floor::in_force(Some(m(0, 9))), m(0, 9));
     }
 
     #[test]

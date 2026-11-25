@@ -387,3 +387,108 @@ async fn review_changed_immutable_deploy_repairs_lost_old_index() {
     assert!(!next.unchanged);
     assert!(app.version(&next.current.version).await.is_ok());
 }
+
+/// ADR 0043, section 3: a fresh app is born finalized by its first
+/// deploy, once accepted, at this build's minor version: the path of
+/// every app served with `--app`, whose nodes wait for that deploy.
+/// Secrets set before it do not make the app one that ran. A deploy that
+/// is cancelled writes no floor, and neither does the first deploy into
+/// an app that only looks new: one with state or a registered node (its
+/// node leases all removed with `cluster forget`, or an app served
+/// without a deploy until now) keeps its way back until `finalize`.
+#[tokio::test]
+async fn a_first_deploy_creates_the_floor_of_a_fresh_app_only() {
+    use wasmkeep_cluster::app_format::floor;
+    let this = wasmkeep_cluster::upgrade::this_minor().unwrap();
+    let runtime = runtime();
+    let new_store = || -> Arc<dyn ObjectStore> { Arc::new(object_store::memory::InMemory::new()) };
+    let floor_of = async |store: &Arc<dyn ObjectStore>| match store
+        .get(&"formats/default/shop/floor".into())
+        .await
+    {
+        Ok(got) => Some(got.bytes().await.unwrap().to_vec()),
+        Err(_) => None,
+    };
+    let put = async |store: &Arc<dyn ObjectStore>, key: &str, body: String| {
+        store
+            .put(&key.into(), body.into_bytes().into())
+            .await
+            .unwrap();
+    };
+    let deploy = async |store: &Arc<dyn ObjectStore>, body: &[u8], accept: bool| {
+        AppRef::new(Arc::clone(store), "", "default", "shop")
+            .deploy_changes_with(&runtime, changes(body), |_| accept)
+            .await
+    };
+
+    // Fresh, with secrets set before the first deploy.
+    let fresh = new_store();
+    put(&fresh, "apps/default/shop/secrets/current", "x".into()).await;
+    assert!(matches!(
+        deploy(&fresh, b"abc", false).await,
+        Err(DeployError::Stopped)
+    ));
+    assert_eq!(
+        floor_of(&fresh).await,
+        None,
+        "a cancelled deploy writes nothing"
+    );
+    deploy(&fresh, b"abc", true).await.unwrap();
+    assert_eq!(floor_of(&fresh).await, Some(floor::encode(this)));
+
+    // State without a node, and a registered node: not fresh.
+    let with_state = new_store();
+    put(&with_state, "state/default/shop/owners/c/x", "x".into()).await;
+    let with_node = new_store();
+    put(
+        &with_node,
+        "nodes/gone",
+        format!(
+            "wasmkeep-node 3\nreleased beef\n1\ngone\nhttp://gone\n{}\ndefault/shop\n\n\nserving\n\ntake\n",
+            crate::VERSION
+        ),
+    )
+    .await;
+    for (what, store) in [("state", &with_state), ("a registered node", &with_node)] {
+        deploy(store, b"abc", true).await.unwrap();
+        assert_eq!(floor_of(store).await, None, "an app with {what}");
+    }
+    // Live nodes of another app under the prefix, one minor version
+    // behind this build: the deploy must not shut them out of the new
+    // app. The lower version is not above what no record means on this
+    // build, so nothing is written; a `wasmkeep` further ahead creates
+    // the floor at the nodes' version (`upgrade::tests`, where the
+    // version that deploys is a value).
+    let beside_older = new_store();
+    put(
+        &beside_older,
+        "nodes/other",
+        format!(
+            "wasmkeep-node 3\nlive beef\n{}\nother\nhttp://other\n{}.0\ndefault/blog\n\n\nserving\n\ntake\n",
+            crate::alarm::now_ms_i64(),
+            this.previous().unwrap()
+        ),
+    )
+    .await;
+    deploy(&beside_older, b"abc", true).await.unwrap();
+    let expected = wasmkeep_cluster::upgrade::deploy_floor(this, [&wasmkeep_cluster::membership::NodeInfo::decode(
+        format!(
+            "wasmkeep-node 3\nlive beef\n1\nother\nhttp://other\n{}.0\ndefault/blog\n\n\nserving\n\ntake\n",
+            this.previous().unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap()]);
+    assert!(
+        expected.is_none_or(|f| f < this),
+        "never the deploying version"
+    );
+    assert_eq!(
+        floor_of(&beside_older).await,
+        expected.map(floor::encode),
+        "the lower of the two, or nothing"
+    );
+    // A later deploy creates none either: the app has a deploy.
+    deploy(&with_state, b"abcd", true).await.unwrap();
+    assert_eq!(floor_of(&with_state).await, None);
+}

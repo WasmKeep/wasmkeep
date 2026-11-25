@@ -122,6 +122,8 @@ mod supervisor;
 mod traces;
 #[path = "two_apps.rs"]
 mod two_apps;
+#[path = "upgrade.rs"]
+mod upgrade;
 #[path = "websockets.rs"]
 mod websockets;
 #[path = "writes_deploys.rs"]

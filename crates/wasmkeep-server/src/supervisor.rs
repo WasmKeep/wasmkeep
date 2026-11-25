@@ -438,20 +438,15 @@ pub async fn nodes_without_multi_app(
     store: Arc<dyn object_store::ObjectStore>,
     prefix: &str,
 ) -> Result<Vec<String>, String> {
-    let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix.to_owned());
-    let all = wasmkeep_cluster::membership::all_heartbeats(&bucket)
+    // The one helper every writer asks (ADR 0043, section 2), over every
+    // app's live nodes: the process serves several.
+    Ok(crate::apps::Readers::read_prefix(store, prefix)
         .await
-        .map_err(|e| e.to_string())?;
-    let horizon = crate::cluster::heartbeat_horizon_ms(
-        crate::cluster::DEFAULT_HEARTBEAT,
-        &wasmkeep_cluster::lease::LeaseConfig::default_safe(),
-    );
-    let now = crate::cluster_tls::now_ms();
-    Ok(all
-        .into_iter()
-        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon) && !n.can_multi_app)
-        .map(|n| n.id)
-        .collect())
+        .map_err(|e| match e {
+            crate::apps::DeployError::Bucket(e) => e,
+            e => e.to_string(),
+        })?
+        .without_on_prefix(&["multi-app"]))
 }
 
 #[cfg(test)]

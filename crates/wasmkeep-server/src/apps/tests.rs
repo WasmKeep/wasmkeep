@@ -338,10 +338,13 @@ fn writes_lines_are_refused_where_they_do_not_belong() {
     }
 }
 
-/// A live heartbeat of a node serving `default/shop` with these words.
+/// A live heartbeat of a node serving `default/shop` with these words,
+/// at this build's version (a writer refuses beside a live node more than
+/// one minor version away, ADR 0043).
 pub(super) async fn heartbeat(store: &Arc<dyn ObjectStore>, id: &str, words: &str) {
     let body = format!(
-        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n0.4.2\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n{}\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+        crate::VERSION,
         crate::alarm::now_ms_i64()
     );
     store
@@ -642,4 +645,22 @@ async fn an_unreadable_local_marker_never_removes_local_files_at_start() {
     );
     assert_eq!(std::fs::read(local.join("state")).unwrap(), b"kept");
     assert!(local.join(RECREATED_LOCAL).is_dir());
+}
+
+/// ADR 0043, section 2: a tombstone is one by its presence, and its
+/// readers take its `id` line alone, so a later version may add lines (or
+/// number its header) without an older node misreading it.
+#[test]
+fn a_tombstone_is_read_by_its_id_line_alone() {
+    use super::delete::{TOMBSTONE_HEADER, tombstone_id};
+    assert_eq!(TOMBSTONE_HEADER, "wasmkeep-app-deleted 1");
+    let body = format!("{TOMBSTONE_HEADER}\nby ops\nat 5\nid 0a1b\n");
+    assert_eq!(tombstone_id(&body), Some("0a1b"));
+    for later in [
+        "wasmkeep-app-deleted 2\nby ops\nat 5\nid 0a1b\n",
+        "wasmkeep-app-deleted 1\nby ops\nat 5\nreason moved\nid 0a1b\nnext line\n",
+    ] {
+        assert_eq!(tombstone_id(later), Some("0a1b"), "{later:?}");
+    }
+    assert_eq!(tombstone_id("wasmkeep-app-deleted 1\nby ops\nat 5\n"), None);
 }

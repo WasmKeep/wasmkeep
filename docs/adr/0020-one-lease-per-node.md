@@ -1460,6 +1460,12 @@ zeros (`0.9`). It names the lowest minor version allowed to serve the app.
   live node runs the new minor version. Nothing in 0.8.1 writes it. A node
   of the previous minor version that was offline when the upgrade was
   finalized then cannot start into the cluster.
+- Written also, from 0.9.0, for an app that never ran (no floor, no
+  registered node, no deploy, no state): its first deploy,
+  or its first node when it is served without a deploy, creates the floor
+  at its own minor version
+  ([ADR 0043](0043-rolling-upgrades.md), section 3). Both writers only
+  create or raise it, by conditional writes.
 
 ### Tests
 

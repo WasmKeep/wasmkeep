@@ -522,6 +522,11 @@ impl AppRef {
         if !unchanged && !plan(&diff) {
             return Err(DeployError::Stopped);
         }
+        // An app's first deploy, accepted, and before it writes anything
+        // of the app: a fresh app is born finalized (ADR 0043, section 3).
+        if read.is_none() {
+            self.born_finalized().await?;
+        }
         let supplied = match &changes.assets {
             crate::assets::Change::Set(b) => Some(b),
             _ => None,

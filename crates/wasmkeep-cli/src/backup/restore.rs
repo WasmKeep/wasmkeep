@@ -130,9 +130,17 @@ async fn nodes(args: &Restore, store: &Store, prefix: &str) -> anyhow::Result<()
             format!("{prefix}/")
         },
     );
-    for node in wasmkeep_cluster::membership::all_heartbeats(&bucket).await? {
+    // Every registered node of the app, offline ones included, through
+    // the one test of "announces this word" (ADR 0043, section 2).
+    let registered = wasmkeep_cluster::membership::all_heartbeats(&bucket).await?;
+    let served = format!("{tenant}/{app}");
+    let lacking = wasmkeep_cluster::upgrade::without(
+        &["restore"],
+        registered.iter().filter(|n| n.app == served),
+    );
+    for node in registered.iter().filter(|n| lacking.contains(&n.id)) {
         ensure!(
-            node.app != format!("{tenant}/{app}") || node.can_restore || args.force,
+            args.force,
             "node {} version {} ignores restore fences (including offline nodes); upgrade or use --force after stopping it",
             node.id,
             node.version

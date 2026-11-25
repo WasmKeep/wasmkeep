@@ -31,6 +31,19 @@ impl ObjectStoreBucket {
         Path::from(format!("{}{key}", self.prefix))
     }
 
+    /// Whether any object lives under the folder `prefix` (its last
+    /// segment whole: `apps/acme/shop` does not match `apps/acme/shop2`).
+    /// One listing, read no further than its first key.
+    pub async fn any_key(&self, prefix: &str) -> Result<bool, BucketError> {
+        use futures_util::StreamExt as _;
+        let base = self.path(prefix.trim_end_matches('/'));
+        match self.store.list(Some(&base)).next().await {
+            None => Ok(false),
+            Some(Ok(_)) => Ok(true),
+            Some(Err(e)) => Err(BucketError::Unavailable(e.to_string())),
+        }
+    }
+
     /// When the object at `key` was last written, by the bucket's own clock
     /// (ms since the epoch; S3 gives whole seconds, rounded down); `None` if
     /// there is none. `wasmkeep cluster fence` checks the operator's clock

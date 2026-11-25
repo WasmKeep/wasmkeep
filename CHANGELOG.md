@@ -14,6 +14,37 @@ The text under a version's heading is its GitHub release text
 - **Traces** (ADR 0044, first slice): optional OTLP/HTTP export
   (`--otlp-endpoint`) of spans for requests, fronts, actor events and
   their bucket requests. Off by default.
+- **`wasmkeep cluster upgrade status` and `finalize`** (ADR 0043).
+  `status` shows each node's version, each app's upgrade floor and the
+  state of its upgrade. `finalize --yes` ends an upgrade: it raises the
+  app's floor to the new version once every live node runs it, and is
+  refused, naming them, while a live node is older, or while an older
+  node's lease is stale without a release or a fence (run `wasmkeep
+  cluster fence` first). After it, no node of an older version starts. `cluster status` shows the floor and
+  `finalize pending` in one line per app.
+- **A node refuses to start beside a version it cannot run with.** A
+  node of minor version N starts only while every live node of its app
+  runs N-1, N or N+1, and names the node that stops it. It also refuses
+  an app whose previous upgrade was never finalized.
+- **A new app is born finalized.** The first deploy of an app that
+  never ran, or the first node of an app served without a deploy,
+  creates its upgrade floor at its own version. An app that already has
+  a deploy, state or a registered node keeps the floor it has until
+  `finalize`. A deploy never sets the floor above the lowest version
+  live under the bucket prefix, and a node restarted in place on a
+  newer version creates none.
+
+### Changed
+
+- **Commands that write are refused from a `wasmkeep` older than the
+  app's upgrade floor**, and while a live node of the app is more than
+  one minor version away: `deploy`, `secrets`, `app delete` (without
+  `--force`) and `app format --enable`. A deploy is also refused while
+  the app's floor record is unreadable. Each refusal says which
+  `wasmkeep` may write: one within one minor version of every live
+  node, and not older than the floor.
+- One check now answers "does every live node announce this word" for
+  every writer, the CLI included. The messages are unchanged.
 
 ### Removed
 

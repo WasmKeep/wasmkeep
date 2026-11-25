@@ -21,6 +21,10 @@ const META_MAX: u64 = 64 << 20;
 const ACTOR_MAX: u64 = 8 << 20;
 const SPOOL_MAX: u64 = 1 << 30;
 const INDEX_MAX: u64 = 64 << 20;
+/// The `format` of a complete backup run. Not a cluster format: no node
+/// reads it. A newer `wasmkeep` reads older runs; an older one refuses a
+/// newer run (ADR 0043, section 2).
+const RUN_FORMAT: u64 = 1;
 fn charge(used: &mut u64, bytes: u64, limit: u64, label: &str) -> anyhow::Result<()> {
     *used = used.checked_add(bytes).context("backup budget overflow")?;
     ensure!(
@@ -565,7 +569,7 @@ async fn load_with_budget(
         "started membership mismatch"
     );
     ensure!(
-        complete["format"] == 1 && complete["run"] == id,
+        complete["format"] == RUN_FORMAT && complete["run"] == id,
         "unknown or inconsistent backup format"
     );
     ensure!(
@@ -2062,7 +2066,7 @@ async fn create_undo(
             "app deleted or recreated before completion"
         );
     }
-    let complete = json!({"format":1,"started_sha256":started_hash,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
+    let complete = json!({"format":RUN_FORMAT,"started_sha256":started_hash,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
     charge(
         &mut run_index_bytes,
         encode_bounded(&complete, META_MAX - 1)?.len() as u64,

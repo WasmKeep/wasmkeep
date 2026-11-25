@@ -276,7 +276,7 @@ Usage: `wasmkeep cluster [OPTIONS] <COMMAND>`
 
 #### `wasmkeep cluster status`
 
-Show the cluster under a bucket prefix, read from the bucket alone (no node needs to answer): each node's heartbeat (version, app, addresses, TLS pin, age, live or not) and each app's deployed version.
+Show the cluster under a bucket prefix, read from the bucket alone (no node needs to answer): each node's heartbeat (version, app, addresses, TLS pin, age, live or not), each app's deployed version, and each app's upgrade floor with the state of its upgrade (`finalize pending` once every live node runs the new version).
 
 Usage: `wasmkeep cluster status [OPTIONS] --bucket <BUCKET>`
 
@@ -332,6 +332,36 @@ Usage: `wasmkeep cluster forget [OPTIONS] --bucket <BUCKET> <NODE>`
 |---|---|---|
 | `<NODE>  The node's id` | |  |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
+
+#### `wasmkeep cluster upgrade`
+
+Follow and end an upgrade of WasmKeep itself, one node at a time: `status` shows each node's version, each app's upgrade floor and what blocks a finalize; `finalize` ends the upgrade
+
+Usage: `wasmkeep cluster upgrade [OPTIONS] <COMMAND>`
+
+#### `wasmkeep cluster upgrade status`
+
+Show the upgrade of WasmKeep itself, per app, read from the bucket alone: each registered node with its version, the app's upgrade floor (the lowest version allowed to serve it), one state (`one version`, `mixed`, `finalize pending`, `no live node`, `node below the floor`, `refused`) and the nodes that block a finalize.
+
+Usage: `wasmkeep cluster upgrade status [OPTIONS] --bucket <BUCKET>`
+
+| Flag or argument | Default | Meaning |
+|---|---|---|
+| `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables; read access is enough) |
+| `--app <APP>` |  | One app, TENANT/APP, instead of every app with registered nodes |
+| `--json` |  | Print JSON instead of text, for scripts |
+
+#### `wasmkeep cluster upgrade finalize`
+
+End an upgrade: raise each app's upgrade floor to this `wasmkeep`'s minor version, so that no node of an older version starts again (there is no way back).
+
+Usage: `wasmkeep cluster upgrade finalize [OPTIONS] --bucket <BUCKET>`
+
+| Flag or argument | Default | Meaning |
+|---|---|---|
+| `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
+| `--app <APP>` |  | One app, TENANT/APP, instead of every app with registered nodes |
+| `--yes` |  | Write the floor; without it, print what would be done and exit with 2 |
 
 #### `wasmkeep cluster diagnose`
 

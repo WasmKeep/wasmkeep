@@ -90,7 +90,7 @@ pub async fn delete_app(
         ensure!(
             tombstone
                 .as_deref()
-                .is_some_and(|body| body.lines().any(|line| line == format!("id {id}"))),
+                .is_some_and(|body| tombstone_id(body) == Some(id.as_str())),
             "operation {id} is unknown or its app incarnation changed; nothing removed"
         );
     }
@@ -100,7 +100,7 @@ pub async fn delete_app(
     // A node of a version before ADR 0028 ignores a tombstone: it would
     // keep serving the app, and writing, while its data is removed. Asked
     // before the tombstone, and again on a run that resumes.
-    let old = super::nodes_without_ends(Arc::clone(&store), prefix, tenant, name).await?;
+    let (old, writer) = tombstone_readers(&store, prefix, tenant, name).await?;
     ensure!(
         old.is_empty() || args.force,
         "live nodes of {shown} run a version that ignores an app's tombstone ({}): upgrade \
@@ -112,6 +112,21 @@ pub async fn delete_app(
             ""
         }
     );
+    // Then the writer itself (ADR 0043, sections 3 and 5): not a build
+    // older than the app's upgrade floor, nor beside a live node more than
+    // one minor version away.
+    if let Err(why) = writer
+        && !args.force
+    {
+        return Err(DeployError::Refused(format!(
+            "{shown}: {why}{}",
+            if existed.is_none() {
+                " (nothing was written)"
+            } else {
+                ""
+            }
+        )));
+    }
     let mut since_ms = now();
     if existed.is_none() {
         ensure!(
@@ -126,7 +141,7 @@ pub async fn delete_app(
         );
         since_ms = now();
         let body = format!(
-            "wasmkeep-app-deleted 1\nby {}\nat {}\nid {}\n",
+            "{TOMBSTONE_HEADER}\nby {}\nat {}\nid {}\n",
             args.who,
             since_ms,
             wasmkeep_cluster::control::new_request_id()
@@ -152,9 +167,7 @@ pub async fn delete_app(
             "app incarnation changed; delete stopped"
         );
     }
-    let id = tombstone
-        .lines()
-        .find_map(|line| line.strip_prefix("id "))
+    let id = tombstone_id(&tombstone)
         .ok_or_else(|| DeployError::Refused("delete tombstone has no operation ID".into()))?;
     if let Some(expected) = &args.resume {
         ensure!(expected == id, "delete operation changed; nothing removed");
@@ -227,7 +240,7 @@ pub async fn delete_app(
         // A node started while the command waited: it stops on the
         // tombstone; whatever it wrote goes in the next round.
         if !args.force {
-            let old = super::nodes_without_ends(Arc::clone(&store), prefix, tenant, name).await?;
+            let (old, _) = tombstone_readers(&store, prefix, tenant, name).await?;
             ensure!(
                 old.is_empty(),
                 "{shown}: nodes that ignore a tombstone started during the delete ({}): stop \
@@ -337,6 +350,39 @@ pub async fn fence_app_nodes(
         }
     }
     Ok(last)
+}
+
+/// The first line of an app's tombstone, as `app delete` writes it. A
+/// tombstone is one by its presence: readers take its `at` and `id`
+/// lines and nothing else, so lines may be added (ADR 0043, section 2).
+pub(crate) const TOMBSTONE_HEADER: &str = "wasmkeep-app-deleted 1";
+
+/// The operation id a tombstone carries: its `id` line, whatever the
+/// other lines say.
+pub(crate) fn tombstone_id(body: &str) -> Option<&str> {
+    body.lines().find_map(|line| line.strip_prefix("id "))
+}
+
+/// Who would read a tombstone written now (ADR 0043, section 2): the
+/// live nodes of the app that ignore one (no `ends`: such a node would
+/// keep serving and writing while the app's data is removed), and whether
+/// this build may write to the app at all.
+async fn tombstone_readers(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    name: &str,
+) -> Result<(Vec<String>, Result<(), String>), DeployError> {
+    use wasmkeep_cluster::upgrade::{self, Blocked};
+    let readers = super::Readers::read(Arc::clone(store), prefix, tenant, name).await?;
+    // An unreadable floor is the writer's refusal, which `--force`
+    // passes: a delete is how an app with a broken floor is removed.
+    let writer = upgrade::this_minor().and_then(|this| readers.writer(this));
+    let ignoring = match upgrade::format(TOMBSTONE_HEADER).map(|f| readers.gate(f)) {
+        Some(Err(Blocked::Nodes { nodes, .. })) => nodes,
+        Some(Ok(()) | Err(_)) | None => Vec::new(),
+    };
+    Ok((ignoring, writer))
 }
 
 async fn live_ids(

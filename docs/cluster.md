@@ -1576,6 +1576,75 @@ versions in one cluster, even for the length of a rolling restart. The
 cluster then serves nothing between the last stop and the first start, so
 plan a short window.
 
+### Versions, the upgrade floor and `finalize`
+
+From 0.9.0 the tools for an upgrade one node at a time are in the binary
+([ADR 0043](adr/0043-rolling-upgrades.md)). Whether a given pair of
+versions may be upgraded that way is still what the release's upgrading
+page says; these are the commands it uses.
+
+- **A node refuses to start beside a version it cannot run with.** A node
+  of minor version N starts only while every live node of its app runs
+  N-1, N or N+1. Otherwise it writes no lease, logs the node and its
+  version, and reports not ready. Upgrade one minor version at a time.
+- **Each app has an upgrade floor**, `formats/<tenant>/<app>/floor` in
+  the bucket: the lowest minor version allowed to serve it. A node below
+  the floor does not start (0.8.1 reads it too). Without a record the
+  floor is 0.8. A new app gets its floor at the version that creates it:
+  the first deploy of an app that never ran (no deploy, no state, no
+  registered node), or its first node. A deploy never sets the floor
+  above the lowest version live under the bucket prefix, so the nodes
+  that run the other apps can start into the new one.
+- **`wasmkeep cluster upgrade status`** shows, per app, each node's
+  version, the floor, and one state: `one version`, `mixed`, `finalize
+  pending` (every live node runs the new version, the floor is still the
+  old one), `no live node`, `node below the floor`, or `refused`. It names
+  the nodes that block a finalize. Exit code 0 for `one version`, 3 while
+  an upgrade is under way, 1 when something needs attention.
+  `wasmkeep cluster status` prints the same floor and state in one line
+  per app.
+- **`wasmkeep cluster upgrade finalize --yes`** ends the upgrade: it
+  raises the floor to the version of the `wasmkeep` that runs it. It is
+  refused, naming them, while a live node of the app is older. After the
+  write it waits about 25 s and lists the nodes again; an older node live
+  then is reported as an error and must be stopped. Without `--yes` it
+  prints what it would do.
+
+```sh
+wasmkeep cluster upgrade status --bucket s3://wasmkeep-demo
+wasmkeep cluster upgrade finalize --bucket s3://wasmkeep-demo --yes
+```
+
+Until you finalize, any node may go back to the previous version, and
+nothing the previous version cannot read is written. After it, no node of
+an older version starts, and going back is not supported. A format a new
+version introduces is refused until the app is finalized, and then still
+while a live node does not announce its capability word. Commands that
+write (`deploy`, `secrets`, `app delete`, `app format --enable`) are
+refused from a `wasmkeep` older than the app's floor, or while a live
+node of the app is more than one minor version away from it. The way
+out is in the message: use a `wasmkeep` within one minor version of
+every live node, and not older than the floor.
+
+`finalize` counts an older node as stopped only when its lease is
+`released` or `fenced`. A lease that is merely stale (the machine
+vanished, or is cut off) is refused: run `wasmkeep cluster fence <id>`
+first; a fence counts 15 s after the node's last write. It also needs a
+live node: after an upgrade done with every node stopped, start the
+nodes, then finalize.
+
+Finalize before you stop the last node of the previous version for the
+next upgrade. A node refuses to start two minor versions above an app's
+floor, even alone: restarted in place from 0.9 on 0.10 without a
+finalize at 0.9, it does not start. Put 0.9 back, finalize, then
+upgrade.
+
+`node below the floor` means a node of an older version is live under a
+floor above it. Either it started while the floor was being written, or
+its read of the floor got no answer after its first lease write and it
+keeps checking without serving; its `/_wasmkeep/ready` answer says which.
+Stop it.
+
 **One exception: from 0.4.0 to 0.4.1, one node at a time.** 0.4.1
 changes nothing 0.4.0 reads or writes in the bucket (layout, manifests,
 ownership records, alarm index), signs calls between nodes as 0.4.0

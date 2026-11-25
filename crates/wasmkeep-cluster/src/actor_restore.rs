@@ -1,6 +1,11 @@
 //! Wire format for staged single-actor restores (ADR 0033).
 use crate::replication::SegmentId;
 
+/// The first line of a restore request. Its reader is strict: a node
+/// refuses and deletes a request under any other header (ADR 0043,
+/// section 2).
+pub const HEADER: &str = "wasmkeep-restore 1";
+
 /// Validated description of a staged LTX snapshot. No credentials belong here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -19,7 +24,7 @@ impl Request {
     /// Stable, bounded text format.
     pub fn encode(&self) -> Vec<u8> {
         format!(
-            "wasmkeep-restore 1\n{}\n{} {} {}\n{}\n",
+            "{HEADER}\n{}\n{} {} {}\n{}\n",
             self.source,
             self.size,
             self.page_size,
@@ -35,7 +40,7 @@ impl Request {
             return None;
         }
         let mut lines = std::str::from_utf8(bytes).ok()?.lines();
-        if lines.next()? != "wasmkeep-restore 1" {
+        if lines.next()? != HEADER {
             return None;
         }
         let source = lines.next()?.to_owned();

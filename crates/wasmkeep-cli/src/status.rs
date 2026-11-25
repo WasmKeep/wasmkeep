@@ -249,6 +249,9 @@ pub(crate) struct Report {
     pub(crate) horizon_ms: u64,
     pub(crate) nodes: Vec<Node>,
     pub(crate) apps: Vec<App>,
+    /// The upgrade of WasmKeep itself (ADR 0043), for each app that has
+    /// registered nodes: its floor and one state.
+    pub(crate) upgrades: Vec<wasmkeep_cluster::upgrade::AppUpgrade>,
 }
 
 /// Reads the cluster under `prefix` of `store`, at `now_ms`, counting a
@@ -311,6 +314,19 @@ async fn read_with_limit(
         }
     }
     heartbeats.sort_by(|a, b| a.id.cmp(&b.id));
+    // Each app's upgrade floor, one read per app with registered nodes.
+    let floors = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+        Arc::clone(&store),
+        prefix.to_owned(),
+    );
+    let mut upgrades = Vec::new();
+    for app in wasmkeep_cluster::upgrade::apps_of(&heartbeats) {
+        upgrades.push(
+            wasmkeep_cluster::upgrade::status_of(&floors, &app, &heartbeats, now_ms, horizon_ms)
+                .await
+                .map_err(|e| anyhow::anyhow!("reading the upgrade floor of {app}: {e}"))?,
+        );
+    }
     let nodes = heartbeats
         .into_iter()
         .map(|info| Node {
@@ -326,6 +342,7 @@ async fn read_with_limit(
         horizon_ms,
         nodes,
         apps: read_apps(&store, prefix, bucket, max).await?,
+        upgrades,
     })
 }
 
@@ -546,6 +563,13 @@ impl Report {
                 held.join(", ")
             ));
         }
+        // ADR 0043, section 5: what the skew check refuses, and a live
+        // node below an app's floor.
+        for upgrade in &self.upgrades {
+            if upgrade.state.exit_code() == 1 {
+                out.push(format!("upgrade of {}", upgrade.line()));
+            }
+        }
         let versions = self.versions();
         if versions.len() > 1 {
             let list: Vec<String> = versions
@@ -672,7 +696,20 @@ impl Report {
                 "mixed_tls": !tls.is_empty() && !plain.is_empty(),
                 "versions": versions,
                 "mixed_versions": versions.len() > 1,
+                "finalize_pending": self
+                    .upgrades
+                    .iter()
+                    .filter(|u| u.state == wasmkeep_cluster::upgrade::State::FinalizePending)
+                    .map(|u| u.app.as_str())
+                    .collect::<Vec<_>>(),
             },
+            // ADR 0043: each app's upgrade floor and the state of its
+            // upgrade, as `cluster upgrade status --json` lists them.
+            "upgrade": self
+                .upgrades
+                .iter()
+                .map(crate::upgrade_cmd::app_json)
+                .collect::<Vec<_>>(),
             "warnings": self.warnings(),
         })
     }
@@ -819,6 +856,11 @@ impl Report {
                 versions.join(", ")
             }
         );
+        // One line per app: its upgrade floor and the state of its
+        // upgrade (ADR 0043). What needs attention is a warning below.
+        for upgrade in self.upgrades.iter().filter(|u| u.state.exit_code() != 1) {
+            let _ = writeln!(out, "upgrade of {}", upgrade.line());
+        }
         for w in self.warnings() {
             let _ = writeln!(out, "warning: {w}");
         }
@@ -1553,6 +1595,78 @@ mod tests {
             row("beta/new"),
             ["beta/new", "fedcba9876543210", "1", "-", "no", "1"]
         );
+    }
+
+    /// ADR 0043: `cluster status` shows each app's upgrade floor and the
+    /// state of its upgrade in one line, `finalize pending` among them,
+    /// and warns about a live node below the floor.
+    #[test]
+    fn the_upgrade_floor_and_finalize_pending_are_shown() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node = async |id: &str, version: &str| {
+            put(
+                &store,
+                &format!("demo/nodes/{id}"),
+                &format!(
+                    "wasmkeep-node 3\nlive i-{id}\n{NOW}\n{id}\nhttp://{id}:8080\n{version}\nacme/shop\n\n\nserving\n\ntake\n"
+                ),
+            )
+            .await;
+        };
+        block_on(async {
+            node("a", "0.9.0").await;
+            node("b", "0.9.1").await;
+        });
+        let r = report(Arc::clone(&store));
+        let text = r.to_text();
+        assert!(
+            text.contains(
+                "\nupgrade of acme/shop: floor none (0.8), finalize pending: every live node \
+                 runs 0.9 and the floor is 0.8: run `wasmkeep cluster upgrade finalize`"
+            ),
+            "{text}"
+        );
+        let j = r.to_json();
+        assert_eq!(j["summary"]["finalize_pending"], json!(["acme/shop"]));
+        assert_eq!(j["upgrade"][0]["app"], "acme/shop");
+        assert_eq!(j["upgrade"][0]["state"], "finalize pending");
+        assert_eq!(j["upgrade"][0]["floor"], Value::Null);
+        assert_eq!(j["upgrade"][0]["floor_in_force"], "0.8");
+        assert!(r.warnings().iter().all(|w| !w.contains("upgrade of")));
+
+        // Finalized: one version, nothing pending.
+        block_on(put(
+            &store,
+            "demo/formats/acme/shop/floor",
+            "wasmkeep-floor 1\n0.9\n",
+        ));
+        let r = report(Arc::clone(&store));
+        assert!(
+            r.to_text().contains(
+                "\nupgrade of acme/shop: floor 0.9, one version: every live node runs 0.9\n"
+            ),
+            "{}",
+            r.to_text()
+        );
+        assert_eq!(r.to_json()["summary"]["finalize_pending"], json!([]));
+        assert_eq!(r.to_json()["upgrade"][0]["floor"], "0.9");
+
+        // A live node below the floor: a warning, naming it.
+        block_on(node("late", "0.8.1"));
+        let r = report(Arc::clone(&store));
+        let w = r.warnings();
+        assert!(
+            w.iter().any(|w| w.starts_with(
+                "upgrade of acme/shop: floor 0.9, node below the floor: late (0.8.1) live below \
+                 the floor 0.9"
+            )),
+            "{w:?}"
+        );
+        assert_eq!(r.to_json()["upgrade"][0]["blocks"], json!(["late"]));
+        // No app, no line.
+        let empty = report(Arc::new(InMemory::new()));
+        assert!(!empty.to_text().contains("upgrade of"));
+        assert_eq!(empty.to_json()["upgrade"], json!([]));
     }
 
     #[test]

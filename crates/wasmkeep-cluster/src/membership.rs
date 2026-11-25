@@ -508,6 +508,12 @@ impl NodeInfo {
         .filter_map(|(has, word)| has.then_some(word))
     }
 
+    /// Whether this node announces the capability word `word`. A word
+    /// this version does not know is announced by no node it reads.
+    pub fn announces(&self, word: &str) -> bool {
+        self.capabilities().any(|w| w == word)
+    }
+
     /// What line 11 says: capability words (`take`, `front`) and the process's
     /// token (`instance=<hex>`, 1 to 64 lowercase hex digits; anything else
     /// is ignored). Every other field is empty.
@@ -707,6 +713,14 @@ impl<D: Directory, C: Clock> Membership<D, C> {
     #[must_use]
     pub fn with_place(mut self, place: bool) -> Self {
         self.place = place;
+        self
+    }
+
+    /// The version this node announces (default: this build's,
+    /// [`crate::VERSION`]). Tests set it to stand for a node of another
+    /// version.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = version.into();
         self
     }
 

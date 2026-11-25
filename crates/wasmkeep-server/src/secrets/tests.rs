@@ -357,3 +357,20 @@ fn object_names_sort_by_seq() {
         assert_eq!(parse_object_name(bad), None, "{bad}");
     }
 }
+
+/// ADR 0043, section 2: an object under another header is refused, never
+/// opened as the format this version knows (a new one needs a gate).
+#[test]
+fn an_object_under_another_header_is_refused() {
+    let key = SecretsKey::generate().unwrap();
+    let object = String::from_utf8(seal(&key, &place(), 1, &set()).unwrap()).unwrap();
+    assert!(object.starts_with("wasmkeep-secrets 1\n"), "{object}");
+    assert!(open(std::slice::from_ref(&key), &place(), 1, object.as_bytes()).is_ok());
+    for later in ["wasmkeep-secrets 2", "wasmkeep-secrets 10"] {
+        let other = object.replacen("wasmkeep-secrets 1", later, 1);
+        assert!(
+            open(std::slice::from_ref(&key), &place(), 1, other.as_bytes()).is_err(),
+            "{later}"
+        );
+    }
+}

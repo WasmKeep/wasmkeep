@@ -186,6 +186,11 @@ pub struct ClusterConfig {
     /// This node reads the app's secrets from the bucket (heartbeat line
     /// 10, ADR 0016); `false` with `--no-secrets`.
     pub reads_secrets: bool,
+    /// The WasmKeep version this node announces and judges other nodes'
+    /// versions and the app's upgrade floor by (ADR 0043): `None` for
+    /// this build's ([`crate::VERSION`]). Tests set it to stand for a node
+    /// of another version.
+    pub version: Option<String>,
     /// How long a request for a dead node's actor is kept until the actor
     /// can be taken over, instead of a 503 at once (a GET or HEAD without
     /// a body, or a WebSocket upgrade, arriving from outside): `None` for
@@ -274,6 +279,7 @@ impl ClusterConfig {
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             restore_budget: crate::replica::RESTORE_BUDGET,
             reads_secrets: true,
+            version: None,
             failover_wait: None,
             failover_wait_max: crate::http::ServeLimits::default().max_connections / 4,
             expiry_every: Duration::from_millis(wasmkeep_cluster::expiry::PASS_EVERY_MS),
@@ -438,6 +444,15 @@ pub(crate) struct Cluster {
     /// The root of every actor-state key (ADR 0022), and the one copy of
     /// the bucket prefix.
     root: StateRoot,
+    /// This node's minor version (ADR 0043): what the app's upgrade floor
+    /// and the other nodes' versions are compared with at start.
+    /// `Err`, with why, for a version that has none: such a node does
+    /// not start (nothing is judged by a guess).
+    own_minor: Result<wasmkeep_cluster::app_format::floor::Minor, String>,
+    /// Set when this node created its app's floor and the listing after
+    /// the create showed an older node of the app: why this node must
+    /// not start (ADR 0043, section 3).
+    born_late: std::sync::Mutex<Option<String>>,
     /// How long after its due time an alarm counts as abandoned: a lease
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
@@ -795,6 +810,24 @@ impl Cluster {
         .with_app(serves)
         .with_reads_secrets(config.reads_secrets)
         .with_place(config.placement);
+        let membership = match &config.version {
+            Some(version) => membership.with_version(version.clone()),
+            None => membership,
+        };
+        // A version with no minor version to compare is never guessed:
+        // the node refuses to start at its first read of the floor.
+        let own_minor =
+            config
+                .version
+                .as_deref()
+                .map_or_else(wasmkeep_cluster::upgrade::this_minor, |v| {
+                    wasmkeep_cluster::app_format::floor::Minor::of_version(v).ok_or_else(|| {
+                        format!(
+                            "this node's version {v} has no minor version to check the app's \
+                             upgrade floor against"
+                        )
+                    })
+                });
         // Random per runtime, published in every heartbeat (a second
         // process writing this id shows another one), so never the seed of
         // call nonces, which nobody can guess (`nonce_seed`).
@@ -875,6 +908,8 @@ impl Cluster {
             ttl: Duration::from_millis(config.lease.ttl_ms()),
             store,
             root: StateRoot::new(&config.prefix, root.tenant(), root.app()),
+            own_minor,
+            born_late: std::sync::Mutex::new(None),
             alarm_overdue: Duration::from_millis(
                 config
                     .lease
@@ -1597,6 +1632,12 @@ impl Cluster {
             Identity::Refused(_) => return Some("the bucket does not enforce conditional writes"),
             Identity::BelowFloor(_) => {
                 return Some("the app's upgrade floor is above this node's version, or unreadable");
+            }
+            Identity::VersionSkew(_) => {
+                return Some(
+                    "a node of a WasmKeep version this one cannot run beside is live, or the \
+                     app's last upgrade was not finalized",
+                );
             }
             Identity::Unique => {}
         }
@@ -2471,6 +2512,8 @@ mod placing_tests;
 mod sender_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod upgrade_tests;
 #[cfg(test)]
 mod wire_tests;
 

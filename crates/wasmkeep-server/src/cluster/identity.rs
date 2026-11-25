@@ -23,13 +23,18 @@ pub(crate) enum Identity {
     /// The app's upgrade floor is above this binary's minor version, or
     /// unreadable; why, for the operator ([`Cluster::read_floor`]).
     BelowFloor(String),
+    /// A live node of the app runs a version this one cannot run beside,
+    /// or the app's floor is below the version before this one; why, for
+    /// the operator ([`Cluster::version_guard`], ADR 0043, section 5).
+    VersionSkew(String),
 }
 
 /// What one read of the app's upgrade floor found ([`Cluster::read_floor`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FloorRead {
-    /// Absent, or at most this binary's minor version.
-    Allowed,
+    /// Absent (`None`), or at most this binary's minor version: the floor
+    /// found.
+    Allowed(Option<wasmkeep_cluster::app_format::floor::Minor>),
     /// Above this binary's minor version, or unreadable: why.
     Refused(String),
     /// No answer, or an error: proves nothing.
@@ -244,9 +249,12 @@ impl Cluster {
             .await
             .map(|s| s.clone());
         match state {
-            Ok(Identity::Taken(_, why) | Identity::Refused(why) | Identity::BelowFloor(why)) => {
-                Err(why)
-            }
+            Ok(
+                Identity::Taken(_, why)
+                | Identity::Refused(why)
+                | Identity::BelowFloor(why)
+                | Identity::VersionSkew(why),
+            ) => Err(why),
             Ok(_) => Ok(()),
             // The sender lives in `self`: not reached.
             Err(_) => Err("the node id check stopped".into()),
@@ -297,12 +305,9 @@ impl Cluster {
         use wasmkeep_cluster::app_format::floor;
         let name = floor::key_of(&self.root);
         let key = object_store::path::Path::from(name.as_str());
-        let Some(this) = floor::Minor::of_version(env!("CARGO_PKG_VERSION")) else {
-            return FloorRead::Refused(format!(
-                "this binary's version {} has no minor version to check the app's upgrade \
-                 floor against",
-                env!("CARGO_PKG_VERSION")
-            ));
+        let this = match &self.own_minor {
+            Ok(this) => *this,
+            Err(why) => return FloorRead::Refused(why.clone()),
         };
         let read = tokio::time::timeout(self.lease_attempt, async {
             match self.store.get(&key).await {
@@ -315,7 +320,7 @@ impl Cluster {
         match read {
             Ok(Ok(body)) => match floor::decode(body.as_deref()) {
                 Ok(found) => match floor::allows(found, this) {
-                    Ok(()) => FloorRead::Allowed,
+                    Ok(()) => FloorRead::Allowed(found),
                     Err(why) => FloorRead::Refused(why),
                 },
                 Err(e) => FloorRead::Refused(format!(
@@ -329,20 +334,211 @@ impl Cluster {
     }
 
     /// The app's upgrade floor, read before this node writes its first
-    /// lease ([`Self::read_floor`]): `Some(why)` if the node must not
-    /// start, `None` to go on. A read with no answer proves nothing and is
-    /// tried again every half period, as the bucket check is.
-    pub(super) async fn check_floor(&self) -> Option<String> {
+    /// lease ([`Self::read_floor`]): `Err(why)` if the node must not
+    /// start, the floor in force to go on. A read with no answer proves
+    /// nothing and is tried again every half period, as the bucket check
+    /// is.
+    ///
+    /// An app with no floor that holds nothing is born finalized (ADR
+    /// 0043, section 3): this node creates its floor at its own minor
+    /// version ([`wasmkeep_cluster::upgrade::born_finalized`]).
+    pub(super) async fn check_floor(
+        &self,
+    ) -> Result<Option<wasmkeep_cluster::app_format::floor::Minor>, String> {
+        // A floor another writer created meanwhile is read again, a few
+        // times at most (a read may lag the create).
+        let mut again = 3;
         loop {
             match self.read_floor().await {
-                FloorRead::Allowed => return None,
-                FloorRead::Refused(why) => return Some(why),
+                FloorRead::Allowed(None) => match self.born_finalized().await {
+                    Ok(floor) => return Ok(floor),
+                    Err(()) if again > 0 => again -= 1,
+                    Err(()) => return Ok(None),
+                },
+                FloorRead::Allowed(found) => return Ok(found),
+                FloorRead::Refused(why) => return Err(why),
                 FloorRead::NoAnswer(e) => {
                     tracing::warn!(error = %e, "reading the app's upgrade floor failed; retrying before starting");
                     tokio::time::sleep(self.heartbeat_every / 2).await;
                 }
             }
         }
+    }
+
+    /// Creates the floor of an app that holds nothing, at this node's
+    /// minor version; the floor in force after (`None`: still none). Any
+    /// doubt writes nothing and the node starts as before: another
+    /// registered node, this node's own earlier lease at an older
+    /// version, state, a tombstone, or a bucket that did not answer. A
+    /// deploy is not a doubt (see
+    /// [`wasmkeep_cluster::upgrade::born_finalized`]). `Err`: the app has
+    /// a floor after all (another writer created it), to read.
+    ///
+    /// The nodes are listed again after the create. An older node of the
+    /// app found then started between the listing and the create: the
+    /// floor stays, and this node does not start beside it
+    /// ([`Self::version_guard`] reports it).
+    async fn born_finalized(
+        &self,
+    ) -> Result<Option<wasmkeep_cluster::app_format::floor::Minor>, ()> {
+        use wasmkeep_cluster::upgrade::{Born, FirstWriter, born_finalized};
+        let Ok(this) = self.own_minor.clone() else {
+            return Ok(None);
+        };
+        let born = tokio::time::timeout(
+            self.lease_attempt.saturating_mul(2),
+            born_finalized(
+                &self.control_keys,
+                self.root.tenant(),
+                self.root.app(),
+                FirstWriter::Node(&self.node_id),
+                this,
+                now_ms(),
+                self.heartbeat_horizon_ms,
+            ),
+        )
+        .await;
+        match born {
+            Ok(Ok(Born::Late { floor, nodes })) => {
+                let why = format!(
+                    "this node created its app's upgrade floor at {floor}, and the listing after \
+                     it shows older nodes of the app that started meanwhile: {nodes}. The floor \
+                     stays, and such a node cannot come back on its old version: upgrade each of \
+                     them (or stop it, or `wasmkeep cluster fence` it), then start this node again"
+                );
+                *self.born_late.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+                Ok(Some(floor))
+            }
+            Ok(Ok(Born::Created(floor))) => {
+                tracing::info!(
+                    %floor,
+                    "this app held nothing: created its upgrade floor at this node's version (ADR 0043)"
+                );
+                Ok(Some(floor))
+            }
+            Ok(Ok(Born::HasFloor)) => Err(()),
+            Ok(Ok(Born::NotFresh(_))) => Ok(None),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "checking whether this app is new failed; starting without creating its upgrade floor");
+                Ok(None)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "checking whether this app is new got no answer; starting without creating its upgrade floor"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// One listing of the node objects for the start's version check,
+    /// tried again every half period until the bucket answers.
+    async fn list_for_start(&self) -> wasmkeep_cluster::upgrade::Listed {
+        loop {
+            match wasmkeep_cluster::upgrade::list_nodes(&self.control_keys).await {
+                Ok(listed) => return listed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "listing the nodes failed; retrying before starting");
+                    tokio::time::sleep(self.heartbeat_every / 2).await;
+                }
+            }
+        }
+    }
+
+    /// The live nodes of this app in `listed` that this node must not run
+    /// beside (ADR 0043, section 5), as one sentence naming each; `None`
+    /// if it may. This node's own id is left out, and so is a heartbeat
+    /// from before node leases: the start guard waits for it or refuses.
+    fn skewed(&self, listed: &wasmkeep_cluster::upgrade::Listed) -> Option<String> {
+        let served = format!("{}/{}", self.root.tenant(), self.root.app());
+        let now = now_ms();
+        let live = listed.nodes.iter().filter(|n| {
+            n.id != self.node_id
+                && wasmkeep_cluster::membership::serves(n, &served)
+                && n.lease.is_some()
+                && wasmkeep_cluster::membership::is_live(n, now, self.heartbeat_horizon_ms)
+        });
+        let outside = match &self.own_minor {
+            Ok(this) => wasmkeep_cluster::upgrade::skew(*this, live),
+            Err(why) => vec![why.clone()],
+        };
+        (!outside.is_empty()).then(|| outside.join("; "))
+    }
+
+    /// The skew check at start (ADR 0043, section 5), first half, beside
+    /// the node id check: `Err(why)` if this node must not start, else
+    /// the listing it judged, for [`Self::version_recheck`].
+    ///
+    /// A node of minor version N refuses to start while a live node of
+    /// its app runs a version outside N-1 to N+1, or names one that does
+    /// not parse, and names that node. It also refuses when the app has
+    /// registered nodes and `floor` (as read before) is below N-1: the
+    /// upgrade before this one was never finalized (section 3).
+    pub(super) async fn version_guard(
+        &self,
+        floor: Option<wasmkeep_cluster::app_format::floor::Minor>,
+    ) -> Result<(wasmkeep_cluster::upgrade::Listed, tokio::time::Instant), String> {
+        let this = self.own_minor.clone()?;
+        let born_late = self
+            .born_late
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(why) = born_late {
+            return Err(why);
+        }
+        let first = self.list_for_start().await;
+        if let Some(why) = self.skewed(&first) {
+            return Err(why);
+        }
+        // This node's own earlier lease counts when it names an older
+        // version: a node restarted in place on a newer binary.
+        let served = format!("{}/{}", self.root.tenant(), self.root.app());
+        let registered = first.registered_at_start(&served, &self.node_id, this);
+        wasmkeep_cluster::upgrade::floor_from_below(floor, this, registered)?;
+        Ok((first, tokio::time::Instant::now()))
+    }
+
+    /// The skew check's second half, once the node id check passed and
+    /// before the first lease write: `Some(why)` if this node must not
+    /// start. The nodes are listed again, for one that became live
+    /// meanwhile, and for an object under `nodes/` that does not decode:
+    /// it cannot be judged by its fields, but rewritten between the two
+    /// listings (or written since the first), a node this version cannot
+    /// read is running. Only when the first listing (`first`, made at
+    /// `at`) held such an object is the second one held back until a
+    /// lease's ttl plus grace after it, the time its writer is given to
+    /// show itself; a start with none is not delayed. This node's own key
+    /// is the node id check's to judge.
+    pub(super) async fn version_recheck(
+        &self,
+        first: &wasmkeep_cluster::upgrade::Listed,
+        at: tokio::time::Instant,
+    ) -> Option<String> {
+        let own = self.node_key();
+        if first.unread.iter().any(|(key, _)| *key != own) {
+            tokio::time::sleep_until(at + self.alarm_overdue).await;
+        }
+        let second = self.list_for_start().await;
+        if let Some(why) = self.skewed(&second) {
+            return Some(why);
+        }
+        let rewritten: Vec<&str> = second
+            .rewritten(first)
+            .into_iter()
+            .filter(|key| *key != own)
+            .collect();
+        (!rewritten.is_empty()).then(|| {
+            format!(
+                "a node of a WasmKeep version this one cannot read runs in this cluster (`{}` \
+                 holds something this version does not read, written while this node started): \
+                 this version ({}) runs only beside the one before and the one after",
+                rewritten.join("`, `"),
+                self.own_minor
+                    .as_ref()
+                    .map_or_else(String::clone, ToString::to_string)
+            )
+        })
     }
 
     /// Waits while any heartbeat in a format from before node leases
