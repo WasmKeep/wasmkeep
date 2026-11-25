@@ -33,6 +33,10 @@ page says; these are the checks and the commands it uses.
   of minor version N starts only while every live node of its app runs
   N-1, N or N+1. Otherwise it writes no lease, logs the node and its
   version, and reports not ready. Upgrade one minor version at a time.
+  With every node stopped it reads the node leases they left: an app
+  with no floor whose leases all name a version below N-1 is refused
+  too (a cluster stopped on 0.7 does not start on 0.9), and so is a node
+  stopped cleanly and restarted under its own id over a minor version.
 - **Each app has an upgrade floor**, `formats/<tenant>/<app>/floor` in
   the bucket: the lowest minor version allowed to serve it. A node below
   the floor does not start (0.8.1 reads it too). Without a record the
@@ -73,7 +77,9 @@ write (`deploy`, `secrets`, `app delete`, `app format --enable`) are
 refused from a `wasmkeep` older than the app's floor, or while a live
 node of the app is more than one minor version away from it. The way
 out is in the message: use a `wasmkeep` within one minor version of
-every live node, and not older than the floor.
+every live node, and not older than the floor. Commands that only read
+(`cluster status`, `cluster upgrade status`, `actor where`) warn in that
+case and go on.
 
 `finalize` counts an older node as stopped only when its lease is
 `released` or `fenced`. A lease that is merely stale (the machine

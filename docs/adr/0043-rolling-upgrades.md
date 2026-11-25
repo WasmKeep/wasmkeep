@@ -199,7 +199,11 @@ file (`wasmkeep-node.toml`) **rejects unknown keys and tables**, so
    directions. The first pair is `0.8.1` to `0.9.x`; a cluster on `0.8.0`
    installs `0.8.1` first. One node at a time, by the documented steps:
    drain, stop, install, start, wait for `serving`. Skipping a minor
-   version is refused by the node (section 5), not merely unsupported.
+   version is refused by the node (section 5), not merely unsupported:
+   beside a live node by the skew check, and with every node stopped by
+   the leases they left ("A skipped minor version"). `0.8.0` to `0.9.x`
+   is the one pair that is unsupported and not refused ("No patch
+   floor", in the same section).
 2. **During the upgrade.** Every acknowledged write is kept. Alarms fire
    as they do on one version. The cluster is never stopped as a whole
    and nothing is migrated offline. Clients see what a rolling restart
@@ -706,6 +710,108 @@ two listings that does not decode refuses the start too. The node's own
 key is left to the node id check, and a heartbeat from before node
 leases to the start guard.
 
+**A skipped minor version, every node stopped.** The check above sees
+live nodes only, and an app with no floor record reads as `0.8`. So a
+cluster stopped on `0.7` and started on `0.9` would pass both. The
+bucket still says what ran: a node lease, released or fenced, names the
+version that wrote it. A starting node of N that finds **no floor
+record** judges the registered nodes of its app in the listing it
+already made, its own earlier lease included, and refuses to start when
+
+- none of them names N-1 or a later version: "node `<id>` last ran
+  `<version>` [...], and no registered node of this app ran `<N-1>`:
+  this binary is `<N>`, and a minor version is not skipped", with the
+  path: install the last release of N-1 on every node and start them,
+  then install N;
+- or, others having run N-1, its own earlier lease is `released` and
+  names a version below N-1: it was stopped and is restarted in place
+  over a minor version. The path is this node's: install the last
+  release of N-1 on it and start it once, or start it under a new node
+  id; `cluster forget <id>` if the id belonged to a node retired before
+  the app ran N-1.
+
+As decided:
+
+- **The newest version decides, not the oldest.** A lease that a
+  retired node left on `0.7` beside nodes that ran `0.8` is not a skip:
+  such leases stay until `cluster forget` removes them, and a correctly
+  upgraded cluster must start. The cost: once one node of the app has
+  run N-1, a new node id of N starts although the others stopped on
+  N-2. Nothing in the bucket tells that case from the retired node.
+- **A node's own fenced lease is not judged alone.** A fenced lease is
+  a process that did not stop cleanly, and no command removes one
+  (`cluster forget` removes released leases only): a node started under
+  that id is how it goes. So a replacement for a node that crashed on
+  `0.7`, started on `0.9` under the same id once the others ran `0.8`,
+  starts. Every way out a refusal names is one that works: `cluster
+  forget` is named only for a released lease.
+- **Leases of an earlier incarnation of the app are not counted.**
+  `app delete` fences the leases still written live and leaves them, and
+  `deploy --recreate` leaves the marker `apps/<tenant>/<app>/recreated`.
+  A lease last written before that marker (its last-modified time, the
+  bucket's clock) belongs to the app that was deleted: an app deleted
+  while it ran `0.7` and created again on `0.9` starts. `--recreate` is
+  refused until well after the app's nodes last wrote, so no lease of
+  the earlier app is dated after the marker. The marker is listed only
+  when the leases would refuse the start. A lease has no incarnation of
+  its own, so this is a comparison of dates; a lease written since by an
+  old version still refuses.
+- **A start that passes beside older leases says so**: one warning in
+  the node's log, naming the leases it took for retired nodes.
+- **A lease whose version line does not parse** counts as older than
+  any version, as it does for `finalize`.
+- **A heartbeat from before node leases** (headers 1 and 2) is not
+  counted, for or against: it stays with the start guard, which waits
+  for a recent one and refuses one that is rewritten. Counting it would
+  put this refusal before that wait, and would change again when those
+  headers stop decoding (section 6). An app stopped before node leases
+  is older than `0.4.0`, and its layout is what refuses it: "migrate
+  with 0.8.x first".
+- **The mark of a `cluster forget`** and an object that does not decode
+  name no version and are not counted either. The second is still
+  judged by whether it is rewritten (above).
+- **An app with no registered node passes**: a fresh app, and one whose
+  leases were all removed with `cluster forget`. Nothing says what ran
+  the second; it also gets no floor at start (section 3). Removing
+  released leases is also how an operator overrides the rule: it guards
+  against a mistake, not against intent.
+- **With a floor record the floor answers** (section 3): at or above
+  N-1 the app ran N-1 whatever old leases say, and below N-1 the start
+  is already refused. Without a record, a node whose N-1 is above
+  `0.8` is refused by that same rule when the app has registered
+  nodes. So this rule decides only where no floor could have been
+  written: for a node of `0.9`, an app last run by `0.7` or older. It
+  is a rule of the code and not of one release: a build that calls
+  itself `0.8` (the tree, until the version is raised) applies it one
+  step down, and refuses an app whose leases all name `0.6` or older.
+
+**No patch floor: `0.8.0` beside `0.9`.** Only major and minor are
+compared, so nothing refuses a `0.8.0` node beside `0.9`, and the rule
+above passes a cluster stopped on `0.8.0`. The upgrading page says to
+install `0.8.1` first, and that stays advice. Decided: no check on the
+patch.
+
+- Until the finalize it would protect no format. `0.9` then writes only
+  what `0.8.1` reads, `0.8.1` added no format, word or header to `0.8.0`
+  ("Read in the code"), and each gate's live-word half counts a `0.8.0`
+  node as it counts any other.
+- What `0.8.0` lacks is the floor reader: started after the finalize it
+  is not stopped, and reads formats it does not know. No check in `0.9`
+  can refuse that start, since the binary that starts is `0.8.0`. `0.9`
+  shows it (`node below the floor`, a warning in `cluster status`), and
+  `finalize` is refused while one is live.
+- What it would remove is the stale-read case of `0.8.0` beside a newer
+  reader (Context, known problem 3), which a `0.8.0` node beside `0.9`
+  can meet as it can beside `0.8.1`: narrow (a bucket that serves stale
+  reads, a `0.8.0` node starting over a created fence), and over at
+  that node's next renewals. It is why the pair stays unsupported, and
+  it was not judged worth a check.
+- A refusal on the patch number would break the rule that patches of
+  one minor version are interchangeable (section 1), for one release.
+
+So `0.8.0` to `0.9.x` is unsupported and not refused, and the upgrading
+page says so.
+
 **While running.** A node never stops because another node started.
 Seeing a live node outside its range, it logs an error once a minute
 and `cluster status` warns; the newcomer is the one that refused. The
@@ -716,7 +822,11 @@ built yet.)
 **The CLI.** A command that writes refuses when a live node of the app
 is outside the CLI's range, with the same message. Read-only commands
 (`cluster status`, `cluster upgrade status`, `actor where`) warn and
-go on. As built, the commands that refuse are `deploy` and a rollback,
+go on: each prints one line, "this `wasmkeep` (`<N>`) runs only beside
+the version before and the one after, and `<app>` has live nodes
+outside that: ...", or that the app's floor is above it. `actor where`
+prints it on standard error for the apps it was asked about, so its
+table and its JSON are unchanged. As built, the commands that refuse are `deploy` and a rollback,
 `secrets` writes, `app delete` without `--force` and `app format
 --enable`; the same check refuses a `wasmkeep` older than the app's
 floor.
@@ -755,8 +865,9 @@ one-time, so it is outside the mixed-version promise. Cut-off: a cluster older t
   still decode as one, never as a record or an unknown version. It has
   no production caller: no node reads the layout from before `0.4.0`,
   and the start check reads a tenant's commit before it lists those keys.
-- The upgrading page of `0.9` (`upgrading-to-0.9.md`, not written yet)
-  must name this removal and its last carrier, `0.8.1`.
+- The upgrading page of `0.9`
+  ([`upgrading-to-0.9.md`](../deploy/upgrading-to-0.9.md), "Removed in
+  0.9.0") names this removal and its last carrier, `0.8.1`.
 
 **The per-actor lease marker: not removed in `0.9.0`.** `mark_old_lease`
 costs one GET and one PUT when an actor's first ownership record is

@@ -18,10 +18,14 @@ is the rule for this release.
   [from 0.8.0 to 0.8.1](upgrading-to-0.8.md#from-080-to-081) says. A 0.8.0
   node does not read the upgrade floor, and the pair 0.8.0 beside 0.9.0 is
   not supported. Nothing refuses it for you: a node compares major and
-  minor versions only, so it cannot tell 0.8.0 from 0.8.1.
+  minor versions only, so it cannot tell 0.8.0 from 0.8.1
+  ([Limits](#limits-and-what-is-not-built)).
   `wasmkeep cluster status` shows each node's version.
 - **Older clusters go one minor version at a time**, by each release's
   page. A 0.9.0 node refuses to start beside a live node older than 0.8.
+  It also refuses with every node stopped, when the node leases they
+  left say the app last ran 0.7 or older: it names one of them and says
+  to install the last 0.8 release on every node and start them first.
 - **A bucket from before 0.4.0 is migrated with 0.8.1 first.**
   `wasmkeep cluster migrate` is removed in 0.9.0
   ([below](#removed-in-090)).
@@ -282,6 +286,24 @@ and not older than the app's floor.
 
 ## Limits, and what is not built
 
+- **0.8.0 to 0.9.0 is not refused.** Versions compare by major and minor
+  only, so a 0.8.0 node runs beside 0.9.0 and a cluster stopped on 0.8.0
+  starts on 0.9.0. Until the finalize it reads everything 0.9.0 writes.
+  It does not read the floor: started after the finalize it is not
+  stopped, and meets formats it does not know. Install 0.8.1 first.
+- **A skipped minor version is refused from the leases left, so only
+  while they are there.** An app whose node leases were all removed with
+  `wasmkeep cluster forget` starts on any version: nothing says what ran
+  it. Once one node of an app has run 0.8, a new node id starts on 0.9.0
+  even if the app's other nodes stopped on 0.7 and never ran 0.8; the
+  node logs a warning that names their leases. A node stopped cleanly on
+  0.7 and restarted under its own id is refused until it has run 0.8:
+  install 0.8.1 on it and start it once, or start it under a new node
+  id. If that id belonged to a node retired before the app ran 0.8,
+  remove its lease with `wasmkeep cluster forget <id>`. A fenced lease
+  (a node that crashed) is removed by no command and does not refuse a
+  replacement under its id. Leases from before an app was deleted and
+  created again (`deploy --recreate`) are not counted.
 - **No finalize without a live node.** After an upgrade done with every
   node stopped, start the nodes, then finalize.
 - **A serving node does not read the floor again.** A node already

@@ -289,6 +289,135 @@ async fn a_node_restarted_in_place_on_a_newer_binary_creates_no_floor() {
     assert_eq!(floor_of(&same).await, Some(v(0, 9)));
 }
 
+/// Section 5, "A skipped minor version": an app with no floor whose
+/// nodes are all stopped is started on N only when a lease left names
+/// N-1 or later. Stopped on 0.7, a 0.9 node writes no lease and no floor;
+/// stopped on 0.8 it starts, and so it does beside a retired node's 0.7
+/// lease, in a fresh app, and in one whose leases were all removed with
+/// `cluster forget` (nothing says what ran it). A heartbeat from before
+/// node leases is left to the start guard, as it was.
+#[tokio::test]
+async fn a_stopped_cluster_is_not_started_over_a_minor_version() {
+    let skipped = store();
+    for id in ["a", "b", "c"] {
+        lease_of(&skipped, id, "t/default", "0.7.4", "released").await;
+    }
+    // Another app's nodes ran 0.8: they say nothing of this one.
+    lease_of(&skipped, "other", "t/blog", "0.8.1", "released").await;
+    let one_step = store();
+    for id in ["a", "b", "c"] {
+        lease_of(&one_step, id, "t/default", "0.8.0", "released").await;
+    }
+    let retired = store();
+    lease_of(&retired, "gone", "t/default", "0.7.4", "fenced").await;
+    lease_of(&retired, "b", "t/default", "0.8.1", "released").await;
+    let fresh = store();
+    let forgotten = store();
+    forgotten
+        .put(
+            &StorePath::from("state/t/default/owners/room/lobby"),
+            b"x".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let before_leases = store();
+    before_leases
+        .put(
+            &StorePath::from("nodes/old"),
+            b"wasmkeep-node 2\nold\nhttp://old\n0.3.0\n5\nt/default\n"
+                .to_vec()
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let earlier = store_body(&skipped, "nodes/a").await;
+    for id in ["a", "d"] {
+        let why = node_at(id, "0.9.0", &skipped).identity().await.unwrap_err();
+        assert!(
+            why.contains("last ran `0.7.4`")
+                && why.contains("this binary is 0.9")
+                && why.contains("install the last release of 0.8"),
+            "{why}"
+        );
+    }
+    assert!(!exists(&skipped, "nodes/d").await, "no lease written");
+    assert_eq!(store_body(&skipped, "nodes/a").await, earlier);
+    assert_eq!(floor_of(&skipped).await, None, "no floor written");
+    // The release between, started over the same bucket; then 0.9 runs
+    // beside it.
+    node_at("a", "0.8.1", &skipped).identity().await.unwrap();
+    node_at("d", "0.9.0", &skipped).identity().await.unwrap();
+
+    node_at("a", "0.9.0", &one_step).identity().await.unwrap();
+    assert_eq!(floor_of(&one_step).await, None);
+    node_at("a", "0.9.0", &retired).identity().await.unwrap();
+    // A replacement under the id of the node that crashed on 0.7 (its
+    // lease is fenced, and no command removes it) starts too.
+    node_at("gone", "0.9.0", &retired).identity().await.unwrap();
+    // A node stopped cleanly on 0.7 and restarted in place is refused,
+    // with its own ways out.
+    let in_place = store();
+    lease_of(&in_place, "c", "t/default", "0.7.4", "released").await;
+    lease_of(&in_place, "b", "t/default", "0.9.0", "released").await;
+    let why = node_at("c", "0.9.0", &in_place)
+        .identity()
+        .await
+        .unwrap_err();
+    assert!(
+        why.contains("this node did not run 0.8")
+            && why.contains("on this node and start it once")
+            && why.contains("under a new node id")
+            && why.contains("`wasmkeep cluster forget c`"),
+        "{why}"
+    );
+
+    // An app deleted while it ran 0.7 and created again (`deploy
+    // --recreate` leaves `recreated`): the leases of the incarnation
+    // before, which `app delete` fenced and no command removes, say
+    // nothing of this one. Every node id starts. A lease written since on
+    // 0.7 is this incarnation's, and refuses.
+    let again = store();
+    lease_of(&again, "a", "t/default", "0.7.4", "fenced").await;
+    lease_of(&again, "b", "t/default", "0.7.4", "released").await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    again
+        .put(
+            &StorePath::from("apps/t/default/recreated"),
+            b"wasmkeep-app-deleted 1\nby op\nat 5\nid x\n"
+                .to_vec()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let since = store();
+    lease_of(&since, "a", "t/default", "0.7.4", "fenced").await;
+    since
+        .put(
+            &StorePath::from("apps/t/default/recreated"),
+            b"wasmkeep-app-deleted 1\nby op\nat 5\nid x\n"
+                .to_vec()
+                .into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    lease_of(&since, "c", "t/default", "0.7.4", "released").await;
+    for id in ["a", "b", "d"] {
+        node_at(id, "0.9.0", &again).identity().await.unwrap();
+    }
+    let why = node_at("d", "0.9.0", &since).identity().await.unwrap_err();
+    assert!(why.contains("node `c` last ran `0.7.4`"), "{why}");
+    node_at("a", "0.9.0", &fresh).identity().await.unwrap();
+    assert_eq!(floor_of(&fresh).await, Some(v(0, 9)));
+    node_at("a", "0.9.0", &forgotten).identity().await.unwrap();
+    assert_eq!(floor_of(&forgotten).await, None);
+    node_at("a", "0.9.0", &before_leases)
+        .identity()
+        .await
+        .unwrap();
+}
+
 /// A node whose version has no minor version to compare is never judged
 /// by a guess: it refuses to start, before any lease write.
 #[tokio::test]

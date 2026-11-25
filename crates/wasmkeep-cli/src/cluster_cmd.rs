@@ -414,13 +414,14 @@ pub(super) fn cluster_status(args: StatusArgs) -> anyhow::Result<()> {
         wasmkeep_server::DEFAULT_HEARTBEAT,
         &wasmkeep_server::LeaseConfig::default_safe(),
     );
-    let report = rt.block_on(status::read(
+    let mut report = rt.block_on(status::read(
         store,
         &prefix,
         &args.bucket,
         now_ms,
         horizon_ms,
     ))?;
+    report.wasmkeep = wasmkeep_cluster::upgrade::this_minor().ok();
     if args.json {
         println!("{:#}", report.to_json());
     } else {

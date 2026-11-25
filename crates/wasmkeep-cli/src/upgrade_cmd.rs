@@ -153,8 +153,9 @@ pub(crate) fn status_exit(apps: &[AppUpgrade]) -> u8 {
 
 /// A read-only command warns and goes on when a live node is outside
 /// this `wasmkeep`'s range, or the floor is above it (ADR 0043, section
-/// 5); a command that writes refuses.
-fn reader_warning(app: &AppUpgrade, this: Minor) -> Option<String> {
+/// 5); a command that writes refuses. `cluster upgrade status`, `cluster
+/// status` and `actor where` print it.
+pub(crate) fn reader_warning(app: &AppUpgrade, this: Minor) -> Option<String> {
     let outside: Vec<String> = app
         .nodes
         .iter()

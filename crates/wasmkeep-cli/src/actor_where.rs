@@ -1,6 +1,7 @@
 //! `wasmkeep actor where`: which node owns each named actor (ADR 0017,
-//! ADR 0020). Reads the actors' ownership records and the heartbeats, and
-//! nothing else: it writes no key, claims nothing and wakes no actor.
+//! ADR 0020). Reads the actors' ownership records, the heartbeats and
+//! the floor of each app named (for the warning of ADR 0043, section 5),
+//! and nothing else: it writes no key, claims nothing and wakes no actor.
 
 use std::sync::Arc;
 
@@ -52,13 +53,20 @@ pub(crate) struct Row {
 }
 
 #[derive(Debug)]
-pub(crate) struct Report(Vec<Row>);
+pub(crate) struct Report {
+    rows: Vec<Row>,
+    /// What a read-only command warns about and goes on (ADR 0043,
+    /// section 5): an app named whose live nodes are outside this
+    /// `wasmkeep`'s range, or whose floor is above it. Printed on standard
+    /// error, so the table and the JSON are what they were.
+    pub(crate) warnings: Vec<String>,
+}
 
 impl Report {
     /// Plain columns, as `cluster status`; `now_ms` dates "since".
     pub(crate) fn to_text(&self, now_ms: u64) -> String {
         let rows: Vec<[String; 4]> = self
-            .0
+            .rows
             .iter()
             .map(|r| {
                 let dash = || "-".to_owned();
@@ -79,7 +87,7 @@ impl Report {
 
     pub(crate) fn to_json(&self) -> Value {
         Value::Array(
-            self.0
+            self.rows
                 .iter()
                 .map(|r| {
                     json!({
@@ -97,7 +105,18 @@ impl Report {
 }
 
 pub(crate) fn run(args: &WhereArgs) -> anyhow::Result<()> {
-    let report = report_on(args, || wasmkeep_cli::open_bucket_unchecked(&args.bucket))?;
+    // The warning is beside the answer, never in its way: a version or a
+    // floor that cannot be read is said, and the rows are printed.
+    let this = wasmkeep_cluster::upgrade::this_minor();
+    if let Err(why) = &this {
+        eprintln!("warning: {why}; the nodes' versions are not checked");
+    }
+    let report = report_on(args, this.ok(), || {
+        wasmkeep_cli::open_bucket_unchecked(&args.bucket)
+    })?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
     if args.json {
         println!("{:#}", report.to_json());
     } else {
@@ -106,9 +125,12 @@ pub(crate) fn run(args: &WhereArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The report on the bucket `open` gives. Only reads.
+/// The report on the bucket `open` gives, read by a `wasmkeep` of minor
+/// version `this` (`None`: the nodes' versions are not checked). Only
+/// reads.
 pub(crate) fn report_on(
     args: &WhereArgs,
+    this: Option<wasmkeep_cluster::app_format::floor::Minor>,
     open: impl FnOnce() -> anyhow::Result<(Arc<dyn ObjectStore>, String)>,
 ) -> anyhow::Result<Report> {
     let mut targets = Vec::new();
@@ -136,6 +158,25 @@ pub(crate) fn report_on(
     let nodes: Vec<NodeInfo> = rt
         .block_on(membership::all_heartbeats(&keys))
         .map_err(|e| anyhow::anyhow!("listing the heartbeats: {e}"))?;
+    let apps: std::collections::BTreeSet<String> = targets
+        .iter()
+        .map(|((tenant, app), _, _)| format!("{tenant}/{app}"))
+        .collect();
+    let mut warnings = Vec::new();
+    for app in this.map(|_| apps).unwrap_or_default() {
+        let read = rt.block_on(wasmkeep_cluster::upgrade::status_of(
+            &keys, &app, &nodes, now, horizon_ms,
+        ));
+        match (read, this) {
+            (Ok(upgrade), Some(this)) => {
+                warnings.extend(crate::upgrade_cmd::reader_warning(&upgrade, this));
+            }
+            (Err(e), _) => warnings.push(format!(
+                "reading the upgrade floor of {app}: {e}; its nodes' versions are not checked"
+            )),
+            (Ok(_), None) => {}
+        }
+    }
     let mut rows = Vec::new();
     for ((tenant, app), class, name) in targets {
         let root = StateRoot::new("", tenant.as_str(), app.as_str());
@@ -176,5 +217,5 @@ pub(crate) fn report_on(
             since_ms,
         });
     }
-    Ok(Report(rows))
+    Ok(Report { rows, warnings })
 }
