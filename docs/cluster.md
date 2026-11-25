@@ -16,6 +16,14 @@ For the short version of what callers see when a node stops or dies, and
 of what adding nodes does, read
 [When a node dies, and how it scales](failover-and-scaling.md).
 
+This page says how a cluster works, how its nodes replicate, and which
+flags a node takes. Three more pages cover the rest:
+[Deploying to a cluster](cluster-deploying.md) (versions, the front,
+access rules, secrets),
+[Checking and operating a cluster](cluster-operations.md) (`cluster
+status`, `cluster verify`, draining, moving and deleting) and
+[Upgrading WasmKeep](cluster-upgrades.md) (the binary itself).
+
 ## How it works
 
 - Each node writes a **heartbeat** to `nodes/<id>` with its address, every
@@ -104,8 +112,8 @@ of what adding nodes does, read
   live or fenced node lease, and a released one a record still names (that
   lease is what frees the record; each such record is taken over by the
   next request for its actor). A store's DELETE takes no condition. Once
-  the app's upgrade to 0.9 is finalized (`wasmkeep cluster upgrade
-  finalize`, below), the command removes a released lease in two steps:
+  the app's upgrade to 0.9 is finalized ([`wasmkeep cluster upgrade
+  finalize`](cluster-upgrades.md#versions-the-upgrade-floor-and-finalize)), the command removes a released lease in two steps:
   it replaces the lease with a mark, by a write that lands only over the
   lease it checked, then deletes the mark. A process that started under
   that id meanwhile makes that write fail, and the command leaves its
@@ -612,7 +620,7 @@ fault), the sockets close with 1012 when one of them next sends a message,
 or at the node's owner sweep (once a minute), so a client that only
 listens is closed too, a minute later at most (ten minutes for a room the
 node had parked). Sockets also close with 1012 when their node drains and
-another node can take its actors (see "Draining a node" below), and when
+another node can take its actors ([Draining a node](cluster-operations.md#draining-a-node)), and when
 its lease runs out (no write reached
 the bucket for ttl minus safety, 8 s with the defaults): before any other
 node can take its actors, and without waiting for the bucket to answer
@@ -786,8 +794,9 @@ bucket controls the cluster, as with the call secret.
   gives up on a WebSocket handshake sooner than that sees its own
   timeout instead.
 
-An upgrade of WasmKeep itself, including one that changes the format of
-signed calls, upgrades every node together ([below](cluster-upgrades.md#upgrading-wasmkeep)).
+An upgrade of WasmKeep itself is another matter:
+[Upgrading WasmKeep](cluster-upgrades.md#upgrading-wasmkeep). One that
+changes the format of signed calls upgrades every node together.
 
 ## Deploying, operating and upgrading
 
@@ -818,8 +827,12 @@ page keep their anchors here:
 
 ## Upgrading WasmKeep
 
-Upgrading the `wasmkeep` binary itself is on its own page:
-[Upgrading WasmKeep](cluster-upgrades.md#upgrading-wasmkeep).
+Upgrading the `wasmkeep` binary itself is on its own page,
+[Upgrading WasmKeep](cluster-upgrades.md#upgrading-wasmkeep). In short:
+from 0.8.1 to 0.9.0 a cluster is upgraded one node at a time and then
+finalized ([upgrading to 0.9.0](deploy/upgrading-to-0.9.md)); between
+any other pair of versions, stop every node, upgrade them all and start
+them all, unless that release's upgrading page says otherwise.
 
 ## Several apps in one process
 

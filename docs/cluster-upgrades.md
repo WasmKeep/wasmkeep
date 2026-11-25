@@ -1,25 +1,33 @@
 # Upgrading WasmKeep
 
 Upgrading the `wasmkeep` binary itself (not your application: that is
-[Deploying](cluster-deploying.md#deploying), which rolls from node to node safely): **stop
-every node, upgrade them all, start them all**, unless that release's
-upgrading page says a rolling upgrade, one node at a time, is supported.
-Read the page for the release you move to
+[Deploying](cluster-deploying.md#deploying), which rolls from node to node
+safely). Which way a cluster moves between two versions is what the
+upgrading page of the release you move to says
 ([0.4.0](deploy/upgrading-to-0.4.md), [0.5.0](deploy/upgrading-to-0.5.md),
 [0.6.0](deploy/upgrading-to-0.6.md), [0.7.0](deploy/upgrading-to-0.7.md),
-[0.8.0](deploy/upgrading-to-0.8.md)):
+[0.8.0](deploy/upgrading-to-0.8.md), [0.9.0](deploy/upgrading-to-0.9.md)):
 it is the rule for that release, and this page does not override it.
-Without such a statement, WasmKeep does not support nodes of different
-versions in one cluster, even for the length of a rolling restart. The
-cluster then serves nothing between the last stop and the first start, so
-plan a short window.
+
+- **From 0.8.1 to 0.9.0: one node at a time**, then `wasmkeep cluster
+  upgrade finalize`. The steps are in
+  [upgrading to 0.9.0](deploy/upgrading-to-0.9.md); the commands and what
+  they check are [below](#versions-the-upgrade-floor-and-finalize).
+- **Every other pair: stop every node, upgrade them all, start them
+  all**, unless that release's page names the pair as one that can be
+  upgraded one node at a time
+  ([the steps](#with-every-node-stopped)). Without such a statement,
+  WasmKeep does not support nodes of different versions in one cluster,
+  even for the length of a rolling restart. The cluster then serves
+  nothing between the last stop and the first start, so plan a short
+  window.
 
 ## Versions, the upgrade floor and `finalize`
 
 From 0.9.0 the tools for an upgrade one node at a time are in the binary
 ([ADR 0043](adr/0043-rolling-upgrades.md)). Whether a given pair of
 versions may be upgraded that way is still what the release's upgrading
-page says; these are the commands it uses.
+page says; these are the checks and the commands it uses.
 
 - **A node refuses to start beside a version it cannot run with.** A node
   of minor version N starts only while every live node of its app runs
@@ -86,6 +94,8 @@ its read of the floor got no answer after its first lease write and it
 keeps checking without serving; its `/_wasmkeep/ready` answer says which.
 Stop it.
 
+## Exceptions before 0.9.0
+
 **One exception: from 0.4.0 to 0.4.1, one node at a time.** 0.4.1
 changes nothing 0.4.0 reads or writes in the bucket (layout, manifests,
 ownership records, alarm index), signs calls between nodes as 0.4.0
@@ -133,7 +143,9 @@ is upgraded:
 Going back to 0.4.1 is the same, one node at a time, as long as no
 version with an idle limit is current and no component that needs 0.4.2
 is deployed; a 0.4.1 node cannot serve either. Every other pair of
-versions follows the rule above.
+versions before 0.8.1 follows the rule [above](#upgrading-wasmkeep).
+
+## With every node stopped
 
 1. `wasmkeep cluster status --bucket ...`: note the nodes it lists as live.
 2. Stop every node cleanly (`systemctl stop wasmkeep`, `SIGTERM`). Each
@@ -194,14 +206,14 @@ for the rule; there may be others nobody has listed):
   ownership records or alarm index entries are written. A node of another
   version may skip what it cannot read, so it may not see its peers'
   ownership or alarms: actors refused, alarms late or missed.
-- **No other guard**: the deploy `seq`
+- **No other guard before 0.9.0**: the deploy `seq`
   ([ADR 0008](adr/0008-deploy-and-rolling-upgrades.md)) keeps an actor
   from running older *application* code, not from an older WasmKeep.
-  Nothing compares WasmKeep versions between nodes; the version in each
-  heartbeat is only reported, by `cluster status`.
-
-Rolling upgrades of WasmKeep across mixed versions are planned
-([ROADMAP](../ROADMAP.md)).
+  Before 0.9.0 nothing compares WasmKeep versions between nodes; the
+  version in each heartbeat is only reported, by `cluster status`. From
+  0.9.0 a starting node refuses a live node more than one minor version
+  away ([above](#versions-the-upgrade-floor-and-finalize)); a node of
+  0.8.1 or before still checks nothing about the other nodes' versions.
 
 ## Rolling upgrades and new storage functions
 

@@ -64,7 +64,7 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   resident fill: actors over actors plus `actor_room`, how many more
   residents the app could have there now (its `max-resident`, its
   `min-resident` floor and the process's limit counted); `-` from a
-  version before placement. Placement at wake-up (above) reads the rooms
+  version before placement. [Placement at wake-up](cluster.md#how-it-works) reads the rooms
   of a heartbeat first seen less than three periods ago, to choose a
   candidate, never to decide who holds an actor.
   A node not live shows `-` (a fenced or released heartbeat keeps the
@@ -278,6 +278,19 @@ What it keeps in memory:
 - 16 bytes per actor with history, up to 4 million actors per app
   (about 100 MiB). Past that, each further ownership record and alarm
   entry costs one listing request instead.
+
+## Fencing and forgetting a node
+
+Two commands act on a node's lease, and both are described with the
+lease itself, under [How it works](cluster.md#how-it-works):
+
+- `wasmkeep cluster fence <node>` writes a fence over the lease of a node
+  that is gone or cut off, so that its actors are free 15 s later. It is
+  also what `cluster upgrade finalize` asks for when an older node's
+  lease is stale without a release.
+- `wasmkeep cluster forget <node>` removes the lease a node left when it
+  stopped cleanly, once no ownership record names it. It is tidying: a
+  released lease costs nothing per heartbeat period.
 
 ## Draining a node
 
