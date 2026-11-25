@@ -1101,7 +1101,11 @@ has no conditional delete), so a process starting under that id whose
 first write lands between the second read and the delete loses its lease
 (its next write finds no object, `LostCause::Deleted`) and exits, to be
 started again. That costs availability only: nothing was held under the
-new instance yet, and no other node's state is touched. A `fenced` lease stays: its process did not stop cleanly, so
+new instance yet, and no other node's state is touched. From `0.9`, once
+the app's upgrade is finalized, the command closes that gap with a mark
+written over the lease by a conditional write before the delete
+([ADR 0043](0043-rolling-upgrades.md#built-the-removals-and-the-mark-of-cluster-forget)).
+A `fenced` lease stays: its process did not stop cleanly, so
 records likely still name it, and the fence is the evidence that frees
 them and that ends that instance. A `live` one stays (fence it to revoke
 the node).

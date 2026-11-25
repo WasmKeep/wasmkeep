@@ -138,6 +138,147 @@ pub fn tail(body: &[u8]) -> &[u8] {
     rest
 }
 
+/// The header of the mark `wasmkeep cluster forget` leaves at a node's
+/// key (`nodes/<id>`) while it removes a released lease (ADR 0043, "Built:
+/// the removals, and the mark of `cluster forget`").
+pub const FORGOTTEN_HEADER: &str = "wasmkeep-node-forgotten 1";
+
+/// The mark's stored form: its header, then when it was written (the
+/// operator's clock, ms since the epoch).
+pub fn encode_forgotten(at_ms: u64) -> Vec<u8> {
+    format!("{FORGOTTEN_HEADER}\n{at_ms}\n").into_bytes()
+}
+
+/// When the mark `body` was written, if `body` is one: exactly the bytes
+/// [`encode_forgotten`] writes, and nothing else.
+///
+/// A mark is not a node. A reader of `nodes/<id>` skips it: it is no
+/// heartbeat, no lease, and not an object "this version cannot read". It
+/// is there only between the two requests of a `cluster forget`, or after
+/// one that did not finish. Only that command writes over it or deletes
+/// it: the delete that follows takes no condition, so a node that wrote
+/// its lease over a mark would lose it. A node starting under that id
+/// waits until the key is absent ([`forget_finish`] ends a removal that
+/// did not).
+pub fn forgotten(body: &[u8]) -> Option<u64> {
+    let at = std::str::from_utf8(body)
+        .ok()?
+        .strip_prefix(FORGOTTEN_HEADER)?
+        .strip_prefix('\n')?
+        .strip_suffix('\n')?;
+    let at_ms: u64 = at.parse().ok()?;
+    (encode_forgotten(at_ms) == body).then_some(at_ms)
+}
+
+/// What [`forget_released`] and [`forget_finish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgot {
+    /// The object is gone.
+    Removed,
+    /// The object is not the one that was checked (a node started under
+    /// that id meanwhile, or another command changed it): nothing was
+    /// deleted.
+    Changed,
+    /// The mark is written (or was found) and its delete got no answer
+    /// in time: it was given up, and may or may not have landed. The
+    /// command is run again, which reads the key first.
+    Unfinished,
+}
+
+/// How long the delete of a mark may take before it is given up, in ms:
+/// two thirds of a lease's ttl plus grace (10 s at the defaults).
+///
+/// A bucket client sends a DELETE again when it gets no answer, for a
+/// long time by default. One that was applied with its answer lost, and
+/// sent again much later, would delete the lease a node created
+/// meanwhile. A node creates its lease no sooner than a lease's ttl plus
+/// grace after it first read the key absent (its start check), so a
+/// delete no longer sent after less than that cannot land on it.
+pub fn forget_delete_bound_ms(config: &LeaseConfig) -> u64 {
+    config.ttl_ms().saturating_add(config.grace_ms()) / 3 * 2
+}
+
+/// `work`'s output, or `None` once `give_up` ends first; `work` is then
+/// dropped, which ends its retries.
+async fn before<T>(
+    work: impl std::future::Future<Output = T>,
+    give_up: impl std::future::Future<Output = ()>,
+) -> Option<T> {
+    use std::task::Poll;
+    let mut work = std::pin::pin!(work);
+    let mut give_up = std::pin::pin!(give_up);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(done) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(done));
+        }
+        give_up.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Removes the released node lease at `key`, read at `version` and
+/// checked by the caller: replaces it with the mark, `If-Match` on that
+/// version, then deletes the mark.
+///
+/// A store's DELETE takes no condition. The conditional write is what
+/// makes the removal safe: a process that started under that id and
+/// wrote its lease first makes it fail ([`Forgot::Changed`]), and one
+/// that reads the mark waits for the key to be absent, then creates its
+/// lease. Only for a cluster whose every node knows the mark
+/// ([`crate::upgrade::forget_gate`]): an older node would write over it.
+///
+/// The delete is given up when `give_up` ends, a timer of
+/// [`forget_delete_bound_ms`] ([`Forgot::Unfinished`]): the mark stays
+/// until the command is run again.
+///
+/// # Errors
+/// No answer. The mark may have been written: run the command again,
+/// which ends the removal ([`forget_finish`]).
+pub async fn forget_released<B: Bucket + crate::control::Keys>(
+    bucket: &B,
+    key: &str,
+    version: &Version,
+    at_ms: u64,
+    give_up: impl std::future::Future<Output = ()>,
+) -> Result<Forgot, BucketError> {
+    match bucket.replace(key, encode_forgotten(at_ms), version).await {
+        Ok(_) => {}
+        Err(BucketError::Conflict) => return Ok(Forgot::Changed),
+        Err(e) => return Err(e),
+    }
+    match before(bucket.delete(key), give_up).await {
+        Some(deleted) => deleted.map(|()| Forgot::Removed),
+        None => Ok(Forgot::Unfinished),
+    }
+}
+
+/// Ends a removal that did not finish: deletes `key` if it holds the
+/// mark, read right before the delete. The delete is given up when
+/// `give_up` ends, as in [`forget_released`].
+///
+/// Two of these at once, with a node starting under that id between
+/// them, can still delete that node's new lease: the second delete lands
+/// after the first one and the node's create. The node then stops at its
+/// next write and is started again.
+///
+/// # Errors
+/// No answer.
+pub async fn forget_finish<B: Bucket + crate::control::Keys>(
+    bucket: &B,
+    key: &str,
+    give_up: impl std::future::Future<Output = ()>,
+) -> Result<Forgot, BucketError> {
+    match bucket.get(key).await? {
+        Some((body, _)) if forgotten(&body).is_some() => {
+            match before(bucket.delete(key), give_up).await {
+                Some(deleted) => deleted.map(|()| Forgot::Removed),
+                None => Ok(Forgot::Unfinished),
+            }
+        }
+        _ => Ok(Forgot::Changed),
+    }
+}
+
 /// Whether a record naming `instance` of a node is free, given that node's
 /// lease object as read after the record (see the module documentation).
 /// An absent object, or one in an older format, frees nothing.
@@ -547,6 +688,9 @@ pub enum LostCause {
     OldVersion,
     /// Something this version cannot read.
     Unreadable,
+    /// The mark of a `wasmkeep cluster forget` ([`forgotten`]): the
+    /// object is being removed.
+    Forgotten,
     /// This process holds no lease to write: never started, or released.
     NotHeld,
 }
@@ -559,6 +703,9 @@ impl LostCause {
         let Some(body) = body else {
             return Self::Deleted;
         };
+        if forgotten(body).is_some() {
+            return Self::Forgotten;
+        }
         match NodeLeaseObject::decode(body) {
             Some(o) => match o.state {
                 NodeState::Fenced => Self::Fenced,
@@ -841,6 +988,10 @@ pub enum OperatorFence {
     /// A heartbeat in a format from before node leases: refused (its node
     /// would not read a fence; `cluster forget` removes a retired one).
     OldFormat,
+    /// The mark of a `cluster forget` that did not finish ([`forgotten`]):
+    /// refused, since only that command writes over its mark. The lease
+    /// it replaced was released, so nothing is held under that id.
+    Forgotten,
 }
 
 /// An operator's fence of the node lease at `key`, without the watch a peer
@@ -874,6 +1025,9 @@ pub async fn operator_fence<B: Bucket, C: Clock>(
                 )
             }
             Some((body, version)) => {
+                if forgotten(&body).is_some() {
+                    return Ok(OperatorFence::Forgotten);
+                }
                 let Some(o) = NodeLeaseObject::decode(&body) else {
                     return Ok(OperatorFence::OldFormat);
                 };
@@ -3691,5 +3845,264 @@ mod tests {
         assert_eq!(hold.head.idle_since_ms, None);
         assert_eq!(run(a.release(&hold)), Released::Released);
         assert_eq!(idle("owners/x"), None, "released without the stale origin");
+    }
+
+    /// The mark of `cluster forget` (ADR 0043): exactly its two lines, and
+    /// never read as a node lease, a heartbeat or a lost lease's unknown
+    /// object.
+    #[test]
+    fn a_forgotten_mark_is_exact_or_not_one() {
+        let mark = encode_forgotten(1_700_000_000_123);
+        assert_eq!(mark, b"wasmkeep-node-forgotten 1\n1700000000123\n");
+        assert_eq!(forgotten(&mark), Some(1_700_000_000_123));
+        assert_eq!(forgotten(&encode_forgotten(0)), Some(0));
+        for other in [
+            &b""[..],
+            b"wasmkeep-node-forgotten 1\n",
+            b"wasmkeep-node-forgotten 1\n\n",
+            b"wasmkeep-node-forgotten 1\n12",
+            b"wasmkeep-node-forgotten 1\n12\n\n",
+            b"wasmkeep-node-forgotten 1\r\n12\r\n",
+            b"wasmkeep-node-forgotten 1\n012\n",
+            b"wasmkeep-node-forgotten 1\n+12\n",
+            b"wasmkeep-node-forgotten 1\n12 \n",
+            b"wasmkeep-node-forgotten 1\n12\nmore\n",
+            b"wasmkeep-node-forgotten 2\n12\n",
+            b"wasmkeep-node-forgotten 10\n12\n",
+            b"wasmkeep-node 3\nreleased i1\n12\n",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(
+                forgotten(other),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(other)
+            );
+        }
+        // Not a lease, in any reader of one.
+        assert_eq!(NodeLeaseObject::decode(&mark), None);
+        assert_eq!(crate::membership::NodeInfo::decode(&mark), None);
+        assert!(tail(&mark).is_empty());
+        assert_eq!(LostCause::of(Some(&mark)), LostCause::Forgotten);
+        // And a lease is not a mark.
+        let released = NodeLeaseObject {
+            state: NodeState::Released,
+            instance: Some("i1".into()),
+            written_at_ms: 12,
+        };
+        assert_eq!(forgotten(&released.encode()), None);
+        assert_eq!(LostCause::of(Some(&released.encode())), LostCause::Released);
+    }
+
+    /// A node's lease writes are conditional, so none lands over the mark:
+    /// a first write conditioned on the released lease the start check
+    /// read fails once `cluster forget` replaced it, and says why. A fence
+    /// does not write over it either.
+    #[test]
+    fn a_node_never_writes_over_a_forgotten_mark() {
+        use crate::lease::tests::{At, Mem, run};
+        let mem = Mem::default();
+        let t = std::cell::Cell::new(100_000);
+        let mut old = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        run(old.start(None)).unwrap();
+        run(old.release()).unwrap();
+        let (_, released) = run((&mem).get("nodes/a")).unwrap().unwrap();
+        // `cluster forget` is half-way: the mark is written, not deleted.
+        let mark = encode_forgotten(100_500);
+        run((&mem).replace("nodes/a", mark.clone(), &released)).unwrap();
+        let mut new = NodeLease::new(&mem, At(&t), "nodes/a", "i2", cfg());
+        assert_eq!(
+            run(new.start(Some(&released))),
+            Err(NodeLeaseError::Lost(LostCause::Forgotten))
+        );
+        assert_eq!(
+            run(new.start(None)),
+            Err(NodeLeaseError::Lost(LostCause::Forgotten))
+        );
+        assert!(!new.is_valid());
+        assert_eq!(
+            run(operator_fence(&&mem, &At(&t), "nodes/a")),
+            Ok(OperatorFence::Forgotten)
+        );
+        assert_eq!(
+            run(fence(&&mem, &At(&t), &cfg(), "nodes/a", "i1", 100_000)),
+            Fence::NotLive
+        );
+        assert_eq!(
+            run(raise_created_fence(&&mem, "nodes/a", 999_000)),
+            Ok(false)
+        );
+        assert_eq!(run((&mem).get("nodes/a")).unwrap().unwrap().0, mark);
+        // Once the command deleted it, the node creates its lease.
+        mem.overwrite("nodes/a", None);
+        assert_eq!(run(new.start(None)), Ok(()));
+        assert!(new.is_valid());
+    }
+
+    #[cfg(feature = "object-store")]
+    mod forget {
+        use super::*;
+        use crate::control::Keys as _;
+        use crate::object_store::ObjectStoreBucket;
+
+        fn bucket() -> ObjectStoreBucket {
+            ObjectStoreBucket::new(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+                "wk",
+            )
+        }
+
+        /// A timer that never ends: the delete is waited for.
+        fn never() -> std::future::Pending<()> {
+            std::future::pending()
+        }
+
+        /// A bucket whose DELETE gets no answer: a client that keeps
+        /// sending it again.
+        struct NoDelete(ObjectStoreBucket);
+
+        impl Bucket for NoDelete {
+            async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+                self.0.get(key).await
+            }
+            async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+                self.0.create(key, body).await
+            }
+            async fn replace(
+                &self,
+                key: &str,
+                body: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BucketError> {
+                self.0.replace(key, body, expected).await
+            }
+        }
+
+        impl crate::control::Keys for NoDelete {
+            async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+                self.0.list_keys(prefix).await
+            }
+            async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+                self.0.put_empty(key).await
+            }
+            async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+                self.0.put_body(key, body).await
+            }
+            async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+                self.0.get_body(key).await
+            }
+            async fn delete(&self, _key: &str) -> Result<(), BucketError> {
+                std::future::pending().await
+            }
+        }
+
+        /// The mark's delete is bounded: one that gets no answer before
+        /// the timer ends is given up (no retry lands much later, on a
+        /// lease a node created meanwhile), the mark stays, and the next
+        /// run reads the key first. A delete that answers is not cut by
+        /// a timer that has already ended.
+        #[tokio::test]
+        async fn a_delete_of_the_mark_that_gets_no_answer_is_given_up() {
+            let cfg = LeaseConfig::default_safe();
+            let bound = forget_delete_bound_ms(&cfg);
+            assert_eq!(bound, 10_000);
+            assert!(bound < cfg.ttl_ms() + cfg.grace_ms());
+            let b = NoDelete(bucket());
+            let version =
+                b.0.create("nodes/a", lease(NodeState::Released, "i1"))
+                    .await
+                    .unwrap();
+            let ended = std::future::ready(());
+            assert_eq!(
+                forget_released(&b, "nodes/a", &version, 99, ended).await,
+                Ok(Forgot::Unfinished)
+            );
+            let (body, _) = b.0.get("nodes/a").await.unwrap().unwrap();
+            assert_eq!(forgotten(&body), Some(99));
+            assert_eq!(
+                forget_finish(&b, "nodes/a", std::future::ready(())).await,
+                Ok(Forgot::Unfinished)
+            );
+            assert!(b.0.get("nodes/a").await.unwrap().is_some());
+            // A bucket that answers: removed, whatever the timer.
+            assert_eq!(
+                forget_finish(&b.0, "nodes/a", std::future::ready(())).await,
+                Ok(Forgot::Removed)
+            );
+            assert_eq!(b.0.get("nodes/a").await, Ok(None));
+        }
+
+        fn lease(state: NodeState, instance: &str) -> Vec<u8> {
+            NodeLeaseObject {
+                state,
+                instance: Some(instance.into()),
+                written_at_ms: 12,
+            }
+            .encode_with(b"a\nhttp://a\n0.9.0\nacme/shop\n")
+        }
+
+        /// The removal is the mark, written only over the version that
+        /// was checked, then the delete.
+        #[tokio::test]
+        async fn forget_removes_the_released_lease_it_checked() {
+            let b = bucket();
+            let version = b
+                .create("nodes/a", lease(NodeState::Released, "i1"))
+                .await
+                .unwrap();
+            assert_eq!(
+                forget_released(&b, "nodes/a", &version, 99, never()).await,
+                Ok(Forgot::Removed)
+            );
+            assert_eq!(b.get("nodes/a").await, Ok(None));
+            // Again, over nothing: the condition fails, nothing is created.
+            assert_eq!(
+                forget_released(&b, "nodes/a", &version, 99, never()).await,
+                Ok(Forgot::Changed)
+            );
+            assert_eq!(b.get("nodes/a").await, Ok(None));
+        }
+
+        /// A process that started under the id after the lease was
+        /// checked wrote its own over it: the mark's condition fails, and
+        /// its lease stays. Before the mark, the delete removed it.
+        #[tokio::test]
+        async fn forget_leaves_a_lease_written_since_it_was_checked() {
+            let b = bucket();
+            let checked = b
+                .create("nodes/a", lease(NodeState::Released, "i1"))
+                .await
+                .unwrap();
+            let live = lease(NodeState::Live, "i2");
+            b.replace("nodes/a", live.clone(), &checked).await.unwrap();
+            assert_eq!(
+                forget_released(&b, "nodes/a", &checked, 99, never()).await,
+                Ok(Forgot::Changed)
+            );
+            assert_eq!(b.get("nodes/a").await.unwrap().unwrap().0, live);
+            // Nor does the end of an unfinished removal touch a lease.
+            assert_eq!(
+                forget_finish(&b, "nodes/a", never()).await,
+                Ok(Forgot::Changed)
+            );
+            assert_eq!(b.get("nodes/a").await.unwrap().unwrap().0, live);
+        }
+
+        /// A run that wrote the mark and stopped there is ended by the
+        /// next one.
+        #[tokio::test]
+        async fn forget_ends_a_removal_that_did_not_finish() {
+            let b = bucket();
+            assert_eq!(
+                forget_finish(&b, "nodes/a", never()).await,
+                Ok(Forgot::Changed)
+            );
+            b.put_body("nodes/a", encode_forgotten(99)).await.unwrap();
+            assert_eq!(
+                forget_finish(&b, "nodes/a", never()).await,
+                Ok(Forgot::Removed)
+            );
+            assert_eq!(b.get("nodes/a").await, Ok(None));
+        }
     }
 }

@@ -417,7 +417,8 @@ async fn review_used_internal_signature_is_refused_before_body_read() {
     );
     let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
     let headers = format!(
-        "x-wasmkeep-internal: v4 {ts} abc {hash} {mac}\r\nx-wasmkeep-app: default/shop\r\n"
+        "x-wasmkeep-internal: v4 {ts} abc {hash} {mac}\r\nx-wasmkeep-app: default/shop\r\n{}",
+        sender_line(secret, &mac, "by-hand")
     );
     let first = send(a.addr, "POST", path, &headers).await;
     // In the TLS suite, signatures on the public port do not grant bypass.

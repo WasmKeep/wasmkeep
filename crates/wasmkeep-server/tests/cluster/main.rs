@@ -2404,6 +2404,19 @@ fn percent_decode_str(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The sender's header line of a call signed by hand, whose signature
+/// ends with `mac`: node `node`, bound to that signature as every node
+/// binds itself (ADR 0038, section 5). A signed call without it is
+/// refused. Over plain HTTP between nodes a sender that is not listed is
+/// taken, so a test may name any node id.
+fn sender_line(secret: &str, mac: &str, node: &str) -> String {
+    let bound = hmac_hex(
+        secret.as_bytes(),
+        format!("wasmkeep-sender v1\ninternal\n{mac}\n{node}\n").as_bytes(),
+    );
+    format!("x-wasmkeep-sender: {node} {bound}\r\n")
+}
+
 /// HMAC-SHA256, hex, for signing a call the way a node does.
 fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
     use sha2::{Digest, Sha256};

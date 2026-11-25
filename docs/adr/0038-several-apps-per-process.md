@@ -515,7 +515,9 @@ sender's node id in the envelope and the mandatory forward proof are sent
 by every node of this version from stage 1 on. A single-app receiver
 still accepts the older forms during stage 1; a receiver serving several
 apps requires the new ones, and the `multi-app` gate ensures that by then
-every live node of its apps sends them.
+every live node of its apps sends them. From `0.9.0` no receiver accepts
+the older forms: see
+[the amendment of 2026-11-25](#amendment-2026-11-25-the-older-forms-are-no-longer-accepted).
 
 No manifest format changes. No WIT change. Ownership records, leases and
 replication are unchanged.
@@ -678,3 +680,60 @@ Each slice is one change; each says what it proves.
 - **M6. Process-wide operations.** `cluster status` grouped by process,
   `cluster drain` of a process (every node id it runs), the upgrade page.
   Proves the rolling upgrade and the rollback path.
+
+## Amendment (2026-11-25): the older forms are no longer accepted
+
+"Compatibility and a rolling upgrade" kept a single-app receiver
+accepting the forms from before this record: a signed hop that names no
+sender, and the forward proof's client address written without its
+charged flag. `0.9.0` removes both, under the removal rule of
+[ADR 0043, section 6](0043-rolling-upgrades.md#6-removing-old-paths): a
+version drops what only versions before the previous minor write or
+send, and `0.9` runs beside `0.8.1` and nothing older.
+
+Read in the tree at the `v0.8.1` tag before anything was removed:
+
+- **One function signs every hop.** `sign_hop` (`cluster/signing.rs`)
+  writes the signature and then the sender, bound to it. It is reached
+  from `sign_call` (an actor call, a take call and an alarm hand-off,
+  all through `call_once`; the hello; the relayed socket hand-off,
+  through `sign_hand_off`) and from `sign_admission` (a forward and a
+  WebSocket upgrade relay, through `prepare_forward` and the upgrade's
+  own path). Nothing else writes `x-wasmkeep-internal` or
+  `x-wasmkeep-admitted`.
+- **The sender is always written.** Its value is the node id and a MAC
+  in hex, and a node id is `[a-z0-9-]{1,64}`, checked when the node
+  starts, so the header value is always valid.
+- **The proof's client address** is written as a flag and 32 hex digits,
+  or 64 digits for a charged proof. No path writes the 32 digits alone.
+- **A relayed socket hand-off carries one sender, the call's.** It is
+  signed twice (the proof, then the call) and the second sender replaces
+  the first. The receiver takes the call and not the proof, in `0.8.1`
+  as now; this change leaves that as it was.
+
+What `0.9.0` does:
+
+- A signed hop without a sender is refused on every port and in both
+  plaintext modes, with the reason "hop names no sender (every node
+  since 0.6.0 names it)": a node call answers 503 and is never served as
+  a client's request, and a forward's proof without a sender is not a
+  proof. Until now only a process serving several apps refused it.
+- The proof's client address is read in the two forms a node writes.
+- A hello answered 404 (a node of `0.4.1` and before) counts as not
+  taken, and is sent again as any other failed hello.
+
+What stays:
+
+- **A forward with no proof at all.** A `0.8.1` node that serves one app
+  sends one when its cluster secret is not loaded yet, and when the
+  client's address is unknown (`sign_admission` returns without signing).
+  What a receiver does with such a forward is unchanged: it carries no
+  trusted client address. A process serving several apps never sends
+  one, as before.
+- Plain HTTP between nodes (`--cluster-plaintext accept`) is a
+  configuration, not an older form.
+- A request without a sender still passes the connection's pin check
+  (`sender_presented`): that is the forward with no proof.
+- The heartbeat formats from before node leases (`wasmkeep-node 1` and
+  `2`) and their start guard, which ADR 0043 also lists as removable, are
+  not removed by this change.

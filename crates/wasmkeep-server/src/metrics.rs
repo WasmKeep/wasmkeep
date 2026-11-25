@@ -1146,7 +1146,7 @@ pub(crate) const FRONT_CALL_OUTCOMES: [&str; 4] = ["ok", "busy", "timeout", "fai
 /// [`crate::ActorService::not_ready`], of the cluster's readiness and the
 /// words of a stopped node. A reason not listed here is still rendered
 /// while it holds; a test keeps the list complete.
-pub(crate) const NOT_READY_REASONS: [&str; 23] = [
+pub(crate) const NOT_READY_REASONS: [&str; 24] = [
     "shutting down",
     "checking that no other process runs with this node id",
     "another process runs with this node id",
@@ -1156,6 +1156,7 @@ pub(crate) const NOT_READY_REASONS: [&str; 23] = [
     "an older version of WasmKeep runs with this node id",
     "a node of an older WasmKeep version runs in this cluster",
     "this node's lease object holds something this version cannot read",
+    "this node's lease is being removed by cluster forget",
     "this node holds no lease",
     "the bucket does not enforce conditional writes",
     "the app's upgrade floor is above this node's version, or unreadable",

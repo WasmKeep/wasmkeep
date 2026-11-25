@@ -98,6 +98,7 @@ fn sign(
     }
     let mac = hmac_hex(secret.as_bytes(), msg.as_bytes());
     let mut headers = format!("x-wasmkeep-internal: v4 {ts} {nonce} {hash} {mac}\r\n");
+    headers.push_str(&sender_line(secret, &mac, "by-hand"));
     if forwarded {
         headers.push_str("x-wasmkeep-forwarded: 1\r\n");
     }

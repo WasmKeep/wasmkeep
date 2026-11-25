@@ -62,6 +62,9 @@ pub(crate) enum Stopped {
     OlderNode,
     /// Something this version cannot read under this node id.
     Unreadable,
+    /// The mark of a `wasmkeep cluster forget` under this node id, which
+    /// that command did not remove in time.
+    Forgotten,
     /// This process held no lease to write (not expected while running).
     NotHeld,
 }
@@ -77,6 +80,7 @@ impl Stopped {
             Self::OldVersion => "an older version of WasmKeep runs with this node id",
             Self::OlderNode => "a node of an older WasmKeep version runs in this cluster",
             Self::Unreadable => "this node's lease object holds something this version cannot read",
+            Self::Forgotten => "this node's lease is being removed by cluster forget",
             Self::NotHeld => "this node holds no lease",
         }
     }
@@ -91,6 +95,7 @@ impl Stopped {
             LostCause::Deleted => Self::Deleted,
             LostCause::OldVersion => Self::OldVersion,
             LostCause::Unreadable => Self::Unreadable,
+            LostCause::Forgotten => Self::Forgotten,
             LostCause::NotHeld => Self::NotHeld,
         }
     }
@@ -116,6 +121,17 @@ pub(super) fn fence_wait_message(node: &str, when: &str, wait: Duration) -> Stri
     format!(
         "an operator's fence of node id {node} {when}: its first lease write waits until the \
          fence is twice the allowed clock skew old on this clock; ready in about {secs} s"
+    )
+}
+
+/// The start check's line when `wasmkeep cluster forget` is removing this
+/// node id's released lease: the first write waits for the key to be
+/// absent, for at most `wait` (whole seconds, rounded up).
+pub(super) fn forgotten_wait_message(node: &str, wait: Duration) -> String {
+    let secs = wait.as_millis().div_ceil(1000);
+    format!(
+        "`wasmkeep cluster forget` is removing node id {node}'s released lease: waiting up to \
+         {secs} s for it to be gone, then checking the node id again"
     )
 }
 
@@ -608,11 +624,81 @@ impl Cluster {
         }
     }
 
+    /// [`Self::check_identity_once`], begun again whenever a released
+    /// lease it was watching is gone, or it meets the mark of a `wasmkeep
+    /// cluster forget` under this node id (ADR 0043):
+    /// that command replaced this id's released lease with the mark and
+    /// deletes it next, without a condition, so a lease written over the
+    /// mark would be deleted with it. This node never writes over a mark.
+    /// It reads the key every half period until the mark is gone, then
+    /// runs the whole check again, its full wait included, and so creates
+    /// its lease over no object. A mark still there four times a lease's ttl
+    /// plus grace after it was first read (60 s at the defaults; the
+    /// command's delete follows its write at once) is one its command did
+    /// not remove: the node does not start, and says to run the command
+    /// again.
+    pub(super) async fn check_identity(
+        &self,
+    ) -> (Identity, Option<Version>, Option<(String, u64)>) {
+        loop {
+            if let Err(verdict) = self.forgotten_gone().await {
+                return (verdict, None, None);
+            }
+            match self.check_identity_once().await {
+                (Identity::Checking, _, _) => {}
+                checked => return checked,
+            }
+        }
+    }
+
+    /// Waits while this node id's key holds the mark of a `cluster forget`
+    /// ([`wasmkeep_cluster::node_lease::forgotten`]), reading it every
+    /// half period. `Err`: it is still there after four times a lease's ttl
+    /// plus grace, with the verdict that stops the start. A read that
+    /// fails proves nothing and is made again.
+    async fn forgotten_gone(&self) -> Result<(), Identity> {
+        let period = self.heartbeat_every;
+        let key = self.node_key();
+        let bound = self.alarm_overdue * 4;
+        let mut until = None;
+        loop {
+            let marked = match self.control_keys.get(&key).await {
+                Ok(found) => found.is_some_and(|(body, _)| {
+                    wasmkeep_cluster::node_lease::forgotten(&body).is_some()
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "reading this node id's heartbeat failed; retrying before starting");
+                    tokio::time::sleep(period / 2).await;
+                    continue;
+                }
+            };
+            if !marked {
+                return Ok(());
+            }
+            let until = *until.get_or_insert_with(|| {
+                tracing::info!("{}", forgotten_wait_message(&self.node_id, bound));
+                tokio::time::Instant::now() + bound
+            });
+            if tokio::time::Instant::now() >= until {
+                return Err(Stopped::Forgotten.identity(&format!(
+                    "`{key}` holds the mark of a `wasmkeep cluster forget` that did not finish, \
+                     and this node never writes over it: run `wasmkeep cluster forget {}` \
+                     again, then start this node",
+                    self.node_id
+                )));
+            }
+            tokio::time::sleep(period / 2).await;
+        }
+    }
+
     /// Whether another process runs with this node id, checked before this
     /// one writes its first node lease; with the version of the object to
     /// condition that write on (`None`: there is none, create it) and, if
     /// that object is a node lease naming an instance, its instance and
     /// `written_at` (the predecessor that write replaces).
+    /// [`Identity::Checking`]: a read found the mark of a `cluster forget`,
+    /// or the released lease read before is gone, and nothing was judged
+    /// ([`Self::check_identity`] begins again).
     ///
     /// The object is read (a versioned GET) every half period for at least
     /// a lease's ttl plus grace from the first read in every case, even
@@ -628,11 +714,16 @@ impl Cluster {
     /// own. Unchanged through a successful read at the end: the predecessor
     /// stopped, and this one goes on. Failed reads are retried and never
     /// count as unchanged; nothing is claimed meanwhile.
-    pub(super) async fn check_identity(
-        &self,
-    ) -> (Identity, Option<Version>, Option<(String, u64)>) {
+    async fn check_identity_once(&self) -> (Identity, Option<Version>, Option<(String, u64)>) {
         let period = self.heartbeat_every;
         let key = self.node_key();
+        // The mark of a `cluster forget` is never judged, and never the
+        // object a first write is conditioned on.
+        let forgotten = |found: &Option<(Vec<u8>, Version)>| {
+            found
+                .as_ref()
+                .is_some_and(|(body, _)| wasmkeep_cluster::node_lease::forgotten(body).is_some())
+        };
         let read = async || loop {
             match self.control_keys.get(&key).await {
                 Ok(found) => return found,
@@ -661,6 +752,9 @@ impl Cluster {
         };
         let window = wasmkeep_cluster::node_lease::fence_window_ms(&self.lease_config);
         let mut last = read().await;
+        if forgotten(&last) {
+            return (Identity::Checking, None, None);
+        }
         // The lease's ttl plus grace in every case, also with no object: a
         // process whose object was deleted while it ran is given time to
         // show itself.
@@ -723,6 +817,29 @@ impl Cluster {
         loop {
             tokio::time::sleep(period / 2).await;
             let now = read().await;
+            if forgotten(&now) {
+                return (Identity::Checking, None, None);
+            }
+            // A released node lease that is gone: `cluster forget` removed
+            // it (its mark is there for less than the time between two
+            // reads), or an operator deleted it. Its process stopped
+            // cleanly and nothing writes under this id, so this is no
+            // other writer: the check runs again from its first read,
+            // over no object, with its full wait. Only for a released
+            // lease: a live or fenced one, or a heartbeat from before
+            // node leases, that goes absent keeps the deleted verdict.
+            if now.is_none()
+                && last
+                    .as_ref()
+                    .and_then(|(body, _)| NodeLeaseObject::decode(body))
+                    .is_some_and(|o| o.state == NodeState::Released)
+            {
+                tracing::info!(
+                    "node id {}'s released lease was removed during the start check; checking again",
+                    self.node_id
+                );
+                return (Identity::Checking, None, None);
+            }
             let changed = now.as_ref().map(|(body, _)| body) != last.as_ref().map(|(body, _)| body);
             if changed {
                 // A fence or a release over the process first read: that

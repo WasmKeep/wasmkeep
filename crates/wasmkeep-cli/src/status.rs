@@ -138,6 +138,16 @@ pub(crate) async fn records_naming(
 /// `wasmkeep cluster forget <node>` on `store` under `prefix` at `now_ms`:
 /// deletes `nodes/<node>` if [`may_forget`] allows it. What it did, or why
 /// it refused.
+///
+/// A store's DELETE takes no condition. For a released lease of an app
+/// whose upgrade to 0.9 is finalized (ADR 0043: every node that can start
+/// there knows the mark), the lease is first replaced with the mark of
+/// this command, by a write conditioned on the version that was checked,
+/// and the mark is deleted: a process that started under that id
+/// meanwhile makes that write fail, and one that reads the mark waits for
+/// it to be gone. Before the finalize, and for a heartbeat from before
+/// node leases, the object is read again and deleted, as before 0.9, and
+/// the answer says so. A mark an earlier run left is deleted.
 pub(crate) async fn forget_on(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
@@ -146,9 +156,12 @@ pub(crate) async fn forget_on(
 ) -> Result<String, String> {
     use wasmkeep_cluster::control::Keys as _;
     use wasmkeep_cluster::lease::Bucket as _;
+    use wasmkeep_cluster::node_lease::{Forgot, forget_finish, forget_released, forgotten};
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(store), prefix);
     let key = format!("nodes/{node}");
-    let Some((body, _)) = bucket
+    let changed =
+        || format!("{key} changed while it was checked: left alone; run the command again");
+    let Some((body, version)) = bucket
         .get(&key)
         .await
         .map_err(|e| format!("reading {key}: {e:?}"))?
@@ -157,6 +170,35 @@ pub(crate) async fn forget_on(
             "{node} has no heartbeat object: nothing to forget."
         ));
     };
+    // A delete of the mark that gets no answer is given up, not sent
+    // again for as long as the bucket client would: one that landed much
+    // later would remove the lease a node created meanwhile.
+    let bound = wasmkeep_cluster::node_lease::forget_delete_bound_ms(
+        &wasmkeep_cluster::lease::LeaseConfig::default_safe(),
+    );
+    let give_up = || tokio::time::sleep(std::time::Duration::from_millis(bound));
+    let unfinished = || {
+        format!(
+            "{key} holds this command's mark, and its delete got no answer within {} s: run \
+             `wasmkeep cluster forget {node}` again",
+            bound / 1000
+        )
+    };
+    // The mark of a run that did not finish: the lease it replaced was
+    // checked then, and nothing writes over a mark.
+    if forgotten(&body).is_some() {
+        return match forget_finish(&bucket, &key, give_up())
+            .await
+            .map_err(|e| format!("deleting {key}: {e:?}"))?
+        {
+            Forgot::Unfinished => Err(unfinished()),
+            Forgot::Removed => Ok(format!(
+                "Removed {node}'s node lease: an earlier `cluster forget` had replaced it with \
+                 its mark and not deleted it."
+            )),
+            Forgot::Changed => Err(changed()),
+        };
+    }
     let what = may_forget(&body, now_ms)?;
     if what == Forgettable::Released {
         // No new record can name it: only its own process writes records
@@ -169,6 +211,43 @@ pub(crate) async fn forget_on(
             ));
         }
     }
+    // With the mark, once every node that can start under this id knows
+    // it: the write is conditioned on the version checked above.
+    let mut unmarked = String::new();
+    if what == Forgettable::Released {
+        let app = NodeInfo::decode(&body).map(|i| i.app).unwrap_or_default();
+        let lease = wasmkeep_cluster::lease::LeaseConfig::default_safe();
+        let horizon =
+            wasmkeep_server::heartbeat_horizon_ms(wasmkeep_server::DEFAULT_HEARTBEAT, &lease);
+        match wasmkeep_cluster::upgrade::forget_gate(&bucket, &app, now_ms, horizon)
+            .await
+            .map_err(|e| format!("reading the upgrade floor and the nodes of {app}: {e:?}"))?
+        {
+            Ok(()) => {
+                return match forget_released(&bucket, &key, &version, now_ms, give_up())
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "removing {key}: {e:?}. Its mark may have been written: run the \
+                             command again to finish"
+                        )
+                    })? {
+                    Forgot::Removed => Ok(format!("Removed {node}'s released node lease.")),
+                    Forgot::Changed => Err(changed()),
+                    Forgot::Unfinished => Err(unfinished()),
+                };
+            }
+            Err(why) => {
+                unmarked = format!(
+                    " Removed as before 0.9, by a delete without a condition: a process \
+                     starting under that id at the same moment would lose its lease and stop, \
+                     to be started again. The removal that keeps such a lease is used once \
+                     the app's upgrade to 0.9 is finalized and no older node of it is live \
+                     ({why})."
+                );
+            }
+        }
+    }
     // Read again right before the delete (a store's DELETE takes no
     // condition): a new node's first write over the stale heartbeat in
     // between must not be deleted. The window left is the time between the
@@ -179,9 +258,7 @@ pub(crate) async fn forget_on(
         .map_err(|e| format!("reading {key}: {e:?}"))?
         .map(|(b, _)| b);
     if again.as_deref() != Some(body.as_slice()) {
-        return Err(format!(
-            "{key} changed while it was checked: left alone; run the command again"
-        ));
+        return Err(changed());
     }
     bucket
         .delete(&key)
@@ -189,7 +266,7 @@ pub(crate) async fn forget_on(
         .map_err(|e| format!("deleting {key}: {e:?}"))?;
     Ok(match what {
         Forgettable::OldFormat => format!("Removed {node}'s retired heartbeat."),
-        Forgettable::Released => format!("Removed {node}'s released node lease."),
+        Forgettable::Released => format!("Removed {node}'s released node lease.{unmarked}"),
     })
 }
 
@@ -252,7 +329,16 @@ pub(crate) struct Report {
     /// The upgrade of WasmKeep itself (ADR 0043), for each app that has
     /// registered nodes: its floor and one state.
     pub(crate) upgrades: Vec<wasmkeep_cluster::upgrade::AppUpgrade>,
+    /// The node ids whose key holds the mark of a `cluster forget` (ADR
+    /// 0043) written more than [`FORGET_UNFINISHED_MS`] ago: the command
+    /// deletes its mark at once, so one that old was left by a run that
+    /// did not finish, and keeps a node from starting under that id.
+    pub(crate) unfinished_forgets: Vec<String>,
 }
+
+/// How old the mark of a `cluster forget` is before `cluster status`
+/// says its command did not finish.
+pub(crate) const FORGET_UNFINISHED_MS: u64 = 5_000;
 
 /// Reads the cluster under `prefix` of `store`, at `now_ms`, counting a
 /// heartbeat live for `horizon_ms`.
@@ -304,8 +390,18 @@ async fn read_with_limit(
         .trim_start_matches('/')
         .to_owned();
     let mut heartbeats = Vec::new();
+    let mut unfinished_forgets = Vec::new();
     for (key, _) in list_objects(&store, &node_prefix, max).await? {
         let body = metadata(&store, &StorePath::from(format!("{node_prefix}/{key}"))).await?;
+        // Not a node: shown only when its command left it there.
+        if let Some(at) = wasmkeep_cluster::node_lease::forgotten(&body) {
+            if now_ms.saturating_sub(at) > FORGET_UNFINISHED_MS
+                && wasmkeep_cluster::membership::validate_node_id(&key).is_ok()
+            {
+                unfinished_forgets.push(key);
+            }
+            continue;
+        }
         if let Some(info) = NodeInfo::decode(&body)
             && key == info.id
             && wasmkeep_cluster::membership::validate_node_id(&info.id).is_ok()
@@ -343,6 +439,7 @@ async fn read_with_limit(
         nodes,
         apps: read_apps(&store, prefix, bucket, max).await?,
         upgrades,
+        unfinished_forgets,
     })
 }
 
@@ -482,6 +579,12 @@ impl Report {
                 "draining but stuck: {} still hold actors and have no node to hand them to; \
                  start or undrain a node that serves the same app (ADR 0014)",
                 stuck.join(", ")
+            ));
+        }
+        for id in &self.unfinished_forgets {
+            out.push(format!(
+                "{id}: forget did not finish; run `wasmkeep cluster forget {id}` (no node \
+                 starts under that id until then)"
             ));
         }
         // ADR 0035: an app whose live nodes differ on `recorded-head`
@@ -1229,6 +1332,127 @@ mod tests {
             assert!(why.contains("never deleted"), "{state}: {why}");
             assert!(exists(&store));
         }
+    }
+
+    /// ADR 0043: once the app's upgrade to 0.9 is finalized, `cluster
+    /// forget` removes a released lease through its mark (a conditional
+    /// write, then the delete), and says nothing more. Before, and while
+    /// a live node of the app is older, it deletes as it did before 0.9
+    /// and says so, naming what the safe removal waits for.
+    #[test]
+    fn forget_marks_a_released_lease_only_after_the_finalize() {
+        let lease = |id: &str, state: &str, version: &str, at: u64| {
+            format!(
+                "wasmkeep-node 3\n{state} beef\n{at}\n{id}\nhttp://{id}\n{version}\nacme/shop\n\n\nserving\n\ntake\n"
+            )
+        };
+        let put = |store: &Arc<dyn ObjectStore>, key: &str, body: Vec<u8>| {
+            block_on(store.put(&StorePath::from(key), body.into())).unwrap();
+        };
+        let exists = |store: &Arc<dyn ObjectStore>| {
+            block_on(store.head(&StorePath::from("nodes/b"))).is_ok()
+        };
+        let released = || lease("b", "released", "0.9.0", NOW - 600_000).into_bytes();
+        let floor = b"wasmkeep-floor 1\n0.9\n".to_vec();
+
+        // Not finalized (no floor record: 0.8): as before 0.9, and said.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(&store, "nodes/b", released());
+        let done = block_on(forget_on(&store, "", "b", NOW)).unwrap();
+        assert!(
+            done.starts_with("Removed b's released node lease. "),
+            "{done}"
+        );
+        assert!(
+            done.contains("a delete without a condition")
+                && done.contains("upgrade floor is 0.8")
+                && done.contains("cluster upgrade finalize"),
+            "{done}"
+        );
+        assert!(!exists(&store));
+
+        // Finalized at 0.9: through the mark, and nothing more to say.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(&store, "nodes/b", released());
+        put(&store, "formats/acme/shop/floor", floor.clone());
+        put(
+            &store,
+            "nodes/a",
+            lease("a", "live", "0.9.0", NOW).into_bytes(),
+        );
+        assert_eq!(
+            block_on(forget_on(&store, "", "b", NOW)).as_deref(),
+            Ok("Removed b's released node lease.")
+        );
+        assert!(!exists(&store));
+        // The checks before it are the same: a record that names the
+        // node keeps its lease, and a recent release is left alone.
+        put(
+            &store,
+            "nodes/b",
+            lease("b", "released", "0.9.0", NOW - 1_000).into_bytes(),
+        );
+        assert!(block_on(forget_on(&store, "", "b", NOW)).is_err());
+        assert!(exists(&store));
+
+        // Finalized, and a live node of the app that is older (it passed
+        // its floor read before the finalize): as before 0.9, naming it.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        put(&store, "nodes/b", released());
+        put(&store, "formats/acme/shop/floor", floor);
+        put(
+            &store,
+            "nodes/old",
+            lease("old", "live", "0.8.1", NOW).into_bytes(),
+        );
+        let done = block_on(forget_on(&store, "", "b", NOW)).unwrap();
+        assert!(
+            done.contains("a delete without a condition") && done.contains("old (0.8.1)"),
+            "{done}"
+        );
+        assert!(!exists(&store));
+    }
+
+    /// A `cluster forget` that wrote its mark and stopped before its
+    /// delete is ended by the next run, whatever the mark's age. Until
+    /// then the mark is not a node: `cluster status` shows none for it,
+    /// and `cluster fence` does not write over it.
+    #[test]
+    fn forget_ends_a_removal_an_earlier_run_left_half_way() {
+        use wasmkeep_cluster::node_lease::{OperatorFence, encode_forgotten, operator_fence};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on(store.put(&StorePath::from("nodes/b"), encode_forgotten(NOW).into())).unwrap();
+        // Just written: its command is about to delete it. Nothing shown.
+        let report = block_on(read(Arc::clone(&store), "", "mem", NOW, 10_000)).unwrap();
+        assert!(report.nodes.is_empty() && report.upgrades.is_empty());
+        assert!(report.unfinished_forgets.is_empty());
+        assert!(report.warnings().iter().all(|w| !w.contains("forget")));
+        // Still there seconds later: one line, with the command to run.
+        let later = NOW + FORGET_UNFINISHED_MS + 1;
+        let report = block_on(read(Arc::clone(&store), "", "mem", later, 10_000)).unwrap();
+        assert!(report.nodes.is_empty() && report.upgrades.is_empty());
+        let lines: Vec<String> = report
+            .warnings()
+            .into_iter()
+            .filter(|w| w.contains("forget"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("b: forget did not finish; run `wasmkeep cluster forget b`"),
+            "{lines:?}"
+        );
+        assert!(report.to_text().contains(&format!("warning: {}", lines[0])));
+        let bucket = ObjectStoreBucket::new(Arc::clone(&store), "");
+        assert_eq!(
+            block_on(operator_fence(&bucket, &Wall, "nodes/b")),
+            Ok(OperatorFence::Forgotten)
+        );
+        let done = block_on(forget_on(&store, "", "b", NOW)).unwrap();
+        assert!(done.contains("an earlier `cluster forget`"), "{done}");
+        assert!(block_on(store.head(&StorePath::from("nodes/b"))).is_err());
+        // Nothing left: nothing to forget.
+        let done = block_on(forget_on(&store, "", "b", NOW)).unwrap();
+        assert!(done.contains("nothing to forget"), "{done}");
     }
 
     /// ADR 0038, M6: node ids of one process are grouped by the process

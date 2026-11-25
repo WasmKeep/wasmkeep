@@ -403,7 +403,7 @@ const EXPECTED: &str = "\
 refuse=false secret=true cluster_port=true absent: internal=false refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true valid: internal=true refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=1 burnt=false\n\
-refuse=false secret=true cluster_port=true no-sender: internal=true refused=None bad=0 burnt=false\n\
+refuse=false secret=true cluster_port=true no-sender: internal=false refused=Some(\"hop names no sender (every node since 0.6.0 names it)\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true sender-twice: internal=false refused=Some(\"hop names its sender twice\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true sender-unbound: internal=false refused=Some(\"hop's sender is not bound to its signature\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=true sender-other-app: internal=false refused=Some(\"hop's sender is a node of another app\") bad=0 burnt=false\n\
@@ -411,7 +411,7 @@ refuse=false secret=true cluster_port=true sender-not-live: internal=false refus
 refuse=false secret=true cluster_port=false absent: internal=false refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=false valid: internal=true refused=None bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=false bad: internal=false refused=None bad=1 burnt=false\n\
-refuse=false secret=true cluster_port=false no-sender: internal=true refused=None bad=0 burnt=false\n\
+refuse=false secret=true cluster_port=false no-sender: internal=false refused=Some(\"hop names no sender (every node since 0.6.0 names it)\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=false sender-twice: internal=false refused=Some(\"hop names its sender twice\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=false sender-unbound: internal=false refused=Some(\"hop's sender is not bound to its signature\") bad=0 burnt=false\n\
 refuse=false secret=true cluster_port=false sender-other-app: internal=false refused=Some(\"hop's sender is a node of another app\") bad=0 burnt=false\n\
@@ -435,7 +435,7 @@ refuse=false secret=false cluster_port=false sender-not-live: internal=false ref
 refuse=true secret=true cluster_port=true absent: internal=false refused=None bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true valid: internal=true refused=None bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true bad: internal=false refused=Some(\"bad, expired or misaddressed signature\") bad=1 burnt=false\n\
-refuse=true secret=true cluster_port=true no-sender: internal=true refused=None bad=0 burnt=false\n\
+refuse=true secret=true cluster_port=true no-sender: internal=false refused=Some(\"hop names no sender (every node since 0.6.0 names it)\") bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true sender-twice: internal=false refused=Some(\"hop names its sender twice\") bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true sender-unbound: internal=false refused=Some(\"hop's sender is not bound to its signature\") bad=0 burnt=false\n\
 refuse=true secret=true cluster_port=true sender-other-app: internal=false refused=Some(\"hop's sender is a node of another app\") bad=0 burnt=false\n\

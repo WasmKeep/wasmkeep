@@ -400,6 +400,10 @@ impl Cluster {
                 "stop every node of the older version before starting this one (ADR 0020)"
             }
             Stopped::NotHeld => "this process held no lease to write",
+            Stopped::Forgotten => {
+                "`wasmkeep cluster forget` replaced it with its mark; this process stops, and \
+                 a restart writes it again once that command is done"
+            }
             Stopped::Twin | Stopped::Unreadable => {
                 "this one stops and the other goes on; give each node an id of its own"
             }

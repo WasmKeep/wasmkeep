@@ -103,9 +103,25 @@ of what adding nodes does, read
   on the prefix still names, once either is older than 25 s; it refuses a
   live or fenced node lease, and a released one a record still names (that
   lease is what frees the record; each such record is taken over by the
-  next request for its actor). A store's DELETE takes no condition, so
-  the command reads the object twice and deletes only if it did not
-  change between the reads; a process starting under that id whose first
+  next request for its actor). A store's DELETE takes no condition. Once
+  the app's upgrade to 0.9 is finalized (`wasmkeep cluster upgrade
+  finalize`, below), the command removes a released lease in two steps:
+  it replaces the lease with a mark, by a write that lands only over the
+  lease it checked, then deletes the mark. A process that started under
+  that id meanwhile makes that write fail, and the command leaves its
+  lease alone. A process that starts while the mark is there writes
+  nothing over it, waits for it to be gone and then starts as on a new
+  id; if the mark is still there 60 s later (the command stopped between
+  its two steps), the process does not start, reports `this node's lease
+  is being removed by cluster forget`, and running the command again
+  removes the mark; `cluster status` warns about a mark older than a
+  few seconds, with that command. A process that was already checking
+  its node id when the released lease was removed checks it again, over
+  no object, and starts. The mark is not a node: no listing counts it.
+  Before
+  the finalize, and for a heartbeat from before node leases, the command
+  reads the object twice and deletes only if it did not change between
+  the reads, and says so: a process starting under that id whose first
   write lands in the moment between the second read and the delete loses
   that lease and exits (its next write finds the object gone), and its
   service manager starts it again: availability only, nothing is taken

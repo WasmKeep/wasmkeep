@@ -85,7 +85,7 @@ pub(crate) struct Signed {
     /// The body's SHA-256 it signs, lowercase hex.
     pub(crate) body: String,
     /// The node its [`SENDER`] names, bound to this signature and checked
-    /// a live node of this app; `None` without one (an older node).
+    /// a live node of this app; `None` only before that check.
     pub(crate) sender: Option<String>,
 }
 
@@ -138,6 +138,10 @@ pub(super) const SECRET_NOT_LOADED: &str = "cluster secret not loaded yet";
 pub(super) const BAD_SIGNATURE: &str = "bad, expired or misaddressed signature";
 /// The same, logged with its likely causes where no router logs it.
 pub(super) const BAD_SIGNATURE_WHY: &str = "bad, expired or misaddressed signature (clock skew? another cluster's secret? a node of an older version?)";
+/// Why a signed hop that names no sender is refused (ADR 0038, section
+/// 5). No node of 0.8.1, the oldest version this one runs beside, sends
+/// such a hop.
+pub(super) const NO_SENDER: &str = "hop names no sender (every node since 0.6.0 names it)";
 
 /// SHA-256 of a call's body, lowercase hex, as signed in [`INTERNAL`].
 pub(crate) fn body_sha256(body: &[u8]) -> String {
@@ -597,9 +601,10 @@ pub(crate) fn verify_sender(
 
 /// Whether the connection a hop came on (`peer`, on the cluster port) is
 /// the one its [`SENDER`] names (ADR 0038, section 5): that node's own
-/// live heartbeat publishes the pin presented. A hop without a sender (a
-/// node of an older version) or over plain HTTP (`None`) passes here; a
-/// sender named twice does not.
+/// live heartbeat publishes the pin presented. A request without a sender
+/// (a forward with no proof; a signed hop without one is refused later,
+/// by [`Cluster::sender_checked`]) or over plain HTTP (`None`) passes
+/// here; a sender named twice does not.
 pub(crate) fn sender_presented(
     headers: &hyper::HeaderMap,
     peer: Option<&crate::http::ClusterPeer>,
@@ -717,7 +722,10 @@ impl Cluster {
                     path,
                     on_cluster_port,
                 ) {
-                    Ok(sender) => HopCheck::Signed(Signed { sender, ..signed }),
+                    Ok(sender) => HopCheck::Signed(Signed {
+                        sender: Some(sender),
+                        ..signed
+                    }),
                     Err(why) => HopCheck::Refused(why),
                 }
             }
@@ -823,11 +831,12 @@ impl Cluster {
 
     /// The sender a signed hop names, checked (ADR 0038, section 5): bound
     /// to the hop's signature (`given`, its [`INTERNAL`] or [`ADMITTED`]
-    /// value), named once, and a live node of this app. `Ok(None)`: no
-    /// sender (a node of an older version, rolling upgrade stage 1). A
-    /// hello may come from a node not listed yet (it asks for a listing);
-    /// over plain HTTP between nodes (`accept`) an unlisted sender is taken
-    /// as an unsigned-sender hop was, its app checked when known.
+    /// value), named once, and a live node of this app. A signed hop
+    /// without a sender is refused: every node since 0.6.0 names it
+    /// ([`Self::sign_hop`]), and 0.9 runs beside 0.8.1 and nothing older
+    /// (ADR 0043, section 6). A hello may come from a node not listed yet
+    /// (it asks for a listing); over plain HTTP between nodes (`accept`)
+    /// an unlisted sender is taken, its app checked when known.
     pub(super) fn sender_checked(
         &self,
         headers: &hyper::HeaderMap,
@@ -836,15 +845,10 @@ impl Cluster {
         given: &str,
         path: &str,
         on_cluster_port: bool,
-    ) -> Result<Option<String>, &'static str> {
+    ) -> Result<String, &'static str> {
         let mut values = headers.get_all(SENDER).iter();
         let Some(first) = values.next() else {
-            // Required once several apps share the process (ADR 0038,
-            // section 5): every live node then sends it.
-            if self.several_apps() {
-                return Err("hop names no sender (several apps per process require it)");
-            }
-            return Ok(None);
+            return Err(NO_SENDER);
         };
         if values.next().is_some() {
             return Err("hop names its sender twice");
@@ -856,7 +860,7 @@ impl Cluster {
             .and_then(|v| verify_sender(secret, kind.sender_kind(), primary, v))
             .ok_or("hop's sender is not bound to its signature")?;
         if path == HELLO_PATH {
-            return Ok(Some(sender));
+            return Ok(sender);
         }
         // The process's view of the live nodes, every runtime's listings
         // merged, as its pins are: a node a sibling runtime listed first is
@@ -869,14 +873,14 @@ impl Cluster {
                 .map(|p| p.app.clone())
         });
         match app {
-            Some(app) if app == self.serves => Ok(Some(sender)),
+            Some(app) if app == self.serves => Ok(sender),
             Some(_) => Err("hop's sender is a node of another app"),
             None if on_cluster_port || self.refuse_plaintext => {
                 self.want_listing();
                 self.read_soon(&sender);
                 Err("hop's sender is not a live node")
             }
-            None => Ok(Some(sender)),
+            None => Ok(sender),
         }
     }
 

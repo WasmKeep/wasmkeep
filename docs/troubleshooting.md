@@ -165,6 +165,7 @@ same words.
 | `this node's lease object was deleted` (for good) | `nodes/<id>` was removed | Do not delete it by hand; restart the node. |
 | `an older version of WasmKeep runs with this node id`, `a node of an older WasmKeep version runs in this cluster`, `a live node of an older version (no multi-app) runs in this cluster` | A mixed-version cluster | Finish the upgrade, in the order of [Upgrading WasmKeep](cluster.md#upgrading-wasmkeep). |
 | `this node's lease object holds something this version cannot read` | An unreadable object under this id | Check that the bucket prefix is the cluster's own; see the version notes under [Upgrade](cluster.md#upgrading-wasmkeep). |
+| `this node's lease is being removed by cluster forget` (for good) | A `wasmkeep cluster forget` of this node id replaced its released lease with a mark and did not delete it | Run `wasmkeep cluster forget <node>` again, then start the node. |
 | `this node holds no lease` | The node has not written a lease yet | Wait; if it lasts, the bucket refuses writes. |
 | `the bucket does not enforce conditional writes` (for good) | The start check failed | Use a bucket that enforces them ([Buckets](deploy/buckets.md)). |
 | `the app's upgrade floor is above this node's version, or unreadable` (for good) | The app's upgrade was finalized at a newer minor version than this binary, or its floor record is corrupt | Install that version or later; for a corrupt record, the log names the key ([ADR 0020](adr/0020-one-lease-per-node.md#the-upgrade-floor-record)). |
