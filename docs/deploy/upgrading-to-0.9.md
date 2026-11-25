@@ -1,7 +1,8 @@
 # Upgrade a cluster to 0.9.0
 
-0.9.0 is the first release a cluster moves to one node at a time, without
-stopping as a whole. The supported pair is **0.8.1 to 0.9.0**. The
+0.9.0 is the first minor release a cluster moves to one node at a time,
+without stopping as a whole, with the checks for it in the binary. The
+supported pair is **0.8.1 to 0.9.0**. The
 upgrade ends with one command, `wasmkeep cluster upgrade finalize`:
 **until you run it, any node may go back to 0.8.1, and what 0.9.0 adds to
 the bucket stays off.** After it there is no way back.
@@ -48,15 +49,15 @@ For each node in turn:
    status` then lists it as `no (released)`.
 3. **Install 0.9.0.**
 4. **Withdraw the drain request**, so that the new process takes actors
-   from its first heartbeat. `--force` is needed because no live node has
-   the id at that moment:
+   from its first heartbeat. `undrain` withdraws a request even when no
+   live node has the id:
 
    ```bash
-   wasmkeep cluster undrain node-b --bucket s3://wasmkeep-demo --force
+   wasmkeep cluster undrain node-b --bucket s3://wasmkeep-demo
    ```
 
-   Or start the node first and run `undrain` without `--force`; until
-   then it stays `drained`.
+   Or start the node first and run `undrain` then; the drain request
+   stays in the bucket until it is withdrawn.
 5. **Start it.**
 6. **Wait for `serving`**: `/_wasmkeep/ready` answers 200 on the node, and
    `cluster status` lists it live, on 0.9.0, with `STATE` `serving`. Then
@@ -89,7 +90,7 @@ upgrade floor, one state, the nodes that block a finalize, and each
 registered node with its version and whether it is live. After the last
 node it says `finalize pending`: every live node runs 0.9 and the floor
 is still 0.8. `--app TENANT/APP` narrows both commands to one app;
-`--json` is for scripts.
+`status --json` is for scripts.
 
 | State | Meaning | Exit code |
 | --- | --- | --- |
@@ -274,10 +275,10 @@ and not older than the app's floor.
   fence`, `actor delete`, `actor move`, `backup create` and `secrets
   rotate-key`. `cluster forget` asks only whether it may write its mark.
   They write what 0.8.1 reads, and stay usable during the upgrade.
-- **A 0.8.1 `wasmkeep` has no such check.** It works against a cluster
-  that is not finalized. Do not use it against a finalized app: it does
-  not read the floor, and what it does there beyond failing on a
-  manifest it cannot parse has not been tested.
+- **A 0.8.1 `wasmkeep` has no such check.** Before the finalize the
+  bucket holds only what 0.8.1 reads. Do not use it against a finalized
+  app: it does not read the floor, and what it does there beyond failing
+  on a manifest it cannot parse has not been tested.
 
 ## Limits, and what is not built
 

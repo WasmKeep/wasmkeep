@@ -207,15 +207,19 @@ it exits with 1 if no node is live. See
   listener: a refusing node does not reach that node's actors (503), and
   that node's calls to it are treated as a client's. To roll back, add
   `accept` to every node before removing any listener.
-- **Upgrading WasmKeep** (the binary, not your app): upgrade every node
-  together, not one at a time. `systemctl stop wasmkeep` on all three, wait
+- **Upgrading WasmKeep** (the binary, not your app): read the release's
+  upgrading page first. From 0.8.1 to 0.9.0 the cluster is upgraded one
+  node at a time and then finalized
+  ([upgrading to 0.9.0](upgrading-to-0.9.md)). For any other pair of
+  versions, upgrade every node together, not one at a time.
+  `systemctl stop wasmkeep` on all three, wait
   until `wasmkeep cluster status --bucket s3://acme-wasmkeep/prod` exits
   with 1 (no live node, about 10 s after the last stop), install the new
   binary on all three, start them, and check `cluster status` again: three
   live nodes, one version, no warning. Clients get errors between the last
   stop and the first start. Old and new nodes refuse each other's calls
-  and handle alarms differently, so a rolling restart across versions is
-  not supported yet: see [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep).
+  and handle alarms differently, so a rolling restart across those
+  versions is not supported: see [Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep).
 - **Restarting a node** on the same binary (a configuration change, a host
   reboot): one node at a time is fine. A stopping node finishes its
   in-flight requests, then hands its actors over: the other nodes serve

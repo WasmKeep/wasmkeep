@@ -50,7 +50,7 @@ wasmkeep cluster drain a --bucket s3://wasmkeep-demo
 wasmkeep cluster status --bucket s3://wasmkeep-demo      # until a shows STATE drained
 sudo systemctl stop wasmkeep                             # on a's machine
 # install the 0.9.0 binary on a's machine
-wasmkeep cluster undrain a --bucket s3://wasmkeep-demo --force
+wasmkeep cluster undrain a --bucket s3://wasmkeep-demo
 sudo systemctl start wasmkeep                            # on a's machine
 ```
 

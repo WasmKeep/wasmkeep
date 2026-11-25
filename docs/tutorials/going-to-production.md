@@ -382,7 +382,9 @@ Two kinds, with different rules:
 - **WasmKeep itself** (the `wasmkeep` binary): read the release's notes
   first. Its "Upgrading" section, in the [changelog](../../CHANGELOG.md)
   and the GitHub release, says whether its upgrade is rolling (one node
-  at a time) or stops the cluster. So far every upgrade stops it: stop
+  at a time) or stops the cluster. From 0.8.1 to 0.9.0 it is rolling
+  ([Upgrade a cluster to 0.9.0](../deploy/upgrading-to-0.9.md)). Every
+  upgrade before that stops the cluster: stop
   every node, wait until `cluster status` exits with 1, install the new
   binary everywhere, start them all
   ([Upgrading WasmKeep](../cluster-upgrades.md#upgrading-wasmkeep)). `0.4.0` also
