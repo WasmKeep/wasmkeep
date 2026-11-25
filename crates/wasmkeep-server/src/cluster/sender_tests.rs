@@ -351,6 +351,7 @@ async fn a_live_node_without_multi_app_makes_several_apps_not_ready() {
         can_recorded_head: true,
         can_multi_app: multi,
         can_place: false,
+        can_apart: false,
         process: None,
     };
     b.note_multi_app(&[n("a", true), n("old", false)]);

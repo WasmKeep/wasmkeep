@@ -249,6 +249,14 @@ pub const FORMATS: &[Format] = &[
         Rule::Gate(&["assets", "rate_limits", "flush", "ends", "front"]),
         "manifests_with_unknown_or_inconsistent_lines_are_refused",
     ),
+    // The first format behind the floor: the per-class placement keys
+    // `apart` and `spread`, for classes with the app's own names.
+    row(
+        "wasmkeep-manifest 8",
+        m(0, 9),
+        Rule::Gate(&["apart", "assets", "rate_limits", "flush", "ends", "front"]),
+        "manifests_with_unknown_or_inconsistent_lines_are_refused",
+    ),
     row(
         "current",
         m(0, 4),
@@ -356,7 +364,7 @@ pub fn format(name: &str) -> Option<&'static Format> {
     FORMATS.iter().find(|f| f.name == name)
 }
 
-/// The deploy manifest's row for format `number` (1 to 7 today).
+/// The deploy manifest's row for format `number` (1 to 8 today).
 pub fn manifest_format(number: u8) -> Option<&'static Format> {
     format(&format!("wasmkeep-manifest {number}"))
 }

@@ -97,6 +97,16 @@ pub struct Changes {
     /// `(class, mode)`: sets how the class's plain writes reach the bucket
     /// (ADR 0034). Classes not named keep theirs.
     pub writes: Vec<(String, Writes)>,
+    /// `(class, entry)`: sets the class another class's actor of the same
+    /// name is kept apart from at wake-up (`apart-from`, ADR 0043, section
+    /// 2): another class, or [`wasmkeep_cluster::placement::APART_NONE`].
+    /// `None` removes the entry, so the built-in rule applies. Classes not
+    /// named keep theirs.
+    pub apart: Vec<(String, Option<String>)>,
+    /// `(class, entry)`: sets whether the class's actors wake spread over
+    /// the live nodes (`spread`). `None` removes the entry, so the
+    /// built-in rule applies. Classes not named keep theirs.
+    pub spread: Vec<(String, Option<bool>)>,
     /// None preserves policies; Some replaces the complete policy set.
     pub limits: Option<limits::Policies>,
     /// The front (ADR 0023): kept by default.
@@ -127,6 +137,14 @@ pub struct Part {
     /// How a class's plain writes reach the bucket (ADR 0034). Ignored for
     /// the front.
     pub writes: Writes,
+    /// The class whose actor of the same name a class's actor is kept
+    /// apart from (`apart-from`), or
+    /// [`wasmkeep_cluster::placement::APART_NONE`]; `None`: the built-in
+    /// rule. Ignored for the front.
+    pub apart: Option<String>,
+    /// Whether a class's actors wake spread over the live nodes
+    /// (`spread`); `None`: the built-in rule. Ignored for the front.
+    pub spread: Option<bool>,
 }
 
 impl std::fmt::Debug for Part {
@@ -140,6 +158,8 @@ impl std::fmt::Debug for Part {
             .field("requires", &self.requires)
             .field("expire", &self.expire)
             .field("writes", &self.writes)
+            .field("apart", &self.apart)
+            .field("spread", &self.spread)
             .finish()
     }
 }
@@ -164,6 +184,8 @@ impl Changes {
             changes.requires.push((name.clone(), part.requires));
             changes.expire.push((name.clone(), part.expire));
             changes.writes.push((name.clone(), part.writes));
+            changes.apart.push((name.clone(), part.apart));
+            changes.spread.push((name.clone(), part.spread));
             if let Some(table) = changes.classes.as_mut() {
                 table.push((name, part.wasm));
             }
@@ -249,6 +271,9 @@ pub struct Version {
     /// The classes whose writes are batched (ADR 0034; every other class
     /// is strict).
     pub batched: std::collections::BTreeSet<String>,
+    /// What the version asks of placement for its own class names (ADR
+    /// 0043, section 2); empty, the built-in rules alone.
+    pub placing: wasmkeep_cluster::placement::Asked,
     /// Node-local ingress policies (ADR 0036).
     pub limits: limits::Policies,
     /// The version's front (ADR 0023), if it has one. Its values are not
@@ -358,6 +383,12 @@ pub struct Manifest {
     /// is written as absence, said or not, so a version of strict classes
     /// keeps its format, bytes and id.
     pub batched: std::collections::BTreeSet<String>,
+    /// What the version asks of placement for its own class names (ADR
+    /// 0043, section 2): `apart <class> <other>` (`-` for none) and
+    /// `spread <class> on|off`, written in format 8 only. A class without
+    /// a line takes the built-in rule, so a version that says nothing
+    /// keeps its format, bytes and id, and a node of 0.8 still reads it.
+    pub placing: wasmkeep_cluster::placement::Asked,
     /// Node-local ingress policies (ADR 0036).
     pub limits: limits::Policies,
 }
@@ -401,6 +432,13 @@ impl Manifest {
         for (name, policy) in &self.limits {
             out.push_str(&policy.line(name));
         }
+        for (class, other) in &self.placing.apart {
+            out.push_str(&format!("apart {class} {other}\n"));
+        }
+        for (class, on) in &self.placing.spread {
+            let on = if *on { "on" } else { "off" };
+            out.push_str(&format!("spread {class} {on}\n"));
+        }
         out
     }
 
@@ -415,6 +453,8 @@ impl Manifest {
         hex(&Sha256::digest(text.as_bytes()))[..16].to_owned()
     }
 
+    /// 8 with a per-class placement key (ADR 0043, section 2), the first
+    /// number behind the upgrade floor; 7 with static assets;
     /// 6 with ingress policies (ADR 0036); 5 with a batched class (ADR
     /// 0034); 4 with an idle limit (ADR
     /// 0028); 3 with a front, or an explicit `open` rule (ADR 0023); else 1
@@ -422,7 +462,9 @@ impl Manifest {
     /// ADR 0013, kept as the minimal one), else 2.
     #[must_use]
     pub fn format_number(&self) -> u8 {
-        if self.assets.is_some() {
+        if !self.placing.is_empty() {
+            8
+        } else if self.assets.is_some() {
             7
         } else if !self.limits.is_empty() {
             6
@@ -459,6 +501,7 @@ impl Manifest {
             "wasmkeep-manifest 5" => 5,
             "wasmkeep-manifest 6" => 6,
             "wasmkeep-manifest 7" => 7,
+            "wasmkeep-manifest 8" => 8,
             _ => return None,
         };
         let mut manifest = Self {
@@ -471,6 +514,7 @@ impl Manifest {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            placing: Default::default(),
             limits: Default::default(),
         };
         for line in lines {
@@ -507,7 +551,7 @@ impl Manifest {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
                 (Some("assets"), Some(d), None, None)
-                    if format == 7
+                    if format >= 7
                         && manifest.assets.is_none()
                         && crate::assets::valid_digest(d) =>
                 {
@@ -548,6 +592,19 @@ impl Manifest {
                 {
                     manifest.batched.insert(n.to_owned());
                 }
+                // A class kept apart from another's actor of the same name
+                // (ADR 0043, section 2), once per class: a class, or `-`.
+                (Some("apart"), Some(n), Some(o), None)
+                    if format >= 8 && !manifest.placing.apart.contains_key(n) =>
+                {
+                    manifest.placing.apart.insert(n.to_owned(), o.to_owned());
+                }
+                // A class said to spread or not, once per class.
+                (Some("spread"), Some(n), Some(on @ ("on" | "off")), None)
+                    if format >= 8 && !manifest.placing.spread.contains_key(n) =>
+                {
+                    manifest.placing.spread.insert(n.to_owned(), on == "on");
+                }
                 (Some("requires"), Some(n), Some(name), None)
                     if format >= 2 && crate::env::valid_name(name) =>
                 {
@@ -563,6 +620,15 @@ impl Manifest {
         if format == 7 && manifest.assets.is_none() {
             return None;
         }
+        // Format 8 says it for a placement line, and its lines name the
+        // version's own classes, each in one pair at most.
+        if format == 8 && manifest.placing.is_empty() {
+            return None;
+        }
+        manifest
+            .placing
+            .check(|c| manifest.classes.contains_key(c))
+            .ok()?;
         let known = |c: &String| manifest.classes.contains_key(c);
         // The front's scope holds values and required names, never a rule,
         // and only beside a `front` line.

@@ -263,6 +263,7 @@ async fn start_runtime(
     config.config = deployed.config;
     config.requires = deployed.requires;
     config.batched = deployed.batched;
+    config.placing = deployed.placing;
     config.limits = deployed.limits;
     config.assets = deployed.assets;
     config.assets_cache = shared.assets_cache.clone();

@@ -265,8 +265,9 @@ pub const DEFAULT_APART: (&str, &str) = ("pusher", "room");
 /// The class whose actor of the same name `class`'s actor is kept apart
 /// from (ADR 0041, amendment of 2026-11-22), if any: the other class of
 /// [`DEFAULT_APART`], when `classes` (the version's) has both. Symmetric:
-/// `room/x` and `pusher/x` are kept apart from each other. Only the
-/// built-in pair: a setting naming other classes is future work.
+/// `room/x` and `pusher/x` are kept apart from each other. The built-in
+/// pair alone: [`Asked::companion`] is the rule with a version's own
+/// entries.
 pub fn companion(classes: &[&str], class: &str) -> Option<&'static str> {
     let (a, b) = DEFAULT_APART;
     if !(classes.contains(&a) && classes.contains(&b)) {
@@ -310,8 +311,8 @@ pub const DEFAULT_SPREAD: &str = "edge";
 
 /// Whether `class`'s actors wake spread over the live nodes (ADR 0040,
 /// amendment of 2026-11-22): [`DEFAULT_SPREAD`], when `classes` (the
-/// version's) also has the room and its pusher. Only the built-in class:
-/// a setting naming others is future work.
+/// version's) also has the room and its pusher. The built-in class alone:
+/// [`Asked::spreads`] is the rule with a version's own entries.
 pub fn spreads(classes: &[&str], class: &str) -> bool {
     let (a, b) = DEFAULT_APART;
     class == DEFAULT_SPREAD
@@ -332,6 +333,145 @@ pub fn spread<'a>(here: &str, eligible: &[&'a str], key: &str) -> Option<&'a str
         return None;
     }
     eligible.iter().copied().find(|p| *p == chosen)
+}
+
+/// An `apart` entry naming no class: the class is kept apart from nothing,
+/// which also turns the built-in pair off for it. Never a class name (a
+/// class starts with a letter).
+pub const APART_NONE: &str = "-";
+
+/// What a version asks of placement for its own class names (ADR 0043,
+/// section 2; manifest format 8): the per-class keys `apart-from` and
+/// `spread` of `wasmkeep.toml`. Empty, the built-in rules alone apply
+/// ([`companion`], [`spreads`]), and the version keeps its older format.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Asked {
+    /// A class, and the class whose actor of the same name its actor is
+    /// kept apart from, or [`APART_NONE`]. The relation is symmetric, so
+    /// one entry is enough for a pair.
+    pub apart: BTreeMap<String, String>,
+    /// A class, and whether its actors wake spread over the live nodes.
+    pub spread: BTreeMap<String, bool>,
+}
+
+impl Asked {
+    /// Nothing asked: the built-in rules alone.
+    pub fn is_empty(&self) -> bool {
+        self.apart.is_empty() && self.spread.is_empty()
+    }
+
+    /// Whether the entries make sense for a version whose classes `has`
+    /// answers for. Every entry is for a class of the version. An `apart`
+    /// entry names another class of it, or [`APART_NONE`]. A class is in
+    /// one pair at most: a wake-up looks for one companion.
+    ///
+    /// # Errors
+    /// The class of the first entry that does not, and why.
+    pub fn check(&self, has: impl Fn(&str) -> bool) -> Result<(), (String, String)> {
+        let mut partner: BTreeMap<&str, &str> = BTreeMap::new();
+        for (class, other) in &self.apart {
+            let refuse = |why: String| Err((class.clone(), why));
+            if !has(class) {
+                return refuse(
+                    "a class to keep apart from, for a class this version does not have".into(),
+                );
+            }
+            if other == APART_NONE {
+                continue;
+            }
+            if other == class || !has(other) {
+                return refuse(format!(
+                    "apart from {other:?}: not another class of this version"
+                ));
+            }
+            for (a, b) in [
+                (class.as_str(), other.as_str()),
+                (other.as_str(), class.as_str()),
+            ] {
+                if let Some(was) = partner.insert(a, b)
+                    && was != b
+                {
+                    return refuse(format!(
+                        "apart from {other:?}: {a} is already kept apart from {was}, and a class \
+                         is kept apart from one class at most"
+                    ));
+                }
+            }
+        }
+        for (class, other) in &self.apart {
+            if other == APART_NONE
+                && let Some(by) = partner.get(class.as_str())
+            {
+                return Err((
+                    class.clone(),
+                    format!("apart from no class, while {by} is kept apart from it"),
+                ));
+            }
+        }
+        match self.spread.keys().find(|class| !has(class)) {
+            Some(class) => Err((
+                class.clone(),
+                "spread, for a class this version does not have".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The entries whose classes `has` still answers for: what a deploy
+    /// that changes the class table keeps of the version before.
+    #[must_use]
+    pub fn kept(&self, has: impl Fn(&str) -> bool) -> Self {
+        Self {
+            apart: self
+                .apart
+                .iter()
+                .filter(|(c, o)| has(c) && (o.as_str() == APART_NONE || has(o)))
+                .map(|(c, o)| (c.clone(), o.clone()))
+                .collect(),
+            spread: self
+                .spread
+                .iter()
+                .filter(|(c, _)| has(c))
+                .map(|(c, on)| (c.clone(), *on))
+                .collect(),
+        }
+    }
+
+    /// The class whose actor of the same name `class`'s actor is kept
+    /// apart from, in a version with the classes `classes`: the other
+    /// class of the pair an entry names, in either direction. Without
+    /// one, the built-in pair ([`companion`]), unless an entry is for
+    /// either of its classes or names one: an entry replaces the built-in
+    /// pair for both. An entry naming a class the version lacks names
+    /// nothing.
+    pub fn companion(&self, classes: &[&str], class: &str) -> Option<String> {
+        let has = |c: &str| classes.contains(&c);
+        let named = self
+            .apart
+            .iter()
+            .filter(|(c, o)| c != o && o.as_str() != APART_NONE && has(c) && has(o))
+            .find_map(|(c, o)| match () {
+                () if c == class => Some(o.clone()),
+                () if o == class => Some(c.clone()),
+                () => None,
+            });
+        if named.is_some() {
+            return named;
+        }
+        let other = companion(classes, class)?;
+        let said = |c: &str| self.apart.iter().any(|(k, o)| k == c || o == c);
+        (!said(class) && !said(other)).then(|| other.to_owned())
+    }
+
+    /// Whether `class`'s actors wake spread over the live nodes, in a
+    /// version with the classes `classes`: what its entry says, or the
+    /// built-in rule ([`spreads`]) without one.
+    pub fn spreads(&self, classes: &[&str], class: &str) -> bool {
+        match self.spread.get(class) {
+            Some(on) => *on && classes.contains(&class),
+            None => spreads(classes, class),
+        }
+    }
 }
 
 /// The highest rendezvous weight, ties by node id: server
@@ -762,6 +902,138 @@ mod tests {
         // Every peer holds a companion: still taken, by the plain choice.
         assert_eq!(peer_apart(&["a"], key, &["a"]), Some("a"));
         assert_eq!(peer_apart(&[], key, &["a"]), None);
+    }
+
+    fn asked(apart: &[(&str, &str)], spread: &[(&str, bool)]) -> Asked {
+        Asked {
+            apart: apart
+                .iter()
+                .map(|(c, o)| ((*c).to_owned(), (*o).to_owned()))
+                .collect(),
+            spread: spread
+                .iter()
+                .map(|(c, on)| ((*c).to_owned(), *on))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn nothing_asked_is_the_built_in_rules() {
+        let none = Asked::default();
+        assert!(none.is_empty());
+        for classes in [
+            &["directory", "edge", "pusher", "relay", "room"][..],
+            &["room", "edge"],
+            &["feed", "fan"],
+        ] {
+            for class in classes {
+                assert_eq!(
+                    none.companion(classes, class).as_deref(),
+                    companion(classes, class)
+                );
+                assert_eq!(none.spreads(classes, class), spreads(classes, class));
+            }
+        }
+    }
+
+    #[test]
+    fn an_apart_entry_names_a_pair_of_the_apps_own_classes() {
+        let classes = ["fan", "feed", "leaf", "pusher", "room"];
+        // One entry, both ways; the built-in pair still holds beside it.
+        let named = asked(&[("fan", "feed")], &[]);
+        assert_eq!(named.companion(&classes, "fan").as_deref(), Some("feed"));
+        assert_eq!(named.companion(&classes, "feed").as_deref(), Some("fan"));
+        assert_eq!(named.companion(&classes, "leaf"), None);
+        assert_eq!(named.companion(&classes, "pusher").as_deref(), Some("room"));
+        assert_eq!(named.companion(&classes, "room").as_deref(), Some("pusher"));
+        // `-` on either class of the built-in pair turns it off for both.
+        for off in ["pusher", "room"] {
+            let off = asked(&[(off, APART_NONE)], &[]);
+            assert_eq!(off.companion(&classes, "pusher"), None);
+            assert_eq!(off.companion(&classes, "room"), None);
+        }
+        // An entry for one of them, or naming one, replaces it for both.
+        for other in [
+            asked(&[("pusher", "feed")], &[]),
+            asked(&[("feed", "pusher")], &[]),
+        ] {
+            assert_eq!(other.companion(&classes, "pusher").as_deref(), Some("feed"));
+            assert_eq!(other.companion(&classes, "feed").as_deref(), Some("pusher"));
+            assert_eq!(other.companion(&classes, "room"), None);
+        }
+        // A class the version lacks names nothing.
+        let gone = asked(&[("fan", "gone")], &[]);
+        assert_eq!(gone.companion(&classes, "fan"), None);
+        assert_eq!(gone.companion(&["fan", "feed"], "feed"), None);
+    }
+
+    #[test]
+    fn a_spread_entry_is_for_any_class_and_turns_the_built_in_one_off() {
+        let classes = ["edge", "leaf", "pusher", "room"];
+        let said = asked(&[], &[("leaf", true), ("edge", false)]);
+        assert!(said.spreads(&classes, "leaf"));
+        assert!(!said.spreads(&classes, "edge"));
+        assert!(!said.spreads(&classes, "room"));
+        // Without the room and its pusher too, and only for a class of
+        // the version.
+        assert!(said.spreads(&["leaf"], "leaf"));
+        assert!(!said.spreads(&["edge"], "leaf"));
+    }
+
+    #[test]
+    fn entries_are_checked_against_the_versions_classes() {
+        let classes = ["fan", "feed", "leaf", "room"];
+        let has = |c: &str| classes.contains(&c);
+        for ok in [
+            asked(&[("fan", "feed")], &[("leaf", true)]),
+            // The same pair said from both sides.
+            asked(&[("fan", "feed"), ("feed", "fan")], &[]),
+            asked(&[("fan", APART_NONE), ("room", "leaf")], &[("fan", false)]),
+        ] {
+            assert_eq!(ok.check(has), Ok(()), "{ok:?}");
+        }
+        for (bad, class, why) in [
+            (asked(&[("fan", "fan")], &[]), "fan", "not another class"),
+            (asked(&[("fan", "gone")], &[]), "fan", "not another class"),
+            (asked(&[("gone", "fan")], &[]), "gone", "does not have"),
+            (asked(&[], &[("gone", true)]), "gone", "does not have"),
+            // One companion per class.
+            (
+                asked(&[("fan", "room"), ("feed", "room")], &[]),
+                "feed",
+                "one class at most",
+            ),
+            (
+                asked(&[("fan", "feed"), ("feed", "leaf")], &[]),
+                "feed",
+                "one class at most",
+            ),
+            (
+                asked(&[("fan", "feed"), ("feed", APART_NONE)], &[]),
+                "feed",
+                "apart from no class",
+            ),
+        ] {
+            let (at, said) = bad.check(has).unwrap_err();
+            assert_eq!(at, class, "{bad:?}");
+            assert!(said.contains(why), "{bad:?}: {said}");
+        }
+        // What a deploy keeps when a class goes.
+        let all = asked(
+            &[("fan", "feed"), ("leaf", APART_NONE), ("room", "leaf")],
+            &[("leaf", true), ("fan", false)],
+        );
+        assert_eq!(
+            all.kept(|c| c != "feed"),
+            asked(
+                &[("leaf", APART_NONE), ("room", "leaf")],
+                &[("leaf", true), ("fan", false)]
+            )
+        );
+        assert_eq!(
+            all.kept(|c| c != "leaf"),
+            asked(&[("fan", "feed")], &[("fan", false)])
+        );
     }
 
     #[test]

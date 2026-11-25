@@ -225,6 +225,43 @@ fn a_gate_needs_the_floor_and_every_live_word() {
         "take front ends flush rate_limits assets",
     );
     assert_eq!(gate(seven, Ok(None), [&able]), Ok(()));
+    // Manifest 8 is the first format behind the floor (the per-class
+    // placement keys): refused under a floor below 0.9, beside a live
+    // node of 0.8.1, and beside a node of 0.9 that does not announce
+    // `apart`; written once all three hold.
+    let eight = manifest_format(8).unwrap();
+    assert_eq!(eight.since, v(0, 9));
+    let every = "take front ends flush rate_limits assets";
+    let new = node("new", "0.9.0", "live", &format!("{every} apart"));
+    let wordless = node("wordless", "0.9.0", "live", every);
+    for floor in [None, Some(v(0, 8))] {
+        assert_eq!(
+            gate(eight, Ok(floor), [&new]),
+            Err(Blocked::Floor {
+                format: "wasmkeep-manifest 8",
+                needs: v(0, 9),
+                floor: v(0, 8),
+            })
+        );
+    }
+    assert_eq!(
+        gate(eight, Ok(Some(v(0, 9))), [&new, &able]),
+        Err(Blocked::OlderNodes {
+            format: "wasmkeep-manifest 8",
+            needs: v(0, 9),
+            nodes: vec!["n (0.8.1)".to_owned()],
+        })
+    );
+    assert_eq!(
+        gate(eight, Ok(Some(v(0, 9))), [&new, &wordless]),
+        Err(Blocked::Nodes {
+            format: "wasmkeep-manifest 8",
+            word: "apart",
+            nodes: vec!["wordless".to_owned()],
+        })
+    );
+    assert_eq!(gate(eight, Ok(Some(v(0, 9))), [&new]), Ok(()));
+    assert_eq!(gate(eight, Ok(Some(v(0, 10))), [&new]), Ok(()));
     // The words of a manifest number are named highest first.
     let bare = node("bare", "0.8.1", "live", "take");
     let Err(Blocked::Nodes { word, .. }) = gate(manifest_format(5).unwrap(), Ok(None), [&bare])
@@ -1052,8 +1089,8 @@ fn every_format_constant_has_a_row_in_the_gate_table() {
         "format constants with no row in wasmkeep_cluster::upgrade::FORMATS (ADR 0043, \
          section 2): {missing:#?}"
     );
-    // The manifest's writer formats its number: 1 to 7 are its decoder's.
-    for number in 1..=7 {
+    // The manifest's writer formats its number: 1 to 8 are its decoder's.
+    for number in 1..=8 {
         assert!(seen.contains(&format!("wasmkeep-manifest {number}")));
     }
     for row in FORMATS {

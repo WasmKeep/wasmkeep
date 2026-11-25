@@ -185,7 +185,7 @@ impl AppRef {
             Arc::clone(&self.store),
             self.prefix.clone(),
         );
-        let this = upgrade::this_minor().map_err(DeployError::Refused)?;
+        let this = self.this_minor().map_err(DeployError::Refused)?;
         let horizon = crate::heartbeat_horizon_ms(
             crate::DEFAULT_HEARTBEAT,
             &crate::LeaseConfig::default_safe(),
@@ -250,7 +250,9 @@ impl AppRef {
     /// Refuses `manifest` while it may not be written (ADR 0043, section
     /// 2): its format's row of the gate table, through [`Readers::gate`].
     /// Format 5 needs `flush` (ADR 0034), and every format inherits the
-    /// words of those below it (4 needs `ends`, 3 needs `front`). Then
+    /// words of those below it (4 needs `ends`, 3 needs `front`). Format 8
+    /// is the first that also needs the floor: at 0.9 or above, with every
+    /// live node at 0.9 or later and announcing `apart`. Then
     /// the writer itself: refused under a floor above this build's
     /// version, or beside a live node outside its range.
     pub(super) async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
@@ -264,6 +266,7 @@ impl AppRef {
             Err(Blocked::Nodes { word, nodes, .. }) => {
                 let nodes = nodes.join(", ");
                 return Err(match word {
+                    "apart" => DeployError::NodesWithoutApart { app, nodes },
                     "assets" => DeployError::NodesWithoutAssets { app, nodes },
                     "flush" => DeployError::NodesWithoutFlush {
                         app,
@@ -280,7 +283,7 @@ impl AppRef {
             }
             Err(blocked) => return Err(DeployError::Refused(format!("{app}: {blocked}"))),
         }
-        upgrade::this_minor()
+        self.this_minor()
             .and_then(|this| readers.writer(this))
             .map_err(|why| DeployError::Refused(format!("{app}: {why}")))
     }

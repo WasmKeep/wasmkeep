@@ -219,6 +219,7 @@ impl AppRef {
             requires,
             expire,
             batched,
+            placing,
             limits,
             front,
         } = self
@@ -246,6 +247,7 @@ impl AppRef {
                 &config,
                 &requires,
                 &batched,
+                &placing,
                 front.as_ref(),
                 &limits,
             )

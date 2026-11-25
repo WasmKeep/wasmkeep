@@ -139,6 +139,20 @@ pub enum DeployError {
         /// What needs it: the classes importing it, or the format.
         what: String,
     },
+    /// Live nodes of the app do not announce the capability word `apart`
+    /// (ADR 0043, section 2): they cannot read a version with a per-class
+    /// placement key (manifest format 8). There is no `--force`.
+    #[error(
+        "live nodes of {app} cannot read a version with a per-class placement key, apart-from \
+         or spread (manifest format 8) ({nodes}): upgrade every node of the app first, then \
+         deploy"
+    )]
+    NodesWithoutApart {
+        /// `tenant/app`.
+        app: String,
+        /// Their ids, comma separated.
+        nodes: String,
+    },
     /// Live nodes of the app do not announce the capability word `blobs`
     /// (ADR 0030, section 11) while a class or the front imports
     /// `wasmkeep:actor/blobs`: they cannot link it, nor end an actor's
@@ -252,6 +266,9 @@ pub struct AppRef {
     prefix: String,
     tenant: String,
     app: String,
+    /// The minor version this writer acts as, when it is not this build's
+    /// ([`AppRef::as_version`]).
+    writer: Option<wasmkeep_cluster::app_format::floor::Minor>,
 }
 
 /// The app's tombstone, under `apps/<t>/<a>/` (ADR 0028, section 5).
@@ -281,7 +298,26 @@ impl AppRef {
             prefix,
             tenant: tenant.to_owned(),
             app: app.to_owned(),
+            writer: None,
         }
+    }
+
+    /// The same app, written to as a `wasmkeep` of minor version `minor`
+    /// (ADR 0043): its deploys are checked against the app's upgrade floor
+    /// and the live nodes' versions as that version's. Tests set it to
+    /// stand for a `wasmkeep` of another version, as a node's
+    /// `ClusterConfig::version` does; a command leaves this build's.
+    #[must_use]
+    pub fn as_version(mut self, minor: wasmkeep_cluster::app_format::floor::Minor) -> Self {
+        self.writer = Some(minor);
+        self
+    }
+
+    /// The minor version this writer acts as: this build's, unless
+    /// [`Self::as_version`] set another.
+    pub(crate) fn this_minor(&self) -> Result<wasmkeep_cluster::app_format::floor::Minor, String> {
+        self.writer
+            .map_or_else(wasmkeep_cluster::upgrade::this_minor, Ok)
     }
 
     fn path(&self, key: &str) -> StorePath {
@@ -707,6 +743,7 @@ impl AppRef {
             requires,
             expire: manifest.expire.clone(),
             batched: manifest.batched.clone(),
+            placing: manifest.placing.clone(),
             limits: manifest.limits.clone(),
             front,
         })

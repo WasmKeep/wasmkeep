@@ -205,6 +205,7 @@ mod tests {
                 requires: BTreeMap::new(),
                 expire: BTreeMap::new(),
                 batched: std::collections::BTreeSet::new(),
+                placing: Default::default(),
                 limits: Default::default(),
             };
             put(format!("apps/acme/shop/v{i}/manifest"), manifest.format()).await;
@@ -362,6 +363,7 @@ mod tests {
             requires: BTreeMap::new(),
             expire: BTreeMap::new(),
             batched: std::collections::BTreeSet::new(),
+            placing: Default::default(),
             limits: Default::default(),
         };
         put(&store, "apps/acme/shop/v1/manifest", &manifest.format()).await;

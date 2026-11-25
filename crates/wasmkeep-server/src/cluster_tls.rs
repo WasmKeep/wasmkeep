@@ -802,6 +802,7 @@ mod tests {
             can_recorded_head: false,
             can_multi_app: false,
             can_place: false,
+            can_apart: false,
             process: None,
         }
     }
