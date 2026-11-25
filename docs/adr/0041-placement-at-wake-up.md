@@ -10,6 +10,9 @@
   ([amendment](#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)).
   The same path spreads a big room's edges over the live nodes
   ([ADR 0040, section 14](0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
+- Amended 2026-11-25 (0.9.0, item 4): the per-class keys `apart-from`
+  and `spread` ask for both rules for classes with the app's own names
+  ([amendment](#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names)).
 - Date: 2026-11-17
 - Milestone: [Next](../../ROADMAP.md#next), `0.6.0`, item 6
 - Follows: [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) (a
@@ -698,10 +701,11 @@ apart, for every name `x`; this matches the SDKs' addressing
 (`room/lobby` has the pusher `pusher/lobby`). Each node works it out
 from the version's classes. Nothing is written at deploy: the manifest,
 its format and the version id are unchanged, and an upgraded node
-applies the rule without a redeploy. There is no setting in this
-version. A key naming other classes (renamed SDK classes, other pairs)
-is future work: it needs a manifest line that older nodes cannot read,
-and so a format and a deploy gate of its own.
+applies the rule without a redeploy. There was no setting in `0.8`. A
+key naming other classes (renamed SDK classes, other pairs) needs a
+manifest line that older nodes cannot read, and so a format and a deploy
+gate of its own: it came in `0.9.0`
+([amendment of 2026-11-25](#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names)).
 
 **The rule.** An actor of the pair is kept apart on a wake-up when all
 of these hold:
@@ -824,3 +828,83 @@ it ignores.
   has a mutation that fails it: a receiver that judges a handed alarm
   again, and routing blind to the rule. It does not model simultaneous
   wake-ups or leases.
+
+## Amendment (2026-11-25): `apart-from` and `spread` for an app's own class names
+
+The two rules above apply by class name: `room` and `pusher` are kept
+apart, and `edge` is spread beside them. An app that names its classes
+otherwise got neither. Two per-class keys in `wasmkeep.toml` ask for
+them. Nothing else changes: the wake-up path, what it sends and when,
+the fallbacks and the metrics are those of the amendment of 2026-11-22
+and of ADR 0040, section 14.
+
+**The keys.**
+
+- `apart-from = "<class>"`: the actor of this class and the actor of
+  the same name in the named class are kept apart, both ways. One entry
+  is enough for a pair; saying it on both classes is the same pair.
+  `apart-from = false`: this class is kept apart from no class.
+- `spread = true`: this class's actors wake spread over the live nodes.
+  `spread = false`: they do not.
+
+The spread key is named `spread`: the word the rule already has in ADR
+0040, in the glossary and in `wasmkeep_placement_spread_total`. It is a
+yes or no because the rule takes no parameter. `apart-from` names a
+class because that rule needs the other one.
+
+**With the built-in rules.** A class the file says nothing about keeps
+the built-in rule, so a version without the keys behaves as before.
+
+- An `apart-from` entry replaces the built-in pair for both of its
+  classes when it is on `room` or `pusher`, or names one of them.
+  `false` on either turns the pair off.
+- A `spread` entry decides for its class, with or without `room` and
+  `pusher` in the version.
+
+**One pair for a class.** A wake-up looks for one companion, held here
+or not. So a class is in one pair at most: the project file, the deploy
+and the manifest's decoder all refuse a second pair for a class, and
+`false` on a class that another class names. Several companions for one
+class would need the wake-up and the drain to look for each; that is not
+built.
+
+**In the version.** `apart <class> <other>` (`-` for none) and
+`spread <class> on|off`, one line per class that says the key, in
+manifest format 8. A version without such a line keeps the format it had
+(1 to 7), its bytes and its id, so nodes of `0.8.1` keep reading it. A
+deploy from the project file writes what the file says and removes what
+it does not; a deploy with flags keeps the version's entries for the
+classes that stay.
+
+**The gate.** Format 8 is the first format behind the upgrade floor
+([ADR 0043, section 2](0043-rolling-upgrades.md#2-the-gate-table)): a
+deploy that needs it is refused while the app's floor is below `0.9`,
+while a live node of the app runs an older version, and while a live
+node does not announce the capability word `apart`. Every node of `0.9`
+announces it, with placement on or off: the word says the node reads the
+format. A node with `--no-placement` reads the lines and applies
+neither rule, as it applies no built-in one.
+
+**Not included.** A pair of more than two classes; a companion with
+another name than the actor's; a parameter for `spread` (a subset of
+nodes, a count). An outside request still wakes a spread actor where it
+lands, as it does an `edge`: the rule is for wake-ups by a call or an
+alarm.
+
+**Tests.**
+
+- The pure rule with entries: `placement::Asked::companion`, `spreads`,
+  `check` and `kept`; nothing asked gives the built-in rules.
+- The project file: both keys, each refusal.
+- The manifest: format 8 round trip, each refused line, and the older
+  format, bytes and id without the keys.
+- The gate: `a_gate_needs_the_floor_and_every_live_word` (the row of
+  format 8) and `format_8_needs_the_floor_and_apart_on_every_live_node`.
+- `tests/cluster/apart_from.rs`, plain and over TLS, with three nodes of
+  `0.9` that follow the app and classes named `feed`, `fan` and `leaf`:
+  without the keys they wake where they land; the deploy with the keys
+  is refused under a floor of `0.8`, beside a live node of `0.8.1` and
+  beside a node of `0.9` without `apart`, each time leaving `current` as
+  it was; accepted once every node announces the word; then `fan` and
+  `feed` of one name end on different nodes, in both orders, and each
+  `leaf` called from a `feed` wakes on its own choice.

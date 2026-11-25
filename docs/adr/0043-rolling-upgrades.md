@@ -1,12 +1,14 @@
 # 0043. Rolling upgrades of WasmKeep
 
-- Status: accepted (2026-11-25), item 3 built: the skew check at start
+- Status: accepted (2026-11-25), items 3 and 4 built: the skew check at start
   (section 5), the gate table as a test and the one gate helper (section
   2), the floor's writer and the born-finalized rule (section 3), and
   `cluster upgrade status|finalize` (section 4). What that change decided,
   and what it left to build, is under
-  ["Built: the upgrade mechanics"](#built-the-upgrade-mechanics). Sections
-  6 to 8 are still to build.
+  ["Built: the upgrade mechanics"](#built-the-upgrade-mechanics). The
+  first gated format, deploy manifest 8 with the word `apart`, is under
+  ["Built: the first gated format"](#built-the-first-gated-format).
+  Sections 6 to 8 are still to build.
 - Milestone: `0.9.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: ADR 0008 (deploys roll; this record is about the binary), ADR
   0011 (the cluster port), ADR 0020 (node leases, the heartbeat, and the
@@ -37,7 +39,8 @@ The pieces of a rolling upgrade exist, built one feature at a time:
 - **Capability words.** A node's heartbeat (`nodes/<id>`, header
   `wasmkeep-node 3`) carries a line of words (`take`, `front`, `handoff`,
   `ends`, `flush`, `rate_limits`, `restore`, `actor-restore`,
-  `recorded-head`, `multi-app`, `assets`, `blobs`, `place`). A reader
+  `recorded-head`, `multi-app`, `assets`, `blobs`, `place`, and
+  `apart` from `0.9`). A reader
   ignores words it does not know (`NodeInfo::words`, `membership.rs`).
 - **Writers that read them.** A deploy refuses a manifest a live node of
   the app could not read (`check_readers` and `check_imports`,
@@ -239,7 +242,7 @@ Formats that exist in `0.8.1` keep their live-word gate alone: `0.8.1`
 announces every word, so the floor adds nothing for them.
 
 **The first gated format is deploy manifest 8.** It carries per-class
-keys, `apart-from` and one for spreading, that ask for the built-in
+keys, `apart-from` and `spread`, that ask for the built-in
 placement rules for classes with the app's own names. Today the rules
 apply by class name only: `pusher` and `room` are kept apart
 ([ADR 0041, amendment](0041-placement-at-wake-up.md#amendment-2026-11-22-keeping-a-room-and-its-pusher-apart)),
@@ -253,7 +256,7 @@ format it really writes behind the gate, or the gate ships untested
 | Heartbeat and node lease, lines 1 to 3 | `wasmkeep-node 3`, `<state> <instance>`, `<written-at>` | Unknown header: the node is invisible to gates and never failed over. Extra word on line 2: its actors are taken over while it lives | **Frozen, byte grammar included.** It carries the gates, so it cannot be gated |
 | Heartbeat payload, lines 1 to 4 | id, address, version, app | A missing line: the node is invisible | **Frozen** |
 | Heartbeat payload, later lines | Cluster address, pins, drain, `secrets`, words, load | Unknown words and load keys ignored; lines after the load ignored | Extend by words, by load keys, and by appended lines. No gate; a test |
-| Deploy manifest | `wasmkeep-manifest 1` to `7`, exact match, every line known | Refused as corrupt (table above) | A new line is a new number. Gate each number, as `check_readers` does for 3 to 7 |
+| Deploy manifest | `wasmkeep-manifest 1` to `7`, exact match, every line known | Refused as corrupt (table above) | A new line is a new number. Gate each number, as `check_readers` does for 3 to 7. `wasmkeep-manifest 8` (`0.9`, the `apart` and `spread` lines): gated on the floor at `0.9` and on the word `apart`, and written only for a version that has such a line |
 | `current` | `<version> <seq> 3` | Refused as corrupt | Frozen until a gated change is needed |
 | Ownership record | `wasmkeep-owner 1`, `2` | Refused as corrupt; version 2 must re-encode byte for byte | Gate, with a per-app setting as ADR 0035 |
 | App format setting | `formats/<t>/<a>/recorded-head`, exact body | Any other body refuses the app | Gate. A new setting is a new key, never a new body |
@@ -886,10 +889,10 @@ Not built by that change:
   major version, and the floor from below has no "previous minor" across
   a major version. `1.0` decides its own rule (section 1, "Not
   included").
-- **No format is behind the floor yet.** Manifest 8 and the word `apart`
-  (section 2) are the next item. The floor half of `gate` is tested with
-  a made-up format; every format `0.8.1` writes passes it by
-  construction.
+- **No format was behind the floor.** Manifest 8 and the word `apart`
+  (section 2) came with the next item, below. Until then the floor half
+  of `gate` was tested with a made-up format; every format `0.8.1`
+  writes passes it by construction.
 - **A serving node's read of the floor** when it sees a newer live node,
   and its drain and stop below the floor (section 3, "Readers"), and the
   once-a-minute error for a live node outside its range (section 5).
@@ -900,6 +903,43 @@ Not built by that change:
   usable during an upgrade, and writes the format `0.8.1` reads.
 - Sections 6 (removals), 7 (nothing to build: `0.9` sends as `0.8.1`)
   and 8 (the mixed-version check as proof).
+
+## Built: the first gated format
+
+Built on 2026-11-25, as the fourth item of `0.9.0`: deploy manifest 8,
+behind the floor and the word `apart`. What the keys mean is in
+[ADR 0041, amendment of 2026-11-25](0041-placement-at-wake-up.md#amendment-2026-11-25-apart-from-and-spread-for-an-apps-own-class-names).
+
+1. **The spread key is named `spread`** (section 2 left it unnamed):
+   `spread = true|false` per class, beside `apart-from = "<class>"|false`.
+2. **The row.** `wasmkeep-manifest 8` in `upgrade::FORMATS`: since
+   `0.9`, gated on `apart` and on the words of the numbers below it. It
+   is the first row whose `since` is above what no floor means, so the
+   first for which `gate` checks the floor and the live nodes' versions.
+3. **One writer, one path.** The deploy and the rollback reach it
+   through `check_readers` and `Readers::gate`, as for 1 to 7; nothing
+   checks the word on its own. A refusal names what blocks: the floor
+   and `finalize`, the older nodes with their versions, or the nodes
+   without `apart`.
+4. **Only when asked.** A manifest is format 8 only when it has an
+   `apart` or a `spread` line. Every other version keeps the number it
+   had, so `0.8.1` nodes read it during the upgrade and after a way
+   back. A version with the keys, once current, is what ends the way
+   back for that app, as section 4 says of formats an app opts into.
+5. **The word `apart` is announced by every node of `0.9`**, placement
+   on or off: it says the node reads the format, not that it applies the
+   rules.
+6. **The writer's version is a value.** `AppRef::as_version` lets a test
+   deploy as a `wasmkeep` of `0.9` while the workspace version is still
+   `0.8.1`, as `ClusterConfig::version` does for a node. No command sets
+   it. With this build's own version (`0.8`), a deploy with the keys is
+   refused at the floor: the release's version bump turns it on.
+
+Tests: the gate's row and both halves (`upgrade::tests`,
+`apps::tests::format_8_needs_the_floor_and_apart_on_every_live_node`),
+and `tests/cluster/apart_from.rs`, the gated write section 8's proof
+needs (phase 3): refused under the floor, beside an older node and
+beside a node without the word, then accepted.
 
 ## Not settled
 
