@@ -953,6 +953,128 @@ mod bucket {
         assert_eq!(deploy_floor(v(0, 9), [&at("0.10.0")]), Some(v(0, 9)));
         assert_eq!(deploy_floor(v(0, 10), [&at("0.10.0"), &at("")]), None);
     }
+
+    /// Section 3, "A restore": the target ends on the higher of its floor
+    /// and the backup's, a floor is never set above a live node under the
+    /// prefix or above the restoring `wasmkeep` (refused instead), and a
+    /// backup without a floor writes one only for a manifest that needs
+    /// it, as a first deploy would.
+    #[test]
+    fn a_restore_keeps_the_higher_floor_and_never_sets_one_above_a_live_node() {
+        use RestoreFloor::{CreateIfNew, Keep, Raise};
+        let at = |version: &str| live("n", version);
+        let eight = manifest_format(8).unwrap();
+        let none: [&NodeInfo; 0] = [];
+        let plan = |this, existing, archived, needs, live: &[&NodeInfo]| {
+            restore_floor(this, Ok(existing), archived, needs, live.iter().copied())
+        };
+        // No floor anywhere, nothing that needs one: as before 0.9.
+        assert_eq!(plan(v(0, 9), None, None, None, &none), Ok(Keep));
+        assert_eq!(
+            plan(
+                v(0, 9),
+                None,
+                None,
+                Some(manifest_format(7).unwrap()),
+                &none
+            ),
+            Ok(Keep)
+        );
+        assert_eq!(plan(v(0, 9), None, None, None, &[&at("0.8.1")]), Ok(Keep));
+        // The backup's floor, whatever the restoring version above it.
+        for this in [v(0, 9), v(0, 10)] {
+            assert_eq!(
+                plan(this, None, Some(v(0, 9)), Some(eight), &none),
+                Ok(Raise(v(0, 9)))
+            );
+        }
+        assert_eq!(
+            plan(v(0, 9), Some(v(0, 8)), Some(v(0, 9)), None, &[&at("0.9.3")]),
+            Ok(Raise(v(0, 9)))
+        );
+        // The higher of the two: the target's is kept when it is.
+        for existing in [v(0, 9), v(0, 10)] {
+            assert_eq!(
+                plan(
+                    v(0, 10),
+                    Some(existing),
+                    Some(v(0, 9)),
+                    Some(eight),
+                    &[&at("0.8.1")]
+                ),
+                Ok(Keep),
+                "nothing to write, so no live node is asked"
+            );
+        }
+        // Never above a live node under the prefix, nor the `wasmkeep`.
+        let e = plan(v(0, 9), None, Some(v(0, 9)), None, &[&at("0.8.1")]).unwrap_err();
+        assert!(
+            e.contains("n (acme/shop, 0.8.1)") && e.contains("0.9"),
+            "{e}"
+        );
+        let e = plan(v(0, 9), None, Some(v(0, 9)), None, &[&at("junk")]).unwrap_err();
+        assert!(e.contains("does not parse"), "{e}");
+        let e = plan(v(0, 8), None, Some(v(0, 9)), None, &none).unwrap_err();
+        assert!(e.contains("older than the app in the backup"), "{e}");
+        // No floor in the backup, and a manifest that needs one.
+        assert_eq!(
+            plan(v(0, 9), None, None, Some(eight), &none),
+            Ok(CreateIfNew(v(0, 9)))
+        );
+        assert_eq!(
+            plan(v(0, 10), None, None, Some(eight), &[&at("0.9.0")]),
+            Ok(CreateIfNew(v(0, 9)))
+        );
+        assert_eq!(
+            plan(v(0, 9), Some(v(0, 9)), None, Some(eight), &none),
+            Ok(Keep)
+        );
+        let e = plan(v(0, 9), None, None, Some(eight), &[&at("0.8.1")]).unwrap_err();
+        assert!(e.contains("n (acme/shop, 0.8.1)"), "{e}");
+        let e = plan(v(0, 8), None, None, Some(eight), &none).unwrap_err();
+        assert!(e.contains("this `wasmkeep` is 0.8"), "{e}");
+        // A floor that exists and is too low is not the restore's to raise.
+        let e = plan(v(0, 9), Some(v(0, 8)), None, Some(eight), &none).unwrap_err();
+        assert!(e.contains("cluster upgrade finalize"), "{e}");
+        // Unreadable: nothing is planned.
+        let e = restore_floor(
+            v(0, 9),
+            Err(floor::Unknown { len: 3 }),
+            Some(v(0, 9)),
+            None,
+            none,
+        )
+        .unwrap_err();
+        assert!(e.contains("unreadable (3 bytes)"), "{e}");
+    }
+
+    /// The restore's write: conditional, only upward, and the nodes are
+    /// listed again after it, as after a first deploy's create.
+    #[tokio::test]
+    async fn a_restore_raises_the_floor_and_lists_again() {
+        let b = bucket();
+        let raise = async |to| restore_raise(&b, "acme", "shop", to, NOW, HORIZON).await;
+        put(&b, "gone", "0.8.1", "released").await;
+        assert_eq!(raise(v(0, 9)).await, Ok(None));
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
+        // Never lowered, and written once.
+        assert_eq!(raise(v(0, 8)).await, Ok(None));
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
+        // An older node of the app that started meanwhile: named, and the
+        // floor stays.
+        put(&b, "late", "0.9.2", "live").await;
+        let late = raise(v(0, 10)).await.unwrap().unwrap();
+        assert!(late.contains("late (0.9.2)"), "{late}");
+        assert_eq!(floor_of(&b).await, Some(v(0, 10)));
+        // Unreadable: refused.
+        b.put_body("formats/acme/shop/floor", b"9\n".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            raise(v(0, 11)).await,
+            Err(floor::RaiseError::Unreadable { len: 2, .. })
+        ));
+    }
 }
 
 /// Every `.rs` file under `crates/`, with its path.

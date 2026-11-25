@@ -1491,3 +1491,181 @@ async fn archive_command_late(
         .await
         .unwrap();
 }
+
+/// ADR 0043, section 3, "A restore": an app on manifest format 8 (a
+/// per-class `spread`), finalized at 0.9, restored into another bucket.
+/// Beside a live node of 0.8 there it is refused before it writes
+/// anything. Otherwise the restore creates the app's upgrade floor before
+/// its state and deploy, so a node of 0.8 started on the restored app
+/// stops at the floor, with no lease, and a node of 0.9 serves the state.
+/// The nodes and the `wasmkeep` stand for 0.9, whatever this build's
+/// version.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_of_a_gated_deploy_goes_through_the_gate_and_carries_the_floor() {
+    use super::app_delete::app_node_following_as;
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    use wasmkeep_server::apps::Changes;
+    const NINE: Minor = Minor { major: 0, minor: 9 };
+    const FLOOR: &str = "formats/default/shop/floor";
+    let keys_of = async |store: &Arc<dyn ObjectStore>| -> Vec<String> {
+        use futures_util::TryStreamExt as _;
+        let mut keys: Vec<String> = store
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        keys.sort();
+        keys
+    };
+    let floor_of = async |store: &Arc<dyn ObjectStore>| match store.get(&Key::from(FLOOR)).await {
+        Ok(got) => Some(got.bytes().await.unwrap().to_vec()),
+        Err(_) => None,
+    };
+
+    // The source: a new app, born finalized at 0.9 by its first deploy,
+    // which carries `spread`.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = AppRef::new(Arc::clone(&store), "", "default", "shop").as_version(NINE);
+    let done = app
+        .deploy_changes(
+            &deploy_runtime(),
+            Changes {
+                classes: Some(vec![("t".to_owned(), test_actor_wasm().to_vec())]),
+                spread: vec![("t".to_owned(), Some(true))],
+                ..Changes::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        app.manifest(&done.current.version)
+            .await
+            .unwrap()
+            .format_number(),
+        8
+    );
+    assert_eq!(floor_of(&store).await, Some(floor::encode(NINE)));
+    let source_dir = tempfile::tempdir().unwrap();
+    let (node, follow) = app_node_following_as("source", source_dir.path(), &store, Some("0.9.0"))
+        .await
+        .unwrap();
+    node.service.node_id_checked().await.unwrap();
+    assert_eq!(
+        send_runnable(node.addr, "POST", "/actor/t/saved/durable", "")
+            .await
+            .body
+            .trim(),
+        "1"
+    );
+    let archive: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let run = archive_command(
+        &[
+            "create",
+            "--bucket",
+            "s3://live",
+            "--to",
+            "s3://archive",
+            "--app",
+            "default/shop",
+        ],
+        &store,
+        &archive,
+    )
+    .await
+    .unwrap();
+    follow.abort();
+    drop(node);
+
+    let restore = async |target: &Arc<dyn ObjectStore>, version: Option<Minor>| {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: wasmkeep_cli::backup::Command,
+        }
+        let cli = Cli::parse_from([
+            "backup",
+            "restore",
+            "--from",
+            "s3://archive",
+            "--run",
+            &run,
+            "--app",
+            "default/shop",
+            "--bucket",
+            "s3://other",
+        ]);
+        let command = match version {
+            Some(minor) => cli.command.as_version(minor),
+            None => cli.command,
+        };
+        wasmkeep_cli::backup::execute_with_stores(
+            &command,
+            &archive,
+            "",
+            target,
+            "",
+            Duration::from_millis(10),
+        )
+        .await
+        .map(drop)
+    };
+
+    // Beside a live node of 0.8 under the target prefix, serving another
+    // app: refused, naming it, and nothing is written.
+    let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    super::upgrade::lease_of(&target, "old", "0.8.1", "live", "take front restore").await;
+    let e = format!("{:#}", restore(&target, Some(NINE)).await.unwrap_err());
+    assert!(
+        e.contains("old (default/default, 0.8.1)") && e.contains("upgrade floor 0.9"),
+        "{e}"
+    );
+    assert_eq!(keys_of(&target).await, ["nodes/old"]);
+    // A `wasmkeep` older than the app's floor: refused the same way.
+    if wasmkeep_cluster::upgrade::this_minor().unwrap() < NINE {
+        let e = format!("{:#}", restore(&target, None).await.unwrap_err());
+        assert!(e.contains("older than the app in the backup"), "{e}");
+        assert_eq!(keys_of(&target).await, ["nodes/old"]);
+    }
+
+    // That node on 0.9: the restore creates the floor, then the app.
+    super::upgrade::lease_of(&target, "old", "0.9.0", "live", "take front restore").await;
+    restore(&target, Some(NINE)).await.unwrap();
+    assert_eq!(floor_of(&target).await, Some(floor::encode(NINE)));
+    let restored = AppRef::new(Arc::clone(&target), "", "default", "shop");
+    assert_eq!(
+        restored.current().await.unwrap().unwrap().version,
+        done.current.version
+    );
+
+    // A node of 0.8 started on the restored app stops at the floor,
+    // before any lease write: it never reads the manifest it could not.
+    let old_dir = tempfile::tempdir().unwrap();
+    let (old, old_follow) = app_node_following_as("back", old_dir.path(), &target, Some("0.8.1"))
+        .await
+        .unwrap();
+    let why = old.service.node_id_checked().await.unwrap_err();
+    assert!(
+        why.contains("finalized at 0.9") && why.contains("older than the floor"),
+        "{why}"
+    );
+    assert!(
+        matches!(
+            target.head(&Key::from("nodes/back")).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
+        "no lease written"
+    );
+    old_follow.abort();
+    drop(old);
+
+    // A node of 0.9 serves the restored state.
+    let new_dir = tempfile::tempdir().unwrap();
+    let (new, new_follow) = app_node_following_as("new", new_dir.path(), &target, Some("0.9.0"))
+        .await
+        .unwrap();
+    new.service.node_id_checked().await.unwrap();
+    assert_eq!(read(new.addr, "saved").await, "1");
+    new_follow.abort();
+}

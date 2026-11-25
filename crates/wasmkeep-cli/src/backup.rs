@@ -25,6 +25,30 @@ const INDEX_MAX: u64 = 64 << 20;
 /// reads it. A newer `wasmkeep` reads older runs; an older one refuses a
 /// newer run (ADR 0043, section 2).
 const RUN_FORMAT: u64 = 1;
+/// The `format` of a run in which an app record carries its app's upgrade
+/// floor (`"floor"`, ADR 0043, section 3). Written only for such a run, so
+/// every other run stays readable by a `wasmkeep` of 0.8: that one ignores
+/// fields it does not know, and would restore the app without its floor.
+/// It refuses this number instead.
+const RUN_FORMAT_FLOOR: u64 = 2;
+/// The upgrade floor an app record carries, if any: `"floor":"0.9"`, the
+/// record's second line. Anything else is refused, as the record is.
+fn archived_floor(
+    app: &Value,
+) -> anyhow::Result<Option<wasmkeep_cluster::app_format::floor::Minor>> {
+    use wasmkeep_cluster::app_format::floor;
+    match app.get("floor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            floor::decode(Some(format!("{}\n{text}\n", floor::HEADER).as_bytes()))
+                .ok()
+                .flatten()
+                .map(Some)
+                .context("invalid upgrade floor in app record")
+        }
+        Some(_) => bail!("invalid upgrade floor in app record"),
+    }
+}
 fn charge(used: &mut u64, bytes: u64, limit: u64, label: &str) -> anyhow::Result<()> {
     *used = used.checked_add(bytes).context("backup budget overflow")?;
     ensure!(
@@ -128,6 +152,23 @@ pub struct Restore {
     /// Allow old nodes and a partial undo backup, with a warning; never live nodes.
     #[arg(long)]
     force: bool,
+    /// The minor version the restore writes as, when not this build's
+    /// ([`Command::as_version`]).
+    #[arg(skip)]
+    writer: Option<wasmkeep_cluster::app_format::floor::Minor>,
+}
+impl Command {
+    /// The same command, a restore written as a `wasmkeep` of minor version
+    /// `minor` (ADR 0043): checked against the target's upgrade floor and
+    /// its nodes' versions as that version's. For tests, as
+    /// `wasmkeep_server::apps::AppRef::as_version`; no command sets it.
+    #[must_use]
+    pub fn as_version(mut self, minor: wasmkeep_cluster::app_format::floor::Minor) -> Self {
+        if let Self::Restore(args) = &mut self {
+            args.writer = Some(minor);
+        }
+        self
+    }
 }
 struct LimitedWriter {
     bytes: Vec<u8>,
@@ -569,7 +610,8 @@ async fn load_with_budget(
         "started membership mismatch"
     );
     ensure!(
-        complete["format"] == RUN_FORMAT && complete["run"] == id,
+        (complete["format"] == RUN_FORMAT || complete["format"] == RUN_FORMAT_FLOOR)
+            && complete["run"] == id,
         "unknown or inconsistent backup format"
     );
     ensure!(
@@ -704,6 +746,15 @@ async fn load_with_budget(
         apps.push(app);
     }
     ensure!(!apps.is_empty(), "missing app records");
+    // A floor only in the format that says so, and that format only with one.
+    let mut floors = false;
+    for app in &apps {
+        floors |= archived_floor(app)?.is_some();
+    }
+    ensure!(
+        floors == (complete["format"] == RUN_FORMAT_FLOOR),
+        "unknown or inconsistent backup format"
+    );
     let mut membership = BTreeSet::new();
     for app in &apps {
         ensure!(
@@ -1908,6 +1959,7 @@ async fn create_undo(
     let mut chunks = Vec::new();
     let mut failures = Vec::new();
     let mut app_records = Vec::new();
+    let mut floors = false;
     let mut run_index_bytes = 0;
     charge(
         &mut run_index_bytes,
@@ -2013,6 +2065,26 @@ async fn create_undo(
         .await?;
         drop(previous_files);
         let mut app = app_metadata(source, sp, dest, dp, &t, &a).await?;
+        // The app's upgrade floor, read after its deploy: the floor is only
+        // ever raised, so it is never below what the manifests just read
+        // needed. An unreadable record is not archived as "none".
+        let floor_key = key(
+            sp,
+            &wasmkeep_cluster::app_format::floor::relative_key(&t, &a),
+        );
+        let floor = wasmkeep_cluster::app_format::floor::decode(
+            optional(source, &floor_key).await?.as_deref(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the upgrade floor of {t}/{a} ({floor_key}) is unreadable ({} bytes); backup refused",
+                e.len
+            )
+        })?;
+        if let Some(floor) = floor {
+            app["floor"] = json!(floor.to_string());
+            floors = true;
+        }
         for (field, value) in copied_files.as_object().context("file fields")? {
             app[field] = value.clone();
         }
@@ -2066,7 +2138,7 @@ async fn create_undo(
             "app deleted or recreated before completion"
         );
     }
-    let complete = json!({"format":RUN_FORMAT,"started_sha256":started_hash,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
+    let complete = json!({"format":if floors { RUN_FORMAT_FLOOR } else { RUN_FORMAT },"started_sha256":started_hash,"run":id,"source":args.bucket,"incarnations":starts,"actors":actor_count,"chunks":chunks,"apps":app_records,"failed":failures,"history":if args.history==History::All{"all"}else{"head"}});
     charge(
         &mut run_index_bytes,
         encode_bounded(&complete, META_MAX - 1)?.len() as u64,

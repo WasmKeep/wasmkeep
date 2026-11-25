@@ -639,12 +639,38 @@ pub(super) async fn execute_settled(
             }
         }
     }
+    // ADR 0043, section 3, "A restore": the floor the restore leaves in the
+    // target, and every manifest it will write through the same gate as a
+    // deploy, before anything is written.
+    let archived_floor = archived_floor(app)?;
+    let mut manifests = Vec::new();
+    if choice == DeployChoice::Backup {
+        for object in array(app, "objects")? {
+            let tail = text(object, "key")?
+                .strip_prefix(&source_app)
+                .context("app object outside app")?;
+            if tail.split('/').count() == 2 && tail.ends_with("/manifest") {
+                manifests.push(
+                    apps::Manifest::parse(std::str::from_utf8(&blob(archive, ap, object).await?)?)
+                        .with_context(|| format!("invalid manifest {tail} in backup"))?,
+                );
+            }
+        }
+    }
+    let gated = apps::AppRef::new(Arc::clone(target), tp, &args.app.0, &args.app.1);
+    let gated = match args.writer {
+        Some(minor) => gated.as_version(minor),
+        None => gated,
+    };
     let undoing = existing.is_some()
         && journal["before_restore"].as_str() == Some(id.as_str())
         && journal["run"] != id;
     let binding = json!({"run":id,"root":digest(&root),"from":args.from,"bucket":args.bucket,
         "app":name,"in_place":args.in_place,"deploy":format!("{choice:?}")});
+    // The app's own nodes first: "stop them" comes before what the gate
+    // would say of them.
     nodes(args, target, tp).await?;
+    gated.check_restore(archived_floor, &manifests).await?;
     if existing.is_some() {
         ensure!(
             journal["binding"] == binding
@@ -666,6 +692,7 @@ pub(super) async fn execute_settled(
     let (lock_version, lock_nonce) = acquire_lock(target, &lock, &binding).await?;
     let result = async {
         nodes(args, target, tp).await?;
+        gated.check_restore(archived_floor, &manifests).await?;
         ensure!(optional(target, &fence).await? == existing, "restore changed while acquiring lock; retry");
         if existing.is_none() {
             ensure!(args.in_place || list_bounded(target, &state).await?.is_empty(),
@@ -724,6 +751,16 @@ pub(super) async fn execute_settled(
         ensure!(settled, "a node of {name} still writes its node lease ({}); stop it before restoring",
             listed.seen.keys().cloned().collect::<Vec<_>>().join(", "));
         nodes(args, target, tp).await?;
+        // The floor before anything of the app's state or deploy: raised
+        // only, never above a live node under the prefix. Then the gate
+        // again, on the floor the target now has. A retry finds the floor
+        // and writes nothing; `--abort` leaves it.
+        if let Some(floor) = gated.check_restore(archived_floor, &manifests).await? {
+            gated.raise_restored_floor(floor).await?;
+            println!("Upgrade floor of {name} set to {floor}: no node of an older version starts for it.");
+            ensure!(gated.check_restore(archived_floor, &manifests).await?.is_none(),
+                "the upgrade floor of {name} changed while it was written; run the restore again");
+        }
 
         if journal["phase"] == "prepare" {
             if args.in_place {

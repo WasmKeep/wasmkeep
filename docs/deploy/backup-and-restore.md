@@ -36,6 +36,18 @@ A copied head includes writes acknowledged before that actor's listing;
 it may include unacknowledged tips. **There is no consistent point across
 actors.** Reconcile cross-actor business invariants after restoring.
 
+A run also carries the app's
+[upgrade floor](../cluster.md#versions-the-upgrade-floor-and-finalize) (`formats/<tenant>/<app>/floor`), when the app
+has one: the minor version below which no node may serve it. Such a run is
+backup format 2 (with `--all`, as soon as one app of the run has a floor). A
+`wasmkeep` of 0.8 would restore the app without its floor, so it refuses a
+format 2 run with `unknown or inconsistent backup format`: for `verify`,
+`restore` and an actor restore from that run, and also for `create` into an
+archive whose latest run is one, and `prune` of an archive that keeps one. Use
+0.9 or later on such an archive. A run in which no app has a floor stays
+format 1, which 0.8.1 reads as before. An unreadable floor record fails the
+backup.
+
 Online create refuses all virtual-hosted-style settings (including an explicit
 false value) and bucket overrides. Explicit endpoint URLs must be origins
 without paths, queries, fragments or credentials. Path-style custom DNS
@@ -281,6 +293,37 @@ from the backup. Expired node leases are fenced. Before writing history the
 command waits only for writes an old holder of the app may still land (the
 quiet wait, below). It rebuilds generation floors and the alarm index, then
 installs versions and current pointers, and removes `restoring` last.
+
+### The upgrade floor and the deploy's format
+
+A restore is checked like a deploy, before it writes anything in the target
+([ADR 0043](../adr/0043-rolling-upgrades.md), section 3, "A restore"):
+
+- **The restored app keeps its floor.** The target ends on the higher of its
+  own floor and the one in the backup. The floor is only ever raised: a
+  restore into the prefix the backup came from changes nothing, and a restore
+  into another prefix creates the floor there, before any state or deploy.
+  With `--deploy keep` too: the floor goes with the state.
+- **Never above a live node.** If the floor has to be created or raised and a
+  node under the target prefix, of any app, runs an older version, the restore
+  is refused and names those nodes. Upgrade them, or restore into another
+  prefix. A restore that has no floor to write asks nothing of them.
+- **Not with an older `wasmkeep`.** A `wasmkeep` older than the floor in the
+  backup, or than the target's, is refused.
+- **Every version it installs goes through the deploy's gate**: the current
+  version's manifest and each kept one's. A version with `apart-from` or
+  `spread` (manifest format 8) needs the floor at 0.9, which the backup of
+  such an app carries.
+- **A backup without a floor** (made by 0.8, or of an app never finalized)
+  restores as before, and no floor is written.
+
+Once the floor is written, no node of an older version starts for the app in
+the target: it stops at the floor, naming both versions. The floor stays if
+the restore fails later or is cancelled with `--abort`; a retry finds it. If
+the listing after the write shows an older node of the app that is live, or
+not stopped for sure, the restore stops there, having written nothing of the
+app: stop that node (or `wasmkeep cluster fence` it) and run the restore
+again.
 
 ### What the restore waits for
 
