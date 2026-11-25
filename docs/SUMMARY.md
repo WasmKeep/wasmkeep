@@ -113,4 +113,6 @@ are designs, not available capabilities. -->
 - [0040 Directory, broadcast groups and the reconnecting room (accepted, as built)](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md)
 - [0041 Placement at wake-up](adr/0041-placement-at-wake-up.md)
 - [0042 Compacting an idle actor's history](adr/0042-compacting-an-idle-actors-history.md)
+- [0043 Rolling upgrades of WasmKeep (accepted, not built)](adr/0043-rolling-upgrades.md)
+- [0044 Traces (accepted, not built)](adr/0044-traces.md)
 
