@@ -1364,6 +1364,12 @@ a pause, and then listed apart, as `not read:` lines and `unread` in
 holds (32 MiB of key names and ETags), which is not checked, and an app
 under restore.
 
+A `note:` line (`notes` in `--json`) is neither: it changes neither the
+verdict nor the exit code. Today there is one, for the mark a `wasmkeep
+cluster forget` left at `nodes/<id>` more than 5 s ago: the command did
+not finish, and no node starts under that id until it is run again. The
+mark itself is not a node and not a problem.
+
 Each problem is one line with the key it is about, and `check` and
 `detail` in `--json`. For a missing segment the key is the one it would
 have, with `*` for the one part its neighbours do not tell:

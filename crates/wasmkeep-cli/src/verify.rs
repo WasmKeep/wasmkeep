@@ -212,6 +212,10 @@ pub struct AppReport {
     pub sweep_records: u64,
 }
 
+/// How old the mark of a `cluster forget` is before `cluster status` and
+/// `cluster verify` say its command did not finish.
+pub const FORGET_UNFINISHED_MS: u64 = 5_000;
+
 /// A run's result.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
@@ -230,6 +234,11 @@ pub struct Report {
     pub nodes: u64,
     /// Heartbeats in a format from before node leases.
     pub nodes_old_format: u64,
+    /// What an operator should know that is neither a problem with what
+    /// the bucket holds nor something left unread: it changes neither
+    /// the verdict nor the exit code. Today: a `cluster forget` that did
+    /// not finish.
+    pub notes: Vec<String>,
     /// The problems, at most 1,000.
     pub problems: Vec<Problem>,
     /// How many there are in all.
@@ -338,6 +347,7 @@ impl Report {
             "actor": self.actor,
             "apps": apps,
             "nodes": {"leases": self.nodes, "old_format": self.nodes_old_format},
+            "notes": self.notes,
             "problems": problems,
             "problems_total": self.problems_total,
             "unread": unread,
@@ -478,6 +488,9 @@ impl Report {
                     String::new()
                 }
             );
+        }
+        for note in &self.notes {
+            let _ = writeln!(out, "note: {note}");
         }
         for p in &self.problems {
             let _ = writeln!(out, "problem: {}: {} ({})", p.key, p.detail, p.check);
@@ -2064,43 +2077,59 @@ impl Run {
     }
 
     /// The node leases: each decodes. Counts in `report` how many do, and
-    /// how many heartbeats are in an older format.
+    /// how many heartbeats are in an older format. The mark a `cluster
+    /// forget` leaves at `nodes/<id>` (ADR 0043) is not a node and not a
+    /// problem; one older than `cluster status` allows is a note, in the
+    /// same words: its command did not finish.
     async fn nodes(&self, report: &mut Report) -> anyhow::Result<()> {
         let folder = format!("{}nodes/", self.prefix);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let mut checks = keys_under(&self.store, &folder)
-            .map_ok(|(_, meta)| async move {
+            .map_ok(|(id, meta)| async move {
                 let body = match self.get(&meta.location, None, MAX_RECORD).await {
                     Ok(body) => body,
                     // Forgotten since it was listed.
-                    Err(history::Error::Missing(_)) => return Ok((0, 0, None)),
+                    Err(history::Error::Missing(_)) => return Ok((0, 0, None, None)),
                     Err(e) => {
                         let key = meta.location.as_ref();
                         let p = failed(key, "node", e.to_string(), lost(&e));
-                        return Ok((0, 0, Some(p)));
+                        return Ok((0, 0, Some(p), None));
                     }
                 };
-                // TODO: once `cluster forget` leaves a mark at the key
-                // (`wasmkeep-node-forgotten 1`), read it as "not a node"
-                // through `node_lease::forgotten`.
+                if let Some(at_ms) = wasmkeep_cluster::node_lease::forgotten(&body) {
+                    let unfinished = now_ms.saturating_sub(at_ms) > FORGET_UNFINISHED_MS;
+                    let note = unfinished.then(|| {
+                        format!(
+                            "{}: forget did not finish; run `wasmkeep cluster forget {id}` \
+                             (no node starts under that id until then)",
+                            meta.location
+                        )
+                    });
+                    return Ok((0, 0, None, note));
+                }
                 Ok::<_, anyhow::Error>(if NodeLeaseObject::decode(&body).is_some() {
-                    (1, 0, None)
+                    (1, 0, None, None)
                 } else if wasmkeep_cluster::membership::NodeInfo::decode(&body).is_some() {
-                    (0, 1, None)
+                    (0, 1, None, None)
                 } else {
                     let p = problem(
                         meta.location.as_ref(),
                         "node",
                         "does not decode as a node lease or a heartbeat",
                     );
-                    (0, 0, Some(p))
+                    (0, 0, Some(p), None)
                 })
             })
             .try_buffer_unordered(CONCURRENCY);
-        while let Some((lease, older, found)) = checks.try_next().await? {
+        while let Some((lease, older, found, note)) = checks.try_next().await? {
             report.nodes += lease;
             report.nodes_old_format += older;
             self.add(found);
+            report.notes.extend(note);
         }
+        report.notes.sort();
         Ok(())
     }
 }

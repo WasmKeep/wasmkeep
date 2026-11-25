@@ -1082,3 +1082,73 @@ fn a_full_set_says_so() {
     seen.insert("c", "a");
     assert!(seen.has("c", "a") && !seen.has("c", "b") && !seen.full);
 }
+
+/// The mark `cluster forget` leaves at `nodes/<id>` (ADR 0043) is not a
+/// node and not a problem. A fresh one says nothing; one its command left
+/// behind is a note, in `cluster status`'s words, that changes neither the
+/// verdict nor the exit code. Anything else that does not decode is still
+/// a problem.
+#[tokio::test]
+async fn a_forget_mark_is_not_a_node_and_an_old_one_is_a_note() {
+    use wasmkeep_cluster::node_lease::encode_forgotten;
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let store = whole_bucket().await;
+    let before = check(&store, false).await;
+    assert!(before.whole(), "{}", before.to_text());
+
+    put(&store, "p/q/nodes/gone", encode_forgotten(now)).await;
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(
+        (report.nodes, report.nodes_old_format),
+        (before.nodes, before.nodes_old_format),
+        "not counted as a node"
+    );
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    let old = now - FORGET_UNFINISHED_MS - 1_000;
+    put(&store, "p/q/nodes/gone", encode_forgotten(old)).await;
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(
+        report.notes,
+        [
+            "p/q/nodes/gone: forget did not finish; run `wasmkeep cluster forget gone` (no node \
+          starts under that id until then)"
+        ]
+    );
+    assert!(
+        report
+            .to_text()
+            .contains("note: p/q/nodes/gone: forget did not finish"),
+        "{}",
+        report.to_text()
+    );
+    assert_eq!(report.to_json()["notes"][0], report.notes[0].as_str());
+    assert_eq!(report.to_json()["exit_code"], 0);
+
+    // A later mark number is not a mark.
+    put(
+        &store,
+        "p/q/nodes/gone",
+        b"wasmkeep-node-forgotten 2\n1\n".to_vec(),
+    )
+    .await;
+    let report = check(&store, false).await;
+    assert_eq!(report.exit_code(), 1);
+    assert!(report.notes.is_empty());
+    assert!(
+        report.problems[0]
+            .detail
+            .contains("does not decode as a node lease or a heartbeat"),
+        "{}",
+        report.to_text()
+    );
+}
