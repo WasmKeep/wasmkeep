@@ -1,4 +1,5 @@
-//! `wasmkeep cluster`: status, drain, undrain, fence and forget.
+//! `wasmkeep cluster`: status, drain, undrain, fence and forget (`upgrade`
+//! is in `upgrade_cmd.rs`).
 
 use super::*;
 
@@ -39,8 +40,10 @@ pub(super) struct NodeArgs {
 pub(super) enum ClusterCommand {
     /// Show the cluster under a bucket prefix, read from the bucket alone
     /// (no node needs to answer): each node's heartbeat (version, app,
-    /// addresses, TLS pin, age, live or not) and each app's deployed
-    /// version. A heartbeat is live for 10 s, the nodes' own rule with the
+    /// addresses, TLS pin, age, live or not), each app's deployed
+    /// version, and each app's upgrade floor with the state of its
+    /// upgrade (`finalize pending` once every live node runs the new
+    /// version). A heartbeat is live for 10 s, the nodes' own rule with the
     /// default settings, measured on this machine's clock. Exits with 1 if
     /// no node is live.
     Status(StatusArgs),
@@ -66,6 +69,11 @@ pub(super) enum ClusterCommand {
     /// record still names (it is what frees that record), and a live or
     /// fenced node lease (never deleted: fence a live one instead).
     Forget(NodeArgs),
+    /// Follow and end an upgrade of WasmKeep itself, one node at a time:
+    /// `status` shows each node's version, each app's upgrade floor and
+    /// what blocks a finalize; `finalize` ends the upgrade.
+    #[command(subcommand)]
+    Upgrade(crate::upgrade_cmd::UpgradeCommand),
     /// Check that a bucket does what WasmKeep needs from it: conditional
     /// creates and replaces, reads and listings that follow writes and
     /// deletes, large objects, last-modified times and the clock. Runs

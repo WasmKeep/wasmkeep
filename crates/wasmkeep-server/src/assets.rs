@@ -6,6 +6,10 @@ pub const MAX_FILE: u64 = 25 * 1024 * 1024;
 pub const MAX_TOTAL: u64 = 512 * 1024 * 1024;
 pub const MAX_FILES: usize = 20_000;
 pub const MAX_INDEX: usize = 8 * 1024 * 1024;
+/// The first line of an assets index. Every line of an index is known to
+/// its reader, so a new line needs a new header and its word (ADR 0043,
+/// section 2).
+pub const INDEX_HEADER: &str = "wasmkeep-assets 1";
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -89,7 +93,7 @@ impl Default for Index {
 }
 impl Index {
     pub fn bytes(&self) -> Vec<u8> {
-        let mut out = format!("wasmkeep-assets 1\nnot-found {}\n", self.not_found);
+        let mut out = format!("{INDEX_HEADER}\nnot-found {}\n", self.not_found);
         for p in &self.front_first {
             out.push_str(&format!("front-first {}\n", encode(p)));
         }
@@ -113,14 +117,14 @@ impl Index {
     }
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         Self::parse_inner(bytes)
-            .ok_or_else(|| "invalid or noncanonical wasmkeep-assets 1 index".into())
+            .ok_or_else(|| format!("invalid or noncanonical {INDEX_HEADER} index"))
     }
     fn parse_inner(bytes: &[u8]) -> Option<Self> {
         if bytes.len() > MAX_INDEX {
             return None;
         }
         let mut lines = std::str::from_utf8(bytes).ok()?.lines();
-        if lines.next()? != "wasmkeep-assets 1" {
+        if lines.next()? != INDEX_HEADER {
             return None;
         }
         let mut index = Self {

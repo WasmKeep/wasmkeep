@@ -573,8 +573,11 @@ async fn a_node_without_hellos_is_found_by_the_scheduled_listing() {
         tokio::spawn(async move {
             loop {
                 let body = format!(
-                    "wasmkeep-node 3\nlive feedface\n{}\nold\nhttp://{old_addr}\n0.4.1\ndefault/default\n\n\nserving\n\ntake\n",
-                    now_ms()
+                    "wasmkeep-node 3\nlive feedface\n{}\nold\nhttp://{old_addr}\n{}\ndefault/default\n\n\nserving\n\ntake\n",
+                    now_ms(),
+                    // Its words and its 404 are 0.4.1's; its version is
+                    // one a new node starts beside (ADR 0043, section 5).
+                    wasmkeep_server::VERSION
                 );
                 shared.put(&key, body.into_bytes().into()).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;

@@ -173,7 +173,7 @@ async fn ingress_limits_header_keys_and_internal_forwarding() {
 }
 
 async fn old_reader(store: &Arc<dyn ObjectStore>) {
-    store.put(&"nodes/old-reader".into(),format!("wasmkeep-node 2\nold-reader\nhttp://10.0.0.9:8080\n0.4.2\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front ends flush\n",now_ms()).into_bytes().into()).await.unwrap();
+    store.put(&"nodes/old-reader".into(),format!("wasmkeep-node 2\nold-reader\nhttp://10.0.0.9:8080\n{}\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front ends flush\n",wasmkeep_server::VERSION,now_ms()).into_bytes().into()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

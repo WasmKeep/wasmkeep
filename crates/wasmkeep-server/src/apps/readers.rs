@@ -1,10 +1,152 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
+use wasmkeep_cluster::app_format::floor::{self, Minor};
+use wasmkeep_cluster::membership::NodeInfo;
+use wasmkeep_cluster::upgrade::{self, Blocked, Format};
 use wasmkeep_runtime::Runtime;
 
 use super::{AppRef, DeployError, Manifest, StorageImports, bucket};
 use crate::actor::FRONT_CLASS as FRONT;
+
+/// Who reads what a writer is about to write (ADR 0043, section 2): an
+/// app's upgrade floor and the live nodes under its bucket prefix, read
+/// once. Every writer, the CLI included, asks this one helper whether
+/// every live node announces a word ([`Readers::without`]) and whether a
+/// format may be written now ([`Readers::gate`]).
+///
+/// Live as `cluster status` counts it: the default horizon, on this
+/// machine's clock.
+#[derive(Debug, Clone)]
+pub struct Readers {
+    /// `tenant/app`.
+    served: String,
+    floor: Result<Option<Minor>, floor::Unknown>,
+    /// Every live node under the prefix, of any app.
+    nodes: Vec<NodeInfo>,
+}
+
+impl Readers {
+    /// Reads `tenant/app`'s floor and the live heartbeats under the
+    /// bucket key `prefix`.
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn read(
+        store: Arc<dyn ObjectStore>,
+        prefix: &str,
+        tenant: &str,
+        app: &str,
+    ) -> Result<Self, DeployError> {
+        use wasmkeep_cluster::lease::Bucket as _;
+        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix.to_owned());
+        let record = keys
+            .get(&floor::relative_key(tenant, app))
+            .await
+            .map_err(bucket)?;
+        let floor = floor::decode(record.as_ref().map(|(body, _)| body.as_slice()));
+        let nodes = live_on(&keys).await?;
+        Ok(Self::of(format!("{tenant}/{app}"), floor, nodes))
+    }
+
+    /// The live nodes under the bucket key `prefix`, of every app, with
+    /// no app's floor: for what a whole process needs (`multi-app`).
+    ///
+    /// # Errors
+    /// The bucket did not answer.
+    pub async fn read_prefix(
+        store: Arc<dyn ObjectStore>,
+        prefix: &str,
+    ) -> Result<Self, DeployError> {
+        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix.to_owned());
+        Ok(Self::of(String::new(), Ok(None), live_on(&keys).await?))
+    }
+
+    /// From what was read already: `served` (`tenant/app`), its floor,
+    /// and the live nodes under the prefix.
+    pub fn of(
+        served: String,
+        floor: Result<Option<Minor>, floor::Unknown>,
+        live: Vec<NodeInfo>,
+    ) -> Self {
+        Self {
+            served,
+            floor,
+            nodes: live,
+        }
+    }
+
+    /// The live nodes of the app.
+    pub fn live(&self) -> impl Iterator<Item = &NodeInfo> + Clone {
+        self.nodes.iter().filter(|n| n.app == self.served)
+    }
+
+    /// The live nodes under the prefix, of every app.
+    pub fn live_on_prefix(&self) -> &[NodeInfo] {
+        &self.nodes
+    }
+
+    /// The app's floor record as read: `Ok(None)` without one.
+    pub fn floor(&self) -> &Result<Option<Minor>, floor::Unknown> {
+        &self.floor
+    }
+
+    /// The live nodes of the app that do not announce every word of
+    /// `words`, by id. Empty: every live node announces them.
+    pub fn without(&self, words: &[&str]) -> Vec<String> {
+        upgrade::without(words, self.live())
+    }
+
+    /// [`Self::without`], among the live nodes of the app that `pick`
+    /// keeps (those that read the app's secrets, for one).
+    pub fn without_among(&self, words: &[&str], pick: impl Fn(&NodeInfo) -> bool) -> Vec<String> {
+        upgrade::without(words, self.live().filter(|n| pick(n)))
+    }
+
+    /// [`Self::without`], among the live nodes of every app under the
+    /// prefix.
+    pub fn without_on_prefix(&self, words: &[&str]) -> Vec<String> {
+        upgrade::without(words, &self.nodes)
+    }
+
+    /// Whether `format` may be written to the app now: its floor at or
+    /// above the version that introduced the format, and every live node
+    /// of the app announcing its words.
+    ///
+    /// # Errors
+    /// What blocks, naming the nodes.
+    pub fn gate(&self, format: &Format) -> Result<(), Blocked> {
+        upgrade::gate(format, self.floor.clone(), self.live())
+    }
+
+    /// Whether a writer of minor version `this` may write to the app at
+    /// all (ADR 0043, sections 3 and 5): not under a floor above its own
+    /// version, nor beside a live node outside its range.
+    ///
+    /// # Errors
+    /// Why not.
+    pub fn writer(&self, this: Minor) -> Result<(), String> {
+        upgrade::writer(this, self.floor.clone(), self.live())
+    }
+}
+
+/// The live heartbeats under `keys`' prefix.
+async fn live_on(
+    keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+) -> Result<Vec<NodeInfo>, DeployError> {
+    let horizon = crate::heartbeat_horizon_ms(
+        crate::DEFAULT_HEARTBEAT,
+        &crate::LeaseConfig::default_safe(),
+    );
+    let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(keys)
+        .await
+        .map_err(bucket)?;
+    Ok(nodes
+        .into_iter()
+        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon))
+        .collect())
+}
 
 impl AppRef {
     /// What a first deploy checks before it creates the app: the names'
@@ -21,6 +163,24 @@ impl AppRef {
             }
         }
         Ok(())
+    }
+
+    /// A fresh app is born finalized (ADR 0043, section 3): the first
+    /// deploy into an app that holds nothing (no floor, no registered
+    /// node, no deploy, no state) creates its upgrade floor at this
+    /// build's minor version, so a new app needs no `finalize` before its
+    /// first gated deploy. Called once the deploy is accepted (a refused
+    /// or cancelled one writes nothing) and before it writes anything of
+    /// the app.
+    pub(super) async fn born_finalized(&self) -> Result<(), DeployError> {
+        let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+            Arc::clone(&self.store),
+            self.prefix.clone(),
+        );
+        upgrade::born_finalized(&keys, &self.tenant, &self.app, None, upgrade::this_minor())
+            .await
+            .map(drop)
+            .map_err(bucket)
     }
 
     /// What a deploy checks before it writes (ADR 0022): no migration in
@@ -40,15 +200,13 @@ impl AppRef {
             })
     }
 
-    /// Live nodes of this app whose heartbeat does not announce the
-    /// capability word `front` (ADR 0023): they cannot read a manifest of
-    /// format 3, nor a secrets set with a `_front` entry. Live as `cluster
-    /// status` counts it (the default horizon, this machine's clock).
+    /// The app's floor and live nodes ([`Readers`]): what a deploy, a
+    /// delete and every other writer ask before they write.
     ///
     /// # Errors
     /// The bucket did not answer.
-    pub async fn nodes_without_front(&self) -> Result<Vec<String>, DeployError> {
-        nodes_without_front(
+    pub async fn readers(&self) -> Result<Readers, DeployError> {
+        Readers::read(
             Arc::clone(&self.store),
             &self.prefix,
             &self.tenant,
@@ -57,93 +215,42 @@ impl AppRef {
         .await
     }
 
-    /// Refuses `manifest` while a live node could not read it: format 5
-    /// needs `flush` (ADR 0034), and every format inherits the checks of
-    /// those below it (4 needs `ends`, 3 needs `front`).
+    /// Refuses `manifest` while it may not be written (ADR 0043, section
+    /// 2): its format's row of the gate table, through [`Readers::gate`].
+    /// Format 5 needs `flush` (ADR 0034), and every format inherits the
+    /// words of those below it (4 needs `ends`, 3 needs `front`). Then
+    /// the writer itself: refused under a floor above this build's
+    /// version, or beside a live node outside its range.
     pub(super) async fn check_readers(&self, manifest: &Manifest) -> Result<(), DeployError> {
-        if manifest.assets.is_some() {
-            let nodes = live_nodes(
-                Arc::clone(&self.store),
-                &self.prefix,
-                &self.tenant,
-                &self.app,
-            )
-            .await?;
-            let lacking: Vec<_> = nodes
-                .iter()
-                .filter(|n| !n.can_assets)
-                .map(|n| n.id.as_str())
-                .collect();
-            if !lacking.is_empty() {
-                return Err(DeployError::NodesWithoutAssets {
-                    app: self.name(),
-                    nodes: lacking.join(", "),
+        let readers = self.readers().await?;
+        let number = manifest.format_number();
+        let format = upgrade::manifest_format(number)
+            .ok_or_else(|| DeployError::Refused(format!("manifest format {number} has no gate")))?;
+        let app = self.name();
+        match readers.gate(format) {
+            Ok(()) => {}
+            Err(Blocked::Nodes { word, nodes, .. }) => {
+                let nodes = nodes.join(", ");
+                return Err(match word {
+                    "assets" => DeployError::NodesWithoutAssets { app, nodes },
+                    "flush" => DeployError::NodesWithoutFlush {
+                        app,
+                        nodes,
+                        what: "a version with a batched class (manifest format 5) needs".into(),
+                    },
+                    "ends" => DeployError::NodesWithoutEnds { app, nodes },
+                    "front" => DeployError::NodesWithoutFront { app, nodes },
+                    // `rate_limits`, the word of format 6.
+                    word => DeployError::Refused(format!(
+                        "manifest format 6 needs {word} on all live readers: {nodes}"
+                    )),
                 });
             }
+            Err(blocked) => return Err(DeployError::Refused(format!("{app}: {blocked}"))),
         }
-        if manifest.format_number() >= 6 {
-            let nodes = live_nodes(
-                Arc::clone(&self.store),
-                &self.prefix,
-                &self.tenant,
-                &self.app,
-            )
-            .await?;
-            let lacking: Vec<_> = nodes
-                .iter()
-                .filter(|n| !n.can_rate_limits)
-                .map(|n| n.id.as_str())
-                .collect();
-            if !lacking.is_empty() {
-                return Err(DeployError::Refused(format!(
-                    "manifest format 6 needs rate_limits on all live readers: {}",
-                    lacking.join(", ")
-                )));
-            }
-        }
-        if manifest.format_number() >= 5 {
-            let nodes = nodes_without_flush(
-                Arc::clone(&self.store),
-                &self.prefix,
-                &self.tenant,
-                &self.app,
-            )
-            .await?;
-            if !nodes.is_empty() {
-                return Err(DeployError::NodesWithoutFlush {
-                    app: format!("{}/{}", self.tenant, self.app),
-                    nodes: nodes.join(", "),
-                    what: "a version with a batched class (manifest format 5) needs".into(),
-                });
-            }
-        }
-        if manifest.format_number() >= 4 {
-            let nodes = nodes_without_ends(
-                Arc::clone(&self.store),
-                &self.prefix,
-                &self.tenant,
-                &self.app,
-            )
-            .await?;
-            if !nodes.is_empty() {
-                return Err(DeployError::NodesWithoutEnds {
-                    app: format!("{}/{}", self.tenant, self.app),
-                    nodes: nodes.join(", "),
-                });
-            }
-        }
-        if manifest.format_number() < 3 {
-            return Ok(());
-        }
-        let nodes = self.nodes_without_front().await?;
-        if nodes.is_empty() {
-            Ok(())
-        } else {
-            Err(DeployError::NodesWithoutFront {
-                app: format!("{}/{}", self.tenant, self.app),
-                nodes: nodes.join(", "),
-            })
-        }
+        readers
+            .writer(upgrade::this_minor())
+            .map_err(|why| DeployError::Refused(format!("{app}: {why}")))
     }
 
     /// Refuses a version whose components import a `storage` function a
@@ -166,17 +273,8 @@ impl AppRef {
         if !needs_any && kept.is_empty() {
             return Ok(());
         }
-        let nodes = live_nodes(
-            Arc::clone(&self.store),
-            &self.prefix,
-            &self.tenant,
-            &self.app,
-        )
-        .await?;
-        if nodes
-            .iter()
-            .all(|n| n.can_flush && n.can_end && n.can_blobs)
-        {
+        let readers = self.readers().await?;
+        if readers.without(&["flush", "ends", "blobs"]).is_empty() {
             return Ok(());
         }
         let mut imports = given.to_vec();
@@ -212,14 +310,7 @@ impl AppRef {
         let (flush, ends) = (classes(|i| i.flush), classes(|i| i.delete_self_durable));
         let blobs = classes(|i| i.blobs);
         let app = format!("{}/{}", self.tenant, self.app);
-        let lacking = |has: fn(&wasmkeep_cluster::membership::NodeInfo) -> bool| {
-            nodes
-                .iter()
-                .filter(|n| !has(n))
-                .map(|n| n.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let lacking = |word: &str| readers.without(&[word]).join(", ");
         let what = |classes: &[&str]| {
             if classes == [FRONT] {
                 return "the front imports".to_owned();
@@ -232,7 +323,7 @@ impl AppRef {
             )
         };
         if !flush.is_empty() {
-            let without = lacking(|n| n.can_flush);
+            let without = lacking("flush");
             if !without.is_empty() {
                 return Err(DeployError::NodesWithoutFlush {
                     app,
@@ -242,7 +333,7 @@ impl AppRef {
             }
         }
         if !blobs.is_empty() {
-            let without = lacking(|n| n.can_blobs);
+            let without = lacking("blobs");
             if !without.is_empty() {
                 return Err(DeployError::NodesWithoutBlobs {
                     app,
@@ -252,7 +343,7 @@ impl AppRef {
             }
         }
         if !ends.is_empty() {
-            let without = lacking(|n| n.can_end);
+            let without = lacking("ends");
             if !without.is_empty() {
                 return Err(DeployError::NodesWithoutDeleteDurable {
                     app,
@@ -263,76 +354,6 @@ impl AppRef {
         }
         Ok(())
     }
-}
-
-/// Live nodes of `tenant/app` whose heartbeat does not announce `front`
-/// (ADR 0023), under the bucket key `prefix`: what a deploy writing format
-/// 3, and a secrets write leaving a `_front` entry, are refused for.
-///
-/// # Errors
-/// The bucket did not answer.
-pub async fn nodes_without_front(
-    store: Arc<dyn ObjectStore>,
-    prefix: &str,
-    tenant: &str,
-    app: &str,
-) -> Result<Vec<String>, DeployError> {
-    without_front(store, prefix, tenant, app, false).await
-}
-
-/// [`nodes_without_front`], among the nodes that read the app's secrets
-/// from the bucket (heartbeat line 10): a node run with `--no-secrets`
-/// never opens the set.
-///
-/// # Errors
-/// The bucket did not answer.
-pub async fn secrets_readers_without_front(
-    store: Arc<dyn ObjectStore>,
-    prefix: &str,
-    tenant: &str,
-    app: &str,
-) -> Result<Vec<String>, DeployError> {
-    without_front(store, prefix, tenant, app, true).await
-}
-
-/// Live nodes of `tenant/app` whose heartbeat does not announce `ends`
-/// (ADR 0028), under the bucket key `prefix`: they cannot read a version
-/// with an idle limit, and would keep serving an app deleted under them.
-///
-/// # Errors
-/// The bucket did not answer.
-pub async fn nodes_without_ends(
-    store: Arc<dyn ObjectStore>,
-    prefix: &str,
-    tenant: &str,
-    app: &str,
-) -> Result<Vec<String>, DeployError> {
-    Ok(live_nodes(store, prefix, tenant, app)
-        .await?
-        .into_iter()
-        .filter(|n| !n.can_end)
-        .map(|n| n.id)
-        .collect())
-}
-
-/// Live nodes of `tenant/app` whose heartbeat does not announce `flush`
-/// (ADR 0034, section 15), under the bucket key `prefix`: they cannot link
-/// a component that imports `storage.flush`, nor read manifest format 5.
-///
-/// # Errors
-/// The bucket did not answer.
-pub async fn nodes_without_flush(
-    store: Arc<dyn ObjectStore>,
-    prefix: &str,
-    tenant: &str,
-    app: &str,
-) -> Result<Vec<String>, DeployError> {
-    Ok(live_nodes(store, prefix, tenant, app)
-        .await?
-        .into_iter()
-        .filter(|n| !n.can_flush)
-        .map(|n| n.id)
-        .collect())
 }
 
 /// The live nodes of `tenant/app` under the bucket key `prefix`, live as
@@ -346,54 +367,12 @@ pub async fn live_nodes(
     prefix: &str,
     tenant: &str,
     app: &str,
-) -> Result<Vec<wasmkeep_cluster::membership::NodeInfo>, DeployError> {
-    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}/")
-    };
-    let heartbeats = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
-    let horizon = crate::heartbeat_horizon_ms(
-        crate::DEFAULT_HEARTBEAT,
-        &crate::LeaseConfig::default_safe(),
-    );
-    let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
+) -> Result<Vec<NodeInfo>, DeployError> {
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix.to_owned());
     let served = format!("{tenant}/{app}");
-    let nodes = wasmkeep_cluster::membership::all_heartbeats(&heartbeats)
-        .await
-        .map_err(bucket)?;
-    Ok(nodes
+    Ok(live_on(&keys)
+        .await?
         .into_iter()
-        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon) && n.app == served)
-        .collect())
-}
-
-async fn without_front(
-    store: Arc<dyn ObjectStore>,
-    prefix: &str,
-    tenant: &str,
-    app: &str,
-    reading_secrets: bool,
-) -> Result<Vec<String>, DeployError> {
-    let prefix = if prefix.is_empty() || prefix.ends_with('/') {
-        prefix.to_owned()
-    } else {
-        format!("{prefix}/")
-    };
-    let heartbeats = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
-    let horizon = crate::heartbeat_horizon_ms(
-        crate::DEFAULT_HEARTBEAT,
-        &crate::LeaseConfig::default_safe(),
-    );
-    let now = u64::try_from(crate::alarm::now_ms_i64()).unwrap_or(0);
-    let served = format!("{tenant}/{app}");
-    let nodes = wasmkeep_cluster::membership::all_heartbeats(&heartbeats)
-        .await
-        .map_err(bucket)?;
-    Ok(nodes
-        .into_iter()
-        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon))
-        .filter(|n| n.app == served && !n.can_front && (n.reads_secrets || !reading_secrets))
-        .map(|n| n.id)
+        .filter(|n| n.app == served)
         .collect())
 }

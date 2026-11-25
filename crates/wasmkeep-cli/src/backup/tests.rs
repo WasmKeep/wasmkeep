@@ -171,6 +171,39 @@ async fn incomplete_partial_and_tampered_manifests_are_refused() {
     .unwrap();
     assert!(verify(&f.dest, "", &id, None).await.is_err());
 }
+/// ADR 0043, section 2: a backup run is the CLI's own format. A run of a
+/// later format, whole and with its digests right, is refused by this
+/// `wasmkeep`, never read as format 1.
+#[tokio::test]
+async fn a_run_of_a_later_format_is_refused() {
+    let f = Fixture::new().await;
+    let id = f.create().await;
+    let run = load(&f.dest, "", &id).await.unwrap();
+    assert_eq!(run.complete["format"], 1);
+    let root_key = format!("runs/{id}/root");
+    let root: Value =
+        serde_json::from_slice(&read(&f.dest, &root_key, META_MAX).await.unwrap()).unwrap();
+    // The run as a later version would write it: its root names the new
+    // manifest's digest.
+    let write = async |complete: &Value| {
+        let hash = json_put(&f.dest, &format!("runs/{id}/complete"), complete, true)
+            .await
+            .unwrap();
+        let mut root = root.clone();
+        root["sha256"] = json!(hash);
+        json_put(&f.dest, &root_key, &root, true).await.unwrap();
+    };
+    let mut later = run.complete.clone();
+    later["format"] = json!(2);
+    write(&later).await;
+    let refused = load(&f.dest, "", &id).await.map(drop).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("unknown or inconsistent backup format"),
+        "{refused:#}"
+    );
+    write(&run.complete).await;
+    load(&f.dest, "", &id).await.unwrap();
+}
 #[tokio::test]
 async fn recreated_source_keys_do_not_overwrite_an_earlier_run() {
     let f = Fixture::new().await;

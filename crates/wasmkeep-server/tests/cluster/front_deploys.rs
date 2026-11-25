@@ -135,8 +135,11 @@ async fn serves(addr: SocketAddr, path: &str, status: u16, body: &str) {
 /// `default/shop`: live, reading secrets, taking actors, without `front`.
 async fn older_node_heartbeat(store: &Arc<dyn ObjectStore>, id: &str, app: &str) {
     use object_store::ObjectStoreExt as _;
+    // At this build's version: only its words are older (a writer
+    // refuses beside a live node more than one minor version away).
     let body = format!(
-        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n0.3.9\n{}\n{app}\n\n\nserving\nsecrets\ntake\n",
+        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n{}\n{}\n{app}\n\n\nserving\nsecrets\ntake\n",
+        wasmkeep_server::VERSION,
         now_ms()
     );
     store
@@ -618,7 +621,7 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         .await
         .unwrap();
     assert_eq!(
-        app.nodes_without_front().await.unwrap(),
+        app.readers().await.unwrap().without(&["front"]),
         Vec::<String>::new()
     );
 
@@ -635,7 +638,7 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         .await
         .unwrap();
     assert_eq!(
-        app.nodes_without_front().await.unwrap(),
+        app.readers().await.unwrap().without(&["front"]),
         Vec::<String>::new()
     );
 
@@ -645,7 +648,8 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         .put(
             &"nodes/plain".into(),
             format!(
-                "wasmkeep-node 2\nplain\nhttp://10.0.0.7:8080\n0.3.9\n{}\ndefault/shop\n\n\nserving\n\ntake\n",
+                "wasmkeep-node 2\nplain\nhttp://10.0.0.7:8080\n{}\n{}\ndefault/shop\n\n\nserving\n\ntake\n",
+                wasmkeep_server::VERSION,
                 now_ms()
             )
             .into_bytes()
@@ -654,23 +658,21 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         .await
         .unwrap();
     assert_eq!(
-        app.nodes_without_front().await.unwrap(),
+        app.readers().await.unwrap().without(&["front"]),
         vec!["plain".to_owned()]
     );
-    let readers = |store: &Arc<dyn ObjectStore>| {
-        wasmkeep_server::apps::secrets_readers_without_front(
-            Arc::clone(store),
-            "",
-            "default",
-            "shop",
-        )
+    // Among the nodes that read the app's secrets from the bucket.
+    let readers = async |store: &Arc<dyn ObjectStore>| {
+        wasmkeep_server::apps::Readers::read(Arc::clone(store), "", "default", "shop")
+            .await
+            .map(|r| r.without_among(&["front"], |n| n.reads_secrets))
     };
     assert_eq!(readers(&store).await.unwrap(), Vec::<String>::new());
     store.delete(&"nodes/plain".into()).await.unwrap();
 
     older_node_heartbeat(&store, "old", "default/shop").await;
     assert_eq!(
-        app.nodes_without_front().await.unwrap(),
+        app.readers().await.unwrap().without(&["front"]),
         vec!["old".to_owned()]
     );
     assert_eq!(readers(&store).await.unwrap(), vec!["old".to_owned()]);
@@ -722,7 +724,8 @@ async fn nodes_without_the_front_word_hold_front_deploys_back() {
         .put(
             &"nodes/old".into(),
             format!(
-                "wasmkeep-node 2\nold\nhttp://10.0.0.9:8080\n0.4.0\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front blobs\n",
+                "wasmkeep-node 2\nold\nhttp://10.0.0.9:8080\n{}\n{}\ndefault/shop\n\n\nserving\nsecrets\ntake front blobs\n",
+                wasmkeep_server::VERSION,
                 now_ms()
             )
             .into_bytes()

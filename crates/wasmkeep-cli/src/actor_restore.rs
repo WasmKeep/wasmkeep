@@ -92,12 +92,18 @@ async fn execute(
         println!("Operation ID: {id}");
         return wait(args, &keys, &key, id, None).await;
     }
-    for node in wasmkeep_cluster::membership::all_heartbeats(&keys).await? {
-        ensure!(
-            node.app != format!("{tenant}/{app}") || (node.can_actor_restore && node.can_blobs),
-            "node {} lacks actor-restore or blobs capability (including offline nodes); upgrade it \
-             before restoring (a node without blobs would bring back an earlier blob incarnation)",
-            node.id
+    // Every registered node of the app, offline ones included, through
+    // the one test of "announces these words" (ADR 0043, section 2).
+    let nodes = wasmkeep_cluster::membership::all_heartbeats(&keys).await?;
+    let served = format!("{tenant}/{app}");
+    let lacking = wasmkeep_cluster::upgrade::without(
+        &["actor-restore", "blobs"],
+        nodes.iter().filter(|n| n.app == served),
+    );
+    if let Some(node) = lacking.first() {
+        bail!(
+            "node {node} lacks actor-restore or blobs capability (including offline nodes); upgrade it \
+             before restoring (a node without blobs would bring back an earlier blob incarnation)"
         );
     }
     ensure!(

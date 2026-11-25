@@ -221,32 +221,40 @@ fn deleted_meanwhile(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<()
 /// Live nodes serving `tenant/app` that do not read secrets from the
 /// bucket (older versions, which say nothing on heartbeat line 10).
 fn nodes_without_secrets(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
-    let (store, prefix) = crate::open_bucket(bucket)?;
-    let heartbeats = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
-    let horizon = wasmkeep_server::heartbeat_horizon_ms(
-        wasmkeep_server::DEFAULT_HEARTBEAT,
-        &wasmkeep_server::LeaseConfig::default_safe(),
-    );
-    let now = now_ms();
-    let served = format!("{tenant}/{app}");
-    let nodes = runtime()?.block_on(wasmkeep_cluster::membership::all_heartbeats(&heartbeats))?;
-    Ok(nodes
-        .into_iter()
-        .filter(|n| wasmkeep_cluster::membership::is_live(n, now, horizon))
-        .filter(|n| n.app == served && !n.reads_secrets)
-        .map(|n| n.id)
+    Ok(readers(bucket, tenant, app)?
+        .live()
+        .filter(|n| !n.reads_secrets)
+        .map(|n| n.id.clone())
         .collect())
 }
 
-/// Live nodes of `tenant/app` that do not announce the capability word
-/// `front` (ADR 0023).
-fn nodes_without_front(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
+/// The app's upgrade floor and live nodes, through the helper every
+/// writer asks (ADR 0043, section 2).
+fn readers(
+    bucket: &str,
+    tenant: &str,
+    app: &str,
+) -> anyhow::Result<wasmkeep_server::apps::Readers> {
     let (store, prefix) = crate::open_bucket(bucket)?;
-    Ok(
-        runtime()?.block_on(wasmkeep_server::apps::secrets_readers_without_front(
-            store, &prefix, tenant, app,
-        ))?,
-    )
+    Ok(runtime()?.block_on(wasmkeep_server::apps::Readers::read(
+        store, &prefix, tenant, app,
+    ))?)
+}
+
+/// Refuses a write to the app's secrets by a `wasmkeep` older than the
+/// app's upgrade floor, or beside a live node outside this version's
+/// range (ADR 0043, sections 3 and 5).
+fn check_writer(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<()> {
+    readers(bucket, tenant, app)?
+        .writer(wasmkeep_cluster::upgrade::this_minor())
+        .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))
+}
+
+/// Live nodes of `tenant/app` that read its secrets from the bucket
+/// (heartbeat line 10: a node run with `--no-secrets` never opens the set)
+/// and do not announce the capability word `front` (ADR 0023).
+fn nodes_without_front(bucket: &str, tenant: &str, app: &str) -> anyhow::Result<Vec<String>> {
+    Ok(readers(bucket, tenant, app)?.without_among(&["front"], |n| n.reads_secrets))
 }
 
 /// Refuses a set that gains a `_front` entry (`had`: the set before had
@@ -276,10 +284,11 @@ fn refuse_front(
 /// Refuses a change while a node of the app would not see it, unless
 /// `--force`.
 fn check_nodes(args: &AppArgs) -> anyhow::Result<()> {
+    let (tenant, app) = &args.app;
+    check_writer(&args.bucket, tenant, app)?;
     if args.force {
         return Ok(());
     }
-    let (tenant, app) = &args.app;
     let older = nodes_without_secrets(&args.bucket, tenant, app)?;
     anyhow::ensure!(
         older.is_empty(),
@@ -541,6 +550,7 @@ pub(crate) fn run(command: SecretsCommand) -> anyhow::Result<()> {
         }
         SecretsCommand::Reset(args) => {
             nodes_have_new_key(args.nodes_have_new_key, "reset")?;
+            check_writer(&args.bucket, &args.app.0, &args.app.1)?;
             if !args.force {
                 let (tenant, app) = &args.app;
                 let older = nodes_without_secrets(&args.bucket, tenant, app)?;

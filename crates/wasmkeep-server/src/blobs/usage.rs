@@ -218,3 +218,26 @@ fn walk(base: &std::path::Path) -> std::io::Result<(u64, u64)> {
     }
     Ok((bytes, files))
 }
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    /// ADR 0043, section 2: a count under another header is no count (the
+    /// app is then treated as not counted yet), and lines after the
+    /// fourth are ignored, so the count is extended by appended lines.
+    #[test]
+    fn a_count_under_another_header_is_no_count() {
+        let body = "wasmkeep-blob-usage 1\n6e340b9cffb37a98\n10\n2\n5\n";
+        let count = Count::decode(body.as_bytes()).expect("its own form is read");
+        assert_eq!((count.bytes, count.files), (10, 2));
+        assert_eq!(
+            Count::decode(format!("{body}later line\n").as_bytes()),
+            Some(count)
+        );
+        for later in ["wasmkeep-blob-usage 2", "wasmkeep-blob-usage 10"] {
+            let other = body.replace("wasmkeep-blob-usage 1", later);
+            assert_eq!(Count::decode(other.as_bytes()), None, "{later}");
+        }
+    }
+}

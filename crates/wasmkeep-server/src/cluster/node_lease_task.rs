@@ -104,7 +104,7 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
                     c.release_node_lease(&mut lease).await;
                     return;
                 }
-                Some(super::identity::FloorRead::Allowed) => {
+                Some(super::identity::FloorRead::Allowed(_)) => {
                     floor_read = true;
                     // A verdict reached meanwhile (a twin found by the
                     // listing) stands: Unique only over Checking.
@@ -224,22 +224,45 @@ impl Cluster {
         }
         // Before any write: a binary below the app's upgrade floor never
         // writes a lease, so it never holds or serves anything.
-        if let Some(why) = self.check_floor().await {
-            tracing::error!("{why}");
-            self.identity.send_replace(Identity::BelowFloor(why));
-            return false;
-        }
+        let floor = match self.check_floor().await {
+            Ok(floor) => floor,
+            Err(why) => {
+                tracing::error!("{why}");
+                self.identity.send_replace(Identity::BelowFloor(why));
+                return false;
+            }
+        };
         loop {
             // The start guard and the start check run together (ADR 0020,
             // section 6): a new node serves about 15 s after it starts when
             // the old nodes stopped at least 10 s before.
-            let (guard, checked) = tokio::join!(self.start_guard(), self.check_identity());
+            let (guard, versions, checked) = tokio::join!(
+                self.start_guard(),
+                self.version_guard(floor),
+                self.check_identity()
+            );
+            // A live node this version cannot run beside (ADR 0043,
+            // section 5): this node writes no lease.
+            let listed = match versions {
+                Ok(listed) => listed,
+                Err(why) => {
+                    tracing::error!("{why}");
+                    self.identity.send_replace(Identity::VersionSkew(why));
+                    return false;
+                }
+            };
             let checked = match guard {
                 Ok(()) => checked,
                 Err(why) => (Stopped::OlderNode.identity(&why), None, None),
             };
             let expected = match checked {
                 (Identity::Unique, expected, replaced) => {
+                    // The nodes listed again, right before the write.
+                    if let Some(why) = self.version_recheck(&listed.0, listed.1).await {
+                        tracing::error!("{why}");
+                        self.identity.send_replace(Identity::VersionSkew(why));
+                        return false;
+                    }
                     // Before the write: the twin check reads it only once
                     // a write landed, and that write is this one, made
                     // over this version (a failed one comes back here).

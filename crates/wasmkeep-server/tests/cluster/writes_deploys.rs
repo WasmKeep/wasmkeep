@@ -18,7 +18,10 @@ async fn manifest_text(store: &Arc<dyn ObjectStore>, app: &str, version: &str) -
 /// A live heartbeat of node `id` serving `default/shop`, with these words.
 async fn node_with_words(store: &Arc<dyn ObjectStore>, id: &str, words: &str) {
     let body = format!(
-        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n0.4.2\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+        "wasmkeep-node 2\n{id}\nhttp://10.0.0.9:8080\n{}\n{}\ndefault/shop\n\n\nserving\nsecrets\n{words}\n",
+        // Only its words are older: a deploy refuses beside a live node
+        // more than one minor version away (ADR 0043, section 5).
+        wasmkeep_server::VERSION,
         now_ms()
     );
     store

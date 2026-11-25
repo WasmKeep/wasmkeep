@@ -65,6 +65,16 @@ pub(crate) fn run(args: &AppFormatArgs) -> anyhow::Result<()> {
     let late = u64::try_from(wasmkeep_server::apps::LATE_WRITES.as_millis()).unwrap_or(u64::MAX);
     enable_check(&nodes, &format!("{tenant}/{app}"), now, horizon, late)
         .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
+    // The writer itself (ADR 0043, sections 3 and 5): not a `wasmkeep`
+    // older than the app's upgrade floor.
+    rt.block_on(wasmkeep_server::apps::Readers::read(
+        std::sync::Arc::clone(&store),
+        &prefix,
+        tenant,
+        app,
+    ))?
+    .writer(wasmkeep_cluster::upgrade::this_minor())
+    .map_err(|why| anyhow::anyhow!("{tenant}/{app}: {why}; nothing written"))?;
     rt.block_on(write_enabled(&store, &key))
         .map_err(|e| anyhow::anyhow!("{tenant}/{app}: {e}"))?;
     println!(
@@ -118,11 +128,9 @@ pub(crate) fn enable_check(
         .iter()
         .filter(|n| wasmkeep_cluster::membership::serves(n, served))
         .collect();
-    let old: Vec<&str> = mine
-        .iter()
-        .filter(|n| !n.can_recorded_head)
-        .map(|n| n.id.as_str())
-        .collect();
+    // Every registered node, offline ones included, through the one test
+    // of "announces this word" (ADR 0043, section 2).
+    let old = wasmkeep_cluster::upgrade::without(&["recorded-head"], mine.iter().copied());
     if !old.is_empty() {
         return Err(format!(
             "registered nodes do not announce `recorded-head` ({}): upgrade them, or once \
