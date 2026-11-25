@@ -469,7 +469,10 @@ async fn a_node_forgotten_after_the_finalize_starts_again_with_its_lease() {
         assert_eq!((r.status, r.body.trim()), (200, "1"));
         // The command's second request. The node then checks its id
         // again, over no object, and creates its lease.
-        assert_eq!(forget_finish(&bucket, "nodes/a").await, Ok(Forgot::Removed));
+        assert_eq!(
+            forget_finish(&bucket, "nodes/a", std::future::pending()).await,
+            Ok(Forgot::Removed)
+        );
         std::time::Instant::now()
     };
     let (again, deleted) = tokio::join!(start("a", da.path()), half_way);
@@ -494,10 +497,20 @@ async fn a_node_forgotten_after_the_finalize_starts_again_with_its_lease() {
     // and writes after: its condition fails, and the node keeps the lease
     // it wrote. (A delete without a condition removed it.)
     assert_eq!(
-        forget_released(&bucket, "nodes/a", &checked, now_ms()).await,
+        forget_released(
+            &bucket,
+            "nodes/a",
+            &checked,
+            now_ms(),
+            std::future::pending()
+        )
+        .await,
         Ok(Forgot::Changed)
     );
-    assert_eq!(forget_finish(&bucket, "nodes/a").await, Ok(Forgot::Changed));
+    assert_eq!(
+        forget_finish(&bucket, "nodes/a", std::future::pending()).await,
+        Ok(Forgot::Changed)
+    );
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let (still, _) = bucket.get("nodes/a").await.unwrap().unwrap();
     assert!(String::from_utf8_lossy(&still).starts_with("wasmkeep-node 3\nlive "));

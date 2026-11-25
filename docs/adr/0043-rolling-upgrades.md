@@ -1046,7 +1046,16 @@ The bucket adapter still has no conditional delete (`object_store`
    node writes first, the command's condition fails; if the command
    writes first, the node's write is refused, or the node reads the
    mark and waits; if the command finishes first, the node starts as on
-   a new id. What a start can still meet is in the limits below.
+   a new id.
+   The command's two requests follow each other at once, so a start
+   check that was already watching the released lease usually reads the
+   lease, then nothing, and never the mark. A released lease that is
+   gone is taken the same way as the mark: nothing is judged and the
+   whole check runs again, over no object. Its process stopped cleanly
+   and nothing writes under the id, so its absence is no other writer.
+   Only for a released lease: a live or fenced one, or a heartbeat from
+   before node leases, that goes absent during the check is a deletion
+   as before, and the start stops.
 4. **The bound.** A mark still there four times a lease's ttl plus grace
    after the node first read it (60 s at the defaults) is one its
    command did not delete. The node does not start, reports `this
@@ -1083,25 +1092,21 @@ The bucket adapter still has no conditional delete (`object_store`
    - a peer's fence: not live, nothing to fence.
    `node_lease::forgotten` is the one test of "is this a mark", for
    commands that read `nodes/` themselves.
+7. **`cluster status` names a mark that stayed.** A mark written more
+   than 5 s ago was left by a command that did not finish. `cluster
+   status` warns with one line, "forget did not finish; run `wasmkeep
+   cluster forget <id>`": until then no node starts under that id.
 
 Limits, kept as documented:
 
-- **A start check that was watching the released lease.** The command's
-  two requests follow each other at once, so a node that is reading its
-  key every half period usually reads the lease, then nothing, and
-  never the mark. That is a deletion during the check, as it was before
-  the mark: this start stops (`this node's lease object was deleted`),
-  having written nothing, and the next start creates the lease. (A
-  check that had ended before the removal is not stopped: its first
-  write fails, it checks the id again and creates the lease.) The mark
-  closes the case that lost a lease the node had written; it does not
-  make a start that overlaps a `forget` succeed. Running the check
-  again when a watched released lease goes absent would, and is left
-  for a change of its own: it changes what the start check answers to a
-  deletion.
-- **A delete that lands late.** A delete the bucket client gave up on
-  and that lands after the node created its lease removes that lease,
-  as the second of two commands does (next).
+- **A delete that lands late.** The delete of the mark is given up
+  when it has had no answer for two thirds of a lease's ttl plus grace
+  (10 s at the defaults), and the command then says to run it again;
+  the next run reads the key first. So no delete is sent again long
+  after one that was applied with its answer lost. A node creates its
+  lease a full ttl plus grace after it first read the key absent, later
+  than the last delete sent. What is left is a single request that the
+  network holds for longer than that after it was sent.
 - **Two `forget` of one node at once.** Each deletes the mark it read.
   If the first delete, a node's create and the second delete land in
   that order, the node's new lease is deleted: it stops at its next
@@ -1116,9 +1121,10 @@ Limits, kept as documented:
 - **Nodes of `0.8.1` of another app on the same prefix** list the mark
   and skip it (their heartbeat decoder reads an unknown first line as
   nothing). One starting under the very id being forgotten, for
-  another app that is not finalized, would write over the mark; a node
-  id belongs to one app, so this needs a node id moved between apps
-  during the removal.
+  another app that is not finalized, would write over the mark: the
+  gate is per app, the app the released lease names, and a node id is a
+  key of the whole prefix. A node id belongs to one app, so this needs
+  a node id moved between apps during the removal.
 
 Tests: the mark's decode (`a_forgotten_mark_is_exact_or_not_one`) and a
 node's writes over it (`a_node_never_writes_over_a_forgotten_mark`),
@@ -1128,8 +1134,10 @@ the command's two steps (`node_lease::tests::forget`), every listing
 (`the_forgotten_mark_waits_for_the_finalize`, and the command's own
 `forget_marks_a_released_lease_only_after_the_finalize`), the start
 check (`a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete`,
-`a_forgotten_mark_never_removed_stops_the_start`, and the limit,
-`a_forget_that_ends_between_two_reads_of_the_start_check_stops_that_start`),
+`a_forgotten_mark_never_removed_stops_the_start`,
+`a_forget_that_ends_between_two_reads_of_the_start_check_lets_the_start_go_on`),
+the bounded delete
+(`a_delete_of_the_mark_that_gets_no_answer_is_given_up`),
 and one cluster case,
 `tests/cluster/upgrade.rs`:
 `a_node_forgotten_after_the_finalize_starts_again_with_its_lease`. No

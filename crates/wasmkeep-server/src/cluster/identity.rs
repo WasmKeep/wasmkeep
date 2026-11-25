@@ -624,8 +624,9 @@ impl Cluster {
         }
     }
 
-    /// [`Self::check_identity_once`], begun again whenever it meets the
-    /// mark of a `wasmkeep cluster forget` under this node id (ADR 0043):
+    /// [`Self::check_identity_once`], begun again whenever a released
+    /// lease it was watching is gone, or it meets the mark of a `wasmkeep
+    /// cluster forget` under this node id (ADR 0043):
     /// that command replaced this id's released lease with the mark and
     /// deletes it next, without a condition, so a lease written over the
     /// mark would be deleted with it. This node never writes over a mark.
@@ -695,8 +696,9 @@ impl Cluster {
     /// condition that write on (`None`: there is none, create it) and, if
     /// that object is a node lease naming an instance, its instance and
     /// `written_at` (the predecessor that write replaces).
-    /// [`Identity::Checking`]: a read found the mark of a `cluster forget`
-    /// and nothing was judged ([`Self::check_identity`] begins again).
+    /// [`Identity::Checking`]: a read found the mark of a `cluster forget`,
+    /// or the released lease read before is gone, and nothing was judged
+    /// ([`Self::check_identity`] begins again).
     ///
     /// The object is read (a versioned GET) every half period for at least
     /// a lease's ttl plus grace from the first read in every case, even
@@ -816,6 +818,26 @@ impl Cluster {
             tokio::time::sleep(period / 2).await;
             let now = read().await;
             if forgotten(&now) {
+                return (Identity::Checking, None, None);
+            }
+            // A released node lease that is gone: `cluster forget` removed
+            // it (its mark is there for less than the time between two
+            // reads), or an operator deleted it. Its process stopped
+            // cleanly and nothing writes under this id, so this is no
+            // other writer: the check runs again from its first read,
+            // over no object, with its full wait. Only for a released
+            // lease: a live or fenced one, or a heartbeat from before
+            // node leases, that goes absent keeps the deleted verdict.
+            if now.is_none()
+                && last
+                    .as_ref()
+                    .and_then(|(body, _)| NodeLeaseObject::decode(body))
+                    .is_some_and(|o| o.state == NodeState::Released)
+            {
+                tracing::info!(
+                    "node id {}'s released lease was removed during the start check; checking again",
+                    self.node_id
+                );
                 return (Identity::Checking, None, None);
             }
             let changed = now.as_ref().map(|(body, _)| body) != last.as_ref().map(|(body, _)| body);

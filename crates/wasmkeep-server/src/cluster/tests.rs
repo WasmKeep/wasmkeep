@@ -1801,34 +1801,72 @@ async fn the_start_check_names_what_changed_the_object() {
     }
 }
 
-/// What the mark of `cluster forget` does not cover (ADR 0043, limits):
-/// the command's two requests follow each other at once, so a node whose
-/// start check is watching the released lease usually reads it, then
-/// nothing, and never the mark. That is a deletion during the check, as
-/// before: this start stops, and the next one creates the lease. The
-/// node wrote nothing, so no lease is lost.
+/// `cluster forget`'s two requests follow each other at once, so a node
+/// whose start check is watching the released lease usually reads it,
+/// then nothing, and never the mark (ADR 0043). A released lease that is
+/// gone is no other writer: the check runs again in full over no object,
+/// and the node creates its lease. Only a released one: a live or fenced
+/// lease, or a heartbeat from before node leases, that goes absent
+/// during the check is still a deletion, and the start stops.
 #[tokio::test]
-async fn a_forget_that_ends_between_two_reads_of_the_start_check_stops_that_start() {
-    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let key = StorePath::from("nodes/a");
-    let released = format!(
-        "wasmkeep-node 3\nreleased beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+async fn a_forget_that_ends_between_two_reads_of_the_start_check_lets_the_start_go_on() {
+    let lease = |state: &str| {
+        format!(
+            "wasmkeep-node 3\n{state} beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+            now_ms()
+        )
+    };
+    let old = format!(
+        "wasmkeep-node 2\na\nhttp://old\n0.0.0\n{}\nt/default\n\n\nserving\n",
         now_ms()
     );
-    store.put(&key, released.into_bytes().into()).await.unwrap();
+    let key = StorePath::from("nodes/a");
+    // Released: the start goes on.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    store
+        .put(&key, lease("released").into_bytes().into())
+        .await
+        .unwrap();
     let a = fast_node("a", &store);
     tokio::time::sleep(Duration::from_millis(300)).await;
     // The mark was there for less than the time between two reads.
     store.delete(&key).await.unwrap();
-    let why = a.identity().await.unwrap_err();
+    let deleted = std::time::Instant::now();
+    a.identity().await.unwrap();
+    // The whole check ran again (ttl plus grace, 1.2 s here).
     assert!(
-        why.starts_with("this node's lease object was deleted"),
-        "{why}"
+        deleted.elapsed() >= Duration::from_millis(1_100),
+        "started {:?} after the delete",
+        deleted.elapsed()
     );
-    assert!(store.head(&key).await.is_err(), "nothing was written");
-    // Started again, it creates its lease.
-    let again = fast_node("a", &store);
-    again.identity().await.unwrap();
+    let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let instance = a.membership.instance().unwrap().to_owned();
+    assert!(
+        String::from_utf8_lossy(&body).starts_with(&format!("wasmkeep-node 3\nlive {instance}\n")),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // Anything else that goes absent: deleted, as before.
+    for (what, body) in [
+        ("live", lease("live")),
+        ("fenced", lease("fenced")),
+        ("old format", old),
+    ] {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store.put(&key, body.into_bytes().into()).await.unwrap();
+        let a = fast_node("a", &store);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        store.delete(&key).await.unwrap();
+        let why = a.identity().await.unwrap_err();
+        assert!(
+            why.starts_with("this node's lease object was deleted"),
+            "{what}: {why}"
+        );
+        assert!(
+            store.head(&key).await.is_err(),
+            "{what}: nothing was written"
+        );
+    }
 }
 
 /// A peer's fence over the process the start check first read is not a

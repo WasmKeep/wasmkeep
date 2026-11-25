@@ -506,6 +506,15 @@ pub fn gate<'a>(
 /// the app's upgrade to 0.9 is finalized a node of 0.8.1 may start under
 /// that id, and it would write its lease over a mark it does not know.
 ///
+/// The gate is per app, `app` being the one the released lease names,
+/// while a node id is a key of the whole prefix (`nodes/<id>`). It says
+/// nothing of the other apps under the prefix. Their nodes of 0.8.1 list
+/// the mark and skip it (an unknown first line is no heartbeat to them).
+/// But a node of 0.8.1 started under this very id for another app, one
+/// that is not finalized, passes that app's floor and writes its lease
+/// over the mark, which the command's delete then removes: the gap from
+/// before the mark, for a node id moved between apps during the removal.
+///
 /// # Errors
 /// The bucket did not answer. Inside: what blocks the mark.
 pub async fn forget_gate<B: Bucket + Directory>(

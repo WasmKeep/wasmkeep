@@ -170,13 +170,28 @@ pub(crate) async fn forget_on(
             "{node} has no heartbeat object: nothing to forget."
         ));
     };
+    // A delete of the mark that gets no answer is given up, not sent
+    // again for as long as the bucket client would: one that landed much
+    // later would remove the lease a node created meanwhile.
+    let bound = wasmkeep_cluster::node_lease::forget_delete_bound_ms(
+        &wasmkeep_cluster::lease::LeaseConfig::default_safe(),
+    );
+    let give_up = || tokio::time::sleep(std::time::Duration::from_millis(bound));
+    let unfinished = || {
+        format!(
+            "{key} holds this command's mark, and its delete got no answer within {} s: run \
+             `wasmkeep cluster forget {node}` again",
+            bound / 1000
+        )
+    };
     // The mark of a run that did not finish: the lease it replaced was
     // checked then, and nothing writes over a mark.
     if forgotten(&body).is_some() {
-        return match forget_finish(&bucket, &key)
+        return match forget_finish(&bucket, &key, give_up())
             .await
             .map_err(|e| format!("deleting {key}: {e:?}"))?
         {
+            Forgot::Unfinished => Err(unfinished()),
             Forgot::Removed => Ok(format!(
                 "Removed {node}'s node lease: an earlier `cluster forget` had replaced it with \
                  its mark and not deleted it."
@@ -209,7 +224,7 @@ pub(crate) async fn forget_on(
             .map_err(|e| format!("reading the upgrade floor and the nodes of {app}: {e:?}"))?
         {
             Ok(()) => {
-                return match forget_released(&bucket, &key, &version, now_ms)
+                return match forget_released(&bucket, &key, &version, now_ms, give_up())
                     .await
                     .map_err(|e| {
                         format!(
@@ -219,6 +234,7 @@ pub(crate) async fn forget_on(
                     })? {
                     Forgot::Removed => Ok(format!("Removed {node}'s released node lease.")),
                     Forgot::Changed => Err(changed()),
+                    Forgot::Unfinished => Err(unfinished()),
                 };
             }
             Err(why) => {
@@ -313,7 +329,16 @@ pub(crate) struct Report {
     /// The upgrade of WasmKeep itself (ADR 0043), for each app that has
     /// registered nodes: its floor and one state.
     pub(crate) upgrades: Vec<wasmkeep_cluster::upgrade::AppUpgrade>,
+    /// The node ids whose key holds the mark of a `cluster forget` (ADR
+    /// 0043) written more than [`FORGET_UNFINISHED_MS`] ago: the command
+    /// deletes its mark at once, so one that old was left by a run that
+    /// did not finish, and keeps a node from starting under that id.
+    pub(crate) unfinished_forgets: Vec<String>,
 }
+
+/// How old the mark of a `cluster forget` is before `cluster status`
+/// says its command did not finish.
+pub(crate) const FORGET_UNFINISHED_MS: u64 = 5_000;
 
 /// Reads the cluster under `prefix` of `store`, at `now_ms`, counting a
 /// heartbeat live for `horizon_ms`.
@@ -365,8 +390,18 @@ async fn read_with_limit(
         .trim_start_matches('/')
         .to_owned();
     let mut heartbeats = Vec::new();
+    let mut unfinished_forgets = Vec::new();
     for (key, _) in list_objects(&store, &node_prefix, max).await? {
         let body = metadata(&store, &StorePath::from(format!("{node_prefix}/{key}"))).await?;
+        // Not a node: shown only when its command left it there.
+        if let Some(at) = wasmkeep_cluster::node_lease::forgotten(&body) {
+            if now_ms.saturating_sub(at) > FORGET_UNFINISHED_MS
+                && wasmkeep_cluster::membership::validate_node_id(&key).is_ok()
+            {
+                unfinished_forgets.push(key);
+            }
+            continue;
+        }
         if let Some(info) = NodeInfo::decode(&body)
             && key == info.id
             && wasmkeep_cluster::membership::validate_node_id(&info.id).is_ok()
@@ -404,6 +439,7 @@ async fn read_with_limit(
         nodes,
         apps: read_apps(&store, prefix, bucket, max).await?,
         upgrades,
+        unfinished_forgets,
     })
 }
 
@@ -543,6 +579,12 @@ impl Report {
                 "draining but stuck: {} still hold actors and have no node to hand them to; \
                  start or undrain a node that serves the same app (ADR 0014)",
                 stuck.join(", ")
+            ));
+        }
+        for id in &self.unfinished_forgets {
+            out.push(format!(
+                "{id}: forget did not finish; run `wasmkeep cluster forget {id}` (no node \
+                 starts under that id until then)"
             ));
         }
         // ADR 0035: an app whose live nodes differ on `recorded-head`
@@ -1380,8 +1422,26 @@ mod tests {
         use wasmkeep_cluster::node_lease::{OperatorFence, encode_forgotten, operator_fence};
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         block_on(store.put(&StorePath::from("nodes/b"), encode_forgotten(NOW).into())).unwrap();
+        // Just written: its command is about to delete it. Nothing shown.
         let report = block_on(read(Arc::clone(&store), "", "mem", NOW, 10_000)).unwrap();
         assert!(report.nodes.is_empty() && report.upgrades.is_empty());
+        assert!(report.unfinished_forgets.is_empty());
+        assert!(report.warnings().iter().all(|w| !w.contains("forget")));
+        // Still there seconds later: one line, with the command to run.
+        let later = NOW + FORGET_UNFINISHED_MS + 1;
+        let report = block_on(read(Arc::clone(&store), "", "mem", later, 10_000)).unwrap();
+        assert!(report.nodes.is_empty() && report.upgrades.is_empty());
+        let lines: Vec<String> = report
+            .warnings()
+            .into_iter()
+            .filter(|w| w.contains("forget"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("b: forget did not finish; run `wasmkeep cluster forget b`"),
+            "{lines:?}"
+        );
+        assert!(report.to_text().contains(&format!("warning: {}", lines[0])));
         let bucket = ObjectStoreBucket::new(Arc::clone(&store), "");
         assert_eq!(
             block_on(operator_fence(&bucket, &Wall, "nodes/b")),
