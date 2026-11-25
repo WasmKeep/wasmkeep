@@ -170,7 +170,7 @@ removed in 0.9.0) works only until the first node starts after the
 migration, and never after `--remove-old --apply`
 ([upgrading to 0.4.0](deploy/upgrading-to-0.4.md)). Builds made from
 a git checkout report the release they follow and their commit
-(`0.8.1+4f1c2a9e7b3d`), a release's tag the release alone, so the version
+(`0.9.0+4f1c2a9e7b3d`), a release's tag the release alone, so the version
 column tells two builds of `main` apart. A build without git (a source
 tarball, a container image built locally) reports the release alone:
 step 3 is what proves no old node is left.

@@ -30,7 +30,7 @@
 
 /* This SDK's version: the WasmKeep release it comes with, the server's
  * version (scripts/check-versions.py keeps them equal). */
-#define WASMKEEP_SDK_VERSION "0.8.1"
+#define WASMKEEP_SDK_VERSION "0.9.0"
 
 #include <stdarg.h>
 #include <stdbool.h>

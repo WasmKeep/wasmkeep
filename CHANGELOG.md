@@ -7,7 +7,7 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## Unreleased
+## 0.9.0
 
 **0.9 is upgraded one node at a time: a cluster moves from 0.8.1 to 0.9.0
 without stopping as a whole, and one command ends the upgrade.** A node

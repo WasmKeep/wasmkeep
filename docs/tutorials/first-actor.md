@@ -3,7 +3,7 @@
 You will write a small actor in Rust, build it into a WebAssembly component,
 serve it with WasmKeep, and see its state survive a restart.
 
-Applies to: WasmKeep `0.8.1` (pre-alpha). Commands assume Linux; on macOS,
+Applies to: WasmKeep `0.9.0` (pre-alpha). Commands assume Linux; on macOS,
 build the server from source (step 1).
 
 **The fast path**, from `0.4.2` on: `wasmkeep new` writes a
@@ -52,7 +52,7 @@ cargo add wasmkeep-sdk
 
 `cargo add` takes the newest version: the SDK carries the version of the
 server it is released with, so keep the two the same
-(`cargo add wasmkeep-sdk@0.8.1` names one). Add to `Cargo.toml`:
+(`cargo add wasmkeep-sdk@0.9.0` names one). Add to `Cargo.toml`:
 
 ```toml
 [lib]
@@ -179,7 +179,7 @@ README it writes has the commands (`rustup target add wasm32-wasip2` or
 `crates/wasmkeep-cli/tests/new_project.rs` for every variant.
 
 The SDK is pinned to the version of the `wasmkeep` that wrote the project
-(`wasmkeep-sdk = "0.8.1"`, `"@wasmkeep/sdk": "0.8.1"`, say), the version
+(`wasmkeep-sdk = "0.9.0"`, `"@wasmkeep/sdk": "0.9.0"`, say), the version
 every release publishes the SDKs at. A `wasmkeep` built from a clone pins
 the clone's version: until that version is on crates.io and npm, build
 against the clone's SDK instead (`<clone>` its absolute path), without

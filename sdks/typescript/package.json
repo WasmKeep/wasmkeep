@@ -1,6 +1,6 @@
 {
   "name": "@wasmkeep/sdk",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Write WasmKeep actors in TypeScript or JavaScript.",
   "license": "Apache-2.0",
   "type": "module",
