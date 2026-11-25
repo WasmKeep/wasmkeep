@@ -996,7 +996,8 @@ Removed:
 2. **The 32-digit client address** in a forward's proof is no longer
    read (`admission_received`).
 3. **A 404 to a hello** is no longer taken as an answer: it is sent
-   again as any failed hello, three rounds at most.
+   again as any failed hello, three rounds at most
+   (`a_hello_answered_404_is_not_taken`).
 
 Kept:
 
@@ -1041,10 +1042,11 @@ The bucket adapter still has no conditional delete (`object_store`
    half period), and then runs the whole check again, its ttl plus
    grace included: it creates its lease over no object. A first write
    whose condition fails because the mark landed after the check comes
-   back to the same wait. So the three orders are safe: the node writes
-   first (the command's condition fails), the command writes first and
-   the node reads the mark (it waits), or the command finishes first
-   (the node starts as on a new id).
+   back to the same wait. So no lease a node wrote is deleted: if the
+   node writes first, the command's condition fails; if the command
+   writes first, the node's write is refused, or the node reads the
+   mark and waits; if the command finishes first, the node starts as on
+   a new id. What a start can still meet is in the limits below.
 4. **The bound.** A mark still there four times a lease's ttl plus grace
    after the node first read it (60 s at the defaults) is one its
    command did not delete. The node does not start, reports `this
@@ -1059,7 +1061,9 @@ The bucket adapter still has no conditional delete (`object_store`
    cannot read and then write its lease over it. So the mark is written
    only when `gate` allows its row for the app the lease names: that
    app's floor at `0.9` or later (no node of `0.8.1` starts there any
-   more), and no live node of the app older than `0.9`. Otherwise
+   more), and no live node of the app older than `0.9`. The floor is
+   read first, and the nodes are listed only when it allows the mark.
+   Otherwise
    `forget` reads twice and deletes, as before `0.9`, and its answer
    says so and names what blocks the mark. A heartbeat from before node
    leases is removed that way too. The command takes no version of its
@@ -1082,6 +1086,22 @@ The bucket adapter still has no conditional delete (`object_store`
 
 Limits, kept as documented:
 
+- **A start check that was watching the released lease.** The command's
+  two requests follow each other at once, so a node that is reading its
+  key every half period usually reads the lease, then nothing, and
+  never the mark. That is a deletion during the check, as it was before
+  the mark: this start stops (`this node's lease object was deleted`),
+  having written nothing, and the next start creates the lease. (A
+  check that had ended before the removal is not stopped: its first
+  write fails, it checks the id again and creates the lease.) The mark
+  closes the case that lost a lease the node had written; it does not
+  make a start that overlaps a `forget` succeed. Running the check
+  again when a watched released lease goes absent would, and is left
+  for a change of its own: it changes what the start check answers to a
+  deletion.
+- **A delete that lands late.** A delete the bucket client gave up on
+  and that lands after the node created its lease removes that lease,
+  as the second of two commands does (next).
 - **Two `forget` of one node at once.** Each deletes the mark it read.
   If the first delete, a node's create and the second delete land in
   that order, the node's new lease is deleted: it stops at its next
@@ -1089,9 +1109,10 @@ Limits, kept as documented:
   operators and a node start in the same second.
 - **Before the finalize** the gap of ADR 0020 is as it was.
 - **A whole-app restore in place** reads `nodes/` itself and takes an
-  object it cannot decode as a node whose app is unknown; a mark that
-  is there at that moment makes it take its cautious path, as any such
-  object does. That reader was not changed here.
+  object it cannot decode as a node whose app is unknown. A mark that
+  is there while it waits for the app's earlier nodes makes it take the
+  longer of its waits, and one more round when the mark goes away, as
+  any such object does. That reader was not changed here.
 - **Nodes of `0.8.1` of another app on the same prefix** list the mark
   and skip it (their heartbeat decoder reads an unknown first line as
   nothing). One starting under the very id being forgotten, for
@@ -1107,7 +1128,9 @@ the command's two steps (`node_lease::tests::forget`), every listing
 (`the_forgotten_mark_waits_for_the_finalize`, and the command's own
 `forget_marks_a_released_lease_only_after_the_finalize`), the start
 check (`a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete`,
-`a_forgotten_mark_never_removed_stops_the_start`), and one cluster case,
+`a_forgotten_mark_never_removed_stops_the_start`, and the limit,
+`a_forget_that_ends_between_two_reads_of_the_start_check_stops_that_start`),
+and one cluster case,
 `tests/cluster/upgrade.rs`:
 `a_node_forgotten_after_the_finalize_starts_again_with_its_lease`. No
 simulation case: the lease protocol between nodes is unchanged, and the

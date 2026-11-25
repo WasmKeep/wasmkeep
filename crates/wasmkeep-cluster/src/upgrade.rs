@@ -517,6 +517,12 @@ pub async fn forget_gate<B: Bucket + Directory>(
     let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
     let floor = bucket.get(&floor::relative_key(tenant, name)).await?;
     let floor = floor::decode(floor.as_ref().map(|(body, _)| body.as_slice()));
+    // The floor first, alone: before the finalize the nodes are not
+    // listed (a prefix that holds many released leases is why `forget`
+    // is run).
+    if let Err(blocked) = gate(&FORGOTTEN, floor.clone(), std::iter::empty()) {
+        return Ok(Err(blocked));
+    }
     let nodes = crate::membership::all_heartbeats(bucket).await?;
     let live = nodes
         .iter()

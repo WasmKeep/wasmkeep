@@ -68,9 +68,9 @@ pub(super) enum ClusterCommand {
     /// Refuses a recent one (that node may still run), a released lease a
     /// record still names (it is what frees that record), and a live or
     /// fenced node lease (never deleted: fence a live one instead). Once
-    /// the app's upgrade to 0.9 is finalized, a node that starts under
-    /// that id at the same moment keeps its lease; before, it may lose it
-    /// and be started again, and the command says so.
+    /// the app's upgrade to 0.9 is finalized, the command never deletes a
+    /// lease a node starting under that id wrote meanwhile; before, it
+    /// may, and says so (that node stops and is started again).
     Forget(NodeArgs),
     /// Follow and end an upgrade of WasmKeep itself, one node at a time:
     /// `status` shows each node's version, each app's upgrade floor and

@@ -1801,6 +1801,36 @@ async fn the_start_check_names_what_changed_the_object() {
     }
 }
 
+/// What the mark of `cluster forget` does not cover (ADR 0043, limits):
+/// the command's two requests follow each other at once, so a node whose
+/// start check is watching the released lease usually reads it, then
+/// nothing, and never the mark. That is a deletion during the check, as
+/// before: this start stops, and the next one creates the lease. The
+/// node wrote nothing, so no lease is lost.
+#[tokio::test]
+async fn a_forget_that_ends_between_two_reads_of_the_start_check_stops_that_start() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let key = StorePath::from("nodes/a");
+    let released = format!(
+        "wasmkeep-node 3\nreleased beef\n{}\na\nhttp://old\n0.0.0\nt/default\n\n\nserving\n\ntake\n",
+        now_ms()
+    );
+    store.put(&key, released.into_bytes().into()).await.unwrap();
+    let a = fast_node("a", &store);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The mark was there for less than the time between two reads.
+    store.delete(&key).await.unwrap();
+    let why = a.identity().await.unwrap_err();
+    assert!(
+        why.starts_with("this node's lease object was deleted"),
+        "{why}"
+    );
+    assert!(store.head(&key).await.is_err(), "nothing was written");
+    // Started again, it creates its lease.
+    let again = fast_node("a", &store);
+    again.identity().await.unwrap();
+}
+
 /// A peer's fence over the process the start check first read is not a
 /// twin: that process stopped writing. The check goes on, and the first
 /// write conditions on the fence's version.

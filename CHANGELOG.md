@@ -73,14 +73,16 @@ The text under a version's heading is its GitHub release text
   node, and not older than the floor.
 - One check now answers "does every live node announce this word" for
   every writer, the CLI included. The messages are unchanged.
-- **`wasmkeep cluster forget` no longer races a node that starts under
-  the same id**, once the app's upgrade to 0.9 is finalized. It replaces
-  the released lease with a mark, by a write that fails if the lease
-  changed, then deletes the mark. A node that starts meanwhile writes
-  nothing over the mark and waits for it to be gone. If the command
-  stopped between its two steps, the node does not start after 60 s and
-  says to run the command again. Before the finalize the command
-  deletes as it did, and says so
+- **`wasmkeep cluster forget` no longer deletes the lease of a node
+  that just started under the same id**, once the app's upgrade to 0.9
+  is finalized. It replaces the released lease with a mark, by a write
+  that fails if the lease changed, then deletes the mark. A node that
+  reads the mark writes nothing over it and waits for it to be gone. If
+  the command stopped between its two steps, the node does not start
+  after 60 s and says to run the command again. A node whose start
+  check was already watching the lease still stops when it is removed,
+  having written nothing, and starts on the next try. Before the
+  finalize the command deletes as it did, and says so
   ([cluster](docs/cluster.md#how-it-works),
   [ADR 0043](docs/adr/0043-rolling-upgrades.md#built-the-removals-and-the-mark-of-cluster-forget)).
 

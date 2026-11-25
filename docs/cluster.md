@@ -114,7 +114,10 @@ of what adding nodes does, read
   id; if the mark is still there 60 s later (the command stopped between
   its two steps), the process does not start, reports `this node's lease
   is being removed by cluster forget`, and running the command again
-  removes the mark. The mark is not a node: no listing counts it. Before
+  removes the mark. A process that was already checking its node id when
+  the lease was removed stops with `this node's lease object was
+  deleted`, having written nothing, and its service manager starts it
+  again. The mark is not a node: no listing counts it. Before
   the finalize, and for a heartbeat from before node leases, the command
   reads the object twice and deletes only if it did not change between
   the reads, and says so: a process starting under that id whose first

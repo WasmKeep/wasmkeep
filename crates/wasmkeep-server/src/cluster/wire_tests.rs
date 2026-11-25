@@ -128,6 +128,11 @@ impl Captured {
 
 /// A listener that records each request (head and body) and answers 200.
 async fn recorder() -> (String, Captured) {
+    answering("200 OK").await
+}
+
+/// [`recorder`], answering every request with `status` (`404 Not Found`).
+async fn answering(status: &'static str) -> (String, Captured) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let captured = Captured::default();
@@ -168,9 +173,8 @@ async fn recorder() -> (String, Captured) {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 into.0.lock().unwrap().push(buf);
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                    .await;
+                let answer = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+                let _ = socket.write_all(answer.as_bytes()).await;
             });
         }
     });
@@ -328,6 +332,32 @@ async fn a_hello_sends_these_bytes() {
         )
     );
     assert_eq!(redact(&raw, &base, Some(&nonce)), GOLDEN_HELLO, "{raw}");
+}
+
+/// A hello a peer answers 404 was not taken, and another round is sent
+/// (ADR 0043, section 6). Until 0.9 a 404 passed for the answer of a node
+/// of 0.4.1 and before, which knew no hello: no node this version runs
+/// beside is one, and a node of 0.8.1 answers 200 or 403.
+#[tokio::test]
+async fn a_hello_answered_404_is_not_taken() {
+    for (status, fails) in [("200 OK", false), ("404 Not Found", true)] {
+        let (base, captured) = answering(status).await;
+        let me = sender(&base).await;
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        me.say_hello(Arc::clone(&failed));
+        // The hello was sent and its answer read.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while captured.0.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "{status}: no hello");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            failed.load(std::sync::atomic::Ordering::Acquire),
+            fails,
+            "{status}"
+        );
+    }
 }
 
 /// A client's request, as a front node forwards it to `owner`: the proof
