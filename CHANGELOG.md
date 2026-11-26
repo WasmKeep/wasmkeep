@@ -7,10 +7,12 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## Unreleased
+## 0.9.0
 
-**0.9 is upgraded one node at a time: a cluster moves from 0.8.1 to 0.9.0
-without stopping as a whole, and one command ends the upgrade.** A node
+**0.9 can be upgraded one node at a time: a cluster moves from 0.8.1 to
+0.9.0 without stopping as a whole, and one command ends the upgrade.
+Stopping every node is still the recommended way for 0.9.0 (see Known
+limits).** A node
 refuses to start beside a version it cannot run with, each app has an
 upgrade floor, and `wasmkeep cluster upgrade finalize` raises it once
 every node runs the new version. Until then any node may go back to 0.8.1
@@ -200,6 +202,15 @@ a **pre-alpha pre-release**.
   declared, and read again one that goes past it or ends short of it (a
   read-back takes a longer one for other bytes at once). A long body
   was read without a bound, and a short one was taken as the object.
+
+### Known limits
+
+- **Edges are not rebalanced after a rolling upgrade.** After an upgrade
+  one node at a time under load, a big room's edges stay on the nodes
+  upgraded first, and the latency goal after the upgrade was not met.
+  Stopping every node is recommended for 0.9.0; rebalancing is planned
+  for 0.10.0
+  ([measured](docs/deploy/upgrading-to-0.9.md#measured)).
 
 ## 0.8.1
 

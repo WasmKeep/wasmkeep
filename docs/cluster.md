@@ -829,8 +829,11 @@ page keep their anchors here:
 
 Upgrading the `wasmkeep` binary itself is on its own page,
 [Upgrading WasmKeep](cluster-upgrades.md#upgrading-wasmkeep). In short:
-from 0.8.1 to 0.9.0 a cluster is upgraded one node at a time and then
-finalized ([upgrading to 0.9.0](deploy/upgrading-to-0.9.md)); between
+from 0.8.1 to 0.9.0 the recommended way is to stop every node and start
+them all on 0.9.0, then finalize; one node at a time is supported and
+safe for data, but under load it is not yet proven to meet the latency
+goal and leaves a big room's edges unbalanced until 0.10.0
+([upgrading to 0.9.0](deploy/upgrading-to-0.9.md#measured)); between
 any other pair of versions, stop every node, upgrade them all and start
 them all, unless that release's upgrading page says otherwise.
 

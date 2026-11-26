@@ -1,11 +1,19 @@
 # Upgrade a cluster to 0.9.0
 
-0.9.0 is the first minor release a cluster moves to one node at a time,
-without stopping as a whole, with the checks for it in the binary. The
-supported pair is **0.8.1 to 0.9.0**. The
-upgrade ends with one command, `wasmkeep cluster upgrade finalize`:
-**until you run it, any node may go back to 0.8.1, and what 0.9.0 adds to
-the bucket stays off.** After it there is no way back.
+0.9.0 is the first minor release a cluster can move to one node at a
+time, without stopping as a whole, with the checks for it in the binary.
+The supported pair is **0.8.1 to 0.9.0**. Either way, the upgrade ends
+with one command, `wasmkeep cluster upgrade finalize`: **until you run
+it, any node may go back to 0.8.1, and what 0.9.0 adds to the bucket
+stays off.** After it there is no way back.
+
+**Recommended for 0.9.0: stop every node, then start them all on 0.9.0**
+([with every node stopped](#with-every-node-stopped-recommended)). An
+upgrade one node at a time is supported and safe for data, but it is not
+yet proven to meet the latency goal under load: while each node
+restarts, its clients see slow and failed deliveries, and afterwards a
+big room's edges stay on the nodes upgraded first until 0.10.0
+rebalances them ([measured](#measured)).
 
 The rules are in [ADR 0043](../adr/0043-rolling-upgrades.md); the commands
 are described in [Upgrading WasmKeep](../cluster-upgrades.md). This page
@@ -36,9 +44,30 @@ is the rule for this release.
 - **Upgrade backup jobs with the cluster**, before the first backup after
   the finalize ([Backups](#backups)).
 
+## With every node stopped (recommended)
+
+The cluster serves nothing between the last stop and the first start,
+so plan a short window.
+
+1. **Stop every node** cleanly (`systemctl stop wasmkeep`, `SIGTERM`),
+   and wait until `wasmkeep cluster status` exits with 1 (no live node).
+2. **Install 0.9.0** on every node.
+3. **Start every node**, and wait until each is `serving`:
+   `/_wasmkeep/ready` answers 200 on it, and `cluster status` lists it
+   live, on 0.9.0.
+4. **Finalize** ([below](#finalize)). It needs a live node, so it comes
+   after the start.
+
+The general steps are in
+[Upgrading WasmKeep](../cluster-upgrades.md#with-every-node-stopped).
+
 ## One node at a time
 
-For each node in turn:
+Supported and safe for data, at a cost under load: each node's clients
+reconnect while it restarts, with slow and failed deliveries for those
+minutes, and the node upgraded last ends with few of a big room's edges,
+which nothing moves back on its own yet ([measured](#measured)). For
+each node in turn:
 
 1. **Drain it**, and wait until `cluster status` shows it `drained`:
 
@@ -107,7 +136,11 @@ is still 0.8. `--app TENANT/APP` narrows both commands to one app;
 
 `finalize` works per app, over every app with a registered node under
 the prefix. Without `--yes` it prints what it would do and exits with 2.
-With it:
+Without `--app`, it raises the floor of every app that has a live node,
+and exits with 1 if any app has no live node, even after raising the
+others. For apps with no node left, finalize the live ones with `--app`,
+or remove the leftover leases with `wasmkeep cluster forget`. With
+`--yes`:
 
 1. It is **refused, naming them, while a live node of the app is older**
    than 0.9. It is refused too while an older node is not live but its
@@ -333,16 +366,48 @@ and not older than the app's floor.
   command. It delays every start by a lease's ttl plus grace and keeps
   the prefix's new apps from getting a floor at their first deploy,
   until it is deleted from the bucket by hand.
-- **Not yet measured.** The mixed-version check as the proof of this
-  upgrade, and a three-node run on a real bucket under load with two
-  hours in the mixed state, are planned in ADR 0043, section 8, and are
-  not done. Two problems known from 0.8.1 are open there: after a rolling
-  restart of every node a big room's edges were no longer spread evenly,
-  and `cluster status` took 7 to 47 s on a prefix with about 140 released
-  node leases (`cluster forget` removes them). The removals above were
-  made on a reading of the 0.8.1 senders and unit tests of each refusal,
-  not on a mixed-version run.
+- **Edges are not rebalanced after a rolling upgrade.** A big room's
+  edges stay on the nodes upgraded first, and the latency goal after the
+  upgrade was not met ([measured](#measured)). Stopping every node is the
+  recommended way for 0.9.0; rebalancing is planned for 0.10.0.
+- **`cluster status` is slow with many released node leases**: 7 to 47 s
+  on a prefix with about 140 of them, measured on 0.8.1. `cluster
+  forget` removes them.
+- **The removals above** were made on a reading of the 0.8.1 senders and
+  unit tests of each refusal; the mixed-version check runs 0.9.0 beside
+  0.8.1 nodes, which no longer send the removed forms.
 - **0.x to 1.0** is not covered by these rules.
+
+## Measured
+
+The proof planned in
+[ADR 0043, section 8](../adr/0043-rolling-upgrades.md#8-how-the-mixed-version-check-becomes-the-proof):
+
+- **The mixed-version check**, `scripts/mixed-version.sh`
+  ([releasing](../releasing.md#the-mixed-version-check)), passed 501 of
+  501 checks from 0.8.1 to 0.9.0.
+
+On a three-node cluster on 4-vCPU machines with a remote S3-compatible
+bucket:
+
+- **A rolling upgrade under load**, 0.8.1 to 0.9.0 one node at a time,
+  under 4,500 clients at 10 messages/s:
+  - nothing was lost: every publish was acknowledged in the end, and no
+    message was delivered twice or skipped;
+  - each node was `serving` again 16 to 25 s after its stop;
+  - while a node restarts, its clients reconnect: for those minutes the
+    delivery p99 is seconds to tens of seconds (3.6 to 23 s measured),
+    and 1 to 2 % of publishes fail and must be retried by the client;
+  - afterwards the node upgraded last held 4 of the 62 edges: nothing
+    rebalances them on its own yet. Moved back by hand with `wasmkeep
+    actor move`, to 17, 22 and 23 edges, the 300 s window after that had
+    a delivery p99 of 0.90 to 1.05 s, against a goal of 1 s: not met.
+- **Two hours in the mixed state**, two nodes on 0.9.0 and one on
+  0.8.1: no acknowledged write lost, 6,694 writes in order.
+
+So a rolling upgrade is safe for data but not yet proven to meet the
+latency goal under load, and stopping every node is the recommended way
+for 0.9.0. Rebalancing edges after a node rejoins is planned for 0.10.0.
 
 ## What else is new
 

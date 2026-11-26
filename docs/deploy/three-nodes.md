@@ -208,8 +208,9 @@ it exits with 1 if no node is live. See
   that node's calls to it are treated as a client's. To roll back, add
   `accept` to every node before removing any listener.
 - **Upgrading WasmKeep** (the binary, not your app): read the release's
-  upgrading page first. From 0.8.1 to 0.9.0 the cluster is upgraded one
-  node at a time and then finalized
+  upgrading page first. From 0.8.1 to 0.9.0, stop every node and start
+  them all on 0.9.0 (recommended), or upgrade one node at a time
+  (supported and safe for data), then finalize
   ([upgrading to 0.9.0](upgrading-to-0.9.md)). For any other pair of
   versions, upgrade every node together, not one at a time.
   `systemctl stop wasmkeep` on all three, wait

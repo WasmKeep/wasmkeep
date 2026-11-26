@@ -6,39 +6,30 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0` and `0.8.1`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0`, `0.8.1` and `0.9.0`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now
 
-`0.9.0`: **operating without the author.** `0.8.1` settled 0.8 (what it
-fixed is under [Built](#built) and in the [changelog](CHANGELOG.md)).
+`0.10.0`: **a cluster that looks after itself between upgrades.**
+`0.9.0` made an upgrade rolling (what it brings is under [Built](#built);
+the limits known at release are in the [changelog](CHANGELOG.md) and on
+its [upgrading page](docs/deploy/upgrading-to-0.9.md)).
 
-1. **Rolling upgrades of WasmKeep** (L): one node at a time from the
-   previous minor version, with no stop of the whole cluster and no
-   offline migration. Two consecutive versions work in one cluster, and
-   a new bucket format is written only once every node reads it. Today
-   every node is upgraded together unless a release's page says
-   otherwise ([how](docs/cluster-upgrades.md#upgrading-wasmkeep)). Built so far:
-   the version check at a node's start, the upgrade floor, `wasmkeep
-   cluster upgrade status|finalize`, and the first format held back
-   until an upgrade is finalized (the class keys `apart-from` and
-   `spread`); the proof is to come
-   ([ADR 0043](docs/adr/0043-rolling-upgrades.md)).
-2. **Verify a bucket** (M/L): a read-only command that checks every
-   actor can be restored from what the bucket holds. Built:
-   `wasmkeep cluster verify`
-   ([how](docs/cluster-operations.md#verifying-a-bucket)).
-3. **Traces** (M/L): one request followed through the front, its actor,
-   the calls it makes, the hop between nodes and the bucket write.
-   Designed, not built ([ADR 0044](docs/adr/0044-traces.md)).
-4. **Old upgrade paths removed** (M), each with a documented last
-   version that carries it
-   ([ADR 0043, section 6](docs/adr/0043-rolling-upgrades.md#6-removing-old-paths)).
+1. **Less left behind** (L): the leases of stopped nodes removed without
+   an operator, an idle actor's history compacted even when its node
+   restarted, and one bucket write less when an actor is first created.
+2. **The second rolling upgrade** (M): `0.9` to `0.10` one node at a
+   time, proved as the first was, with a room's edges rebalanced after a
+   node rejoins, so that the latency goal is met after the upgrade.
+3. **A measured envelope** (M): what three small nodes and a real bucket
+   carry, as one table with its workload and limits.
+4. **A write acknowledged once another node holds it**: measured and
+   designed; built only if the measurement says it is worth it.
 
 ## Next
 
-After 0.9.0, the items below, not before it.
+After 0.10.0, the items below, not before it.
 
 ## After that
 
@@ -355,6 +346,18 @@ Started alongside M3; what is left of it is under [Now](#now) and
   continues, and the mixed-version check against the previous release is
   a release gate ([changelog](CHANGELOG.md),
   [upgrading](docs/deploy/upgrading-to-0.8.md)).
+- In `0.9.0`, operating without the author: a cluster upgraded from
+  `0.8.1` one node at a time, with no stop of the whole cluster, and
+  ended by `wasmkeep cluster upgrade finalize`; a node that refuses to
+  start beside a version it cannot run with, and an upgrade floor per
+  app that holds back what the previous version cannot read
+  ([ADR 0043](docs/adr/0043-rolling-upgrades.md),
+  [upgrading](docs/deploy/upgrading-to-0.9.md)). Also `wasmkeep cluster
+  verify`, a read-only check that a bucket is whole
+  ([how](docs/cluster-operations.md#verifying-a-bucket)); optional traces
+  over OTLP ([ADR 0044](docs/adr/0044-traces.md)); and `wasmkeep cluster
+  migrate` removed, with `0.8.1` the last version that carries it
+  ([changelog](CHANGELOG.md)).
 
 ## Stretch goal: the benchmark showdown
 
