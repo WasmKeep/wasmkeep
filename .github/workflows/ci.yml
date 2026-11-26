@@ -635,7 +635,12 @@ jobs:
           sdks/python/scripts/package.sh "$RUNNER_TEMP/python-package"
           cp "$RUNNER_TEMP/python-package/counter.wasm" examples/py-counter/counter.wasm
       - name: the counter contract and the chat suite, against every language
-        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs --test big_room --locked
+        run: cargo nextest run -p wasmkeep-server --test languages --test chat --test jobs_langs --test workflows_ts --test workflows_langs --test fetch_langs --test db_langs --locked
+      # Alone, after the others: its default-budget tests keep the real 50 ms
+      # CPU budget, which other language suites running beside them on the
+      # runner's few cores push over.
+      - name: the big room against the default CPU budget, alone
+        run: cargo nextest run -p wasmkeep-server --test big_room --locked
       - name: the speed-sensitive StarlingMonkey full-window test (ignored in the other jobs)
         run: cargo nextest run -p wasmkeep-server --test big_room --locked --run-ignored only -E 'test(=typescript_big_room_full_window_at_default_budget_starlingmonkey)'
       - name: the todo front, in Rust and in TypeScript, with its actor; the projects wasmkeep new writes
