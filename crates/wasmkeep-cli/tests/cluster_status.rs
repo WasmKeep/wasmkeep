@@ -473,8 +473,17 @@ fn secrets_round_trip_through_the_bucket() {
         .enable_all()
         .build()
         .unwrap();
+    // The previous minor: inside this version's range (ADR 0043), so the
+    // refusal is the secrets check's, not the version gate's.
+    let (major, minor) = {
+        let mut parts = env!("CARGO_PKG_VERSION").split('.');
+        let major: u64 = parts.next().unwrap().parse().unwrap();
+        let minor: u64 = parts.next().unwrap().parse().unwrap();
+        (major, minor)
+    };
     let old_beat = format!(
-        "wasmkeep-node 2\nold\nhttp://old:8080\n0.0.0\n{}\nacme/shop\n\n\nserving\n",
+        "wasmkeep-node 2\nold\nhttp://old:8080\n{major}.{}.0\n{}\nacme/shop\n\n\nserving\n",
+        minor.saturating_sub(1),
         now_ms()
     );
     let beat_key = Path::from(format!("{prefix}/nodes/old"));
