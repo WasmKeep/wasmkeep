@@ -92,6 +92,7 @@ declare -A PINNED_SHA256=(
   [v0.7.0]=3dda0dfebc23428fff34779515b83bae38327923ffb7755b7a3c97872e5b469b
   [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
   [v0.8.1]=88f7a35dd5e96306f5ef51c0987d9cf7d3f55b7601fb5e8fa8b43a77e6bdf6ac
+  [v0.9.0]=b2a5b38c82f5ef3d6a59c26bd6460610c4dc684305b0a9ec73be3db294311240
 )
 OLD_VERSION=${1:-${OLD_VERSION:-v0.8.1}}
 [[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }

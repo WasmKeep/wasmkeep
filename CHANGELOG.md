@@ -21,7 +21,7 @@ again. Only the `wasmkeep` that runs `finalize` needs 0.9.1.
   With no node of an app live it is now accepted when every lease the
   app's nodes left is `released` or `fenced` and names the target
   version or a later one, and no object under `nodes/` fails to decode;
-  the write and the second listing are unchanged. A lease of an older
+  the write itself is unchanged. A lease of an older
   version refuses it, and the message names the way out for its state
   (a released lease can be forgotten, a fenced one cannot). A fence
   counts as a stop after the default lease timings. The listing after
