@@ -47,7 +47,7 @@ The text under a version's heading is its GitHub release text
   A marker that is the only carrier of a restore's generation is folded
   into the app's generation floor before it is deleted; once none is
   left, nodes stop reading them. `cluster verify` reads the generation
-  floor and reports one that says no marker is left beside a marker.
+  floor, and counts markers left under `markers none` as redundant.
 - Nodes announce the heartbeat word `genfloor`, which older nodes skip.
 
 ### Changed

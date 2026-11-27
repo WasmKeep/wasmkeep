@@ -19,8 +19,21 @@ An actor's ownership record carries a generation. Each acquisition
 writes the record one generation higher, and history objects carry the
 generation of the holder that wrote them, so a late upload from an
 earlier holder is never taken for the head. The rule that must hold
-for ever: **an actor's next generation is above every generation its
-history ever carried, deleted history included.**
+for the life of the app: **an actor's next generation is above every
+generation its history ever carried, deleted history included.** An
+actor deleted and created again keeps it (its ownership record stays,
+ADR 0028), and so does an actor whose app was restored (this record).
+
+The life of the app ends with `app delete`. An app created again
+(`deploy --recreate`) starts from nothing, every actor at generation 1,
+by design: its history, records and markers are gone with the old app's
+state. What keeps the two incarnations apart is not the generation but
+the recreate's fence (ADR 0028): `deploy --recreate` is refused until
+nothing is left under the app's prefixes and the late-write wait has
+passed since the tombstone and since any of the old app's nodes last
+wrote its heartbeat, so no write of the old incarnation can still land.
+It then leaves `apps/<tenant>/<app>/recreated`, which nodes compare their
+local files with.
 
 When an actor has no ownership record yet, its first one is seeded. In
 the code at `v0.9.0`:
@@ -79,8 +92,12 @@ The restore's floor moves to one object per app:
   object fails an acquisition that needs it and every command that
   would write it, naming the key.
 - **Meaning.** No actor of this app gets a first ownership record at or
-  below `<generation>`. `markers none` says no per-actor marker is left
-  under the app.
+  below `<generation>`. `markers none` says readers may ignore any
+  per-actor marker left under the app: none carries a generation that
+  its actor's keys, its ownership record or the floor does not. It does
+  not promise that no marker exists: an acquisition that read the
+  upgrade floor just before the finalize may land its marker after
+  `none` is written, and that marker carries only its actor's keys.
 - **Absent** reads as generation 0 and `markers kept`.
 - **Written by conditional writes only**, and the generation only
   upward; `kept` may become `none`, never the reverse.
@@ -212,9 +229,11 @@ Without `--yes` it prints the counts and writes nothing. It is
 idempotent and may be interrupted at any point: every step leaves the
 rule of the Context true.
 
-`wasmkeep cluster verify` learns the object (exact form, one per app),
-keeps counting leftover markers, and reports an app whose object says
-`none` while a marker exists.
+`wasmkeep cluster verify` learns the object (exact form, one per app)
+and keeps counting leftover markers. Under `markers none` it counts them
+as redundant, not as a problem: they are what an acquisition from just
+before the finalize may still write, and readers ignore them. Under
+`kept` they are the markers that matter, until the cleanup removes them.
 
 `cluster upgrade finalize` does not run the cleanup: it is one more
 command on the upgrading page, run once per app after the finalize.
@@ -358,6 +377,9 @@ As decided, with these notes:
   their first acquisitions, up to two restores in place, and an actor's
   delete and recreate. Each of the five mutations is caught.
 - **The cleanup's name** is `wasmkeep cluster markers clean`.
+- **`markers none`** means "readers may ignore leftover markers", not
+  "no marker exists" (section 1); `cluster verify` reports markers left
+  under it as redundant, with no problem.
 - **An old lease's liveness** is judged by the cleanup with a grace of an
   hour, not the nodes' default: the grace the binary that held it ran
   with is not in the bucket, and only a lease past any grace is folded

@@ -188,8 +188,10 @@ What it checks:
   left under `leases/` are counted, never read or deleted
   ([removing them](#removing-the-per-actor-lease-markers)). The app's
   generation floor (`state/<tenant>/<app>/generation-floor`, ADR 0045)
-  decodes in its exact form, and one that says no marker is left while
-  one is, is a problem.
+  decodes in its exact form. Markers left under a floor that says
+  `markers none` are counted as redundant, not as a problem: a node that
+  read the floor just before the finalize may still have written one,
+  and nodes ignore them.
 
 What it does not check:
 
@@ -323,8 +325,8 @@ wasmkeep cluster verify --bucket s3://my-bucket --app acme/shop              # l
   first folded into the app's generation floor, then deleted. A per-actor
   lease from before 0.4 that expired less than an hour ago stops the
   command, naming it: the grace its binary ran with is not known.
-- When none is left, the generation floor says so, and nodes no longer
-  read markers. A node keeps that in memory: after a restart, its first
+- When none is left, the generation floor says so (`markers none`: nodes
+  may ignore any marker), and nodes no longer read markers. A node keeps that in memory: after a restart, its first
   actor created reads the marker's key once more. A marker written meanwhile by a node that had not yet
   read the finalized floor is reported: run the command again.
 - It may run with nodes live, and be interrupted and run again at any

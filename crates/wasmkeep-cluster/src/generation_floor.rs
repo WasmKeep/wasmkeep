@@ -47,7 +47,11 @@ pub enum Markers {
     /// Some may be: a node reads the actor's marker at a first
     /// acquisition.
     Kept,
-    /// None is left: a node skips the marker's read.
+    /// Readers may ignore any marker left: none carries a generation its
+    /// actor's keys, record or the floor does not, and a node skips the
+    /// marker's read. Not a promise that none exists: an acquisition that
+    /// read the upgrade floor just before the finalize may land its marker
+    /// (its actor's keys alone) after this is written.
     None,
 }
 
