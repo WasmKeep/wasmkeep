@@ -539,6 +539,9 @@ pub(super) async fn move_parked(
     target: &str,
     address: &ActorAddress,
 ) -> (MoveEnd, u64) {
+    // Marked closing until the move ends: an upgrade relayed back here
+    // meanwhile is refused with `503`, `Retry-After: 1`.
+    let _closing = inner.rebalance.mark_closing(address);
     let until_ms =
         now_ms().saturating_add(u64::try_from(MOVE_DEADLINE.as_millis()).unwrap_or(u64::MAX));
     inner
@@ -697,6 +700,11 @@ pub(super) async fn move_resident(
     address: &ActorAddress,
     token: u64,
 ) -> (MoveEnd, u64) {
+    // Marked closing until the move ends (ADR 0040, section 14): a client
+    // reconnecting at once, perhaps relayed back by a node that still names
+    // this one, is refused with `503`, `Retry-After: 1`, instead of
+    // reopening a socket the move job would find.
+    let _closing = inner.rebalance.mark_closing(address);
     // Sockets first: their close events run here, with the lease.
     let open = inner.sockets.of(address, None);
     let closed = u64::try_from(open.len()).unwrap_or(u64::MAX);

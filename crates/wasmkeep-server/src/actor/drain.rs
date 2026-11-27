@@ -292,6 +292,12 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
 /// mailbox, then its alarm to the peer. An alarm whose hand-off failed
 /// stays in this node's timer, for the next pass.
 async fn hand_over_one(inner: Arc<ServiceInner>, cluster: Arc<Cluster>, address: ActorAddress) {
+    // Marked closing until the hand-over ends, as a move is: a client
+    // reconnecting at once, relayed back here by a node that still names
+    // this one, is refused with `503`, `Retry-After: 1`, instead of
+    // reopening a socket the hand-over job would find (and the drain
+    // waiting a pass for it, again and again).
+    let _closing = inner.rebalance.mark_closing(&address);
     // Sockets close first, so their close events run here, each with its
     // upload, before the lease goes. The job checks again.
     let open = inner.sockets.of(&address, None);

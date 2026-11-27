@@ -713,14 +713,25 @@ fn jitter(seed: u64, attempt: u64) -> Duration {
     Duration::from_millis(z % 2000)
 }
 
-/// A client of `edge/<name>` through `addr` that waits a random [0, 2 s)
-/// before every connection, the first included, and after every close or
-/// refused upgrade; `connected` counts the clients connected now. Its
-/// answer: how many times it was closed with 1012.
+/// How long a client waits before a connection, from its seed and the
+/// attempt.
+type Delay = fn(u64, u64) -> Duration;
+
+/// A client that reconnects 1 ms after a close or a refused upgrade,
+/// with no backoff: the worst a client can do to a move.
+fn at_once(_seed: u64, _attempt: u64) -> Duration {
+    Duration::from_millis(1)
+}
+
+/// A client of `edge/<name>` through `addr` that waits `delay(seed,
+/// attempt)` before every connection, the first included, and so after
+/// every close or refused upgrade; `connected` counts the clients
+/// connected now. Its answer: how many times it was closed with 1012.
 fn crowd_client(
     addr: SocketAddr,
     name: String,
     seed: u64,
+    delay: Delay,
     connected: Arc<AtomicUsize>,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<u32> {
@@ -732,7 +743,7 @@ fn crowd_client(
         let url = format!("ws://{addr}/actor/edge/{name}");
         loop {
             attempt += 1;
-            tokio::time::sleep(jitter(seed, attempt)).await;
+            tokio::time::sleep(delay(seed, attempt)).await;
             if *stop.borrow() {
                 return closes;
             }
@@ -806,6 +817,7 @@ async fn a_crowded_edge_moves_home_while_its_clients_reconnect_at_once() {
                 a.addr,
                 edge.clone(),
                 k,
+                jitter,
                 Arc::clone(&connected),
                 stop_rx.clone(),
             )
@@ -928,4 +940,179 @@ async fn a_parked_edge_with_a_socket_moves_home() {
     assert_eq!(echoed, "back");
     assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("b"));
     drop((a, b, c, ws));
+}
+
+/// The ways the crowds below reconnect: at once, and after ADR 0040's
+/// rule 5 delay.
+const CROWDS: [(&str, Delay); 2] = [("1 ms", at_once), ("[0, 2 s)", jitter)];
+
+/// 30 clients on each of `edges` through `via`, `delay` before each
+/// connection; waits until all are connected.
+async fn crowd(
+    via: SocketAddr,
+    edges: &[String],
+    delay: Delay,
+    connected: &Arc<AtomicUsize>,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<u32>> {
+    let clients: Vec<_> = edges
+        .iter()
+        .flat_map(|e| std::iter::repeat_n(e, 30))
+        .zip(0_u64..)
+        .map(|(e, seed)| {
+            crowd_client(
+                via,
+                e.clone(),
+                seed,
+                delay,
+                Arc::clone(connected),
+                stop.clone(),
+            )
+        })
+        .collect();
+    wait_connected(connected, clients.len(), "at first").await;
+    clients
+}
+
+/// Waits until `want` clients are connected.
+async fn wait_connected(connected: &AtomicUsize, want: usize, when: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while connected.load(Ordering::SeqCst) < want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {want} clients connected {when}",
+            connected.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Two edges whose home is c, woken there (through c).
+async fn two_edges_on_c(c: &Node) -> Vec<String> {
+    let first = edge_on("c", &[]);
+    let edges = vec![first.clone(), edge_on("c", &[first.as_str()])];
+    for e in &edges {
+        let r = send_reachable(c.addr, "POST", &format!("/actor/edge/{e}/durable"), "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("c")),
+            "{}",
+            r.body
+        );
+    }
+    edges
+}
+
+/// A drain's hand-over closes an actor's sockets as a move does, and gets
+/// the same closing mark (ADR 0040, section 14): two edges on c, each with
+/// 30 clients connected through a that reconnect at once (1 ms) or after
+/// rule 5's random [0, 2 s), and c drains. Without the mark, upgrades
+/// relayed back to c reopen sockets behind each hand-over, which then
+/// finds them and waits for the next pass, again and again. With it, c is
+/// `drained` within 15 s, every client is connected again, both edges are
+/// then held elsewhere, and each client was closed with 1012 at most twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_hands_over_crowded_edges_whose_clients_reconnect_at_once() {
+    use object_store::ObjectStoreExt as _;
+    for (case, delay) in CROWDS {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let [a, b, c] = three(&store, &dirs, |_, _| {}).await;
+        let edges = two_edges_on_c(&c).await;
+        let connected = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let clients = crowd(a.addr, &edges, delay, &connected, &stop_rx).await;
+
+        let started = std::time::Instant::now();
+        drain(&store, "c").await;
+        let key = object_store::path::Path::from("nodes/c");
+        loop {
+            let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            if drain_line(&body) == Some("drained") {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "{case}: c not drained after {:?}: {:?}",
+                started.elapsed(),
+                drain_line(&body)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Released by c; woken elsewhere by the clients coming back.
+        wait_connected(&connected, clients.len(), "after the drain").await;
+        for e in &edges {
+            let at = holder(&store, "edge", e).await;
+            assert!(
+                at.as_deref().is_some_and(|n| n != "c"),
+                "{case}: {e} on {at:?}"
+            );
+        }
+        stop_tx.send(true).unwrap();
+        for client in clients {
+            let closes = client.await.unwrap();
+            assert!(closes <= 2, "{case}: closed {closes} times with 1012");
+        }
+        drop((a, b, c));
+    }
+}
+
+/// An operator's move (ADR 0017) closes an actor's sockets as a rebalance
+/// move does, and gets the same closing mark: two edges on c, each with
+/// 30 clients connected through b that reconnect at once (1 ms) or after
+/// rule 5's random [0, 2 s), are moved to b. Without the mark, upgrades
+/// relayed back to c reopen sockets behind each move, whose job finds them
+/// and gives up until a later pass, again and again. With it, both land on
+/// b within 15 s, every client is connected again and each was closed with
+/// 1012 at most twice. Rebalancing is off, so b keeps them.
+///
+/// The clients go through the target: through a third node, one of them
+/// may wake the edge there between c's release and b's take (ADR 0017: the
+/// move is then moot, and a moves it on only if it still sees the
+/// request).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operators_move_of_crowded_edges_whose_clients_reconnect_at_once() {
+    for (case, delay) in CROWDS {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let [a, b, c] = three(&store, &dirs, |_, config| no_rebalance(config)).await;
+        let edges = two_edges_on_c(&c).await;
+        let connected = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let clients = crowd(b.addr, &edges, delay, &connected, &stop_rx).await;
+
+        let started = std::time::Instant::now();
+        for e in &edges {
+            request_move_of(&store, "edge", e, "b").await;
+        }
+        for e in &edges {
+            loop {
+                let at = holder(&store, "edge", e).await;
+                if at.as_deref() == Some("b") {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "{case}: {e} not moved to b after {:?}: on {at:?}",
+                    started.elapsed()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        wait_connected(&connected, clients.len(), "after the move").await;
+        stop_tx.send(true).unwrap();
+        for client in clients {
+            let closes = client.await.unwrap();
+            assert!(closes <= 2, "{case}: closed {closes} times with 1012");
+        }
+        for e in &edges {
+            assert_eq!(
+                holder(&store, "edge", e).await.as_deref(),
+                Some("b"),
+                "{case}"
+            );
+        }
+        drop((a, b, c));
+    }
 }

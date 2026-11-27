@@ -199,17 +199,14 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
-        // A rebalance move is closing this actor's sockets here (ADR 0040,
-        // section 14): a client reconnecting at once, perhaps relayed back
-        // by a node that still names this one, tries again in a second
-        // instead of reopening a socket the move waits for.
+        // A move (a rebalance's or an operator's) or a drain's hand-over is
+        // closing this actor's sockets here (ADR 0040, section 14): a
+        // client reconnecting at once, perhaps relayed back by a node that
+        // still names this one, tries again in a second instead of
+        // reopening a socket the move waits for.
+        // `accept_socket` checks again, under the mark's lock.
         if self.inner.rebalance.closing(&address) {
-            let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor moving; reconnect\n");
-            r.headers_mut().insert(
-                hyper::header::RETRY_AFTER,
-                hyper::header::HeaderValue::from_static("1"),
-            );
-            return r;
+            return moving_response();
         }
         // Only a validated replacement closes this gate. Merely discovering
         // or checking a restore request must leave upgrade admission alone.
@@ -565,6 +562,17 @@ impl ActorService {
     }
 }
 
+/// `503`, `Retry-After: 1`: a move or a drain's hand-over is closing the
+/// actor's sockets here.
+fn moving_response() -> Response<HyperOutgoingBody> {
+    let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor moving; reconnect\n");
+    r.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    r
+}
+
 fn restore_pending_response() -> Response<HyperOutgoingBody> {
     let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor restore pending\n");
     response.headers_mut().insert(
@@ -577,8 +585,10 @@ fn restore_pending_response() -> Response<HyperOutgoingBody> {
 pub(super) fn open_error_response(
     error: crate::websocket::OpenError,
 ) -> Response<HyperOutgoingBody> {
-    if matches!(error, crate::websocket::OpenError::RestorePending) {
-        return restore_pending_response();
+    match error {
+        crate::websocket::OpenError::RestorePending => return restore_pending_response(),
+        crate::websocket::OpenError::Moving => return moving_response(),
+        crate::websocket::OpenError::ActorFull | crate::websocket::OpenError::NodeFull => {}
     }
     crate::metrics::refused(crate::metrics::Refusal::Capacity);
     let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, "too many connections\n");
