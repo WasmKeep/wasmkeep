@@ -527,7 +527,8 @@ fn a_live_node_below_the_floor_is_named_apart() {
 fn finalize_is_refused_for_each_precondition() {
     let a9 = live("a", "0.9.0");
     let b9 = live("b", "0.9.1");
-    let check = |target, floor, nodes: &[NodeInfo]| finalize_check(target, &status(floor, nodes));
+    let check =
+        |target, floor, nodes: &[NodeInfo]| finalize_check(target, &status(floor, nodes), &[]);
     let both = [a9.clone(), b9.clone()];
     assert_eq!(
         check(v(0, 9), Ok(None), &both),
@@ -568,11 +569,12 @@ fn finalize_is_refused_for_each_precondition() {
         matches!(&refused, FinalizeRefusal::NewerLive { nodes, .. } if nodes == "new (0.10.0)")
     );
     assert!(refused.to_string().contains("that version's `wasmkeep`"));
-    // No live node; a stopped older one changes nothing.
-    assert_eq!(
+    // No live node and a stopped older one: the offline finalize is
+    // refused (see `the_offline_finalize_needs_every_lease_stopped_at_the_target`).
+    assert!(matches!(
         check(v(0, 9), Ok(None), &[node("gone", "0.8.1", "released", "")]),
-        Err(FinalizeRefusal::NoLiveNode)
-    );
+        Err(FinalizeRefusal::OlderStopped { .. })
+    ));
     // An older lease still `live` but stale is not a stopped node: it
     // may be cut off or slow, and still act. Refused, naming the fence;
     // fenced or released, it is stopped for sure.
@@ -654,6 +656,117 @@ fn finalize_is_refused_for_each_precondition() {
     assert_eq!(
         check(v(0, 9), Err(Unknown { len: 4 }), &both),
         Err(FinalizeRefusal::Unreadable { len: 4 })
+    );
+}
+
+/// Section 4, the offline finalize (decided on 2026-11-27, was "Not
+/// settled" 10): with no node of the app live, accepted only when the
+/// app has registered leases, every one stopped for sure and naming the
+/// target or a later version, and no object under `nodes/` fails to
+/// decode.
+#[test]
+fn the_offline_finalize_needs_every_lease_stopped_at_the_target() {
+    let check = |floor, nodes: &[NodeInfo], unread: &[&str]| {
+        finalize_check(v(0, 9), &status(floor, nodes), unread)
+    };
+    let released = |id: &str, version: &str| node(id, version, "released", "take");
+    let fenced = |id: &str, version: &str, ago: u64| {
+        let mut n = node(id, version, "fenced", "take");
+        n.written_at_ms = NOW - ago;
+        n
+    };
+    // Every lease released or fenced, at 0.9 or later: raised, from no
+    // record or from an older one.
+    let stopped = [
+        released("a", "0.9.0"),
+        fenced("b", "0.9.2", 60_000),
+        released("c", "0.10.0"),
+    ];
+    assert_eq!(
+        check(Ok(None), &stopped, &[]),
+        Ok(Finalize::Raise(None, v(0, 9)))
+    );
+    assert_eq!(
+        check(Ok(Some(v(0, 8))), &stopped, &[]),
+        Ok(Finalize::Raise(Some(v(0, 8)), v(0, 9)))
+    );
+    // One lease of 0.8, released: the app may last have run there.
+    let older = [released("a", "0.9.0"), released("old", "0.8.1")];
+    let refused = check(Ok(None), &older, &[]).unwrap_err();
+    assert_eq!(
+        refused,
+        FinalizeRefusal::OlderStopped {
+            target: v(0, 9),
+            nodes: "old (0.8.1)".to_owned(),
+            ids: "old".to_owned(),
+        }
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("Start the app once on 0.9")
+            && text.contains("`wasmkeep cluster forget <id>` (old)")
+            && text.contains("delete the app"),
+        "{text}"
+    );
+    // One whose version does not parse counts as older.
+    assert!(matches!(
+        check(Ok(None), &[released("odd", "nine")], &[]),
+        Err(FinalizeRefusal::OlderStopped { nodes, .. }) if nodes == "odd (nine)"
+    ));
+    // An object under `nodes/` that does not decode: refused, named.
+    let refused = check(Ok(None), &stopped, &["nodes/x"]).unwrap_err();
+    assert_eq!(
+        refused,
+        FinalizeRefusal::Undecodable {
+            target: v(0, 9),
+            keys: "nodes/x".to_owned(),
+        }
+    );
+    assert!(
+        refused.to_string().contains("delete each object"),
+        "{refused}"
+    );
+    // Beside a live node, the undecodable object is not this rule's.
+    assert_eq!(
+        check(Ok(None), &[live("a", "0.9.0")], &["nodes/x"]),
+        Ok(Finalize::Raise(None, v(0, 9)))
+    );
+    // A lease of 0.9 still `live` but stale, or fenced too recently, is
+    // no proof of a stop: refused, naming the fence.
+    let mut stale = node("cut", "0.9.0", "live", "take");
+    stale.written_at_ms = NOW - 3_600_000;
+    for running in [stale, fenced("cut", "0.9.0", 14_999)] {
+        let refused = check(Ok(None), &[released("a", "0.9.0"), running], &[]).unwrap_err();
+        assert_eq!(
+            refused,
+            FinalizeRefusal::NotStopped {
+                nodes: "cut (0.9.0)".to_owned(),
+                ids: "cut".to_owned(),
+            }
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("cluster fence <id>` for each (cut)")
+        );
+    }
+    // An older stale lease keeps its own refusal.
+    let mut old_stale = node("cut", "0.8.1", "live", "take");
+    old_stale.written_at_ms = NOW - 3_600_000;
+    assert!(matches!(
+        check(Ok(None), &[released("a", "0.9.0"), old_stale], &[]),
+        Err(FinalizeRefusal::OlderNotStopped { .. })
+    ));
+    // No lease at all (an app named that never ran here): nothing proves
+    // its version.
+    assert_eq!(
+        check(Ok(None), &[], &[]),
+        Err(FinalizeRefusal::NoNode { target: v(0, 9) })
+    );
+    // Already finalized: idempotent, whatever is registered.
+    assert_eq!(
+        check(Ok(Some(v(0, 9))), &older, &["nodes/x"]),
+        Ok(Finalize::Already(v(0, 9)))
     );
 }
 
@@ -773,6 +886,45 @@ mod bucket {
             Ok(None)
         );
         assert_eq!(apps_with_nodes(&b).await.unwrap(), ["acme/shop"]);
+    }
+
+    /// The offline finalize against a bucket: an undecodable object under
+    /// `nodes/` refuses it, written or planned; once deleted, the floor is
+    /// raised with every lease released at the target. An older lease
+    /// refuses it.
+    #[tokio::test]
+    async fn the_offline_finalize_reads_the_whole_listing() {
+        let b = bucket();
+        put(&b, "a", "0.9.0", "released").await;
+        put(&b, "b", "0.9.0", "released").await;
+        b.put_body("nodes/junk", b"junk".to_vec()).await.unwrap();
+        let plan = async || finalize_plan(&b, "acme", "shop", v(0, 9), NOW, HORIZON).await;
+        let run = async || finalize_write(&b, "acme", "shop", v(0, 9), NOW, HORIZON).await;
+        assert!(matches!(
+            plan().await,
+            Err(FinalizeRefusal::Undecodable { keys, .. }) if keys == "nodes/junk"
+        ));
+        assert!(matches!(
+            run().await,
+            Err(FinalizeRefusal::Undecodable { .. })
+        ));
+        assert_eq!(floor_of(&b).await, None, "a refusal writes nothing");
+        b.delete("nodes/junk").await.unwrap();
+        put(&b, "old", "0.8.1", "released").await;
+        assert!(matches!(
+            run().await,
+            Err(FinalizeRefusal::OlderStopped { nodes, .. }) if nodes == "old (0.8.1)"
+        ));
+        assert_eq!(floor_of(&b).await, None);
+        b.delete("nodes/old").await.unwrap();
+        assert_eq!(plan().await, Ok(Finalize::Raise(None, v(0, 9))));
+        assert_eq!(floor_of(&b).await, None, "a plan writes nothing");
+        assert_eq!(run().await, Ok(Finalize::Raise(None, v(0, 9))));
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)));
+        let seen = finalize_confirm(&b, "acme", "shop", v(0, 9), NOW, HORIZON)
+            .await
+            .unwrap();
+        assert_eq!(seen, Confirmed::default());
     }
 
     /// Section 8, phase 5, second outcome: an old node whose first lease
@@ -1518,8 +1670,9 @@ mod forgotten {
         assert!(second.nodes.is_empty() && second.rewritten(&first).is_empty());
     }
 
-    /// `cluster status`, `cluster upgrade status` and `finalize` read the
-    /// nodes through `all_heartbeats`: a mark is no node of the app there.
+    /// `cluster status` and `cluster upgrade status` read the nodes
+    /// through `all_heartbeats`, `finalize` through `list_nodes`: a mark is
+    /// no node of the app, nor an object that does not decode, in either.
     #[tokio::test]
     async fn an_apps_upgrade_state_does_not_count_a_forgotten_mark() {
         let b = bucket();

@@ -7,6 +7,27 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## 0.9.1
+
+**0.9 settled: `cluster upgrade finalize` with every node stopped, and
+no format change.** After an upgrade done the recommended way, by
+stopping every node, 0.9.0 refused the finalize until a node was live
+again. Only the `wasmkeep` that runs `finalize` needs 0.9.1.
+
+### Fixed
+
+- **`wasmkeep cluster upgrade finalize` works with every node of the app
+  stopped** ([ADR 0043, section 4](docs/adr/0043-rolling-upgrades.md#4-wasmkeep-cluster-upgrade-statusfinalize)).
+  With no node of an app live it is now accepted when every lease the
+  app's nodes left is `released` or `fenced` and names the target
+  version or a later one, and no object under `nodes/` fails to decode;
+  the write and the second listing are unchanged. A lease of an older
+  version refuses it, and the message says to start the app once on the
+  new version, `cluster forget` the lease, or delete the app. Without
+  `--app`, every app that can be is raised, each refused app is named
+  with its reason and what to do, and the command exits with 1. The dry
+  run (no `--yes`) now gives the same answers.
+
 ## 0.9.0
 
 **0.9 can be upgraded one node at a time: a cluster moves from 0.8.1 to

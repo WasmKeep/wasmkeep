@@ -1012,9 +1012,65 @@ pub enum FinalizeRefusal {
         /// Their ids, to fence.
         ids: String,
     },
-    /// No node of the app is live.
-    #[error("no node of this app is live: there is nothing to finalize")]
-    NoLiveNode,
+    /// No node of the app is live, and none is registered: nothing shows
+    /// which version last ran it.
+    #[error(
+        "no node of this app is live or registered under this prefix: nothing shows which \
+         version last ran it, so nothing is written. Start a node of the app on {target}, then \
+         finalize"
+    )]
+    NoNode {
+        /// The version that asked.
+        target: Minor,
+    },
+    /// No node of the app is live, and objects under `nodes/` do not
+    /// decode: each may be a node of any app, of a version this one
+    /// cannot read.
+    #[error(
+        "no node of this app is live, and objects under `nodes/` do not decode: {keys}. Each \
+         may be a node of this app, of a version this `wasmkeep` cannot read, so a finalize \
+         without a live node is refused while one is there. Start a node of the app on \
+         {target} and finalize, or delete each object from the bucket by hand once you know \
+         no running node writes it"
+    )]
+    Undecodable {
+        /// The version that asked.
+        target: Minor,
+        /// The keys, comma-separated.
+        keys: String,
+    },
+    /// No node of the app is live, and a lease of the target version or a
+    /// later one is neither released nor fenced: stale is not stopped.
+    #[error(
+        "no node of this app is live, and leases were never released, nor fenced for longer \
+         than a lease's ttl plus grace: {nodes}. Without a live node, every lease of the app \
+         must prove its node stopped: run `wasmkeep cluster fence <id>` for each ({ids}), \
+         wait 15 s, then finalize"
+    )]
+    NotStopped {
+        /// The nodes, each with its version.
+        nodes: String,
+        /// Their ids, to fence.
+        ids: String,
+    },
+    /// No node of the app is live, and a stopped lease names a version
+    /// older than the target (or one that does not parse): the app may
+    /// last have run there.
+    #[error(
+        "no node of this app is live, and stopped nodes name a version older than {target}: \
+         {nodes}. Without a live node, every lease of the app must name {target} or a later \
+         version. Start the app once on {target} (a node started under its id replaces its \
+         lease), then finalize; or, for a node that will not serve the app again, remove its \
+         lease with `wasmkeep cluster forget <id>` ({ids}); or delete the app"
+    )]
+    OlderStopped {
+        /// The version that asked.
+        target: Minor,
+        /// The nodes, each with its version.
+        nodes: String,
+        /// Their ids.
+        ids: String,
+    },
     /// The floor record is unreadable.
     #[error("the app's upgrade floor is unreadable ({len} bytes); nothing written")]
     Unreadable {
@@ -1041,9 +1097,20 @@ pub enum Finalize {
 /// older node must have stopped for sure: its lease `released` or
 /// `fenced`, not merely stale.
 ///
+/// With no node of the app live (the offline finalize, decided on
+/// 2026-11-27), the app's registered leases are the only record of the
+/// version that last ran it: at least one, every one stopped for sure
+/// and naming `target` or a later version, and no object under `nodes/`
+/// that does not decode (`unread`, its keys: it may be a node of this
+/// app that this version cannot read).
+///
 /// # Errors
 /// The precondition that fails, naming the nodes.
-pub fn finalize_check(target: Minor, status: &AppUpgrade) -> Result<Finalize, FinalizeRefusal> {
+pub fn finalize_check(
+    target: Minor,
+    status: &AppUpgrade,
+    unread: &[&str],
+) -> Result<Finalize, FinalizeRefusal> {
     let found = status
         .floor
         .map_err(|len| FinalizeRefusal::Unreadable { len })?;
@@ -1094,9 +1161,53 @@ pub fn finalize_check(target: Minor, status: &AppUpgrade) -> Result<Finalize, Fi
         });
     }
     if live.is_empty() {
-        return Err(FinalizeRefusal::NoLiveNode);
+        offline_check(target, status, unread)?;
     }
     Ok(Finalize::Raise(found, target))
+}
+
+/// The offline finalize ([`finalize_check`] with no live node).
+fn offline_check(
+    target: Minor,
+    status: &AppUpgrade,
+    unread: &[&str],
+) -> Result<(), FinalizeRefusal> {
+    let ids = |nodes: &[&NodeVersion]| {
+        nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if status.nodes.is_empty() {
+        return Err(FinalizeRefusal::NoNode { target });
+    }
+    if !unread.is_empty() {
+        return Err(FinalizeRefusal::Undecodable {
+            target,
+            keys: unread.join(", "),
+        });
+    }
+    let running: Vec<&NodeVersion> = status.nodes.iter().filter(|n| !n.stopped()).collect();
+    if !running.is_empty() {
+        return Err(FinalizeRefusal::NotStopped {
+            nodes: named(&running),
+            ids: ids(&running),
+        });
+    }
+    let older: Vec<&NodeVersion> = status
+        .nodes
+        .iter()
+        .filter(|n| n.older_than(target))
+        .collect();
+    if !older.is_empty() {
+        return Err(FinalizeRefusal::OlderStopped {
+            target,
+            nodes: named(&older),
+            ids: ids(&older),
+        });
+    }
+    Ok(())
 }
 
 /// Reads `tenant/app`'s floor and every heartbeat, and assesses them.
@@ -1187,10 +1298,41 @@ pub async fn apps_with_nodes<B: Directory>(bucket: &B) -> Result<Vec<String>, Bu
     Ok(apps_of(&crate::membership::all_heartbeats(bucket).await?))
 }
 
+/// Steps 1 to 3 of `finalize` for one app (section 4), writing nothing:
+/// one listing of `nodes/` (the objects that do not decode kept), the
+/// app's floor, and [`finalize_check`]. What `finalize` without `--yes`
+/// prints, and what [`finalize_write`] writes.
+///
+/// # Errors
+/// A precondition failed, or the bucket did not answer.
+pub async fn finalize_plan<B: Bucket + Directory>(
+    bucket: &B,
+    tenant: &str,
+    app: &str,
+    target: Minor,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Result<Finalize, FinalizeRefusal> {
+    let bucket_failed = |e: BucketError| FinalizeRefusal::Bucket(e.to_string());
+    let listed = list_nodes(bucket).await.map_err(bucket_failed)?;
+    let status = status_of(
+        bucket,
+        &format!("{tenant}/{app}"),
+        &listed.nodes,
+        now_ms,
+        horizon_ms,
+    )
+    .await
+    .map_err(bucket_failed)?;
+    let unread: Vec<&str> = listed.unread.iter().map(|(key, _)| key.as_str()).collect();
+    finalize_check(target, &status, &unread)
+}
+
 /// Steps 1 to 4 of `finalize` for one app (section 4): checks the floor
-/// and the live nodes as read at `now_ms`, then raises the floor to
-/// `target` by conditional write. The caller then waits one start check
-/// and calls [`finalize_confirm`]: the second listing is not optional.
+/// and the nodes as read at `now_ms` ([`finalize_plan`]), then raises the
+/// floor to `target` by conditional write. The caller then waits one
+/// start check and calls [`finalize_confirm`]: the second listing is not
+/// optional, with or without a live node.
 ///
 /// # Errors
 /// A precondition failed (nothing written), or the bucket did not answer.
@@ -1202,11 +1344,7 @@ pub async fn finalize_write<B: Bucket + Directory>(
     now_ms: u64,
     horizon_ms: u64,
 ) -> Result<Finalize, FinalizeRefusal> {
-    let bucket_failed = |e: BucketError| FinalizeRefusal::Bucket(e.to_string());
-    let status = read_status(bucket, tenant, app, now_ms, horizon_ms)
-        .await
-        .map_err(bucket_failed)?;
-    let plan = finalize_check(target, &status)?;
+    let plan = finalize_plan(bucket, tenant, app, target, now_ms, horizon_ms).await?;
     if let Finalize::Raise(..) = plan {
         match floor::raise(bucket, &floor::relative_key(tenant, app), target).await {
             // A lost race was read again: another finalize got there.
