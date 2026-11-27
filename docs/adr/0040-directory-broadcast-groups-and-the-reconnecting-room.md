@@ -1127,16 +1127,22 @@ holds, or that is backed off after a move that did not finish here
 A move is the owner's sequence of ADR 0017, started from memory: close
 the actor's sockets with 1012, flush, record the move, release, send the
 target a signed take call. It writes no move key and reads none. From
-before it closes the sockets until it ends, the actor is marked closing
-on its node: an upgrade for it there is answered `503` with
-`Retry-After: 1`. Without the mark, a client that reconnects at once is
+before it closes the sockets until the release (for a parked room,
+until its take), the actor is marked
+closing on its node: an upgrade for it there is answered `503` with
+`Retry-After: 1` (counted as `moving` in
+`wasmkeep_admission_refused_total`). After the release, the move is
+recorded and upgrades there are relayed to the target. Without the mark, a client that reconnects at once is
 relayed back by a node that still names this one as the owner, reopens a
 socket, and the move finds it busy, every time. An operator's move (ADR
 0017) and a drain's hand-over (ADR 0014) close sockets the same way and
 take the same mark. A socket's registration checks the mark again under
 its lock, so an upgrade that passed the first check just before the mark
-is either refused or registered before the move reads the sockets to
-close. A move ends:
+is either refused, or registered before the move closes the sockets. A
+socket registered then may still be pending (not yet accepted), so the
+first close does not list it; the move keeps waiting while any socket of
+the actor is reserved, and closes each one as it is accepted. A move
+ends:
 
 - `moved`, or `taken_elsewhere` (another node took it in the gap): done;
 - `busy`, for a cause of this node's (a socket still closing, the

@@ -937,14 +937,19 @@ apart_sent() { # apart_sent R
 # With THIRD, b's other peer is asked to drain first, and undrained after:
 # a node asked to drain is no placement target, so R is b's only one. The
 # lighter peer otherwise takes the wake-up every time (a new node beside
-# the old R holding room/legacy).
+# the old R holding room/legacy). The actors THIRD held stay where the
+# drain put them for the steps after (no rebalance while versions mix).
 apart_refused() { # apart_refused R [THIRD]
   local r=$1 third=${2:-} x=b
   if [ "$(label "${bin[$r]}")" = "$(label "${bin[$x]}")" ]; then fail "apart, refusal: $x and $r run one version"; return; fi
   pin b || return
   if [ -n "$third" ]; then
     if ! new cluster drain "$third" --bucket "$BUCKET" >/dev/null; then fail "apart, refusal: drain $third refused"; return; fi
-    wait_state "$third" drained 90 || { new cluster undrain "$third" --bucket "$BUCKET" >/dev/null 2>&1 || true; return; }
+    if ! wait_state "$third" drained 90; then
+      new cluster undrain "$third" --bucket "$BUCKET" >/dev/null 2>&1 || true
+      wait_state "$third" serving 60 || true
+      return
+    fi
     note "apart, refusal: $third drained, so that b places on $r alone"
   fi
   apart_refused_attempts "$r" "$x"
@@ -1391,10 +1396,11 @@ for spec in "97 10" "120 10" "60 1000"; do
 done
 
 # Kept apart on the mixed cluster: sent on by the new node, and refused by
-# the new node to an old sender.
+# the new node to an old sender. c, b's other peer, is drained for the
+# refusal, so that b places on a.
 begin apart-new-receives
 apart_sent a
-apart_refused a
+apart_refused a c
 check_placement
 
 begin drain-new-with-room

@@ -123,7 +123,7 @@ counts and the others are deleted. For one key, to target T:
    later passes until it expires: a target may be starting, or briefly
    suspect.
 2. **Close the actor's sockets** with 1012 and wait (5 s), as a drain
-   does. From before the sockets close until the move ends, the actor is
+   does. From before the sockets close until the release, the actor is
    marked closing on this node: an upgrade for it here, relayed back by a
    node that still names this one, is answered `503` with
    `Retry-After: 1` ([ADR 0040, section

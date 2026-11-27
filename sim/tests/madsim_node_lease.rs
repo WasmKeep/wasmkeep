@@ -190,7 +190,9 @@ enum Variant {
     /// section 14).
     Moves,
     /// Moves whose owner keeps acting a moment after its release, as if
-    /// the move released before it dropped the instance.
+    /// the move released before it dropped the instance. This tests the
+    /// move's stop-then-release order: any acquirer in that moment catches
+    /// it, the move's target or not.
     MoveActsAfterRelease,
     /// Moves whose target takes a take call for a grant: the record is
     /// written whoever holds it (the take not going through the free rule).
@@ -436,11 +438,14 @@ struct Take {
 }
 
 /// How long a cold take's sender waits for the answer before it acquires
-/// itself (the server's take timeout, scaled to this ttl).
+/// itself: it stands for the server's 10 s take timeout, scaled to this
+/// simulation's 1 s ttl.
 const COLD_WAIT_MS: u64 = 500;
 
 /// Sends a take call to `to`: lost one time in ten, delivered after up
-/// to 200 ms otherwise.
+/// to 200 ms otherwise. Only the call is lost or late: an answer, once a
+/// process gives it, always reaches the cell its sender waits on (a lost
+/// answer looks to the sender like a late one, which the wait covers).
 fn send_take(
     shared: &Mutex<Shared>,
     rng: &mut Rng,
