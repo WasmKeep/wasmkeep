@@ -119,9 +119,16 @@ RUN GOBIN=/usr/local/bin GOPATH=/tmp/go GOCACHE=/tmp/go-cache \
 
 # componentize-py and Zig (the ziglang package, as in CI), in a venv of
 # Debian's Python 3.13; `zig` runs it.
+# Installed from the hashed lockfile CI uses (scripts/requirements/languages.txt),
+# so every wheel is checked; the ARGs below must still name the same pins.
+COPY scripts/requirements/languages.txt /tmp/languages.txt
 RUN python3 -m venv /opt/python \
- && /opt/python/bin/pip install --no-cache-dir \
-      "componentize-py==${COMPONENTIZE_PY_VERSION}" "ziglang==${ZIGLANG_VERSION}" \
+ && /opt/python/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: \
+      -r /tmp/languages.txt \
+ && rm /tmp/languages.txt \
+ && /opt/python/bin/pip show componentize-py ziglang | grep -E '^(Name|Version):' \
+ && test "$(/opt/python/bin/pip show componentize-py | sed -n 's/^Version: //p')" = "${COMPONENTIZE_PY_VERSION}" \
+ && test "$(/opt/python/bin/pip show ziglang | sed -n 's/^Version: //p')" = "${ZIGLANG_VERSION}" \
  && printf '#!/bin/sh\nexec /opt/python/bin/python3 -m ziglang "$@"\n' > /usr/local/bin/zig \
  && chmod 0755 /usr/local/bin/zig
 
