@@ -19,8 +19,11 @@ The text under a version's heading is its GitHub release text
   the move of ADR 0017 and without a move request, once no node drains,
   every live node serves and runs one minor version, and the home has
   served for three heartbeat periods and has room. At most two moves in
-  flight and 500 sockets closed per heartbeat period per node; an actor
-  moved by a take stays a minute. A rolling restart therefore ends with
+  flight and 500 sockets closed per heartbeat period, per app on each
+  node; an actor moved off its home by a take (an operator's move) stays
+  a minute. While a move closes an edge's sockets, an upgrade for it on
+  that node is answered `503` with `Retry-After: 1`, so clients that
+  reconnect at once do not hold the move up. A rolling restart therefore ends with
   the edges where a cold start puts them, at the cost of one more
   reconnect for the clients of the restarted node's edges.
 - **A socket for an edge nobody holds wakes it at its home**: the home

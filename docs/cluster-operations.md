@@ -91,8 +91,11 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   `paused` with why (a node that drains or is not serving, or `mixed
   versions` during an upgrade between minor versions); `-` when no live
   node publishes the count. In `--json`: `rebalance` and
-  `rebalance_paused`. A node started with `--no-rebalance` does not say
-  so in its heartbeat, so the word cannot either.
+  `rebalance_paused`. A node started with `--no-rebalance` publishes no
+  count (`AWAY` `-`), so it never reads `rebalancing`. The drain it names
+  is read from the nodes' heartbeats (`STATE`), which follow a `cluster
+  drain` within a heartbeat period: right after one, the word can still
+  say `balanced`.
 - **Warnings**: no live node; live nodes still plain while others use the
   cluster listener (the state [ADR 0011](adr/0011-node-to-node-mtls.md)
   says not to stay in, and not to refuse plain HTTP from); live nodes on
@@ -363,10 +366,14 @@ drained node's edges wake on the others. When it serves again, the
 edges whose home it is come back to it once it has served for three
 heartbeat periods (9 s), two at a time from each node, their clients
 reconnecting once more ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
-Before draining the next node, wait until `cluster status` shows the
-app's `REBALANCE` as `balanced` (during an upgrade between minor
-versions, `paused (mixed versions)`: nothing moves until the last node
-runs the new version), for at most two minutes; then go on and note it.
+Before draining the next node, wait two heartbeat periods (6 s) after
+the node reports `serving` (until then the others' counts were written
+before they saw it, so `balanced` can be stale), then until `cluster
+status` shows the app's `REBALANCE` as `balanced` (during an upgrade
+between minor versions, `paused (mixed versions)`: nothing moves until
+the last node runs the new version), for at most two minutes; then go on
+and note it. The pacing is per app on each node: two moves in flight and
+500 sockets closed a heartbeat period.
 
 ## Moving one actor
 

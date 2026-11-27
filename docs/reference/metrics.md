@@ -124,7 +124,7 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_placement_spread_total` | counter | app, `outcome` | Wake-ups of a big room's edge spread over the live nodes (spread). |
 | `wasmkeep_placement_fill` | gauge | app, `kind` (`residents`, `sockets`) | This node id's fill, in thousandths. |
 | `wasmkeep_rebalance_misplaced` | gauge | app | Spread actors held here whose home is another node ([ADR 0040, section 14](../adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)). |
-| `wasmkeep_rebalance_moves_total` | counter | app, `outcome` (`moved`, `taken_elsewhere`, `failed`) | Moves of a spread actor to its home. |
+| `wasmkeep_rebalance_moves_total` | counter | app, `outcome` (`moved`, `taken_elsewhere`, `busy`, `failed`) | Moves of a spread actor to its home. |
 | `wasmkeep_rebalance_sockets_closed_total` | counter | app | Sockets those moves closed with 1012. |
 | `wasmkeep_rebalance_paused` | gauge | app, `reason` | 1 for the reason the rebalance is paused. |
 

@@ -1110,22 +1110,39 @@ Then, per actor, its home must have been seen `serving` by this node
 without a break for three heartbeat periods on its own clock (a new
 process starts the count again), answer take calls, and have room by ADR
 0041, section 4's candidate conditions (a fresh load with both room
-fields, resident room above 0, socket fill below 800); a move to it must
-not have failed within a heartbeat horizon; and an actor this node
-acquired through a take call (a rebalance move or an operator's) stays a
-minute before it is moved again. An actor acquired any other way (a
+fields, resident room above 0, socket fill below 800); it must not be
+backed off after a failed take (below); and an actor this node acquired
+through a take call while it is not the actor's home in its own view (an
+operator's move off home, or a move or cold socket whose sender saw
+another home) stays a minute before it is moved again. A take at the
+actor's home in the receiver's view arms no stay: nothing would move it
+from there while the views agree. An actor acquired any other way (a
 wake-up, a takeover, a drain's release) has no wait of its own: the edges
 a restarted node should get back were acquired by the others during its
 drain, less than a minute before it serves. An actor that a move is
-under way for, that an operator's move request names, or that a restore
-holds is left alone.
+under way for, that an operator's move request names, that a restore
+holds, or that is backed off after a move that did not finish here
+(below) is left alone.
 
 A move is the owner's sequence of ADR 0017, started from memory: close
 the actor's sockets with 1012, flush, record the move, release, send the
-target a signed take call. It writes no move key and reads none. It ends
-`moved`, `taken_elsewhere` (another node took it in the gap, which is
-done too) or `failed`, and a failed target is left out for a heartbeat
-horizon.
+target a signed take call. It writes no move key and reads none. While it
+closes the sockets, the actor is marked closing on its node: an upgrade
+for it there is answered `503` with `Retry-After: 1`. Without the mark, a
+client that reconnects at once is relayed back by a node that still
+names this one as the owner, reopens a socket, and the move finds it
+busy, every time. A move ends:
+
+- `moved`, or `taken_elsewhere` (another node took it in the gap): done;
+- `busy`, for a cause of this node's (a socket still closing, the
+  release pending, the actor no longer held here): that actor is backed
+  off, 10 s doubling up to 160 s; the target is not blamed;
+- `failed`, the target refused the take or did not answer: the target is
+  suspected and backed off, a heartbeat horizon doubling on each failure
+  in a row up to 160 s, for moves and cold sockets alike.
+
+What a move closed is charged to the period's budget, not what it was
+expected to close.
 
 **Why it cannot cycle.** A move goes from A to the node B of highest
 weight in A's set, which includes A, so the weight of B is above A's for
@@ -1134,8 +1151,8 @@ would need the opposite. Views that differ cannot change that: weights
 depend on the actor and the node only. The minute after a take bounds a
 node that flaps in and out of the set to one move per actor a minute.
 
-**Pacing.** At most two rebalance moves in flight per node (operators'
-moves have sixteen), the next starting when one ends; at most 500
+**Pacing.** Per app on each node: at most two rebalance moves in flight
+(operators' moves have sixteen), the next starting when one ends; at most 500
 sockets closed per heartbeat period per node (one full edge), a move
 that goes over putting the next period in deficit. On N nodes: at most
 2(N - 1) moves in flight and 500(N - 1) sockets closed per period in the
@@ -1147,7 +1164,10 @@ node asks the home to take it (the take call of ADR 0017), then relays
 the socket to the owner that leaves, as it relays one to any remote
 owner. A take refused, failed or not answered within its 10 s wakes the
 actor where the socket landed, as before: **a wake-up is never refused**.
-A relayed upgrade is never asked again. ADR 0041's reasons against a take
+A relayed upgrade is never asked again. One take runs per actor at a
+time: the sockets reconnecting to one cold edge at once wait for its
+answer. A home without room (ADR 0041, section 4), or backed off after a
+failed take, is not asked; a take that fails suspects and backs it off. ADR 0041's reasons against a take
 at wake-up do not hold here: an edge exists before any socket reaches it
 (the room's `init` creates it before the directory names it), and a
 socket for an edge held elsewhere is relayed already. Without it, during
@@ -1181,11 +1201,13 @@ alone with `serve --no-rebalance` or `rebalance = false` under
 off; to keep edges off a node, drain it.
 
 **What an operator sees.** `misplaced=<n>` on the heartbeat's load line,
-counted whether or not the pass may run; `cluster status` shows it per
+counted whether or not the pass may run, and left out by a node with
+rebalancing off; `cluster status` shows it per
 node (`AWAY`) and one word per app: `balanced` when every live node
 publishes 0, `rebalancing`, or `paused` with the node that drains or is
-not serving, or `mixed versions`. The heartbeat does not say whether a
-node has rebalancing off, so the word cannot. Metrics, by tenant and
+not serving, or `mixed versions`. It is read from heartbeats, so it lags
+a node that just started serving by up to two periods, and a drain
+intent by one. Metrics, by tenant and
 app: `wasmkeep_rebalance_misplaced`, `wasmkeep_rebalance_moves_total{outcome}`,
 `wasmkeep_rebalance_sockets_closed_total` and
 `wasmkeep_rebalance_paused{reason}` (`off`, `draining`, `not_serving`,
@@ -1205,7 +1227,10 @@ during the drain, every edge is back home after and each client was
 closed at most twice; a socket for an edge nobody holds wakes it at its
 home (where it lands with `--no-rebalance`); an edge woken away from home
 moves there, and stays with `--no-rebalance` or `--no-placement`; an
-operator's move off home is undone after the stay. Not tested here: a
+operator's move off home is undone after the stay; an edge with 30
+clients that reconnect after a random wait below 2 s moves home without
+being held up by reopened sockets (and is not moved home without the
+closing mark); a parked edge with a socket is moved as a parked room. Not tested here: a
 peer a minor version apart in a cluster test (the unit tests and the
 mixed-version check cover it), the node-lease simulation with rebalance
 moves as an event, and what a move costs an edge at its socket cap.
