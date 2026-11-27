@@ -383,7 +383,20 @@ pub(crate) async fn finalize(
                 app.app,
                 list(&seen.late)
             );
-        } else if wrote {
+        }
+        if !seen.unread.is_empty() {
+            failed = true;
+            let _ = writeln!(
+                out,
+                "error: {}: objects under `nodes/` do not decode at the listing after the \
+                 write: {}. Each may be a node of this app, of a version this `wasmkeep` cannot \
+                 read, which the floor cannot be shown to stop. The floor stays; find what \
+                 writes each object, stop it, and delete the object from the bucket by hand",
+                app.app,
+                seen.unread.join(", ")
+            );
+        }
+        if wrote && seen.late.is_empty() && seen.unread.is_empty() {
             let _ = writeln!(out, "{}: finalized at {target}", app.app);
         }
         if !seen.stopped_older.is_empty() {
@@ -633,8 +646,8 @@ mod tests {
         assert!(out.contains("acme/shop: finalized at 0.9"), "{out}");
         assert!(
             out.contains("error: acme/blog: no node of this app is live")
-                && out.contains("Start the app once on 0.9")
-                && out.contains("`wasmkeep cluster forget <id>` (old)"),
+                && out.contains("Released (old): start the app once on 0.9")
+                && out.contains("`wasmkeep cluster forget <id>`"),
             "{out}"
         );
         assert!(
@@ -694,6 +707,23 @@ mod tests {
         let (out, code) = run(&c, None, v(0, 9), true).await;
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("acme/shop: finalized at 0.9"), "{out}");
+
+        // Beside a live node the write does not look at an object that
+        // does not decode; the listing after it does: the floor is written
+        // and stays, and the command fails, naming it.
+        let d = bucket();
+        put(&d, "acme/shop", "a", "0.9.0", "live").await;
+        d.put_body("nodes/junk", b"junk".to_vec()).await.unwrap();
+        let (out, code) = run(&d, None, v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains(
+                "error: acme/shop: objects under `nodes/` do not decode at the listing after \
+                 the write: nodes/junk"
+            ) && !out.contains("acme/shop: finalized at 0.9"),
+            "{out}"
+        );
+        assert!(floor(&d, "acme/shop").await.is_some(), "the floor stays");
 
         // An app named that has no lease: nothing proves its version.
         let (out, code) = run(&c, Some("acme/none"), v(0, 9), true).await;

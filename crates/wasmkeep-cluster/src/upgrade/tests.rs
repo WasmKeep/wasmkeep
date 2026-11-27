@@ -698,14 +698,46 @@ fn the_offline_finalize_needs_every_lease_stopped_at_the_target() {
         FinalizeRefusal::OlderStopped {
             target: v(0, 9),
             nodes: "old (0.8.1)".to_owned(),
-            ids: "old".to_owned(),
+            released: "old".to_owned(),
+            fenced: String::new(),
         }
     );
+    // Released: `cluster forget` removes it, and the message says so.
+    let text = refused.to_string();
+    assert_eq!(
+        text,
+        "no node of this app is live, and stopped nodes name a version older than 0.9: old \
+         (0.8.1). Without a live node, every lease of the app must name 0.9 or a later version. \
+         Released (old): start the app once on 0.9 (a node started under its id replaces its \
+         lease), then finalize; or, for a node that will not serve the app again, remove its \
+         lease with `wasmkeep cluster forget <id>`. Or delete the app."
+    );
+    // Fenced: `cluster forget` refuses a fenced lease, so the message
+    // names a live node of the target, or a node under that id.
+    let fenced_old = [released("a", "0.9.0"), fenced("cut", "0.8.1", 60_000)];
+    let refused = check(Ok(None), &fenced_old, &[]).unwrap_err();
+    assert!(matches!(
+        &refused,
+        FinalizeRefusal::OlderStopped { released, fenced, .. }
+            if released.is_empty() && fenced == "cut"
+    ));
     let text = refused.to_string();
     assert!(
-        text.contains("Start the app once on 0.9")
-            && text.contains("`wasmkeep cluster forget <id>` (old)")
-            && text.contains("delete the app"),
+        text.contains(
+            "Fenced (cut), which `cluster forget` does not remove: start a node of the app on 0.9 \
+             and finalize while it is live, or start a node of 0.9 under that id to replace its \
+             lease."
+        ) && !text.contains("Released (")
+            && text.ends_with(" Or delete the app."),
+        "{text}"
+    );
+    // Both: one way out each.
+    let both = [released("old", "0.8.1"), fenced("cut", "0.8.0", 60_000)];
+    let text = check(Ok(None), &both, &[]).unwrap_err().to_string();
+    assert!(
+        text.contains("old (0.8.1), cut (0.8.0)")
+            && text.contains("Released (old)")
+            && text.contains("Fenced (cut)"),
         "{text}"
     );
     // One whose version does not parse counts as older.
@@ -886,6 +918,28 @@ mod bucket {
             Ok(None)
         );
         assert_eq!(apps_with_nodes(&b).await.unwrap(), ["acme/shop"]);
+    }
+
+    /// The listing after the write reads the objects that do not decode
+    /// too: one that appeared between the two listings is reported, and
+    /// the floor stays.
+    #[tokio::test]
+    async fn the_second_listing_reports_an_object_that_does_not_decode() {
+        let b = bucket();
+        put(&b, "a", "0.9.0", "released").await;
+        assert_eq!(
+            finalize_write(&b, "acme", "shop", v(0, 9), NOW, HORIZON).await,
+            Ok(Finalize::Raise(None, v(0, 9)))
+        );
+        b.put_body("nodes/junk", b"wasmkeep-node 9\n".to_vec())
+            .await
+            .unwrap();
+        let seen = finalize_confirm(&b, "acme", "shop", v(0, 9), NOW, HORIZON)
+            .await
+            .unwrap();
+        assert_eq!(seen.unread, ["nodes/junk"]);
+        assert!(seen.late.is_empty());
+        assert_eq!(floor_of(&b).await, Some(v(0, 9)), "the floor stays");
     }
 
     /// The offline finalize against a bucket: an undecodable object under
