@@ -129,6 +129,11 @@ pub struct NodeInfo {
     /// that writes one is refused while a live node lacks it. `false` from
     /// nodes that predate it.
     pub can_apart: bool,
+    /// It reads an app's generation floor (heartbeat line 11, `genfloor`,
+    /// ADR 0045, section 5): a restore or `cluster markers clean` that
+    /// writes one is refused while a live node of the app lacks it.
+    /// `false` from nodes that predate it.
+    pub can_genfloor: bool,
     /// It has tracing on, so every hop it sends carries a `traceparent` it
     /// set itself, or none (heartbeat line 11, `traces`, ADR 0044, section
     /// 4): only such a sender's sampled flag is followed. `false` from
@@ -494,6 +499,7 @@ impl NodeInfo {
             can_multi_app: words.can_multi_app,
             can_place: words.can_place,
             can_apart: words.can_apart,
+            can_genfloor: words.can_genfloor,
             can_trace: words.can_trace,
             process: words.process,
             instance: lease.instance,
@@ -507,7 +513,7 @@ impl NodeInfo {
     /// The capability words this node announces on line 11, in order
     /// (`take`, `front`, `handoff`, `ends`, `flush`, `rate_limits`, `restore`,
     /// `actor-restore`, `recorded-head`, `multi-app`, `assets`, `blobs`,
-    /// `place`, `apart`, `traces`). Readers ignore words they do not
+    /// `place`, `apart`, `genfloor`, `traces`). Readers ignore words they do not
     /// know.
     pub fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
@@ -525,6 +531,7 @@ impl NodeInfo {
             (self.can_blobs, "blobs"),
             (self.can_place, "place"),
             (self.can_apart, "apart"),
+            (self.can_genfloor, "genfloor"),
             (self.can_trace, "traces"),
         ]
         .into_iter()
@@ -570,6 +577,7 @@ impl NodeInfo {
             can_multi_app: words.contains(&"multi-app"),
             can_place: words.contains(&"place"),
             can_apart: words.contains(&"apart"),
+            can_genfloor: words.contains(&"genfloor"),
             can_trace: words.contains(&"traces"),
             process: words.iter().find_map(|w| {
                 let id = w.strip_prefix("process=")?;
@@ -871,6 +879,11 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_multi_app: true,
             can_place: self.place,
             can_apart: true,
+            // Only a node of the version that reads the generation floor
+            // (ADR 0045, section 5): one of an older version, or one whose
+            // version does not parse, does not announce it.
+            can_genfloor: crate::app_format::floor::Minor::of_node_version(&self.version)
+                .is_some_and(|v| v >= crate::generation_floor::SINCE),
             can_trace: self.traces,
             process: self.process.clone(),
             instance: self.instance.clone(),
@@ -1227,6 +1240,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         };
@@ -1275,6 +1289,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         };
@@ -1359,6 +1374,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         }
@@ -1744,6 +1760,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         })
@@ -1866,6 +1883,28 @@ mod tests {
             ),
             "{payload}"
         );
+    }
+
+    /// ADR 0045, section 5: `genfloor` is announced by a node of 0.10 or
+    /// later only, never by an older one or one whose version does not
+    /// parse.
+    #[test]
+    fn genfloor_is_announced_from_0_10_only() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        for (version, announced) in [
+            ("0.9.0", false),
+            ("0.9.9+test.abc", false),
+            ("0.10.0", true),
+            ("0.10.0+test.abc", true),
+            ("1.0.0", true),
+            ("junk", false),
+        ] {
+            let m = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0)
+                .unwrap()
+                .with_version(version);
+            assert_eq!(m.info().can_genfloor, announced, "{version}");
+        }
     }
 
     /// ADR 0038: this binary announces `multi-app` and, when given, its
@@ -2285,6 +2324,7 @@ mod tests {
             load: Some(load),
             can_place: true,
             can_apart: true,
+            can_genfloor: true,
             can_trace: false,
             ..loaded_node()
         };
@@ -2328,6 +2368,8 @@ mod tests {
 
         assert!(NodeInfo::words(Some("take apart")).can_apart);
         assert!(!NodeInfo::words(Some("take place")).can_apart);
+        assert!(NodeInfo::words(Some("take genfloor")).can_genfloor);
+        assert!(!NodeInfo::words(Some("take apart")).can_genfloor);
         assert!(node.capabilities().any(|w| w == "place"));
         assert!(!loaded_node().capabilities().any(|w| w == "place"));
         // `traces` likewise: announced only with tracing on, last on the

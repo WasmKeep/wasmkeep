@@ -5,6 +5,13 @@
 //! A direct tokio::time::sleep probe panics with "there is no reactor running".
 //! Instead this model calls the same fence decisions as the server. The CLI
 //! fault tests exercise the full executor on Tokio; this is not executor coverage.
+//!
+//! The generation floor a restore leaves (ADR 0045) is modelled in
+//! `support/generation_floor.rs`: up to two restores in place of an actor
+//! that lived, before and after the finalize, each followed by the actor
+//! deleting itself and being recreated, with markers left (before 0.10) or
+//! none (at 0.10), and a cleanup. A restore that forgets the generation
+//! floor it clears is caught.
 #![cfg(madsim)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use wasmkeep_cluster::restore_fence::{marker_matches, start_allowed};
@@ -602,4 +609,52 @@ fn seeded_paused_old_holder_and_unanswered_requests_across_two_restores() {
             );
         }
     }
+}
+
+#[path = "support/generation_floor.rs"]
+mod generation_floor_model;
+
+/// An actor that lived to generation 5 (the backup's plan at 3), on a node
+/// of 0.10 that acquires it, deletes it and acquires it again; two
+/// restores in place may run at any quiet point, and a cleanup once the
+/// floor is 0.10. `finalized`: the app starts at the floor 0.10 (no
+/// marker is ever written), or below it (the restore writes markers).
+fn lived(finalized: bool) -> generation_floor_model::Start {
+    use generation_floor_model::{Start, Task};
+    Start {
+        finalized,
+        floor: (0, false),
+        actors: vec![((!finalized).then_some(0), Some(5), 5, 5, 3)],
+        nodes: vec![vec![
+            Task::Acquire(0),
+            Task::Delete(0),
+            Task::Acquire(0),
+            Task::Acquire(0),
+        ]],
+        restores: 2,
+        clean: true,
+    }
+}
+
+/// ADR 0045, exit criterion: after a whole-app restore in place, an actor
+/// deleted and recreated starts above every generation its deleted
+/// history carried, with leftover markers and without.
+#[test]
+fn delete_and_recreate_after_a_restore_keeps_the_generation_above_its_history() {
+    use generation_floor_model::{Mutation, explore};
+    for finalized in [false, true] {
+        let reached = explore(&lived(finalized), Mutation::None)
+            .unwrap_or_else(|reused| panic!("finalized {finalized}: {reused:?}"));
+        assert!(reached.restored > 0 && reached.recreated > 0, "{reached:?}");
+        assert!(reached.from_floor > 0 || !finalized, "{reached:?}");
+        eprintln!("finalized {finalized}: {reached:?}");
+    }
+}
+
+/// A second restore in place with no acquisition between, that does not
+/// read the first one's generation floor, reuses a generation.
+#[test]
+fn a_restore_that_forgets_the_generation_floor_is_caught() {
+    use generation_floor_model::{Mutation, explore};
+    assert!(explore(&lived(true), Mutation::RestoreForgetsFloor).is_err());
 }

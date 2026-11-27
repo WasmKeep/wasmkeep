@@ -34,6 +34,13 @@
 #   step each new node's rebalance pass is paused while a node of the
 #   old release runs a minor version apart, and its moves and
 #   the cold sockets its edges' homes took (old homes included) are noted;
+# - the generation floor (ADR 0045, from a new side of 0.10): an actor
+#   created by a new node before the finalize has a marker, byte for byte
+#   0.9's, and an old node takes it over; one created by an old node is
+#   taken over by a new one after the finalize above its marker; a node
+#   that served through the finalize creates an actor with no marker, and
+#   after `cluster markers clean` one above a removed marker's number,
+#   with `cluster verify` counting no marker left;
 # - CLI skew: the old CLI against the finalized cluster (`deploy`,
 #   `secrets set`, `cluster status`, `cluster drain`, `backup create`):
 #   each works and is read rightly, or is refused and changes nothing.
@@ -96,6 +103,7 @@ declare -A PINNED_SHA256=(
   [v0.7.0]=3dda0dfebc23428fff34779515b83bae38327923ffb7755b7a3c97872e5b469b
   [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
   [v0.8.1]=88f7a35dd5e96306f5ef51c0987d9cf7d3f55b7601fb5e8fa8b43a77e6bdf6ac
+  [v0.9.0]=b2a5b38c82f5ef3d6a59c26bd6460610c4dc684305b0a9ec73be3db294311240
 )
 OLD_VERSION=${1:-${OLD_VERSION:-v0.8.1}}
 [[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }
@@ -215,6 +223,9 @@ else
   mode="next minor version ($old_minor -> $new_minor): every phase"
 fi
 echo "mixed-version: $OLD_VERSION -> $new_label, $mode"
+# ADR 0045's lines, from a new side of 0.10 on.
+genfloor=0
+if [ $gated = 1 ] && [ "$(printf '%s\n0.10\n' "$new_minor" | sort -V | head -1)" = 0.10 ]; then genfloor=1; fi
 # A release from before the floor was read, for the returning node.
 older_bin=""; older_short=""
 OLDER_VERSION=${MIXED_VERSION_OLDER_VERSION-$( [ "$OLD_VERSION" != v0.8.1 ] || echo v0.8.0 )}
@@ -423,6 +434,11 @@ retries() { # the answers retried in this step, counted by status
   [ -s "$run/retries-$step.txt" ] || return 0
   note "retried: $(awk '{ print $7 }' "$run/retries-$step.txt" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')(first: $(head -1 "$run/retries-$step.txt" | cut -c1-160))"
 }
+# A bucket object as moto holds it (unsigned, as the buckets are made).
+s3obj() { curl -sf "http://127.0.0.1:$moto_port/mixed-version/$1" 2>/dev/null || true; }
+# Test-actor NAME's per-actor marker, and its ownership record's generation.
+marker_of() { s3obj "state/$APP/leases/t/$1"; }
+owner_gen() { s3obj "state/$APP/owners/t/$1" | sed -n 3p; }
 holder() { # holder CLASS/NAME: the node owning it, - for none, ? when unknown
   new actor where --app "$APP" --bucket "$BUCKET" --json "$1" 2>/dev/null \
     | jq -r '.[0].owner // "-"' 2>/dev/null || echo "?"
@@ -1464,6 +1480,24 @@ if [ $gated = 1 ]; then
   if [[ $up == "mixed|$old_minor|"* ]]; then pass "cluster upgrade status: mixed, floor $old_minor ($up)"
   else fail "cluster upgrade status on a cluster of $(versions): '$up' (want mixed, floor $old_minor)"; fi
 
+  if [ $genfloor = 1 ]; then
+    # ADR 0045, section 5: before the finalize a new node writes what 0.9
+    # does, and an old node takes the actor over; an actor the old node
+    # creates is kept for the line after the finalize.
+    begin genfloor-before-finalize
+    if pin_actor gf-new a; then
+      m=$(marker_of gf-new)
+      if [[ $m == "wasmkeep-lease 2"$'\n'* ]]; then pass "t/gf-new, created by a ($new_label) before the finalize, has 0.9's marker ($(echo "$m" | tr '\n' ' '))"
+      else fail "t/gf-new, created by a before the finalize, has no 0.9 marker: '$m'"; fi
+      g=$(owner_gen gf-new)
+      if pin_actor gf-new c && [ "$(owner_gen gf-new)" -gt "${g:-0}" ]; then pass "c ($old_label) takes t/gf-new over, at generation $(owner_gen gf-new)"
+      else fail "c ($old_label) did not take t/gf-new over (generation ${g:-?} -> $(owner_gen gf-new))"; fi
+    fi
+    if pin_actor gf-old c && [ -n "$(marker_of gf-old)" ]; then pass "t/gf-old, created by c ($old_label), has a marker"
+    else fail "t/gf-old, created by c ($old_label): no marker ($(marker_of gf-old))"; fi
+    retries
+  fi
+
   # ---------------------------------------------------------------- tracing, one old node live
   # ADR 0044, section 4 and "Not settled", 11: a node follows the sampled
   # flag of a hop only from a node that announces `traces`, which sets the
@@ -1594,6 +1628,32 @@ if [ $gated = 1 ]; then
   else fail "cluster upgrade status after the finalize: '$up' (want one version, floor $new_minor)"; fi
   # The old CLI is judged in its own step from here on.
   status_clis=new
+
+  if [ $genfloor = 1 ] && [ $finalized = 1 ]; then
+    # ADR 0045, sections 2 and 4, on nodes that served through the
+    # finalize: no marker for a new actor; one created by 0.9 taken over
+    # above its marker; after the cleanup, an actor whose marker was the
+    # only carrier of its generation starts above it.
+    begin genfloor-after-finalize
+    old_marker=$(marker_of gf-old | sed -n 2p)
+    if pin_actor gf-old a && [ "$(owner_gen gf-old)" -gt "${old_marker:-0}" ]; then pass "a takes t/gf-old (created by $old_short) over at generation $(owner_gen gf-old), above its marker's ${old_marker:-?}"
+    else fail "t/gf-old after the finalize: generation $(owner_gen gf-old), its marker ${old_marker:-?}"; fi
+    if pin_actor gf-after a && [ -z "$(marker_of gf-after)" ]; then pass "t/gf-after, created by a after the finalize, has no marker"
+    else fail "t/gf-after, created after the finalize: marker '$(marker_of gf-after)'"; fi
+    # A restore's marker, the only carrier of its actor's generation.
+    curl -sf -X PUT --data-binary $'wasmkeep-lease 2\n41\n' "http://127.0.0.1:$moto_port/mixed-version/state/$APP/leases/t/gf-seeded" >/dev/null \
+      || fail "writing a restore's marker for t/gf-seeded to moto failed"
+    run_cli markers-clean new cluster markers clean --bucket "$BUCKET" --app "$APP" --yes
+    if [ "$RC" = 0 ] && [ -z "$(marker_of gf-seeded)" ] && [ -z "$(marker_of gf-new)" ]; then pass "cluster markers clean (exit 0): $OUT"
+    else fail "cluster markers clean: exit $RC, gf-seeded's marker '$(marker_of gf-seeded)': $OUT"; fi
+    left=$( (new cluster verify --bucket "$BUCKET" --app "$APP" --json 2>/dev/null || true) | jq -r '.apps[0].lease_markers' 2>/dev/null || true)
+    if [ "$left" = 0 ]; then pass "cluster verify counts no lease marker left"
+    else fail "cluster verify after the cleanup: lease markers left '$left'"; fi
+    if pin_actor gf-seeded a && [ "$(owner_gen gf-seeded)" -gt 41 ]; then pass "t/gf-seeded starts at generation $(owner_gen gf-seeded), above its removed marker's 41"
+    else fail "t/gf-seeded after the cleanup: generation '$(owner_gen gf-seeded)', not above 41"; fi
+    check_all
+    retries
+  fi
 
   # The floor is raised and nothing behind it is written yet: a node of the
   # old release reads every manifest, and must stop on the floor alone.

@@ -1152,3 +1152,41 @@ async fn a_forget_mark_is_not_a_node_and_an_old_one_is_a_note() {
         report.to_text()
     );
 }
+
+/// ADR 0045, section 4: the generation floor is read in its exact form;
+/// markers left under `markers none` are redundant, not a problem.
+#[tokio::test]
+async fn a_generation_floor_is_read_and_markers_under_none_are_redundant() {
+    use wasmkeep_cluster::generation_floor::{self as gf, GenerationFloor, Markers};
+    let store = whole_bucket().await;
+    let key = format!("{PREFIX}/{}", gf::key(&root()));
+    let kept = GenerationFloor {
+        generation: 9,
+        markers: Markers::Kept,
+    };
+    put(&store, &key, kept.encode()).await;
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(report.apps[0].generation_floor, Some((9, false)));
+    assert!(
+        report
+            .to_text()
+            .contains("generation floor: 9, markers kept")
+    );
+    let none = GenerationFloor {
+        markers: Markers::None,
+        ..kept
+    };
+    put(&store, &key, none.encode()).await;
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(report.apps[0].redundant_markers, 1);
+    assert!(
+        report.to_text().contains("1 left are redundant"),
+        "{}",
+        report.to_text()
+    );
+    put(&store, &key, b"junk".to_vec()).await;
+    let report = check(&store, false).await;
+    assert_eq!(only(&report), (key.as_str(), "ownership"));
+}

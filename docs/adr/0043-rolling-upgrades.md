@@ -884,7 +884,9 @@ restored actor could reuse a generation its deleted history carried.
 The marker is therefore a live format with a writer in `0.8.1`, and the
 rule above keeps it. Removing the per-actor cost needs the restore's
 generation floor to move elsewhere first; that is a record change,
-gated, and not before `0.10`.
+gated, and not before `0.10`. [ADR 0045](0045-the-generation-floor-of-a-restored-app.md)
+makes it: one generation floor per app, and no marker written once an
+app's floor is `0.10`.
 
 **Acceptance of older senders: removed, in part.** What `0.8.1`
 provably sends, read in `sign_call`, `sign_hand_off` and

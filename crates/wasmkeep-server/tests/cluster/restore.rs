@@ -1669,3 +1669,189 @@ async fn restore_of_a_gated_deploy_goes_through_the_gate_and_carries_the_floor()
     assert_eq!(read(new.addr, "saved").await, "1");
     new_follow.abort();
 }
+
+/// ADR 0045, exit criterion: a whole-app restore in place at the floor
+/// 0.10, then the actor deleted and recreated: every ownership record it
+/// gets is above every generation its deleted history carried, the
+/// restore leaves the app's generation floor and no marker, and a node of
+/// 0.10 seeds from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_at_the_floor_0_10_then_a_delete_and_recreate_keeps_generations_above() {
+    use super::app_delete::app_node_following_as;
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    use wasmkeep_cluster::generation_floor as gf;
+    const TEN: Minor = Minor {
+        major: 0,
+        minor: 10,
+    };
+    let owner_generation = async |store: &Arc<dyn ObjectStore>| -> u64 {
+        let body = store
+            .get(&Key::from("state/default/shop/owners/t/saved"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        body.lines().nth(2).unwrap().parse().unwrap()
+    };
+    let stop = async |node: Node, follow: tokio::task::JoinHandle<()>| {
+        node.service.shutdown(Duration::from_secs(2)).await;
+        follow.abort();
+        stop_listening(node).await;
+    };
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    deploy(&store).await.unwrap();
+    floor::raise(
+        &wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(&store), ""),
+        "formats/default/shop/floor",
+        TEN,
+    )
+    .await
+    .unwrap();
+    let start = async |id: &str, dir: &Path| {
+        let (node, follow) = app_node_following_as(id, dir, &store, Some("0.10.0"))
+            .await
+            .unwrap();
+        node.service.node_id_checked().await.unwrap();
+        (node, follow)
+    };
+    let (da, db, dc) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+
+    // The actor at generation 1, backed up; then a second holder writes
+    // at generation 2, the history the restore deletes.
+    let (a, follow) = start("a", da.path()).await;
+    assert_eq!(
+        send_runnable(a.addr, "POST", "/actor/t/saved/durable", "")
+            .await
+            .body
+            .trim(),
+        "1"
+    );
+    assert!(
+        store
+            .head(&Key::from("state/default/shop/leases/t/saved"))
+            .await
+            .is_err(),
+        "no marker at the floor 0.10"
+    );
+    let archive: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let run = archive_command(
+        &[
+            "create",
+            "--bucket",
+            "s3://live",
+            "--to",
+            "s3://archive",
+            "--app",
+            "default/shop",
+        ],
+        &store,
+        &archive,
+    )
+    .await
+    .unwrap();
+    stop(a, follow).await;
+    let (b, follow) = start("b", db.path()).await;
+    assert_eq!(read(b.addr, "saved").await, "1");
+    assert_eq!(
+        send_runnable(b.addr, "POST", "/actor/t/saved/durable", "")
+            .await
+            .body
+            .trim(),
+        "2"
+    );
+    let deleted_history = owner_generation(&store).await;
+    assert!(deleted_history >= 2, "{deleted_history}");
+    stop(b, follow).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !wasmkeep_server::apps::live_nodes(store.clone(), "", "default", "shop")
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The restore in place, by a `wasmkeep` of 0.10.
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: wasmkeep_cli::backup::Command,
+    }
+    let cli = Cli::parse_from([
+        "backup",
+        "restore",
+        "--from",
+        "s3://archive",
+        "--bucket",
+        "s3://live",
+        "--app",
+        "default/shop",
+        "--in-place",
+        "--run",
+        &run,
+    ]);
+    wasmkeep_cli::backup::execute_with_stores(
+        &cli.command.as_version(TEN),
+        &archive,
+        "",
+        &store,
+        "",
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap();
+    let body = store
+        .get(&Key::from("state/default/shop/generation-floor"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let restored = gf::decode(Some(&body)).unwrap();
+    assert!(restored.generation > deleted_history, "{restored:?}");
+    assert_eq!(restored.markers, gf::Markers::None);
+    assert!(
+        store
+            .head(&Key::from("state/default/shop/owners/t/saved"))
+            .await
+            .is_err(),
+        "the restore clears the ownership records"
+    );
+
+    // A node of 0.10 serves the restored state, above the floor.
+    let (c, follow) = start("c", dc.path()).await;
+    assert_eq!(read(c.addr, "saved").await, "1");
+    let first = owner_generation(&store).await;
+    assert!(first > restored.generation, "{first} <= {restored:?}");
+    // Deleted, then created again: above its own record, which a delete
+    // keeps (ADR 0028).
+    let r = send_runnable(c.addr, "POST", "/actor/t/saved/delete-durable", "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        send_runnable(c.addr, "POST", "/actor/t/saved/durable", "")
+            .await
+            .body
+            .trim(),
+        "1"
+    );
+    let again = owner_generation(&store).await;
+    assert!(again > first, "{again} <= {first}");
+    assert!(
+        store
+            .head(&Key::from("state/default/shop/leases/t/saved"))
+            .await
+            .is_err(),
+        "no marker, before or after"
+    );
+    stop(c, follow).await;
+}

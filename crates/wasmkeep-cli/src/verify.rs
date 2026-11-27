@@ -197,8 +197,16 @@ pub struct AppReport {
     /// Keys under `alarms/` that are not entries (readers skip them).
     pub alarms_skipped: u64,
     /// Per-actor lease markers left from before node leases (ADR 0020).
-    /// Counted, never read or deleted.
+    /// Counted, never read or deleted (`wasmkeep cluster markers clean`
+    /// removes them, ADR 0045).
     pub lease_markers: u64,
+    /// The app's generation floor (ADR 0045), if it has one: its
+    /// generation, and whether it says no marker is left.
+    pub generation_floor: Option<(u64, bool)>,
+    /// Markers left under a floor that says `markers none`: redundant
+    /// (what an acquisition from just before the finalize may still
+    /// write), ignored by nodes, not a problem.
+    pub redundant_markers: u64,
     /// Files of the app's current epoch, and their bytes.
     pub files: u64,
     /// See [`Self::files`].
@@ -320,6 +328,10 @@ impl Report {
                     "alarm_entries": a.alarms,
                     "alarm_keys_skipped": a.alarms_skipped,
                     "lease_markers": a.lease_markers,
+                    "redundant_markers": a.redundant_markers,
+                    "generation_floor": a.generation_floor.map(|(generation, none)| {
+                        json!({"generation": generation, "markers": if none { "none" } else { "kept" }})
+                    }),
                     "files": a.files,
                     "file_bytes": a.file_bytes,
                     "files_elsewhere": a.files_elsewhere,
@@ -458,6 +470,22 @@ impl Report {
                 },
                 a.lease_markers
             );
+            if let Some((generation, none)) = a.generation_floor {
+                let _ = writeln!(
+                    out,
+                    "  generation floor: {generation}, markers {}{}",
+                    if none { "none" } else { "kept" },
+                    if a.redundant_markers > 0 {
+                        format!(
+                            " ({} left are redundant: nodes ignore them; `wasmkeep cluster \
+                             markers clean` removes them)",
+                            a.redundant_markers
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            }
             if a.files > 0 || a.files_elsewhere > 0 || a.usage.is_some() || a.sweep_records > 0 {
                 let _ = writeln!(
                     out,
@@ -1331,7 +1359,29 @@ impl Run {
             report.lease_markers += 1;
         }
         drop(listing);
+        self.generation_floor(&view, report).await;
         self.files(tenant, app, &view, report).await
+    }
+
+    /// The app's generation floor (ADR 0045): exact, and saying `markers
+    /// none` only while no marker is left.
+    async fn generation_floor(&self, view: &AppView, report: &mut AppReport) {
+        use wasmkeep_cluster::generation_floor as gf;
+        let key = format!("{}{}", view.root.prefix(), gf::key(&view.root));
+        match self.read(&key, MAX_RECORD).await {
+            Read::Body(body) => match gf::decode(Some(&body)) {
+                Ok(floor) => {
+                    let none = floor.markers == gf::Markers::None;
+                    report.generation_floor = Some((floor.generation, none));
+                    if none {
+                        report.redundant_markers = report.lease_markers;
+                    }
+                }
+                Err(e) => self.add([problem(spelled(&key), "ownership", e.to_string())]),
+            },
+            Read::Absent => {}
+            Read::Failed(why, lost) => self.add([failed(spelled(&key), "ownership", why, lost)]),
+        }
     }
 
     /// One actor of an app: its history and its record.

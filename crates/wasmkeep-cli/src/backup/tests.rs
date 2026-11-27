@@ -2127,6 +2127,18 @@ impl ObjectStore for FailMutation {
 
 #[tokio::test]
 async fn restore_failure_at_each_mutation_can_resume_without_losing_generation_floor() {
+    resume_at_each_mutation(false).await;
+}
+
+/// The same at the floor 0.10 (ADR 0045, section 3): whatever write fails,
+/// the resumed restore leaves the absent actor's seed in the app's
+/// generation floor, and no marker.
+#[tokio::test]
+async fn a_restore_at_the_floor_0_10_resumes_at_each_mutation_with_the_generation_floor() {
+    resume_at_each_mutation(true).await;
+}
+
+async fn resume_at_each_mutation(ten: bool) {
     let mut failures = 0;
     for (lost, fail) in [false, true]
         .into_iter()
@@ -2149,6 +2161,9 @@ async fn restore_failure_at_each_mutation_can_resume_without_losing_generation_f
         )
         .await
         .unwrap();
+        if ten {
+            set_floor(&f.source, TEN).await;
+        }
         let id = f.create().await;
         put(
             &f.source,
@@ -2175,6 +2190,9 @@ async fn restore_failure_at_each_mutation_can_resume_without_losing_generation_f
         });
         let mut args = restore_args(&id, true);
         args.deploy = Some(DeployChoice::Backup);
+        if ten {
+            args.writer = Some(TEN);
+        }
         let result =
             restore::execute(&args, &archive, "", &target, "", std::time::Duration::ZERO).await;
         let total = count.load(std::sync::atomic::Ordering::SeqCst);
@@ -2208,15 +2226,31 @@ async fn restore_failure_at_each_mutation_can_resume_without_losing_generation_f
                     .unwrap_or_else(|e| panic!("failure {fail}: {e:#}"));
             }
         }
-        assert_eq!(
-            wasmkeep_cluster::node_lease::decode_marker(
-                &read(&f.source, "state/acme/shop/leases/counter/absent", MAX)
+        if ten {
+            let floor = generation_floor_at(&f.source).await;
+            assert_eq!(
+                floor.map(|f| (f.generation, f.markers)),
+                Some((43, wasmkeep_cluster::generation_floor::Markers::None)),
+                "failure {fail}"
+            );
+            assert!(
+                list_bounded(&f.source, "state/acme/shop/leases/")
                     .await
                     .unwrap()
-            ),
-            Some(43),
-            "failure {fail}"
-        );
+                    .is_empty(),
+                "failure {fail}"
+            );
+        } else {
+            assert_eq!(
+                wasmkeep_cluster::node_lease::decode_marker(
+                    &read(&f.source, "state/acme/shop/leases/counter/absent", MAX)
+                        .await
+                        .unwrap()
+                ),
+                Some(43),
+                "failure {fail}"
+            );
+        }
         assert!(
             optional(&f.source, "apps/acme/shop/restoring")
                 .await
@@ -2849,6 +2883,7 @@ fn node_lease_of(
         can_multi_app: true,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     };
@@ -5805,4 +5840,129 @@ async fn a_restore_where_a_floor_exists_keeps_the_higher_floor() {
         .unwrap_err();
     assert!(format!("{e:#}").contains("unreadable"), "{e:#}");
     assert_eq!(keys_of(&unreadable).await, [FLOOR_KEY]);
+}
+
+const GENERATION_FLOOR_KEY: &str = "state/acme/shop/generation-floor";
+
+async fn generation_floor_at(
+    store: &Store,
+) -> Option<wasmkeep_cluster::generation_floor::GenerationFloor> {
+    optional(store, GENERATION_FLOOR_KEY)
+        .await
+        .unwrap()
+        .map(|body| wasmkeep_cluster::generation_floor::decode(Some(&body)).unwrap())
+}
+
+/// ADR 0045, section 3: once the target's upgrade floor is 0.10 a restore
+/// in place writes one generation floor, the highest generation collected
+/// plus one, with `markers none`, and no marker; a second restore in place
+/// with no acquisition between reads the first one's floor and keeps it.
+#[tokio::test]
+async fn a_restore_at_the_floor_0_10_writes_the_generation_floor_and_no_marker() {
+    use wasmkeep_cluster::generation_floor::{GenerationFloor, Markers};
+    let f = Fixture::new().await;
+    set_floor(&f.source, TEN).await;
+    let id = f.create().await;
+    // A marker left by a restore before the floor: the only carrier of an
+    // absent actor's seed.
+    put(
+        &f.source,
+        "state/acme/shop/leases/counter/absent",
+        wasmkeep_cluster::node_lease::encode_marker(42),
+        false,
+    )
+    .await
+    .unwrap();
+    restore_as(&f, &id, &f.source, true, Some(TEN))
+        .await
+        .unwrap();
+    assert_eq!(
+        generation_floor_at(&f.source).await,
+        Some(GenerationFloor {
+            generation: 43,
+            markers: Markers::None
+        })
+    );
+    assert!(
+        list_bounded(&f.source, "state/acme/shop/leases/")
+            .await
+            .unwrap()
+            .is_empty(),
+        "no marker"
+    );
+    // Again, nothing acquired between: the floor is read and kept above.
+    restore_as(&f, &id, &f.source, true, Some(TEN))
+        .await
+        .unwrap();
+    assert_eq!(
+        generation_floor_at(&f.source).await,
+        Some(GenerationFloor {
+            generation: 44,
+            markers: Markers::None
+        })
+    );
+    // An unreadable one stops the next restore before it clears anything.
+    put(&f.source, GENERATION_FLOOR_KEY, b"junk".to_vec(), true)
+        .await
+        .unwrap();
+    let e = restore_as(&f, &id, &f.source, true, Some(TEN))
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains(GENERATION_FLOOR_KEY), "{e:#}");
+    assert!(
+        !list_bounded(&f.source, "state/acme/shop/actors/")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Into another prefix that held nothing, at 0.10: the object carries the
+/// plans' highest generation plus one, `markers none`.
+#[tokio::test]
+async fn a_restore_at_the_floor_0_10_into_an_empty_target_writes_the_generation_floor() {
+    use wasmkeep_cluster::generation_floor::{GenerationFloor, Markers};
+    let f = Fixture::new().await;
+    set_floor(&f.source, TEN).await;
+    let id = f.create().await;
+    let target: Store = Arc::new(object_store::memory::InMemory::new());
+    restore_as(&f, &id, &target, false, Some(TEN))
+        .await
+        .unwrap();
+    assert_eq!(floor_at(&target).await, Some(TEN));
+    assert_eq!(
+        generation_floor_at(&target).await,
+        Some(GenerationFloor {
+            generation: 2,
+            markers: Markers::None
+        }),
+        "alice's plan carries generation 1"
+    );
+    assert!(
+        list_bounded(&target, "state/acme/shop/leases/")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Below the floor 0.10, by this build or one of 0.10: markers, byte for
+/// byte as 0.9 writes them, and no generation floor.
+#[tokio::test]
+async fn a_restore_below_the_floor_0_10_writes_markers_as_before() {
+    let f = Fixture::new().await;
+    set_floor(&f.source, NINE).await;
+    let id = f.create().await;
+    for writer in [None, Some(NINE), Some(TEN)] {
+        let target: Store = Arc::new(object_store::memory::InMemory::new());
+        restore_as(&f, &id, &target, false, writer).await.unwrap();
+        assert_eq!(
+            read(&target, "state/acme/shop/leases/counter/alice", MAX)
+                .await
+                .unwrap(),
+            b"wasmkeep-lease 2\n1\n",
+            "{writer:?}"
+        );
+        assert_eq!(generation_floor_at(&target).await, None, "{writer:?}");
+    }
 }

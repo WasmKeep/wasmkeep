@@ -364,6 +364,24 @@ Usage: `wasmkeep cluster upgrade finalize [OPTIONS] --bucket <BUCKET>`
 | `--app <APP>` |  | One app, TENANT/APP, instead of every app with registered nodes |
 | `--yes` |  | Write the floor; without it, print what would be done and exit with 2 |
 
+#### `wasmkeep cluster markers`
+
+Remove the per-actor lease markers an app still has once its upgrade to 0.10 is finalized (ADR 0045): `clean`
+
+Usage: `wasmkeep cluster markers [OPTIONS] <COMMAND>`
+
+#### `wasmkeep cluster markers clean`
+
+Remove an app's per-actor lease markers (ADR 0045), once its upgrade to 0.10 is finalized: refused while the app's upgrade floor is below 0.10, or while a live node of the app does not announce `genfloor`.
+
+Usage: `wasmkeep cluster markers clean [OPTIONS] --bucket <BUCKET> --app <APP>`
+
+| Flag or argument | Default | Meaning |
+|---|---|---|
+| `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
+| `--app <APP>` |  | The app, TENANT/APP |
+| `--yes` |  | Delete; without it, print the counts and exit with 2 |
+
 #### `wasmkeep cluster diagnose`
 
 Check that a bucket does what WasmKeep needs from it: conditional creates and replaces, reads and listings that follow writes and deletes, large objects, last-modified times and the clock.

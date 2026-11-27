@@ -884,6 +884,7 @@ async fn format_lifecycle(seed: u64, erase_format: bool, allow_v1: bool) -> bool
         can_multi_app: false,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
         instance: Some("i1".into()),

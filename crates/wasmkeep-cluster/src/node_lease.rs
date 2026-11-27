@@ -1217,38 +1217,8 @@ pub async fn mark_old_lease<B: Bucket, C: Clock>(
     key: &str,
     keys_generation: u64,
 ) -> Result<u64, AcquireError> {
-    let read = bucket
-        .get(key)
-        .await
-        .map_err(|_| AcquireError::Unavailable)?;
-    let (seed, written) = match read {
-        None => (
-            keys_generation,
-            bucket.create(key, encode_marker(keys_generation)).await,
-        ),
-        Some((body, version)) => {
-            if let Some(marked) = decode_marker(&body) {
-                return Ok(marked.max(keys_generation));
-            }
-            let old = crate::lease::LeaseRecord::decode(&body).ok_or(AcquireError::Corrupt)?;
-            let live = old.expires_at_ms != 0
-                && clock.now_ms() <= old.expires_at_ms.saturating_add(config.grace_ms());
-            if live {
-                return Err(AcquireError::Held {
-                    node: old.owner,
-                    instance: String::new(),
-                });
-            }
-            let seed = old.generation.max(keys_generation);
-            (
-                seed,
-                bucket.replace(key, encode_marker(seed), &version).await,
-            )
-        }
-    };
-    // A conflict: another node marked it, or an old one wrote, meanwhile;
-    // the next acquisition reads it again.
-    written.map(|_| seed).map_err(|_| AcquireError::Unavailable)
+    let read = crate::generation_floor::read_marker(bucket, key).await?;
+    crate::generation_floor::mark_from_read(bucket, clock, config, key, read, keys_generation).await
 }
 
 /// Where routing sends a request for an actor ([`Owners::route`]).

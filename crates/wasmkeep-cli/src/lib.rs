@@ -7,6 +7,7 @@ mod actor_groups;
 pub mod backup;
 pub mod blob_links;
 pub mod feed;
+pub mod markers;
 pub mod verify;
 
 /// Parses `TENANT/APP`.

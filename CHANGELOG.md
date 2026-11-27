@@ -40,9 +40,31 @@ The text under a version's heading is its GitHub release text
   `wasmkeep_rebalance_sockets_closed_total`, `wasmkeep_rebalance_paused{reason}`,
   and the outcomes `home` and `home_failed` of
   `wasmkeep_placement_spread_total`.
+- **`wasmkeep cluster markers clean --app TENANT/APP [--yes]`** removes
+  an app's per-actor lease markers once its upgrade floor is 0.10
+  ([ADR 0045](docs/adr/0045-the-generation-floor-of-a-restored-app.md),
+  [removing the markers](docs/cluster-operations.md#removing-the-per-actor-lease-markers)).
+  A marker that is the only carrier of a restore's generation is folded
+  into the app's generation floor before it is deleted; once none is
+  left, nodes stop reading them. `cluster verify` reads the generation
+  floor, and counts markers left under `markers none` as redundant.
+- Nodes announce the heartbeat word `genfloor`, which older nodes skip.
 
 ### Changed
 
+- **Creating an actor no longer writes a per-actor lease marker once the
+  app's upgrade floor is 0.10**
+  ([ADR 0045](docs/adr/0045-the-generation-floor-of-a-restored-app.md)):
+  its first ownership record is seeded from its history keys, a marker
+  left from before, and the app's generation floor
+  (`state/<tenant>/<app>/generation-floor`), with no write. Before the
+  finalize a 0.10 node writes exactly what 0.9 does, and reads the
+  upgrade floor once more per created actor, so a node that serves
+  through the finalize changes path without a restart.
+- **A whole-app restore writes one generation floor per app** in place of
+  one marker per actor once the target's upgrade floor is 0.10, and reads
+  the target's existing one when it restores in place. Below 0.10 it
+  writes markers, byte for byte as 0.9.
 - Placement's load rule no longer applies to spread classes while the
   rebalance is on: their wake-ups follow the spread rule alone
   ([ADR 0041, amendment of 2026-11-26](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-26-spread-actors-go-home-and-the-load-rule-leaves-them)).

@@ -255,6 +255,16 @@ const FORGOTTEN: Format = row(
     "a_forgotten_mark_is_exact_or_not_one",
 );
 
+/// The row of an app's generation floor
+/// ([`crate::generation_floor`], ADR 0045, section 5): new in 0.10,
+/// behind the floor and the word every 0.10 node announces.
+pub const GENERATION_FLOOR: Format = row(
+    crate::generation_floor::HEADER,
+    crate::generation_floor::SINCE,
+    Rule::Gate(&[crate::generation_floor::WORD]),
+    "the_generation_floor_is_absent_exact_or_refused",
+);
+
 /// The gate table (ADR 0043, section 2), as data. A test fails when a
 /// `wasmkeep-<name> <n>` literal exists in the crates without a row here.
 /// `since` is the first release whose tree holds the form.
@@ -306,12 +316,19 @@ pub const FORMATS: &[Format] = &[
         Rule::Frozen,
         "the_floor_is_absent_exact_or_refused",
     ),
+    // The per-actor lease marker: still written, byte for byte, by a
+    // node below the floor at 0.10 (`0.9` writes it), and read only once
+    // the floor is 0.10 (ADR 0045, section 5).
     row(
         "wasmkeep-lease 2",
         m(0, 1),
         Rule::Frozen,
         "a_later_header_is_never_read_as_a_known_one",
     ),
+    // An app's generation floor (ADR 0045): written by a restore and by
+    // `cluster markers clean` once the floor is 0.10, in place of the
+    // markers.
+    GENERATION_FLOOR,
     // The per-actor lease from before node leases (ADR 0020, section 6):
     // read once, to seed an actor's first record, and never written.
     row(
