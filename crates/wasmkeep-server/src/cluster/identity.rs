@@ -752,12 +752,17 @@ impl Cluster {
     pub(super) async fn check_identity(
         &self,
     ) -> (Identity, Option<Version>, Option<(String, u64)>) {
+        // Whether this start met a removal: a mark under its id, or the
+        // released lease it watched gone. It then watches the absent key
+        // longer before it creates its lease ([`Cluster::after_removal_wait`]).
+        let mut met_removal = false;
         loop {
-            if let Err(verdict) = self.forgotten_gone().await {
-                return (verdict, None, None);
+            match self.forgotten_gone().await {
+                Err(verdict) => return (verdict, None, None),
+                Ok(waited) => met_removal |= waited,
             }
-            match self.check_identity_once().await {
-                (Identity::Checking, _, _) => {}
+            match self.check_identity_once(met_removal).await {
+                (Identity::Checking, _, _) => met_removal = true,
                 checked => return checked,
             }
         }
@@ -767,8 +772,8 @@ impl Cluster {
     /// ([`wasmkeep_cluster::node_lease::forgotten`]), reading it every
     /// half period. `Err`: it is still there after four times a lease's ttl
     /// plus grace, with the verdict that stops the start. A read that
-    /// fails proves nothing and is made again.
-    async fn forgotten_gone(&self) -> Result<(), Identity> {
+    /// fails proves nothing and is made again. `Ok(true)`: a mark was read.
+    async fn forgotten_gone(&self) -> Result<bool, Identity> {
         let period = self.heartbeat_every;
         let key = self.node_key();
         let bound = self.alarm_overdue * 4;
@@ -785,7 +790,7 @@ impl Cluster {
                 }
             };
             if !marked {
-                return Ok(());
+                return Ok(until.is_some());
             }
             let until = *until.get_or_insert_with(|| {
                 tracing::info!("{}", forgotten_wait_message(&self.node_id, bound));
@@ -826,7 +831,10 @@ impl Cluster {
     /// own. Unchanged through a successful read at the end: the predecessor
     /// stopped, and this one goes on. Failed reads are retried and never
     /// count as unchanged; nothing is claimed meanwhile.
-    async fn check_identity_once(&self) -> (Identity, Option<Version>, Option<(String, u64)>) {
+    async fn check_identity_once(
+        &self,
+        met_removal: bool,
+    ) -> (Identity, Option<Version>, Option<(String, u64)>) {
         let period = self.heartbeat_every;
         let key = self.node_key();
         // The mark of a `cluster forget` is never judged, and never the
@@ -871,6 +879,13 @@ impl Cluster {
         // process whose object was deleted while it ran is given time to
         // show itself.
         let mut deadline = tokio::time::Instant::now() + self.alarm_overdue;
+        // After a removal, over no object: the client's whole request
+        // budget more, so that removal's delete, if the network holds it,
+        // lands before this lease is created (ADR 0020, amendment of
+        // 2026-11-27).
+        if met_removal && last.is_none() {
+            deadline = tokio::time::Instant::now() + self.after_removal_wait;
+        }
         // The process the first read names, if live.
         let mut first_instance = None;
         if let Some((body, _)) = &last {

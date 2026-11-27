@@ -982,8 +982,13 @@ async fn start_check<B: Bucket, C: Clock>(
     env: &impl Env,
     over_mark: bool,
 ) -> Checked {
-    let wait = cfg.ttl_ms() + cfg.grace_ms();
+    let ttl_grace = cfg.ttl_ms() + cfg.grace_ms();
     let window = wasmkeep_cluster::node_lease::fence_window_ms(cfg);
+    // The server's rule: a start that met a removal (a mark, or the
+    // released lease it watched gone) watches the absent key the client's
+    // request budget longer (here the simulated bucket's, the resolver's
+    // wait).
+    let mut met_removal = false;
     loop {
         let first = match bucket.get(key).await {
             Ok(first) => first,
@@ -996,8 +1001,14 @@ async fn start_check<B: Bucket, C: Clock>(
             if !wait_for_no_mark(bucket, key, cfg, env).await {
                 return Checked::MarkStayed;
             }
+            met_removal = true;
             continue;
         }
+        let wait = if met_removal && first.is_none() {
+            wasmkeep_cluster::node_lease::after_removal_wait_ms(cfg, UNRESOLVED_WAIT_MS)
+        } else {
+            ttl_grace
+        };
         let first_live = first
             .as_ref()
             .and_then(|(b, _)| NodeLeaseObject::decode(b))
@@ -1009,7 +1020,17 @@ async fn start_check<B: Bucket, C: Clock>(
             if !wait_for_no_mark(bucket, key, cfg, env).await {
                 return Checked::MarkStayed;
             }
+            met_removal = true;
             continue;
+        }
+        // The released lease first read, gone: removed.
+        if matches!(&second, Ok(None))
+            && first
+                .as_ref()
+                .and_then(|(b, _)| NodeLeaseObject::decode(b))
+                .is_some_and(|o| o.state == NodeState::Released)
+        {
+            met_removal = true;
         }
         // An operator's created fence, read first and unchanged: the first
         // write lands no earlier than its `written_at` plus twice the skew
@@ -1048,7 +1069,7 @@ async fn start_check<B: Bucket, C: Clock>(
                     && first_live.is_some()
                     && o.instance == first_live
                 {
-                    let stale = o.written_at_ms.saturating_add(wait);
+                    let stale = o.written_at_ms.saturating_add(ttl_grace);
                     let left = stale.saturating_sub(clock.now_ms());
                     env.sleep_ms(left).await;
                     if matches!(bucket.get(key).await, Ok(Some((again, _))) if again == now) {

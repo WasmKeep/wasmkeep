@@ -124,7 +124,8 @@ status`, `cluster verify`, draining, moving and deleting) and
   that id meanwhile makes that write fail, and the command leaves its
   lease alone. A process that starts while the mark is there writes
   nothing over it, waits for it to be gone and then starts as on a new
-  id; if the mark is still there 60 s later (the command stopped between
+  id, watching the absent key about 45 s (the bucket client's request
+  budget plus ttl and grace) before it creates its lease; if the mark is still there 60 s later (the command stopped between
   its two steps), the process does not start, reports `this node's lease
   is being removed by cluster forget`, and running the command again
   removes the mark; `cluster status` warns about a mark older than a

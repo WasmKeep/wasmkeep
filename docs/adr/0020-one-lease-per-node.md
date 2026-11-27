@@ -1402,6 +1402,20 @@ stale reads, in a cluster that mixes 0.8.0 and this version:
   finds to the bucket's time narrows this to a create that lands after the
   command has exited. The complete fix is
   [#303](https://github.com/WasmKeep/wasmkeep/issues/303).
+- Since the amendment of 2026-11-27 an in-band component can delete a
+  lease too: the live nodes' removal of released leases, within its limit
+  for a delete held by the network (a remover's delete of a mark, sent and
+  then held past the mark's age). Composed with one more late write, that
+  can give two owners: a held remover delete that removes a running
+  process's live lease, then a held create landing over the absence (a
+  fence created earlier with `operator_fence`, or the first create of an
+  earlier process of the same id), dated before that process's last
+  write, and a taker that reads it inside the victim's validity, before
+  its next renewal finds the lease gone. Each part needs a request held
+  for tens of seconds; the simulation reaches the second half with an
+  operator who deletes live leases (seeds 87854 and 127417 of
+  `madsim_node_lease`, skipped there and checked to still fail). The fix
+  is the same: [#303](https://github.com/WasmKeep/wasmkeep/issues/303).
 - The window tolerates exactly the configured skew. A predecessor whose
   clock ran ahead by more than the skew allowed can date a body past the
   window, and the rule is then the one before it (dates alone) for that
@@ -1761,8 +1775,10 @@ The same argument as `cluster forget` after the finalize, made by a node:
 - No lease a node wrote is deleted. The mark is written only over the
   version read; a process that wrote its lease first fails the condition.
   One that reads the mark waits for the key to be absent, then runs its
-  whole check again and creates its lease over no object, ttl plus grace
-  after the first absent read: past the last delete any remover sends.
+  whole check again and creates its lease over no object, the client's
+  request budget plus ttl and grace after the first absent read: past the
+  last delete any remover sends, and past one the network held for that
+  long.
 - No actor is stranded. The released lease is what frees a record still
   naming its node (section 3: an absent object frees nothing), so it stays
   while any record names the node. No new record can name it after the
@@ -1775,7 +1791,9 @@ The same argument as `cluster forget` after the finalize, made by a node:
 
 ### Limits, kept as documented
 
-- **A mark's delete sent twice.** A remover whose delete got no answer
+- **A mark's delete sent twice** (narrowed by the longer wait of a start
+  after a removal: the second delete must now be held past that wait
+  too). A remover whose delete got no answer
   in time ends its own mark a round later, once the mark is 16 s old; and
   a mark names no app, so the removers of two apps on one prefix may both
   end one that stayed. A remover held between its read and its delete
@@ -1795,6 +1813,17 @@ The same argument as `cluster forget` after the finalize, made by a node:
 - **Only where a node runs.** An app with no live node, or whose upgrade
   to 0.9 is not finalized, has no remover: its released leases stay until
   it has one, or until `cluster forget`.
+- **The gate is one app's.** The gate covers only the app the released
+  lease names, while `nodes/` spans the whole prefix: a node of `0.8.1` of
+  another, unfinalized app started under the very id being removed would
+  write over the mark (ADR 0043, the same limit for the command).
+- **A start after a removal waits longer.** A start that read a mark
+  under its id, or saw the released lease it watched go, watches the
+  absent key for the bucket client's request budget plus ttl and grace
+  (45 s at the defaults) before it creates its lease, so a delete of that
+  removal held by the network lands first. The 60 s bound on a mark that
+  stays is unchanged and counts from the first read of the mark; the
+  longer wait starts once the key is absent.
 - **The cost of the record check.** A scan reads every ownership record
   under the prefix once, for every due lease not cleared at its version
   yet, and a round with a lease to remove lists the heartbeats for the

@@ -476,8 +476,10 @@ async fn a_node_forgotten_after_the_finalize_starts_again_with_its_lease() {
         std::time::Instant::now()
     };
     let (again, deleted) = tokio::join!(start("a", da.path()), half_way);
+    // The whole check ran again, over no object, for the longer wait of
+    // a start that met a removal (2.5 s in these timings).
     assert!(
-        deleted.elapsed() >= Duration::from_millis(1_100),
+        deleted.elapsed() >= Duration::from_millis(2_400),
         "the whole check ran again: {:?}",
         deleted.elapsed()
     );

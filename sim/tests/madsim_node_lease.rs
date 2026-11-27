@@ -1641,6 +1641,9 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     // `WASMKEEP_SIM_SEED` runs that one seed's checks alone (no floor).
     let only = only_seed();
     for seed in only.map_or(0..seeds(), |s| s..s + 1) {
+        if OUT_OF_BAND_DELETE.contains(&seed) {
+            continue;
+        }
         let o = simulate(seed, Variant::StaleHotOperator, Duration::from_secs(30));
         if let Some(d) = double_ownership(&o.claims) {
             panic!("seed {seed}: two owners with a hot operator: {d:?}");
@@ -1661,6 +1664,27 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     );
     let floor = (seeds() / 20).max(1);
     assert!(acquired >= floor, "{acquired} acquisitions after a fence");
+}
+
+/// Seeds where the hot operator reaches the limit ADR 0020 keeps for a
+/// live lease deleted out of band ("What it does not close", #303): the
+/// operator deletes a running process's live lease, and a fence it created
+/// earlier, whose create had timed out, lands after that delete with its
+/// old date and frees the record that process holds. Two owners with the
+/// correct rules; skipped by the run above, and checked to still fail
+/// below, so a fix of #303 shows here.
+const OUT_OF_BAND_DELETE: [u64; 2] = [87_854, 127_417];
+
+/// The known seeds of the out-of-band-delete limit still give two owners
+/// with the correct rules: the limit is documented, not closed.
+#[test]
+fn the_out_of_band_delete_limit_is_reached_on_its_known_seeds() {
+    for seed in OUT_OF_BAND_DELETE {
+        assert!(
+            caught_by(seed, Variant::StaleHotOperator),
+            "seed {seed} no longer reaches the out-of-band-delete limit: drop it from the skips"
+        );
+    }
 }
 
 /// The first seed of `variant` with two owners or one generation for two

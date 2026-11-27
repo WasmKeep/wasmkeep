@@ -20,7 +20,8 @@ The text under a version's heading is its GitHub release text
   an ownership record still names. Nothing is removed before the finalize
   or beside a live node older than 0.9. A mark a removal left behind is
   deleted once it is 16 s old, so a node waiting on it starts; no delete
-  leaves a remover past its deadline. At most 16 removals and ends of
+  leaves a remover past its deadline, and a node starting after a removal
+  under its id waits 45 s over the absent key before creating its lease. At most 16 removals and ends of
   marks per round, a round every 15 s (a listing of the keys of
   `nodes/`), one scan of the ownership records for every due lease; a
   lease a record names waits ten minutes, and failed rounds back off (a

@@ -182,6 +182,11 @@ pub struct ClusterConfig {
     /// How often the remover runs a round: `None` for the default, a
     /// lease's ttl plus grace. Tests shorten it.
     pub lease_removal_every: Option<Duration>,
+    /// How long a start that met a removal (a mark under its id, or its
+    /// released lease gone) watches the absent key before it creates its
+    /// lease: `None` for the default, the bucket client's request timeout
+    /// (30 s) plus a lease's ttl and grace. Tests shorten it.
+    pub after_removal_wait: Option<Duration>,
     /// The least time between a periodic snapshot whose upload failed and
     /// the next try: 30 s, the longest bounded wait of a caller queued
     /// behind the actor. Tests shorten it.
@@ -296,6 +301,7 @@ impl ClusterConfig {
                 wasmkeep_cluster::lease_removal::DEFAULT_AFTER_MS,
             )),
             lease_removal_every: None,
+            after_removal_wait: None,
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             restore_budget: crate::replica::RESTORE_BUDGET,
             reads_secrets: true,
@@ -500,6 +506,8 @@ pub(crate) struct Cluster {
     lease_removal: Option<Duration>,
     /// [`ClusterConfig::lease_removal_every`], resolved.
     lease_removal_every: Duration,
+    /// [`ClusterConfig::after_removal_wait`], resolved.
+    pub(super) after_removal_wait: Duration,
     /// Idle snapshots this node takes at once (ADR 0042, section 2): a
     /// hibernation finding none free takes none
     /// ([`crate::replica::IDLE_SNAPSHOTS_AT_ONCE`]).
@@ -1001,6 +1009,12 @@ impl Cluster {
             history_retention: config.history_retention,
             idle_compaction: config.idle_compaction,
             lease_removal: config.lease_removal,
+            after_removal_wait: config.after_removal_wait.unwrap_or_else(|| {
+                Duration::from_millis(wasmkeep_cluster::node_lease::after_removal_wait_ms(
+                    &config.lease,
+                    wasmkeep_cluster::node_lease::UNRESOLVED_WAIT_MS,
+                ))
+            }),
             lease_removal_every: config.lease_removal_every.unwrap_or_else(|| {
                 Duration::from_millis(wasmkeep_cluster::lease_removal::round_every_ms(
                     &config.lease,

@@ -185,6 +185,21 @@ pub enum Forgot {
     Unfinished,
 }
 
+/// How long a start that met a removal watches the absent key before it
+/// creates its lease, in ms: the bucket client's whole request budget
+/// (`request_timeout_ms`) plus a lease's ttl and grace (45 s at the
+/// defaults, with `object_store`'s 30 s). A start met a removal when it
+/// read the mark of one under its id, or saw the released lease it was
+/// watching go. A delete of that removal, sent and held by the network,
+/// lands by then if it lands at all, so it cannot fall on the lease this
+/// start then creates; a start over a key that was simply absent keeps
+/// the ttl plus grace.
+pub fn after_removal_wait_ms(config: &LeaseConfig, request_timeout_ms: u64) -> u64 {
+    request_timeout_ms
+        .saturating_add(config.ttl_ms())
+        .saturating_add(config.grace_ms())
+}
+
 /// How long the delete of a mark may take before it is given up, in ms:
 /// two thirds of a lease's ttl plus grace (10 s at the defaults).
 ///
@@ -1036,6 +1051,12 @@ impl<B: Bucket, C: Clock> NodeLease<B, C> {
                             self.last = None;
                             return Ok(());
                         }
+                        // This process's own write, no newer than the one
+                        // held: its version was taken, so the release is
+                        // tried again over it (no progress matters only to
+                        // a renewal's validity).
+                        Err(NodeLeaseError::Unavailable(_))
+                            if self.last.as_ref().is_some_and(|(v, _)| *v != version) => {}
                         Err(e @ NodeLeaseError::Unavailable(_)) => return Err(e),
                     }
                 }
@@ -3670,6 +3691,39 @@ mod tests {
         // Only a whole window of absent answers drops it.
         reads.gone_at("b", at + 2 * window, &c);
         assert_eq!(reads.newest("b"), None);
+    }
+
+    /// A clean stop whose `released` write meets a conflict, the stored
+    /// object being this process's own write, no newer than the one held:
+    /// the release is tried again over it, and lands.
+    #[test]
+    fn a_release_over_its_own_write_no_newer_lands() {
+        use crate::lease::tests::{At, Mem, run};
+        let mem = Mem::default();
+        let t = std::cell::Cell::new(1_000);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        assert_eq!(run(lease.start(None)), Ok(()));
+        let same = NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some("i1".into()),
+            written_at_ms: 1_000,
+        }
+        .encode();
+        *mem.steal_next.borrow_mut() = Some(("nodes/a".into(), same));
+        assert_eq!(run(lease.release()), Ok(()));
+        let (body, _) = run((&mem).get("nodes/a")).unwrap().unwrap();
+        assert_eq!(
+            NodeLeaseObject::decode(&body).unwrap().state,
+            NodeState::Released
+        );
+    }
+
+    /// The wait of a start that met a removal is the client's request
+    /// budget plus ttl and grace.
+    #[test]
+    fn a_start_after_a_removal_waits_out_the_clients_budget() {
+        assert_eq!(after_removal_wait_ms(&cfg(), UNRESOLVED_WAIT_MS), 45_000);
+        assert!(after_removal_wait_ms(&cfg(), 0) > forget_delete_bound_ms(&cfg()));
     }
 
     /// A lease gone for the unpin window, every answer saying so, is

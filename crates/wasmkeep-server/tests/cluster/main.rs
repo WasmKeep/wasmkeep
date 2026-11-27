@@ -646,6 +646,9 @@ async fn start_node_pooled(
     // `nodes/` each, which the cadence test counts. A test that needs it
     // sooner asks.
     cluster.lease_removal_every = Some(Duration::from_secs(30));
+    // A start that met a removal watches the absent key the client's
+    // request budget longer: scaled to these timings.
+    cluster.after_removal_wait = Some(Duration::from_millis(2_500));
     // Off unless a test asks (`failover_wait.rs`): every other test sees
     // the answer a node gives at once.
     cluster.failover_wait = Some(Duration::ZERO);
