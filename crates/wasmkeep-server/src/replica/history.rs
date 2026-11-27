@@ -753,6 +753,22 @@ pub async fn list_objects(
     list_objects_with_limit(store, prefix, None).await
 }
 
+/// Delimiter discovery with the same stall timeout and retries as history listings.
+/// The store exposes a single future, so no intermediate page progress is visible.
+pub async fn list_with_delimiter(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &object_store::path::Path,
+) -> Result<object_store::ListResult, Error> {
+    for _ in 0..super::READ_ATTEMPTS {
+        match tokio::time::timeout(super::READ_IDLE, store.list_with_delimiter(Some(prefix))).await
+        {
+            Ok(result) => return result.map_err(|e| Error::Bucket(e.to_string())),
+            Err(_) => continue,
+        }
+    }
+    Err(Error::Bucket("history listing kept stalling".into()))
+}
+
 /// List at most `max` objects, returning an error rather than partial results.
 /// Intended for bounded operator views; history readers remain unbounded.
 pub async fn list_objects_bounded(

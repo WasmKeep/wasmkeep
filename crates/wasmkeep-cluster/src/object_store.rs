@@ -15,6 +15,7 @@ use crate::membership::Directory;
 pub struct ObjectStoreBucket {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    reads_at_once: usize,
 }
 
 impl ObjectStoreBucket {
@@ -24,7 +25,17 @@ impl ObjectStoreBucket {
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            reads_at_once: READS_AT_ONCE,
+        }
+    }
+
+    /// Override concurrent directory body reads for an operator view.
+    pub fn with_read_concurrency(mut self, reads: std::num::NonZeroUsize) -> Self {
+        self.reads_at_once = reads.get();
+        self
     }
 
     fn path(&self, key: &str) -> Path {
@@ -198,7 +209,7 @@ const READS_AT_ONCE: usize = 16;
 
 impl ObjectStoreBucket {
     /// The bodies of `objects` (each its key and its location), read up to
-    /// [`READS_AT_ONCE`] at a time, in the order given; one that is gone
+    /// the configured concurrency (default [`READS_AT_ONCE`]) at a time, in the order given; one that is gone
     /// (deleted between a listing and its read, or by `cluster forget`) is
     /// left out. Any other failure fails the whole read.
     async fn bodies(
@@ -210,14 +221,15 @@ impl ObjectStoreBucket {
         // the reads in flight (the futures must be `Send` for any lifetime).
         let reads: Vec<_> = objects
             .into_iter()
-            .map(|(key, location)| {
+            .enumerate()
+            .map(|(index, (key, location))| {
                 let store = Arc::clone(&self.store);
                 async move {
                     match store.get(&location).await {
                         Ok(r) => r
                             .bytes()
                             .await
-                            .map(|b| Some((key, b.to_vec())))
+                            .map(|b| Some((index, key, b.to_vec())))
                             .map_err(|e| BucketError::Unavailable(e.to_string())),
                         Err(object_store::Error::NotFound { .. }) => Ok(None),
                         Err(e) => Err(BucketError::Unavailable(e.to_string())),
@@ -225,11 +237,16 @@ impl ObjectStoreBucket {
                 }
             })
             .collect();
-        let found: Vec<Option<(String, Vec<u8>)>> = futures_util::stream::iter(reads)
-            .buffered(READS_AT_ONCE)
+        let found: Vec<Option<(usize, String, Vec<u8>)>> = futures_util::stream::iter(reads)
+            .buffer_unordered(self.reads_at_once)
             .try_collect()
             .await?;
-        Ok(found.into_iter().flatten().collect())
+        let mut found: Vec<_> = found.into_iter().flatten().collect();
+        found.sort_by_key(|(index, _, _)| *index);
+        Ok(found
+            .into_iter()
+            .map(|(_, key, body)| (key, body))
+            .collect())
     }
 }
 

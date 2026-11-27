@@ -13,7 +13,7 @@ publish.workspace = true
 default = ["object-store"]
 # Production bucket adapter. Off in the madsim simulation, which builds only
 # the trait-based protocol code.
-object-store = ["dep:object_store", "dep:futures-util"]
+object-store = ["dep:object_store"]
 # Test-only, set by no release build: with it, WASMKEEP_TEST_VERSION in the
 # build's environment replaces the version the build reports, marked `+test`
 # (build.rs). For scripts/mixed-version.sh alone.
@@ -22,7 +22,8 @@ test-version = []
 [dependencies]
 thiserror.workspace = true
 object_store = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
+# Not optional: the upgrade status reads overlap with it in every build.
+futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
