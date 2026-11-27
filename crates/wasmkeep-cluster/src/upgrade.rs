@@ -1031,9 +1031,62 @@ pub enum FinalizeRefusal {
         /// Their ids, to fence.
         ids: String,
     },
-    /// No node of the app is live.
-    #[error("no node of this app is live: there is nothing to finalize")]
-    NoLiveNode,
+    /// No node of the app is live, and none is registered: nothing shows
+    /// which version last ran it.
+    #[error(
+        "no node of this app is live or registered under this prefix: nothing shows which \
+         version last ran it, so nothing is written. Start a node of the app on {target}, then \
+         finalize"
+    )]
+    NoNode {
+        /// The version that asked.
+        target: Minor,
+    },
+    /// No node of the app is live, and objects under `nodes/` do not
+    /// decode: each may be a node of any app, of a version this one
+    /// cannot read.
+    #[error(
+        "no node of this app is live, and objects under `nodes/` do not decode: {keys}. Each \
+         may be a node of this app, of a version this `wasmkeep` cannot read, so a finalize \
+         without a live node is refused while one is there. Start a node of the app on \
+         {target} and finalize, or delete each object from the bucket by hand once you know \
+         no running node writes it"
+    )]
+    Undecodable {
+        /// The version that asked.
+        target: Minor,
+        /// The keys, comma-separated.
+        keys: String,
+    },
+    /// No node of the app is live, and a lease of the target version or a
+    /// later one is neither released nor fenced: stale is not stopped.
+    #[error(
+        "no node of this app is live, and leases were never released, nor fenced for longer \
+         than a lease's ttl plus grace: {nodes}. Without a live node, every lease of the app \
+         must prove its node stopped: run `wasmkeep cluster fence <id>` for each ({ids}), \
+         wait 15 s, then finalize"
+    )]
+    NotStopped {
+        /// The nodes, each with its version.
+        nodes: String,
+        /// Their ids, to fence.
+        ids: String,
+    },
+    /// No node of the app is live, and a stopped lease names a version
+    /// older than the target (or one that does not parse): the app may
+    /// last have run there. The way out depends on the lease's state:
+    /// `cluster forget` removes a released lease, never a fenced one.
+    #[error("{}", older_stopped(*.target, .nodes, .released, .fenced))]
+    OlderStopped {
+        /// The version that asked.
+        target: Minor,
+        /// The nodes, each with its version.
+        nodes: String,
+        /// The ids of those whose lease is released, comma-separated.
+        released: String,
+        /// The ids of those whose lease is fenced, comma-separated.
+        fenced: String,
+    },
     /// The floor record is unreadable.
     #[error("the app's upgrade floor is unreadable ({len} bytes); nothing written")]
     Unreadable {
@@ -1043,6 +1096,32 @@ pub enum FinalizeRefusal {
     /// The bucket did not answer.
     #[error("bucket: {0}")]
     Bucket(String),
+}
+
+/// The message of [`FinalizeRefusal::OlderStopped`]: one way out per
+/// lease state.
+fn older_stopped(target: Minor, nodes: &str, released: &str, fenced: &str) -> String {
+    let mut out = format!(
+        "no node of this app is live, and stopped nodes name a version older than {target}: \
+         {nodes}. Without a live node, every lease of the app must name {target} or a later \
+         version."
+    );
+    if !released.is_empty() {
+        out.push_str(&format!(
+            " Released ({released}): start the app once on {target} (a node started under its \
+             id replaces its lease), then finalize; or, for a node that will not serve the app \
+             again, remove its lease with `wasmkeep cluster forget <id>`."
+        ));
+    }
+    if !fenced.is_empty() {
+        out.push_str(&format!(
+            " Fenced ({fenced}), which `cluster forget` does not remove: start a node of the app \
+             on {target} and finalize while it is live, or start a node of {target} under that \
+             id to replace its lease."
+        ));
+    }
+    out.push_str(" Or delete the app.");
+    out
 }
 
 /// What `finalize` would do, or did, to an app's floor.
@@ -1060,9 +1139,20 @@ pub enum Finalize {
 /// older node must have stopped for sure: its lease `released` or
 /// `fenced`, not merely stale.
 ///
+/// With no node of the app live (the offline finalize, decided on
+/// 2026-11-27), the app's registered leases are the only record of the
+/// version that last ran it: at least one, every one stopped for sure
+/// and naming `target` or a later version, and no object under `nodes/`
+/// that does not decode (`unread`, its keys: it may be a node of this
+/// app that this version cannot read).
+///
 /// # Errors
 /// The precondition that fails, naming the nodes.
-pub fn finalize_check(target: Minor, status: &AppUpgrade) -> Result<Finalize, FinalizeRefusal> {
+pub fn finalize_check(
+    target: Minor,
+    status: &AppUpgrade,
+    unread: &[&str],
+) -> Result<Finalize, FinalizeRefusal> {
     let found = status
         .floor
         .map_err(|len| FinalizeRefusal::Unreadable { len })?;
@@ -1113,9 +1203,62 @@ pub fn finalize_check(target: Minor, status: &AppUpgrade) -> Result<Finalize, Fi
         });
     }
     if live.is_empty() {
-        return Err(FinalizeRefusal::NoLiveNode);
+        offline_check(target, status, unread)?;
     }
     Ok(Finalize::Raise(found, target))
+}
+
+/// The offline finalize ([`finalize_check`] with no live node).
+fn offline_check(
+    target: Minor,
+    status: &AppUpgrade,
+    unread: &[&str],
+) -> Result<(), FinalizeRefusal> {
+    let ids = |nodes: &[&NodeVersion]| {
+        nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if status.nodes.is_empty() {
+        return Err(FinalizeRefusal::NoNode { target });
+    }
+    if !unread.is_empty() {
+        return Err(FinalizeRefusal::Undecodable {
+            target,
+            keys: unread.join(", "),
+        });
+    }
+    let running: Vec<&NodeVersion> = status.nodes.iter().filter(|n| !n.stopped()).collect();
+    if !running.is_empty() {
+        return Err(FinalizeRefusal::NotStopped {
+            nodes: named(&running),
+            ids: ids(&running),
+        });
+    }
+    let older: Vec<&NodeVersion> = status
+        .nodes
+        .iter()
+        .filter(|n| n.older_than(target))
+        .collect();
+    if !older.is_empty() {
+        let in_state = |state| {
+            let of: Vec<&NodeVersion> = older
+                .iter()
+                .copied()
+                .filter(|n| n.lease == Some(state))
+                .collect();
+            ids(&of)
+        };
+        return Err(FinalizeRefusal::OlderStopped {
+            target,
+            nodes: named(&older),
+            released: in_state(crate::node_lease::NodeState::Released),
+            fenced: in_state(crate::node_lease::NodeState::Fenced),
+        });
+    }
+    Ok(())
 }
 
 /// Reads `tenant/app`'s floor and every heartbeat, and assesses them.
@@ -1224,10 +1367,41 @@ pub async fn apps_with_nodes<B: Directory>(bucket: &B) -> Result<Vec<String>, Bu
     Ok(apps_of(&crate::membership::all_heartbeats(bucket).await?))
 }
 
+/// Steps 1 to 3 of `finalize` for one app (section 4), writing nothing:
+/// one listing of `nodes/` (the objects that do not decode kept), the
+/// app's floor, and [`finalize_check`]. What `finalize` without `--yes`
+/// prints, and what [`finalize_write`] writes.
+///
+/// # Errors
+/// A precondition failed, or the bucket did not answer.
+pub async fn finalize_plan<B: Bucket + Directory>(
+    bucket: &B,
+    tenant: &str,
+    app: &str,
+    target: Minor,
+    now_ms: u64,
+    horizon_ms: u64,
+) -> Result<Finalize, FinalizeRefusal> {
+    let bucket_failed = |e: BucketError| FinalizeRefusal::Bucket(e.to_string());
+    let listed = list_nodes(bucket).await.map_err(bucket_failed)?;
+    let status = status_of(
+        bucket,
+        &format!("{tenant}/{app}"),
+        &listed.nodes,
+        now_ms,
+        horizon_ms,
+    )
+    .await
+    .map_err(bucket_failed)?;
+    let unread: Vec<&str> = listed.unread.iter().map(|(key, _)| key.as_str()).collect();
+    finalize_check(target, &status, &unread)
+}
+
 /// Steps 1 to 4 of `finalize` for one app (section 4): checks the floor
-/// and the live nodes as read at `now_ms`, then raises the floor to
-/// `target` by conditional write. The caller then waits one start check
-/// and calls [`finalize_confirm`]: the second listing is not optional.
+/// and the nodes as read at `now_ms` ([`finalize_plan`]), then raises the
+/// floor to `target` by conditional write. The caller then waits one
+/// start check and calls [`finalize_confirm`]: the second listing is not
+/// optional, with or without a live node.
 ///
 /// # Errors
 /// A precondition failed (nothing written), or the bucket did not answer.
@@ -1239,11 +1413,7 @@ pub async fn finalize_write<B: Bucket + Directory>(
     now_ms: u64,
     horizon_ms: u64,
 ) -> Result<Finalize, FinalizeRefusal> {
-    let bucket_failed = |e: BucketError| FinalizeRefusal::Bucket(e.to_string());
-    let status = read_status(bucket, tenant, app, now_ms, horizon_ms)
-        .await
-        .map_err(bucket_failed)?;
-    let plan = finalize_check(target, &status)?;
+    let plan = finalize_plan(bucket, tenant, app, target, now_ms, horizon_ms).await?;
     if let Finalize::Raise(..) = plan {
         match floor::raise(bucket, &floor::relative_key(tenant, app), target).await {
             // A lost race was read again: another finalize got there.
@@ -1276,6 +1446,11 @@ pub struct Confirmed {
     /// Registered nodes of an older version whose lease is released or
     /// fenced. Not an error: such a node stops at its next start.
     pub stopped_older: Vec<NodeVersion>,
+    /// The keys of the objects under `nodes/` that do not decode. An
+    /// error, as `late` is: each may be a node of this app, of a version
+    /// this one cannot read, that the floor cannot be shown to stop. The
+    /// floor stays.
+    pub unread: Vec<String>,
 }
 
 /// Step 5 of `finalize` (section 4): the listing after the floor is
@@ -1293,9 +1468,19 @@ pub async fn finalize_confirm<B: Bucket + Directory>(
     now_ms: u64,
     horizon_ms: u64,
 ) -> Result<Confirmed, BucketError> {
-    let status = read_status(bucket, tenant, app, now_ms, horizon_ms).await?;
+    // One listing with the objects that do not decode, as the first.
+    let listed = list_nodes(bucket).await?;
+    let status = status_of(
+        bucket,
+        &format!("{tenant}/{app}"),
+        &listed.nodes,
+        now_ms,
+        horizon_ms,
+    )
+    .await?;
     let older = |n: &&NodeVersion| n.older_than(target);
     Ok(Confirmed {
+        unread: listed.unread.into_iter().map(|(key, _)| key).collect(),
         late: status
             .nodes
             .iter()

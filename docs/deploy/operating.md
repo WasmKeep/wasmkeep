@@ -117,8 +117,12 @@ nodes again, and ends with `acme/shop: finalized at 0.9` and exit code
 | --- | --- |
 | `live nodes are older than 0.9: ...` | Upgrade or stop each node it names, then finalize |
 | `nodes older than 0.9 are not live, but their lease was never released, nor fenced ...` | The node vanished without a clean stop. Make sure it is stopped, run `wasmkeep cluster fence <id>`, wait 15 s, finalize |
-| `no node of this app is live: there is nothing to finalize` | Start the nodes, then finalize |
+| `no node of this app is live, and stopped nodes name a version older than 0.9: ...` | A node left a lease of the older version. Start the app once on 0.9, then finalize. A released lease of a node that will not serve the app again: `wasmkeep cluster forget <id>`. A fenced one: finalize while a 0.9 node of the app is live |
+| `no node of this app is live, and leases were never released, nor fenced ...` | Make sure the node is stopped, run `wasmkeep cluster fence <id>`, wait 15 s, finalize |
+| `no node of this app is live, and objects under nodes/ do not decode: ...` | Start a node of the app and finalize, or delete the object by hand once no running node writes it |
+| `no node of this app is live or registered under this prefix ...` | Start a node of the app, then finalize |
 | `live nodes run a newer version than this ...` | Finalize with that version's `wasmkeep` |
+| After the wait: `objects under nodes/ do not decode at the listing after the write ...`, exit code 1 | Find what writes each object and stop it, then delete the object by hand. The floor stays |
 | After the wait: `nodes older than the floor 0.9 are live ...`, exit code 1 | A 0.8.1 node started while the floor was written. Stop it. The floor stays |
 
 ## 2. A `cluster verify`

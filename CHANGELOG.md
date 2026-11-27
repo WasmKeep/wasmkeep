@@ -111,6 +111,20 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
 
 ### Fixed
 
+- **`wasmkeep cluster upgrade finalize` works with every node of the app
+  stopped** ([ADR 0043, section 4](docs/adr/0043-rolling-upgrades.md#4-wasmkeep-cluster-upgrade-statusfinalize)).
+  After an upgrade done by stopping every node it was refused until a
+  node was live again. With no node of an app live it is now accepted
+  when every lease the app's nodes left is `released` or `fenced` and
+  names the target version or a later one, and no object under `nodes/`
+  fails to decode; the write itself is unchanged. A
+  lease of an older version refuses it, and the message names the way
+  out for its state (a released lease can be forgotten, a fenced one
+  cannot). A fence counts as a stop after the default lease timings.
+  The listing after the write now also reports an object under `nodes/`
+  that does not decode, as an error (exit code 1; the floor stays). Without `--app`, every app that can be is raised, each
+  refused app is named with its reason and what to do, and the command
+  exits with 1. The dry run (no `--yes`) now gives the same answers.
 - **A single slow lease renewal no longer runs a node's lease out.**
   Renewals went a heartbeat period after the previous send, each allowed
   2.67 s, so after one that timed out the next could be answered after

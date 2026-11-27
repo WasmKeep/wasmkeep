@@ -55,8 +55,11 @@ so plan a short window.
 3. **Start every node**, and wait until each is `serving`:
    `/_wasmkeep/ready` answers 200 on it, and `cluster status` lists it
    live, on 0.9.0.
-4. **Finalize** ([below](#finalize)). It needs a live node, so it comes
-   after the start.
+4. **Finalize** ([below](#finalize)). It comes after the start: until a
+   node has run 0.9, every lease the nodes left names 0.8.1. With the
+   0.9.0 `wasmkeep` it needs a live node; from 0.9.1 it also works once
+   those nodes are stopped again, their leases naming 0.9
+   ([with no live node](#finalize)).
 
 The general steps are in
 [Upgrading WasmKeep](../cluster-upgrades.md#with-every-node-stopped).
@@ -136,18 +139,22 @@ is still 0.8. `--app TENANT/APP` narrows both commands to one app;
 
 `finalize` works per app, over every app with a registered node under
 the prefix. Without `--yes` it prints what it would do and exits with 2.
-Without `--app`, it raises the floor of every app that has a live node,
-and exits with 1 if any app has no live node, even after raising the
-others. For apps with no node left, finalize the live ones with `--app`,
-or remove the leftover leases with `wasmkeep cluster forget`. With
-`--yes`:
+Without `--app`, it raises the floor of every app it can, names each
+refused app with its reason, and exits with 1 if any was refused, even
+after raising the others. With `--yes`:
 
 1. It is **refused, naming them, while a live node of the app is older**
    than 0.9. It is refused too while an older node is not live but its
    lease is neither `released` nor `fenced`: a stale lease is not proof
    of a stop (the machine may be cut off and still act). Run `wasmkeep
    cluster fence <id>` for such a node first; a fence counts 15 s after
-   the node's last write.
+   the node's last write. **With no live node of the app**, the 0.9.0
+   `wasmkeep` refuses it. From 0.9.1 it is accepted when every lease
+   of the app is `released` or `fenced` and names 0.9 or later, and no
+   object under `nodes/` fails to decode; a lease that still says 0.8.1
+   refuses it: start the app once on 0.9.0, or remove that lease with
+   `wasmkeep cluster forget`
+   ([the cases](../cluster-upgrades.md#versions-the-upgrade-floor-and-finalize)).
 2. It **raises the app's upgrade floor** to 0.9, by a conditional write.
    An app already at 0.9 is left as it is: the command can be run again.
 3. It **waits one start check (about 25 s) and lists the nodes again.**

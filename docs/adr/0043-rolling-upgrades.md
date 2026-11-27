@@ -11,7 +11,8 @@
   Section 6's removals of older senders, and a second gated format, the
   mark of `cluster forget`, are under
   ["Built: the removals, and the mark of `cluster forget`"](#built-the-removals-and-the-mark-of-cluster-forget).
-  Section 8 is still to build.
+  Section 8 is still to build. The offline finalize (section 4, step 3)
+  was decided and built on 2026-11-27.
 - Milestone: `0.9.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: ADR 0008 (deploys roll; this record is about the binary), ADR
   0011 (the cluster port), ADR 0020 (node leases, the heartbeat, and the
@@ -572,8 +573,9 @@ outside the gate, and a backup did not carry the floor.
   for the app's own stopped nodes.
 - **What it gives up.** A restore in place from a backup with a higher
   floor than the target's ends the target's way back without a
-  `finalize`, with no node of the app live: the offline finalize of
-  "Not settled" 10, for this one case. And an archive that holds a
+  `finalize`, with no node of the app live, and without the offline
+  finalize's check of the leases (section 4, step 3): the backup's floor
+  is the record of the version that served it. And an archive that holds a
   format 2 run needs `0.9` for every backup command: a `0.8.1` `create`
   refused there has already written its run's `started` object, which
   holds `prune` back for 24 hours, and a refused `0.8.1` `restore` has
@@ -644,8 +646,29 @@ one named):
    neither `released` nor `fenced` for longer than a lease's ttl plus
    grace after its last write: a stale lease is not proof of a stop
    (the node may be cut off or slow, and still act), so the message
-   names `wasmkeep cluster fence <id>`. Refused with no live node: there
-   is nothing to finalize.
+   names `wasmkeep cluster fence <id>`. With no live node of the app
+   (an upgrade done by stopping every node), the app's registered leases
+   are the only record of the version that last served it, and the
+   finalize is accepted only on that record (decided on 2026-11-27, was
+   "Not settled" 10): at least one lease of the app is registered, every
+   one is `released` or `fenced` for longer than a lease's ttl plus
+   grace, every one names the target or a later minor version, and no
+   object under `nodes/` fails to decode (it may be a node of this app
+   that this version cannot read; see "Not settled" 11). A lease that
+   names an older version, or one that does not parse, refuses it: that
+   node may start again on its own version, and no node of the target
+   may ever have served the app. The message names a way out per lease
+   state: for a released lease, start the app once on the target and
+   finalize then, or remove the lease with `wasmkeep cluster forget` for
+   a node that will not serve the app again; for a fenced one, which
+   `forget` does not remove, start a node of the app on the target and
+   finalize while it is live, or start a node of the target under that
+   id; or delete the app. Without `--app`, each app is judged alone: the
+   others are raised, each refused one is named with its reason, and the
+   command exits with 1. A fence counts as a stop after the default
+   lease timings (ttl plus grace, 15 s): a lease does not record its
+   node's timings, so the offline finalize, like the rest of this
+   command, assumes the defaults.
 4. Writes the floor by conditional write. A lost race is read again.
 5. Waits one start check (a lease's ttl plus grace, plus a heartbeat
    horizon) and lists again. A `0.8.1` node that was starting meanwhile
@@ -655,7 +678,10 @@ one named):
    reported as an error naming it, with exit code 1. The floor stays:
    gated formats remain refused while that node is live (the second half
    of every gate), and the node must be stopped. This second listing is
-   what closes the race section 3 leaves open; it is not optional.
+   what closes the race section 3 leaves open; it is not optional. It
+   keeps the objects under `nodes/` that do not decode, as the first
+   listing of an offline finalize does: each is reported as an error,
+   with exit code 1, and the floor stays.
 6. Prints the registered nodes whose lease is released or fenced and
    still name an older version. They are not an error: such a node stops
    at its next start. An older lease that is stale without either is
@@ -1446,11 +1472,16 @@ node-lease simulation was run again over the changed module.
    `wasmkeep` than its nodes. The first deploy creates the floor no
    higher than the lowest live version under the prefix, and nothing
    when that is `0.8`.
-10. **No finalize without a live node.** After an upgrade done by
-    stopping every node, `finalize` is refused until a node is live
-    again. `0.9.x` must ship an offline path before `0.10`: a finalize
-    accepted when every registered lease of the app is released or
-    fenced and names the target version or a later one.
+10. *Decided on 2026-11-27* (section 4, step 3): the offline finalize.
+    With no node of the app live, `finalize` is accepted when the app
+    has a registered lease, every one is released or fenced (for a
+    lease's ttl plus grace) and names the target version or a later
+    one, and no object under `nodes/` fails to decode. A lease of an
+    older version refuses it, naming the way out for its state. The
+    write and the second listing are those of a finalize with a live
+    node; the second listing also reports an object that does not
+    decode. It assumes the default lease timings for a fence. Shipped
+    in `0.9.1`.
 11. **An object under `nodes/` that does not decode** is never removed
     by a command: `cluster forget` reads only what it can decode (and
     its own mark, which is not such an object). It

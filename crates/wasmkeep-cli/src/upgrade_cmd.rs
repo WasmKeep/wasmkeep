@@ -3,10 +3,12 @@
 //!
 //! `status` reads each app's upgrade floor and its nodes' versions and
 //! names one state. `finalize` is the operator's "the upgrade is done":
-//! refused while a live node of the app is older, it raises the floor to
-//! this `wasmkeep`'s minor version, then lists the nodes again after one
-//! start check. From then on no node of an older version starts, and the
-//! formats the new version introduced may be written.
+//! refused while a live node of the app is older (or, with no node of the
+//! app live, unless every lease of the app is stopped and names this
+//! version or a later one), it raises the floor to this `wasmkeep`'s
+//! minor version, then lists the nodes again after one start check. From
+//! then on no node of an older version starts, and the formats the new
+//! version introduced may be written.
 //!
 //! [ADR 0043]: ../../../docs/adr/0043-rolling-upgrades.md
 
@@ -33,12 +35,16 @@ pub(crate) enum UpgradeCommand {
     /// End an upgrade: raise each app's upgrade floor to this `wasmkeep`'s
     /// minor version, so that no node of an older version starts again
     /// (there is no way back). Refused, naming them, while a live node of
-    /// the app runs an older version, and when no node of it is live. After the
-    /// write it waits one start check (about 25 s) and lists the nodes
-    /// again: an older node that is live then is an error (exit code 1)
-    /// and must be stopped. From then on no node of an older version
-    /// starts, and going back is not supported. Without --yes it prints
-    /// what it would do and exits with 2.
+    /// the app runs an older version. With no node of the app live (every
+    /// node stopped for the upgrade), accepted when every registered lease
+    /// of the app is released or fenced and names this version or a later
+    /// one. After the write it waits one start check (about 25 s) and
+    /// lists the nodes again: an older node that is live then is an error
+    /// (exit code 1) and must be stopped. From then on no node of an older
+    /// version starts, and going back is not supported. Without --app,
+    /// every app is raised that can be, each refused app is named with
+    /// its reason, and the exit code is 1 if any was refused. Without
+    /// --yes it prints what it would do and exits with 2.
     Finalize(FinalizeArgs),
 }
 
@@ -304,24 +310,28 @@ pub(crate) async fn finalize(
     let mut out = String::new();
     if !yes {
         for app in &apps {
-            let line = match upgrade::finalize_check(target, app) {
-                Ok(Finalize::Already(floor)) => {
-                    format!("{}: already finalized at {floor}", app.app)
-                }
-                Ok(Finalize::Raise(..)) => format!(
-                    "{}: would raise the upgrade floor from {} to {target}; no node older than \
-                     {target} could start after it, and going back would not be supported",
-                    app.app,
-                    app.floor_text()
-                ),
-                Err(refused) => format!("{}: would be refused: {refused}", app.app),
-            };
+            let (tenant, name) = app.app.split_once('/').unwrap_or((&app.app, ""));
+            let line =
+                match upgrade::finalize_plan(bucket, tenant, name, target, now(), horizon).await {
+                    Ok(Finalize::Already(floor)) => {
+                        format!("{}: already finalized at {floor}", app.app)
+                    }
+                    Ok(Finalize::Raise(..)) => format!(
+                        "{}: would raise the upgrade floor from {} to {target}; no node older \
+                         than {target} could start after it, and going back would not be \
+                         supported",
+                        app.app,
+                        app.floor_text()
+                    ),
+                    Err(refused) => format!("{}: would be refused: {refused}", app.app),
+                };
             let _ = writeln!(out, "{line}");
         }
         out.push_str("Nothing written. Pass --yes to finalize.\n");
         return Ok((out, 2));
     }
     let mut failed = false;
+    let mut refused = Vec::new();
     let mut written = Vec::new();
     let mut settled = Vec::new();
     for app in &apps {
@@ -340,9 +350,10 @@ pub(crate) async fn finalize(
                 ));
                 written.push((tenant, name, app, true));
             }
-            Err(refused) => {
+            Err(why) => {
                 failed = true;
-                say(format!("error: {}: {refused}", app.app));
+                refused.push(app.app.as_str());
+                say(format!("error: {}: {why}", app.app));
             }
         }
     }
@@ -377,7 +388,20 @@ pub(crate) async fn finalize(
                 app.app,
                 list(&seen.late)
             );
-        } else if wrote {
+        }
+        if !seen.unread.is_empty() {
+            failed = true;
+            let _ = writeln!(
+                out,
+                "error: {}: objects under `nodes/` do not decode at the listing after the \
+                 write: {}. Each may be a node of this app, of a version this `wasmkeep` cannot \
+                 read, which the floor cannot be shown to stop. The floor stays; find what \
+                 writes each object, stop it, and delete the object from the bucket by hand",
+                app.app,
+                seen.unread.join(", ")
+            );
+        }
+        if wrote && seen.late.is_empty() && seen.unread.is_empty() {
             let _ = writeln!(out, "{}: finalized at {target}", app.app);
         }
         if !seen.stopped_older.is_empty() {
@@ -390,6 +414,16 @@ pub(crate) async fn finalize(
                 list(&seen.stopped_older)
             );
         }
+    }
+    if only.is_none() && !refused.is_empty() && apps.len() > 1 {
+        let _ = writeln!(
+            out,
+            "{} of {} apps refused, nothing written for them: {}. Each `error:` line above says \
+             why and what to do; finalize one again with `--app TENANT/APP`",
+            refused.len(),
+            apps.len(),
+            refused.join(", ")
+        );
     }
     Ok((out, u8::from(failed)))
 }
@@ -574,6 +608,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(refused.to_string().contains("nothing to finalize"));
+    }
+
+    /// The offline finalize (ADR 0043, decided on 2026-11-27): with no
+    /// node of an app live, scoped and unscoped, the floor is raised only
+    /// where every lease of the app is stopped and names the target or a
+    /// later version. Every other app is named with its reason, and the
+    /// command fails as a whole.
+    #[tokio::test]
+    async fn finalize_without_a_live_node_raises_every_app_it_can() {
+        let b = bucket();
+        // Every node stopped cleanly after the upgrade to 0.9.
+        put(&b, "acme/shop", "a", "0.9.0", "released").await;
+        put(&b, "acme/shop", "b", "0.9.1", "released").await;
+        // One app's leases still name 0.8, one is mixed and live.
+        put(&b, "acme/blog", "c", "0.9.0", "released").await;
+        put(&b, "acme/blog", "old", "0.8.1", "released").await;
+        put(&b, "acme/wiki", "d", "0.9.0", "live").await;
+        put(&b, "acme/wiki", "e", "0.8.1", "live").await;
+        // Without --yes: the same answers, nothing written.
+        let (out, code) = run(&b, None, v(0, 9), false).await;
+        assert_eq!(code, 2, "{out}");
+        assert!(
+            out.contains("acme/shop: would raise the upgrade floor from none (0.8) to 0.9"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "acme/blog: would be refused: no node of this app is live, and stopped nodes \
+                 name a version older than 0.9: old (0.8.1)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("acme/wiki: would be refused: live nodes are older than 0.9: e (0.8.1)"),
+            "{out}"
+        );
+        assert_eq!(floor(&b, "acme/shop").await, None);
+
+        let (out, code) = run(&b, None, v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("acme/shop: finalized at 0.9"), "{out}");
+        assert!(
+            out.contains("error: acme/blog: no node of this app is live")
+                && out.contains("Released (old): start the app once on 0.9")
+                && out.contains("`wasmkeep cluster forget <id>`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("error: acme/wiki: live nodes are older than 0.9: e (0.8.1)"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "2 of 3 apps refused, nothing written for them: acme/blog, acme/wiki. Each \
+                 `error:` line above says why and what to do"
+            ),
+            "{out}"
+        );
+        assert!(floor(&b, "acme/shop").await.is_some());
+        assert_eq!(floor(&b, "acme/blog").await, None);
+        assert_eq!(floor(&b, "acme/wiki").await, None);
+
+        // Scoped: refused the same way while the older lease is there,
+        // with no summary line; once it is forgotten, raised alone.
+        let (out, code) = run(&b, Some("acme/blog"), v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains(
+                "error: acme/blog: no node of this app is live, and stopped nodes name a \
+                 version older than 0.9: old (0.8.1)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("apps refused"), "{out}");
+        assert_eq!(floor(&b, "acme/blog").await, None);
+        b.delete("nodes/old").await.unwrap();
+        let (out, code) = run(&b, Some("acme/blog"), v(0, 9), true).await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("acme/blog: finalized at 0.9"), "{out}");
+        assert!(!out.contains("apps refused"), "{out}");
+        assert!(floor(&b, "acme/blog").await.is_some());
+
+        // An object under `nodes/` that does not decode refuses it,
+        // scoped and unscoped, and the summary is for several apps only.
+        let c = bucket();
+        put(&c, "acme/shop", "a", "0.9.0", "released").await;
+        c.put_body("nodes/junk", b"junk".to_vec()).await.unwrap();
+        for only in [Some("acme/shop"), None] {
+            let (out, code) = run(&c, only, v(0, 9), true).await;
+            assert_eq!(code, 1, "{out}");
+            assert!(
+                out.contains(
+                    "error: acme/shop: no node of this app is live, and objects under `nodes/` \
+                     do not decode: nodes/junk"
+                ),
+                "{out}"
+            );
+            assert!(!out.contains("apps refused"), "{out}");
+        }
+        assert_eq!(floor(&c, "acme/shop").await, None);
+        c.delete("nodes/junk").await.unwrap();
+        let (out, code) = run(&c, None, v(0, 9), true).await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("acme/shop: finalized at 0.9"), "{out}");
+
+        // Beside a live node the write does not look at an object that
+        // does not decode; the listing after it does: the floor is written
+        // and stays, and the command fails, naming it.
+        let d = bucket();
+        put(&d, "acme/shop", "a", "0.9.0", "live").await;
+        d.put_body("nodes/junk", b"junk".to_vec()).await.unwrap();
+        let (out, code) = run(&d, None, v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains(
+                "error: acme/shop: objects under `nodes/` do not decode at the listing after \
+                 the write: nodes/junk"
+            ) && !out.contains("acme/shop: finalized at 0.9"),
+            "{out}"
+        );
+        assert!(floor(&d, "acme/shop").await.is_some(), "the floor stays");
+
+        // An app named that has no lease: nothing proves its version.
+        let (out, code) = run(&c, Some("acme/none"), v(0, 9), true).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("error: acme/none: no node of this app is live or registered"),
+            "{out}"
+        );
+        assert_eq!(floor(&c, "acme/none").await, None);
     }
 
     /// `upgrade status`: versions, the floor, one state per app, what
