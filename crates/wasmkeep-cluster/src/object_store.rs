@@ -194,7 +194,7 @@ impl Directory for ObjectStoreBucket {
 
 /// Reads a listing or a set of keys sends at once: one slow object costs
 /// one read's time, not one more read per object before it.
-const READS_AT_ONCE: usize = 16;
+const READS_AT_ONCE: usize = 32;
 
 impl ObjectStoreBucket {
     /// The bodies of `objects` (each its key and its location), read up to
@@ -210,14 +210,15 @@ impl ObjectStoreBucket {
         // the reads in flight (the futures must be `Send` for any lifetime).
         let reads: Vec<_> = objects
             .into_iter()
-            .map(|(key, location)| {
+            .enumerate()
+            .map(|(index, (key, location))| {
                 let store = Arc::clone(&self.store);
                 async move {
                     match store.get(&location).await {
                         Ok(r) => r
                             .bytes()
                             .await
-                            .map(|b| Some((key, b.to_vec())))
+                            .map(|b| Some((index, key, b.to_vec())))
                             .map_err(|e| BucketError::Unavailable(e.to_string())),
                         Err(object_store::Error::NotFound { .. }) => Ok(None),
                         Err(e) => Err(BucketError::Unavailable(e.to_string())),
@@ -225,11 +226,16 @@ impl ObjectStoreBucket {
                 }
             })
             .collect();
-        let found: Vec<Option<(String, Vec<u8>)>> = futures_util::stream::iter(reads)
-            .buffered(READS_AT_ONCE)
+        let found: Vec<Option<(usize, String, Vec<u8>)>> = futures_util::stream::iter(reads)
+            .buffer_unordered(READS_AT_ONCE)
             .try_collect()
             .await?;
-        Ok(found.into_iter().flatten().collect())
+        let mut found: Vec<_> = found.into_iter().flatten().collect();
+        found.sort_by_key(|(index, _, _)| *index);
+        Ok(found
+            .into_iter()
+            .map(|(_, key, body)| (key, body))
+            .collect())
     }
 }
 

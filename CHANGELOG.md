@@ -52,6 +52,10 @@ The text under a version's heading is its GitHub release text
 
 ### Changed
 
+- `cluster status` and `cluster upgrade status` overlap up to 32 reads per
+  batch without waiting for slow earlier objects, keeping their output sorted.
+  CLI app discovery lists tenants and apps without walking deployment history.
+
 - **Creating an actor no longer writes a per-actor lease marker once the
   app's upgrade floor is 0.10**
   ([ADR 0045](docs/adr/0045-the-generation-floor-of-a-restored-app.md)):

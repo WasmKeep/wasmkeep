@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use futures_util::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 #[cfg(test)]
 use object_store::ObjectStoreExt;
@@ -391,10 +392,21 @@ async fn read_with_limit(
     let node_prefix = format!("{}/nodes", prefix.trim_end_matches('/'))
         .trim_start_matches('/')
         .to_owned();
+    let read_nodes = async {
+        let objects = list_objects(&store, &node_prefix, max).await?;
+        futures_util::stream::iter(objects.into_keys().map(|key| {
+            let location = StorePath::from(format!("{node_prefix}/{key}"));
+            let store = &store;
+            async move { metadata(store, &location).await.map(|body| (key, body)) }
+        }))
+        .buffer_unordered(32)
+        .try_collect::<Vec<_>>()
+        .await
+    };
+    let (objects, apps) = tokio::try_join!(read_nodes, read_apps(&store, prefix, bucket, max))?;
     let mut heartbeats = Vec::new();
     let mut unfinished_forgets = Vec::new();
-    for (key, _) in list_objects(&store, &node_prefix, max).await? {
-        let body = metadata(&store, &StorePath::from(format!("{node_prefix}/{key}"))).await?;
+    for (key, body) in objects {
         // Not a node: shown only when its command left it there.
         if let Some(at) = wasmkeep_cluster::node_lease::forgotten(&body) {
             if now_ms.saturating_sub(at) > FORGET_UNFINISHED_MS
@@ -412,19 +424,31 @@ async fn read_with_limit(
         }
     }
     heartbeats.sort_by(|a, b| a.id.cmp(&b.id));
+    unfinished_forgets.sort();
     // Each app's upgrade floor, one read per app with registered nodes.
     let floors = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
         Arc::clone(&store),
         prefix.to_owned(),
     );
-    let mut upgrades = Vec::new();
-    for app in wasmkeep_cluster::upgrade::apps_of(&heartbeats) {
-        upgrades.push(
-            wasmkeep_cluster::upgrade::status_of(&floors, &app, &heartbeats, now_ms, horizon_ms)
-                .await
-                .map_err(|e| anyhow::anyhow!("reading the upgrade floor of {app}: {e}"))?,
-        );
-    }
+    let mut upgrades: Vec<_> = futures_util::stream::iter(
+        wasmkeep_cluster::upgrade::apps_of(&heartbeats)
+            .into_iter()
+            .map(|app| {
+                let floors = &floors;
+                let heartbeats = &heartbeats;
+                async move {
+                    wasmkeep_cluster::upgrade::status_of(
+                        floors, &app, heartbeats, now_ms, horizon_ms,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reading the upgrade floor of {app}: {e}"))
+                }
+            }),
+    )
+    .buffer_unordered(32)
+    .try_collect()
+    .await?;
+    upgrades.sort_by(|a, b| a.app.cmp(&b.app));
     let nodes = heartbeats
         .into_iter()
         .map(|info| Node {
@@ -439,15 +463,16 @@ async fn read_with_limit(
         read_at_ms: now_ms,
         horizon_ms,
         nodes,
-        apps: read_apps(&store, prefix, bucket, max).await?,
+        apps,
         upgrades,
         unfinished_forgets,
         wasmkeep: None,
     })
 }
 
-/// `apps/<tenant>/<app>/current` and its manifest, discovered with an optionally bounded
-/// streaming listing. Component bodies are never downloaded.
+/// App names from delimiter listings, independent of deployment history.
+/// The inspector retains its bounded recursive listing contract.
+/// Component bodies are never downloaded.
 async fn read_apps(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
@@ -459,35 +484,63 @@ async fn read_apps(
     } else {
         StorePath::from(format!("{prefix}/apps"))
     };
-    let mut apps = Vec::new();
-    let objects = list_objects(store, root.as_ref(), max).await?;
-    let names: std::collections::BTreeSet<_> = objects
-        .keys()
-        .filter_map(|key| {
-            let mut parts = key.split('/');
-            Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
-        })
-        .collect();
-    for (tenant_name, app_name) in names {
-        let app = root
-            .clone()
-            .join(tenant_name.as_str())
-            .join(app_name.as_str());
-        let name = format!("{tenant_name}/{app_name}");
-        let current = current(store, &app).await.map_err(|e| e.to_string());
-        let manifest = match &current {
-            Ok(Some(c)) => manifest(store, &app, &c.version).await.ok(),
-            _ => None,
-        };
-        let front = manifest.as_ref().map(|m| m.front.is_some());
-        let manifest_format = manifest.as_ref().map(|m| m.format_number());
-        apps.push(App {
-            name,
-            current,
-            front,
-            manifest_format,
-        });
-    }
+    let names: std::collections::BTreeSet<String> = if max.is_some() {
+        list_objects(store, root.as_ref(), max)
+            .await?
+            .keys()
+            .filter_map(|key| {
+                let mut parts = key.split('/');
+                Some(format!("{}/{}", parts.next()?, parts.next()?))
+            })
+            .collect()
+    } else {
+        let tenants = store
+            .list_with_delimiter(Some(&root))
+            .await?
+            .common_prefixes;
+        let listings: Vec<_> = futures_util::stream::iter(
+            tenants
+                .into_iter()
+                .map(|tenant| async move { store.list_with_delimiter(Some(&tenant)).await }),
+        )
+        .buffer_unordered(32)
+        .try_collect()
+        .await?;
+        let base = format!("{root}/");
+        listings
+            .into_iter()
+            .flat_map(|listing| {
+                listing
+                    .common_prefixes
+                    .into_iter()
+                    .chain(listing.objects.into_iter().map(|object| object.location))
+            })
+            .filter_map(|app| app.as_ref().strip_prefix(&base).map(str::to_owned))
+            .collect()
+    };
+    let mut apps: Vec<_> = futures_util::stream::iter(names.into_iter().map(|name| {
+        let app = name
+            .split('/')
+            .fold(root.clone(), |path, part| path.join(part));
+        async move {
+            let current = current(store, &app).await.map_err(|e| e.to_string());
+            let manifest = match &current {
+                Ok(Some(c)) => manifest(store, &app, &c.version).await.ok(),
+                _ => None,
+            };
+            let front = manifest.as_ref().map(|m| m.front.is_some());
+            let manifest_format = manifest.as_ref().map(|m| m.format_number());
+            App {
+                name,
+                current,
+                front,
+                manifest_format,
+            }
+        }
+    }))
+    .buffer_unordered(32)
+    .collect()
+    .await;
 
     apps.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(apps)
@@ -2344,9 +2397,9 @@ mod hostile_metadata {
         }
         async fn list_with_delimiter(
             &self,
-            _: Option<&StorePath>,
+            prefix: Option<&StorePath>,
         ) -> object_store::Result<object_store::ListResult> {
-            panic!("unexpected delimiter list")
+            self.inner.list_with_delimiter(prefix).await
         }
         async fn copy_opts(
             &self,
@@ -2404,4 +2457,127 @@ async fn large_app_listing_is_unbounded_except_for_inspector() {
             .to_string()
             .contains("listing exceeds 10000 object limit")
     );
+}
+
+#[cfg(test)]
+mod discovery_requests {
+    use super::*;
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        gets: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+        entries: std::sync::atomic::AtomicUsize,
+    }
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("counting store")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::PutPayload,
+            _: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            panic!("source PUT")
+        }
+        async fn put_multipart_opts(
+            &self,
+            _: &StorePath,
+            _: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            panic!("source multipart")
+        }
+        async fn get_opts(
+            &self,
+            path: &StorePath,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_opts(path, opts).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&StorePath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            panic!("app discovery must not recursively list {prefix:?}")
+        }
+
+        fn delete_stream(
+            &self,
+            _: futures_util::stream::BoxStream<'static, object_store::Result<StorePath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<StorePath>> {
+            panic!("source DELETE")
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&StorePath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let listing = self.inner.list_with_delimiter(prefix).await?;
+            self.entries.fetch_add(
+                listing.common_prefixes.len() + listing.objects.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(listing)
+        }
+        async fn copy_opts(
+            &self,
+            _: &StorePath,
+            _: &StorePath,
+            _: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            panic!("source COPY")
+        }
+    }
+
+    #[tokio::test]
+    async fn app_discovery_requests_do_not_grow_with_deployment_history() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for prefix in ["", "demo/nested"] {
+            let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let root = StorePath::from(prefix).join("apps");
+            for name in ["z/shop", "a/shop", "a/blog"] {
+                inner
+                    .put(
+                        &StorePath::from(format!("{root}/{name}/v0/manifest")),
+                        bytes::Bytes::new().into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for history in [0, 2_000] {
+                for i in 0..history {
+                    inner
+                        .put(
+                            &StorePath::from(format!("{root}/a/shop/v{i}/component.wasm")),
+                            bytes::Bytes::new().into(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let counting = Arc::new(CountingStore {
+                    inner: Arc::clone(&inner),
+                    gets: AtomicUsize::new(0),
+                    lists: AtomicUsize::new(0),
+                    entries: AtomicUsize::new(0),
+                });
+                let store: Arc<dyn ObjectStore> = counting.clone();
+                let apps = read_apps(&store, prefix, "memory", None).await.unwrap();
+                assert_eq!(
+                    apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(),
+                    ["a/blog", "a/shop", "z/shop"]
+                );
+                assert_eq!(counting.lists.load(Ordering::Relaxed), 3);
+                assert_eq!(counting.entries.load(Ordering::Relaxed), 5);
+                assert_eq!(counting.gets.load(Ordering::Relaxed), 3);
+            }
+        }
+    }
 }
