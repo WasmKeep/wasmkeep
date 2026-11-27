@@ -170,7 +170,11 @@ that owner acts.
 - **It does not stick.** A moved actor that goes idle hibernates on the
   target after the idle timeout, and its next event claims it wherever
   that event lands. A move puts an actor somewhere now; it does not pin
-  it (ADR 0014 rejects pinning).
+  it (ADR 0014 rejects pinning). A move of a spread actor (a big room's
+  edge) off its home is undone by the rebalance a minute after its take
+  (ADR 0040, section 14, amendment of 2026-11-26): to keep actors off a
+  node, drain it; to place spread actors by hand, turn rebalancing off
+  (`serve --no-rebalance`).
 - **It can evict.** A take on a full target hibernates another idle actor
   there, as any new actor would.
 

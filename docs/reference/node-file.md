@@ -80,6 +80,7 @@ Relative paths are read from the file's directory.
 | `id` | The process's name: its cluster certificate is named for it, and each of its node ids publishes `process=<id>` in its heartbeat. |
 | `data-dir` | Every app's data directory unless its entry names its own (default `.wasmkeep/data`, as `--data-dir`). |
 | `placement` | `false` turns placement at wake-up off for every app of the process, as `--no-placement` ([ADR 0041](../adr/0041-placement-at-wake-up.md)): its node ids keep every actor they wake and do not announce `place`. Default `true`. |
+| `rebalance` | `false` stops spread actors (a big room's edges) being moved to their home node after a node rejoins, for every app of the process, as `--no-rebalance` ([ADR 0040, section 14](../adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)). Default `true`; off anyway with `placement = false`. New in 0.10.0: a 0.9 `serve` refuses the key, so remove it before going back. |
 | `idle-compaction` | `false` turns idle compaction off for every app of the process, as `--no-idle-compaction` ([ADR 0042](../adr/0042-compacting-an-idle-actors-history.md)): no snapshot at the head when an actor hibernates, and no idle pass a retention window later. Default `true`. |
 
 `[listen]`: `public`, `public-advertise`, `cluster`, `cluster-advertise`,

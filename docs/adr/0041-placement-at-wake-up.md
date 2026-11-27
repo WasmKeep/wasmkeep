@@ -44,8 +44,10 @@ of its node lease (`load actors=... sockets=...`), for `wasmkeep cluster
 status` only.
 
 This record decides the first automatic use of it, and the smallest one:
-**where an actor that nobody holds starts**. A running actor never moves
-because of it.
+**where an actor that nobody holds starts**. The load rule never moves a
+running actor; since the amendment of 2026-11-26, a spread actor is moved
+to its home (ADR 0040, section 14), and the load rule does not apply to
+it.
 
 ## Decision
 
@@ -450,7 +452,10 @@ event; the hop was **sent** whatever the answer. For every seed:
 2. **One holder.** The node-lease simulation's ownership invariant
    holds with placement on.
 3. **Nothing resident moves.** An actor changes node only across a
-   hibernation, a refusal before it ran, or a node's failure.
+   hibernation, a refusal before it ran, or a node's failure. Restated
+   by the amendment of 2026-11-26 for the classes that do not spread: a
+   spread actor is also moved to its home, which
+   `sim/tests/madsim_rebalance.rs` checks.
 4. **Direction.** Every hop sent leaves a node whose resident fill was
    at least 200 and goes to a node whose last fill seen by the sender
    was below 80% of it.
@@ -915,3 +920,42 @@ alarm.
   `feed` of one name end on different nodes, in both orders, and each
   `leaf` called from a `feed` wakes on its own choice. A fresh app's
   first deploy with the keys is accepted and creates its floor.
+
+## Amendment (2026-11-26): spread actors go home, and the load rule leaves them
+
+ADR 0040, section 14 gives each spread actor a home, the rendezvous
+choice of the amendment of 2026-11-22 over the nodes that serve, and
+moves a spread actor that a node holds away from its home there once the
+cluster is quiet (that section says when, how fast and what pauses it).
+Two lines of this record change with it:
+
+- **"A running actor never moves because of it"** becomes: the load rule
+  never moves a running actor; a spread actor is moved to its home.
+  Simulation property 3 above holds for the classes that do not spread.
+- **The load rule does not apply to a spread class** while rebalancing
+  is on. A placed hop could send a spread actor to a lighter node past
+  the floor, and the rebalance would move it back at its next quiet pass:
+  two rules cannot both be the fixed point of one actor, and the name
+  rule is the one every node agrees on. A call or request for a spread
+  actor nobody holds is therefore never placed; it wakes by the spread
+  rule, and the receiver's own limits still apply (a node with no
+  resident slot answers `503` before the actor, and the actor wakes where
+  it was called). With `--no-rebalance` the load rule applies first, as
+  before.
+
+Section 1's "an upgrade wakes it where it arrives" keeps holding for
+every class but a spread one: a WebSocket upgrade for a spread actor
+nobody holds has its home take it first, and wakes it where it arrives
+only when that take is refused or fails. The two reasons section 1 gives
+against a take at wake-up do not hold for it: a spread actor exists
+before any socket reaches it (a room's `init` creates its edges), and a
+socket for an actor held elsewhere is relayed already.
+
+Nothing new is sent or written for placement: no mark, no header, no
+bucket key. The heartbeat's load line gains `misplaced=<n>`, which older
+readers skip as section 2 says of unknown load keys.
+
+**Tests.** The exemption: `tests/cluster/spread.rs`'s
+`an_edge_away_from_home_moves_there_unless_rebalancing_is_off` and the
+existing `a_rooms_edges_wake_spread_and_stay_put` (no edge placed by the
+load rule); the rest is ADR 0040's.

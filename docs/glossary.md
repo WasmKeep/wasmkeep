@@ -92,7 +92,9 @@ of events in a batched class. [Replication](cluster.md#replication),
 actor hibernates, so a restore reads one object. [History in the bucket](cluster.md#history-in-the-bucket).
 
 **spread**: waking a big room's edges over the live nodes, so one node does not run every edge's
-send loop. Counted by `wasmkeep_placement_spread_total`.
+send loop; each edge's choice is its **home**, and an edge held elsewhere is moved there once the
+cluster is quiet (the **rebalance**, `--no-rebalance` turns it off). Counted by
+`wasmkeep_placement_spread_total` and `wasmkeep_rebalance_moves_total`.
 [ADR 0040](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22).
 
 **tenant**: the owner of apps: a team, or a client of the operator, not a customer of your app (that
