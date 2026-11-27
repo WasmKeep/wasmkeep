@@ -508,6 +508,49 @@ impl Report {
             .reduce(u64::saturating_add)
     }
 
+    /// Whether `app`'s spread actors are on their homes (ADR 0040, section
+    /// 14), from its live nodes' load lines: `balanced` when every one
+    /// publishes `misplaced=0`, `rebalancing` while some do not, or
+    /// `paused` with the reason a node's pass waits for (a node draining or
+    /// not serving, two minor versions live). `None` without a live node
+    /// publishing the count (a version before it). A node with
+    /// rebalancing switched off counts as the others do: its heartbeat
+    /// does not say so.
+    fn app_rebalance(&self, app: &str) -> Option<(&'static str, Option<String>)> {
+        let nodes: Vec<&Node> = self.live().filter(|n| n.info.app == app).collect();
+        let counts: Vec<Option<u64>> = nodes
+            .iter()
+            .map(|n| n.load().and_then(|l| l.misplaced))
+            .collect();
+        if counts.iter().all(Option::is_none) {
+            return None;
+        }
+        if let Some(n) = nodes
+            .iter()
+            .find(|n| n.state() != Some(DrainState::Serving))
+        {
+            let why = match n.state() {
+                Some(DrainState::Draining | DrainState::Drained | DrainState::Stuck) => {
+                    format!("{} drains", n.info.id)
+                }
+                _ => format!("{} not serving", n.info.id),
+            };
+            return Some(("paused", Some(why)));
+        }
+        let minor = |n: &&Node| wasmkeep_cluster::rebalance::minor(&n.info.version);
+        if nodes
+            .iter()
+            .any(|n| minor(n).is_none() || minor(n) != minor(&nodes[0]))
+        {
+            return Some(("paused", Some("mixed versions".to_owned())));
+        }
+        if counts.iter().all(|c| *c == Some(0)) {
+            Some(("balanced", None))
+        } else {
+            Some(("rebalancing", None))
+        }
+    }
+
     /// Whether any node is live: `cluster status` fails otherwise.
     pub(crate) fn any_live(&self) -> bool {
         self.live().next().is_some()
@@ -768,6 +811,9 @@ impl Report {
                     "actor_room": n.load().and_then(|l| l.actor_room),
                     "socket_room": n.load().and_then(|l| l.socket_room),
                     "fill": resident_fill(n.load()),
+                    // ADR 0040, section 14: its spread actors away from
+                    // their home; null from a version without it.
+                    "misplaced": n.load().and_then(|l| l.misplaced),
                     // ADR 0038: the process the node id runs in.
                     "process": n.info.process,
                 })
@@ -778,7 +824,8 @@ impl Report {
             .iter()
             .map(|a| {
                 let actors = self.app_actors(&a.name);
-                match &a.current {
+                let rebalance = self.app_rebalance(&a.name);
+                let mut app = match &a.current {
                     Ok(Some(c)) => {
                         json!({"app": a.name, "version": c.version, "seq": c.seq, "actors": actors, "front": a.front, "manifest_format": a.manifest_format})
                     }
@@ -788,7 +835,12 @@ impl Report {
                     Err(e) => {
                         json!({"app": a.name, "version": null, "seq": null, "actors": actors, "front": null, "manifest_format": null, "error": e})
                     }
-                }
+                };
+                // ADR 0040, section 14: `balanced`, `rebalancing` or
+                // `paused` (with why); null without a node publishing it.
+                app["rebalance"] = json!(rebalance.as_ref().map(|(w, _)| *w));
+                app["rebalance_paused"] = json!(rebalance.and_then(|(_, why)| why));
+                app
             })
             .collect();
         let versions: Vec<&str> = self.versions().into_iter().map(|(v, _)| v).collect();
@@ -840,7 +892,7 @@ impl Report {
         if self.nodes.is_empty() {
             out.push_str("No nodes.\n");
         } else {
-            let rows: Vec<[String; 15]> = self
+            let rows: Vec<[String; 16]> = self
                 .nodes
                 .iter()
                 .map(|n| {
@@ -865,6 +917,7 @@ impl Report {
                         count(n.load().and_then(|l| l.front_per_min)),
                         resident_fill(n.load())
                             .map_or_else(|| "-".to_owned(), |f| format!("{}.{}%", f / 10, f % 10)),
+                        count(n.load().and_then(|l| l.misplaced)),
                         n.info.version.clone(),
                         or_dash(&n.info.app),
                         n.info.address.clone(),
@@ -893,6 +946,7 @@ impl Report {
                     "EV/MIN",
                     "FRONT/MIN",
                     "FILL",
+                    "AWAY",
                     "VERSION",
                     "APP",
                     "ADDRESS",
@@ -918,7 +972,7 @@ impl Report {
         if self.apps.is_empty() {
             out.push_str("No deployed apps.\n");
         } else {
-            let rows: Vec<[String; 6]> = self
+            let rows: Vec<[String; 7]> = self
                 .apps
                 .iter()
                 .map(|a| {
@@ -939,6 +993,11 @@ impl Report {
                         },
                         a.manifest_format
                             .map_or_else(|| "-".to_owned(), |f| f.to_string()),
+                        match self.app_rebalance(&a.name) {
+                            Some((word, Some(why))) => format!("{word} ({why})"),
+                            Some((word, None)) => word.to_owned(),
+                            None => "-".to_owned(),
+                        },
                     ]
                 })
                 .collect();
@@ -951,6 +1010,7 @@ impl Report {
                     "ACTORS",
                     "FRONT",
                     "FORMAT",
+                    "REBALANCE",
                 ],
                 &rows,
             );
@@ -1142,6 +1202,103 @@ mod tests {
 
     fn report(store: Arc<dyn ObjectStore>) -> Report {
         block_on(read(store, "demo", "s3://b/demo", NOW, HORIZON)).unwrap()
+    }
+
+    /// ADR 0040, section 14: each node's `misplaced` count, and one word
+    /// per app: `balanced` when every live node publishes 0,
+    /// `rebalancing` while one does not, `paused` with the node that
+    /// drains or the mixed versions; `-` from nodes of a version before it.
+    #[test]
+    fn the_rebalance_is_shown_per_node_and_per_app() {
+        let away = |n| {
+            Some(membership::Load {
+                misplaced: Some(n),
+                ..membership::Load::default()
+            })
+        };
+        let rewrite = |store: Arc<dyn ObjectStore>, id: &'static str, from: String, to: &str| {
+            let to = to.to_owned();
+            async move {
+                let key = StorePath::from(format!("demo/nodes/{id}"));
+                let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                assert!(body.contains(&from), "{body}");
+                let body = body.replacen(&from, &to, 1);
+                store.put(&key, PutPayload::from(body)).await.unwrap();
+            }
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on(async {
+            for (id, app, n) in [
+                ("a", "acme/one", 0),
+                ("b", "acme/one", 0),
+                ("c", "acme/two", 0),
+                ("d", "acme/two", 3),
+                ("e", "acme/three", 0),
+                ("f", "acme/three", 0),
+                ("g", "acme/four", 0),
+                ("h", "acme/four", 1),
+            ] {
+                beat_with(&store, id, NOW, false, app, away(n)).await;
+            }
+            beat(&store, "i", NOW, false, "acme/five").await;
+            // f drains; h runs another minor version.
+            rewrite(
+                Arc::clone(&store),
+                "f",
+                "\nserving\n".into(),
+                "\ndraining\n",
+            )
+            .await;
+            rewrite(
+                Arc::clone(&store),
+                "h",
+                format!("\n{}\n", wasmkeep_cluster::VERSION),
+                "\n0.1.0\n",
+            )
+            .await;
+            for app in ["one", "two", "three", "four", "five"] {
+                put(
+                    &store,
+                    &format!("demo/apps/acme/{app}/current"),
+                    "0123456789abcdef 1\n",
+                )
+                .await;
+            }
+        });
+        let r = report(store);
+        let j = r.to_json();
+        let node = |id: &str| {
+            j["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(node("d")["misplaced"], 3);
+        assert_eq!(node("a")["misplaced"], 0);
+        assert_eq!(node("i")["misplaced"], Value::Null);
+        let app = |name: &str| {
+            let a = j["apps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["app"] == name)
+                .unwrap()
+                .clone();
+            (a["rebalance"].clone(), a["rebalance_paused"].clone())
+        };
+        assert_eq!(app("acme/one"), (json!("balanced"), Value::Null));
+        assert_eq!(app("acme/two"), (json!("rebalancing"), Value::Null));
+        assert_eq!(app("acme/three"), (json!("paused"), json!("f drains")));
+        assert_eq!(app("acme/four"), (json!("paused"), json!("mixed versions")));
+        assert_eq!(app("acme/five"), (Value::Null, Value::Null));
+        let text = r.to_text();
+        assert!(text.contains("AWAY"), "{text}");
+        assert!(text.contains("REBALANCE"), "{text}");
+        assert!(text.contains("paused (f drains)"), "{text}");
     }
 
     /// A live node lease dated ahead of this clock by more than the allowed
@@ -1885,11 +2042,11 @@ mod tests {
         );
         assert_eq!(
             row("acme/shop"),
-            ["acme/shop", "0123456789abcdef", "4", "5", "yes", "3"]
+            ["acme/shop", "0123456789abcdef", "4", "5", "yes", "3", "-"]
         );
         assert_eq!(
             row("beta/new"),
-            ["beta/new", "fedcba9876543210", "1", "-", "no", "1"]
+            ["beta/new", "fedcba9876543210", "1", "-", "no", "1", "-"]
         );
     }
 
@@ -2026,15 +2183,15 @@ mod tests {
         assert_eq!(
             j["apps"],
             json!([
-                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null, "error": "unreadable current"},
+                {"app": "acme/admin", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null, "error": "unreadable current", "rebalance": null, "rebalance_paused": null},
                 // An unreadable manifest: not known, and no error.
-                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7, "front": null, "manifest_format": null},
-                {"app": "beta/new", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null},
+                {"app": "acme/shop", "version": "0123456789abcdef", "seq": 4, "actors": 7, "front": null, "manifest_format": null, "rebalance": null, "rebalance_paused": null},
+                {"app": "beta/new", "version": null, "seq": null, "actors": null, "front": null, "manifest_format": null, "rebalance": null, "rebalance_paused": null},
             ])
         );
         let text = r.to_text();
         assert!(
-            text.contains("acme/shop   0123456789abcdef      4    7       -      -\n"),
+            text.contains("acme/shop   0123456789abcdef      4    7       -      -       -\n"),
             "{text}"
         );
     }
