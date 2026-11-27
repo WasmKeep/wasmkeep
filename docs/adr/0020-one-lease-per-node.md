@@ -1679,33 +1679,55 @@ choose is who removes, and when.
   lists the keys of `nodes/` (one LIST, keys and last-modified times, no
   bodies) and reads only the keys it has not read at that time yet and
   that were not written in the last ttl plus grace plus the skew (a live
-  lease is rewritten every few seconds), at most 64 per round. A key read
-  stays judged until a listing shows it written again. A round with
-  nothing to do is that one listing.
+  lease is rewritten every few seconds), the most recently written first
+  (so a mark is not left behind the old leases of a first round), at most
+  64 per round. A key read stays judged until a listing shows it written
+  again. A round with nothing to do is that one listing.
 - **What.** A `released` lease of the remover's app whose `written_at`
   is older than the removal period (a day by default, and never less than
   the window `cluster forget` waits, the heartbeat horizon plus ttl and
-  grace), oldest first, at most 16 per round. Each goes exactly as
-  `cluster forget` removes it, in its order: the lease read with its
-  version; the gate of the mark (`upgrade::forget_gate`: the app's floor
-  at 0.9 or later, and no live node of the app older than 0.9); no
-  ownership record of any app under the prefix naming the node, any
-  instance (one listing per tenant and app, one read per record, once per
-  round and only in a round with a lease to remove; a record that cannot
-  be read keeps every lease, a migration tombstone names nobody); then the
-  mark, `If-Match` on the version read, and its delete, given up after two
-  thirds of ttl plus grace. When the gate blocks, nothing is written: a
-  node never falls back to the read-twice-and-delete the command uses
-  before the finalize. A lease a record names, and the leases of a
-  blocked round, wait ten minutes before they are tried again.
+  grace), oldest first. Each goes with the steps `cluster forget` takes
+  after the finalize: the lease read with its version; the gate of the
+  mark (`upgrade::forget_gate`: the app's floor at 0.9 or later, and no
+  live node of the app older than 0.9), once a round; no ownership record
+  of any app under the prefix naming the node, any instance (one listing
+  per tenant and app, one read per record, one scan for every due lease
+  not cleared at its version yet; a record that cannot be read keeps every
+  lease); then the mark, `If-Match` on the version read, and its delete.
+  Two differences from the command: the gate is read before the records
+  (the command reads the records first, then the gate), and a migration
+  tombstone under `owners/` names nobody (the command counts any object
+  it cannot decode as a record as naming the node). The gate is the
+  lease's app's only, while `nodes/` is the whole prefix's: a node of
+  another app under the same id is not covered, as for the command
+  (ADR 0043, "Nodes of 0.8.1 of another app on the same prefix"). When the
+  gate blocks, nothing is written: a node never falls back to the
+  read-twice-and-delete the command uses before the finalize.
+- **Bounds.** At most 16 removals and ends of marks together per round,
+  within one round period, and only while the node is still the remover
+  (its lease task running, its lease valid, not draining), asked before
+  each. A lease the scan cleared stays cleared until its version changes
+  (a record written since names a process that rewrote the lease first,
+  which the conditional write then refuses), so a later round removes it
+  without a new scan. A lease a record names, and the leases of a round
+  the gate blocked, wait ten minutes from the end of that read. A failed
+  request stops the round, and the due leases of the next rounds wait a
+  round, two, then four at most (a minute); the listing and the end of
+  marks go on every round, since a mark left behind keeps a node from
+  starting under that id and a starting node gives up on it after a
+  minute.
 - **A mark that stayed.** A mark dated more than ttl plus grace plus the
   skew ago (16 s at the defaults), on the remover's clock, was left by a
   removal that did not finish: a remover or a `cluster forget` that
   stopped between its two requests, or whose delete was given up. The
-  remover deletes it, read right before the delete, as the command's
+  remover deletes it, read right before the delete and only if it is
+  still the very mark the round read (its version), as the command's
   second run does. That age is past the bound after which the removal
   that wrote it no longer sends its delete (10 s), and the skew covers a
-  writer whose clock was behind. A starting node gives up on a mark after
+  writer whose clock was behind. The delete's deadline (10 s) is taken
+  before that read, and before the mark's write of a removal: no delete
+  leaves the process past it, however long the steps before took or the
+  process was held. A starting node gives up on a mark after
   four times ttl plus grace (60 s): a remover that dies right after its
   mark is replaced within a horizon, and the mark ended within a round
   and the age, about 40 s at worst.
@@ -1715,9 +1737,11 @@ choose is who removes, and when.
   A node with it off still counts in the choice of the remover: set it the
   same on every node.
 - **What a process reads.** The newest-reads table (amendment of
-  2026-11-24) drops a node's entry once every answer for ttl plus grace,
-  with no body read in between, said its lease is gone (absent to a read,
-  or left out of a listing). It was never pruned: an entry stayed for each
+  2026-11-24) drops a node's entry once every answer for ttl plus grace
+  said its lease is gone (absent to a read, or left out of a listing),
+  with no body read in between: any body, an older one too, and any
+  listing that shows the key, starts that run again, so stale bodies of a
+  removed lease read between absent answers never let the entry go. It was never pruned: an entry stayed for each
   node id the process had ever read. Until then the stale bodies a replica
   serves around the delete stay behind, as before. After it the node is
   one the process never read, so a first read of a stale body is judged as
@@ -1754,26 +1778,30 @@ The same argument as `cluster forget` after the finalize, made by a node:
 - **A mark's delete sent twice.** A remover whose delete got no answer
   in time ends its own mark a round later, once the mark is 16 s old; and
   a mark names no app, so the removers of two apps on one prefix may both
-  end one that stayed. If the first delete is held by the network until
-  after the second was read and sent, lands, and a node starts under that
-  id, the second delete then landing after that node's create deletes
-  the new lease: it stops at its next write and is started again. The
-  first delete must be held past the mark's age (16 s) and the second one
-  past the node's create (15 s after the key was found absent), the limit
-  `cluster forget` already has for a delete that lands late. The
+  end one that stayed. A remover held between its read and its delete
+  sends nothing past its deadline. What is left is a delete already sent:
+  if the network holds the first one until after the second was read and
+  sent, it lands, a node starts under that id, and the second then lands
+  after that node's create, the new lease is deleted: the node stops at
+  its next write and is started again. The first delete must be held past
+  the mark's age (16 s) and the second one past the node's create (15 s
+  after the key was found absent), the limit `cluster forget` already has
+  for a delete that lands late. A delete conditioned on the mark's
+  version would close it; `object_store` 0.14.2 has no conditional
+  delete. The
   simulation runs with requests held at most 2.5 s, below those bounds
   in its scaled timings; at timings where they were above it (a 1 s ttl),
   the correct rule lost a node's lease on one seed in a few thousand.
 - **Only where a node runs.** An app with no live node, or whose upgrade
   to 0.9 is not finalized, has no remover: its released leases stay until
   it has one, or until `cluster forget`.
-- **The cost of the record check.** A round with a lease to remove reads
-  every ownership record under the prefix once, and the gate lists the
-  heartbeats. A lease kept because a record names its node, and the
-  leases of a round the gate blocked, are held back for ten minutes, so a
-  record that keeps naming a stopped node costs one such read every ten
-  minutes, not every round. On a large app with frequent new ids, a round
-  every 15 s with one removal each is the worst case. Turn the removal
+- **The cost of the record check.** A scan reads every ownership record
+  under the prefix once, for every due lease not cleared at its version
+  yet, and a round with a lease to remove lists the heartbeats for the
+  gate. A lease a record names waits ten minutes, so a record that keeps
+  naming a stopped node costs one scan every ten minutes, not every round.
+  On a large app with frequent new ids, a scan for each new due lease is
+  the worst case. Turn the removal
   off and run `cluster forget` at a quieter time if that matters.
 - **A mark dated ahead** of the remover's clock waits until that clock
   passes its date plus the age.
@@ -1789,7 +1817,15 @@ The same argument as `cluster forget` after the finalize, made by a node:
   the bounds per round (`a_round_is_bounded`,
   `keys_are_read_once_and_a_bounded_number_per_round`) and the command's
   window (`never_younger_than_the_window_of_cluster_forget`).
-- `node_lease::tests::a_lease_gone_for_the_window_is_dropped`.
+- `node_lease::tests::a_lease_gone_for_the_window_is_dropped` and
+  `absent_answers_between_stale_bodies_never_drop_the_newest`;
+  `node_lease::tests::forget::a_held_remover_never_deletes_a_lease_written_after_the_mark`
+  (a remover held between its read of a mark and its delete, past its
+  deadline, while another ends the mark and a node writes its lease: it
+  sends nothing); `lease_removal::tests::one_scan_of_the_records_covers_every_due_lease`,
+  `a_failed_round_pauses_the_next_ones`,
+  `a_round_stops_when_told_and_marks_share_the_bound` and
+  `a_mark_is_read_before_old_released_leases`.
 - `tests/cluster/upgrade.rs`:
   `released_leases_are_removed_by_the_live_nodes_after_the_finalize`
   (a node stopped cleanly, its lease removed by the other, a mark left
@@ -1802,7 +1838,12 @@ The same argument as `cluster forget` after the finalize, made by a node:
   start check of the simulations' node now follows the server's rule for
   a mark. Broken, each is caught: the delete without the mark, a start
   check that takes the mark for an object, no read of the records, marks
-  never ended.
+  never ended. Two fixed scenarios: a remover held 12 s between its read
+  of a mark and its delete (caught without the deadline), and a reader
+  served absent answers and a stale body in turn for three windows
+  (caught with only newer bodies ending the absence, and with no table).
+  Not modelled there: peers that could own the node's actors, a gate that
+  blocks, a second app on the prefix.
 
 ### Second part (same amendment): the renewal's budget
 
@@ -1827,20 +1868,47 @@ again.
   goes at once.
 - **A failed renewal is followed at once** once its attempt ended (a
   timeout), and a quarter of a spacing after its send otherwise (a quick
-  error), never in a tighter loop.
+  error), never in a tighter loop. The next renewal is never more than a
+  spacing from now, so a wall clock stepped back does not hold it back.
+- **Adoption is progress only when it is newer.** A conflict whose re-read
+  shows this process's own write adopts it only if it is newer than the
+  write held (another version and a later date). Otherwise the next write
+  is conditioned on what is stored, the validity stays the held one's, and
+  it counts as a failed renewal (tried again soon), not as a success that
+  would be followed at once again and again.
+- **The first write** is bounded by the same attempt (it was bounded by
+  2.67 s), and the read of the upgrade floor that follows it never holds a
+  due renewal back: it is dropped when the renewal is due, and made again
+  after it.
 - **The budget.** The spacing and the attempt are each a quarter of
   `ttl - safety` (2 s at the defaults; the spacing never above a
   heartbeat period), so `spacing + 2 * attempt < ttl - safety`: after a
   renewal that times out, another may take its whole attempt and still
   land 2 s before the lease runs out. A lease write every 2 s instead of
   every 3 s: half again as many writes to `nodes/<id>`.
+- **The last attempt that fits.** A renewal sent when no whole attempt
+  would fit after it before the lease runs out may take the rest of the
+  validity instead of the quarter (from 4 s left, at the defaults): a slow
+  bucket answering in 2.0 to 2.67 s, which the attempt of 2.67 s used to
+  wait for, can still renew the lease with that last write. The other
+  renewals keep the quarter, so a write that hangs is given up in time
+  for the next one.
 - Unchanged: the validity of a write (`written_at + ttl - safety` on the
   node's own clock, so a lease that cannot be renewed still runs out and
   every hold ends, fail-closed), the heartbeat period, the horizon and
   every other read's attempt (`lease_attempt`, 2.67 s), which judge
   peers.
 
-Tests: `node_lease::tests::a_timeout_then_a_slow_retry_keeps_the_lease`
-and `a_timeout_then_a_conflict_that_adopts_keeps_the_lease` run a lease
-through those renewals with this schedule (kept) and with the one before
-(it runs out).
+Tests: `node_lease::tests::a_timeout_then_a_slow_retry_keeps_the_lease`,
+`a_timeout_then_a_conflict_that_adopts_keeps_the_lease` and
+`a_slow_first_write_then_a_timeout_keeps_the_lease` (a first write answered
+2.6 s after its send) run a lease through those renewals with this schedule
+(kept) and with the one before (it runs out);
+`an_adopted_write_that_is_not_newer_is_a_failure` and
+`the_last_attempt_that_fits_runs_to_the_end_of_the_validity`. The
+simulations' node renews on this schedule too. Its writes, closer
+together, leave stale reads less room: the two broken variants of the
+amendment on lease reads are now caught about once in 7,500 seeds (a
+created fence judged by date) and once in 90,000 (an absent read keeping
+the window), and the seeds that showed them (7548 and 87854) are checked
+first.

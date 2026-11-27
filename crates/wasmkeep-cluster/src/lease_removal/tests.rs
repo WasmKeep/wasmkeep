@@ -27,6 +27,7 @@ fn settings() -> Settings {
         after_ms: DAY,
         horizon_ms: 10_000,
         config: LeaseConfig::default_safe(),
+        hold_back_ms: HOLD_BACK_MS,
     }
 }
 
@@ -48,9 +49,21 @@ async fn finalized(b: &ObjectStoreBucket) {
 }
 
 async fn round(r: &mut Remover, b: &ObjectStoreBucket, now: u64) -> Round {
-    r.round(b, now, "acme/shop", &settings(), std::future::pending)
-        .await
-        .unwrap()
+    round_with(r, b, now, &settings()).await
+}
+
+async fn round_with(r: &mut Remover, b: &ObjectStoreBucket, now: u64, s: &Settings) -> Round {
+    let t = std::cell::Cell::new(now);
+    r.round(
+        b,
+        &crate::lease::tests::At(&t),
+        "acme/shop",
+        s,
+        std::future::pending,
+        || true,
+    )
+    .await
+    .unwrap()
 }
 
 async fn present(b: &ObjectStoreBucket, key: &str) -> bool {
@@ -294,14 +307,146 @@ async fn never_younger_than_the_window_of_cluster_forget() {
         ..settings()
     };
     let mut r = Remover::new();
-    let kept = r
-        .round(&b, now, "acme/shop", &s, std::future::pending)
-        .await
-        .unwrap();
+    let kept = round_with(&mut r, &b, now, &s).await;
     assert!(kept.removed.is_empty(), "{kept:?}");
-    let gone = r
-        .round(&b, now + 1, "acme/shop", &s, std::future::pending)
+    let gone = round_with(&mut r, &b, now + 1, &s).await;
+    assert_eq!(gone.removed, ["r"]);
+}
+
+/// The records are read once for every due lease, not once per round: a
+/// lease the scan cleared is removed by a later round at the same version
+/// without reading them again; one whose version changed is scanned again.
+#[tokio::test]
+async fn one_scan_of_the_records_covers_every_due_lease() {
+    let b = bucket();
+    let now = now();
+    finalized(&b).await;
+    for i in 0..MAX_PER_ROUND + 2 {
+        let id = format!("n{i:02}");
+        let at = now - 2 * DAY - u64::try_from(i).unwrap();
+        put(
+            &b,
+            &format!("nodes/{id}"),
+            body("acme/shop", &id, "0.9.0", "released", at),
+        )
+        .await;
+    }
+    let mut r = Remover::new();
+    let first = round(&mut r, &b, now).await;
+    assert_eq!(first.removed.len(), MAX_PER_ROUND);
+    assert_eq!(r.cleared.len(), 2, "the rest cleared by the same scan");
+    // An unreadable record now would keep them, if they were scanned
+    // again: they are not, at the same version.
+    put(&b, "state/acme/shop/owners/c/junk", b"junk".to_vec()).await;
+    let second = round(&mut r, &b, now).await;
+    assert_eq!(second.removed, ["n01", "n00"], "{second:?}");
+    // Rewritten: scanned again, and kept.
+    put(
+        &b,
+        "nodes/z",
+        body("acme/shop", "z", "0.9.0", "released", now - 2 * DAY),
+    )
+    .await;
+    let third = round(&mut r, &b, now).await;
+    assert_eq!(third.named, ["z"], "{third:?}");
+}
+
+/// A failed request stops the round and holds the due leases of the next
+/// ones back, longer after each failure in a row, while marks are still
+/// ended; a round that does its work ends the run.
+#[tokio::test]
+async fn a_failed_round_pauses_the_next_ones() {
+    let b = bucket();
+    let now = now();
+    let mut r = Remover::new();
+    let s = settings();
+    let every = round_every_ms(&s.config);
+    let mut round = Round::default();
+    r.failed(&mut round, "x".into(), now, &s);
+    assert_eq!(r.paused_until, now + every);
+    r.failed(&mut round, "x".into(), now, &s);
+    assert_eq!(r.paused_until, now + 2 * every);
+    // Paused: a mark that stayed is still ended, a due lease waits.
+    finalized(&b).await;
+    put(&b, "nodes/m", encode_forgotten(now - DAY)).await;
+    put(
+        &b,
+        "nodes/r",
+        body("acme/shop", "r", "0.9.0", "released", now - 2 * DAY),
+    )
+    .await;
+    let paused = round_with(&mut r, &b, now + 1, &s).await;
+    assert_eq!(paused.ended, ["m"], "{paused:?}");
+    assert!(paused.removed.is_empty(), "{paused:?}");
+    let later = round_with(&mut r, &b, now + 2 * every, &s).await;
+    assert_eq!(later.removed, ["r"], "{later:?}");
+    assert_eq!(r.failures, 0);
+    // Never longer than four rounds: a starting node waits on a mark for
+    // four times ttl plus grace.
+    for _ in 0..40 {
+        r.failed(&mut round, "x".into(), now, &s);
+    }
+    assert_eq!(r.paused_until, now + 4 * every);
+}
+
+/// A round stops where `go_on` says this node is no longer the remover,
+/// and marks and removals share the round's bound.
+#[tokio::test]
+async fn a_round_stops_when_told_and_marks_share_the_bound() {
+    let b = bucket();
+    let now = now();
+    finalized(&b).await;
+    for i in 0..MAX_PER_ROUND {
+        put(&b, &format!("nodes/m{i:02}"), encode_forgotten(now - DAY)).await;
+    }
+    put(
+        &b,
+        "nodes/r",
+        body("acme/shop", "r", "0.9.0", "released", now - 2 * DAY),
+    )
+    .await;
+    let mut r = Remover::new();
+    let first = round(&mut r, &b, now).await;
+    assert_eq!(first.ended.len(), MAX_PER_ROUND, "{first:?}");
+    assert!(first.removed.is_empty(), "the bound is shared: {first:?}");
+    let second = round(&mut r, &b, now).await;
+    assert_eq!(second.removed, ["r"], "{second:?}");
+    // Told to stop: nothing written.
+    put(&b, "nodes/m", encode_forgotten(now - DAY)).await;
+    let t = std::cell::Cell::new(now);
+    let stopped = r
+        .round(
+            &b,
+            &crate::lease::tests::At(&t),
+            "acme/shop",
+            &settings(),
+            std::future::pending,
+            || false,
+        )
         .await
         .unwrap();
-    assert_eq!(gone.removed, ["r"]);
+    assert!(stopped.is_idle(), "{stopped:?}");
+    assert!(present(&b, "nodes/m").await);
+}
+
+/// A first round over many released leases reads the most recently
+/// written keys first: a mark is not left behind them for rounds.
+#[tokio::test]
+async fn a_mark_is_read_before_old_released_leases() {
+    let b = bucket();
+    let now = now();
+    for i in 0..READS_PER_ROUND + 10 {
+        let id = format!("a{i:03}");
+        put(
+            &b,
+            &format!("nodes/{id}"),
+            body("acme/shop", &id, "0.9.0", "released", now),
+        )
+        .await;
+    }
+    // Written last: listed with the latest time.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    put(&b, "nodes/zz", encode_forgotten(now - DAY)).await;
+    let first = round(&mut Remover::new(), &b, now).await;
+    assert_eq!(first.ended, ["zz"], "{first:?}");
 }

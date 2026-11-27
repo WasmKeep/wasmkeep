@@ -24,6 +24,7 @@ pub(super) async fn lease_removal_loop(cluster: std::sync::Weak<Cluster>) {
         after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
         horizon_ms: c.heartbeat_horizon_ms,
         config: c.lease_config,
+        hold_back_ms: wasmkeep_cluster::lease_removal::HOLD_BACK_MS,
     };
     let bound = Duration::from_millis(wasmkeep_cluster::node_lease::forget_delete_bound_ms(
         &c.lease_config,
@@ -42,10 +43,18 @@ pub(super) async fn lease_removal_loop(cluster: std::sync::Weak<Cluster>) {
         if c.identity_taken() || !c.removes_released_leases() {
             continue;
         }
+        // Each removal or end of a mark only while this node is still the
+        // remover, its lease task running and its lease valid.
+        let go_on = || !*done.borrow() && !c.identity_taken() && c.removes_released_leases();
         let round = remover
-            .round(&c.control_keys, now_ms(), &c.serves, &settings, || {
-                tokio::time::sleep(bound)
-            })
+            .round(
+                &c.control_keys,
+                &SystemClock,
+                &c.serves,
+                &settings,
+                || tokio::time::sleep(bound),
+                go_on,
+            )
             .await;
         match round {
             Err(e) => {

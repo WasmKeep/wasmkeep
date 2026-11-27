@@ -558,11 +558,24 @@ async fn released_leases_are_removed_on_s3() {
         after_ms: day,
         horizon_ms: 10_000,
         config: LeaseConfig::default_safe(),
+        hold_back_ms: wasmkeep_cluster::lease_removal::HOLD_BACK_MS,
     };
+    // Ahead of the wall clock as `now` is.
+    struct Ahead;
+    impl Clock for Ahead {
+        fn now_ms(&self) -> u64 {
+            Wall.now_ms() + 60_000
+        }
+    }
     let round = Remover::new()
-        .round(&bucket, now, "acme/shop", &settings, || {
-            tokio::time::sleep(Duration::from_secs(10))
-        })
+        .round(
+            &bucket,
+            &Ahead,
+            "acme/shop",
+            &settings,
+            || tokio::time::sleep(Duration::from_secs(10)),
+            || true,
+        )
         .await
         .unwrap();
     assert_eq!(round.removed, ["gone"], "{round:?}");

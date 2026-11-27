@@ -6,7 +6,9 @@
 //!
 //! Each process runs on the simulations' shared node (`wasmkeep_sim::node`,
 //! the server's rules): the start check, its lease on a task of its own
-//! (renewed every third of the ttl, a lapse ending its holds into the
+//! (renewed on the server's schedule, `node_lease::Renewals`: a quarter
+//! of `ttl - safety` after the last acknowledged write, a lapse ending its
+//! holds into the
 //! pending releases, stale peers watched and fenced, pending releases and
 //! unresolved acquires retried under the actor's lock), and the workload:
 //! it acquires the actor's ownership record when it holds nothing, acts
@@ -1690,7 +1692,7 @@ fn a_created_fence_judged_by_date_is_caught() {
 }
 
 /// A seed where [`Variant::StaleFenceByDate`] gives two owners.
-const KNOWN_FENCE_BY_DATE: u64 = 4686;
+const KNOWN_FENCE_BY_DATE: u64 = 7_548;
 
 /// A read finding a lease absent that leaves the unpin window running,
 /// under a hot operator's stale reads, is caught: a deleted lease's old
@@ -1712,7 +1714,7 @@ fn an_absent_read_keeping_the_window_is_caught() {
 }
 
 /// A seed where [`Variant::StaleAbsentKeepsWindow`] gives two owners.
-const KNOWN_ABSENT: u64 = 887;
+const KNOWN_ABSENT: u64 = 87_854;
 
 /// Whether `seed` under `variant` gives two owners or one generation for
 /// two holds.

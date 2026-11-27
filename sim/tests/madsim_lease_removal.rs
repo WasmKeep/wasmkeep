@@ -25,6 +25,19 @@
 //! an object, no read of the ownership records, and marks that stay never
 //! ended.
 //!
+//! Two fixed scenarios beside the seeded runs: a remover held between its
+//! read of a mark and its delete while another ends it and the node starts
+//! again (`a_held_remover_never_deletes_a_lease_a_node_wrote_after_the_mark`,
+//! caught without the deadline), and a reader served absent answers and a
+//! stale body in turn for three windows
+//! (`stale_bodies_between_absent_answers_never_free_a_held_record`, caught
+//! with the first form of the pruning and with no table).
+//!
+//! Not modelled: peers of `a` that could own its actors (no double
+//! ownership is checked here; `madsim_node_lease` does that), a gate that
+//! blocks (the floor is at 0.9 from the start and no older node runs), and
+//! a second app on the prefix.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_lease_removal --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -37,10 +50,11 @@ use std::time::Duration;
 use madsim::runtime::Handle;
 use madsim::time::{Instant, sleep};
 use wasmkeep_cluster::app_format::floor::{self, Minor};
-use wasmkeep_cluster::lease::{Bucket, BucketError, Clock, LeaseConfig, Version};
+use wasmkeep_cluster::lease::{Bucket, BucketError, LeaseConfig, Version};
 use wasmkeep_cluster::lease_removal::{Fault, Remover, Round, Settings};
 use wasmkeep_cluster::node_lease::{
-    NodeLeaseObject, NodeState, OwnerRecord, forget_delete_bound_ms, forgotten,
+    NodeLeaseObject, NodeState, OwnerRecord, Owners, ReadFault, encode_forgotten,
+    forget_delete_bound_ms, forgotten,
 };
 use wasmkeep_cluster::store::ObjectMeta;
 use wasmkeep_sim::driver::{Env, SkewedClock};
@@ -64,6 +78,17 @@ const HORIZON_MS: u64 = 3_200;
 const ATTEMPT_MS: u64 = 833;
 /// Versions of the objects written before the run: far above the bucket's.
 const SEEDED: u64 = 1 << 40;
+
+/// The remover's settings: no period beyond the window of `cluster
+/// forget`, and the hold-back scaled to these timings (40 s).
+fn settings() -> Settings {
+    Settings {
+        after_ms: 0,
+        horizon_ms: HORIZON_MS,
+        config: config(),
+        hold_back_ms: 40_000,
+    }
+}
 
 /// ttl 3 s, grace 1 s, safety 500 ms, 200 ms of skew: in the ratios of the
 /// defaults to the bucket's slowest request (2.5 s here). A mark's delete
@@ -127,6 +152,9 @@ struct Removal {
     ep: EpBucket,
     die_one_in: u64,
     dies: Arc<AtomicBool>,
+    /// The process is held this long before each DELETE leaves it (ms):
+    /// a remover paused between its read of a mark and its delete.
+    stall_ms: u64,
 }
 
 impl Removal {
@@ -186,6 +214,9 @@ impl wasmkeep_cluster::control::Keys for Removal {
         Ok(self.ep.get(key).await?.map(|(b, _)| b))
     }
     async fn delete(&self, key: &str) -> Result<(), BucketError> {
+        if self.stall_ms > 0 {
+            sleep(Duration::from_millis(self.stall_ms)).await;
+        }
         self.ep.delete(key).await
     }
 }
@@ -245,6 +276,9 @@ impl wasmkeep_cluster::store::Store for Removal {
         self.ep.put(key, body).await
     }
     async fn delete(&self, key: &str) -> Result<(), BucketError> {
+        if self.stall_ms > 0 {
+            sleep(Duration::from_millis(self.stall_ms)).await;
+        }
         self.ep.delete(key).await
     }
 }
@@ -388,11 +422,7 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
 
         // Removers: one at a time mostly, now and then two; one may die
         // right after its mark landed.
-        let after = Settings {
-            after_ms: 0,
-            horizon_ms: HORIZON_MS,
-            config: cfg,
-        };
+        let after = settings();
         let bound = forget_delete_bound_ms(&cfg);
         let fault = variant.fault();
         let start_remover = |n: u64, die_one_in: u64, dies: Arc<AtomicBool>| {
@@ -416,14 +446,20 @@ fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
                             ep: EpBucket::connect_with_timeout(Duration::from_millis(1_000)).await,
                             die_one_in,
                             dies,
+                            stall_ms: 0,
                         };
                         let mut remover = Remover::with_fault(fault);
                         loop {
                             sleep(Duration::from_millis(300 + rng.below(1_500))).await;
                             let round: Round = match remover
-                                .round(&bucket, clock.now_ms(), APP, &after, || {
-                                    sleep(Duration::from_millis(bound))
-                                })
+                                .round(
+                                    &bucket,
+                                    &clock,
+                                    APP,
+                                    &after,
+                                    || sleep(Duration::from_millis(bound)),
+                                    || true,
+                                )
                                 .await
                             {
                                 Ok(r) => r,
@@ -570,10 +606,251 @@ fn each_broken_removal_rule_is_caught() {
         Variant::RecordsUnchecked,
         Variant::MarksKept,
     ] {
-        let caught = (0..seeds()).find_map(|seed| {
+        // Each run is short: at least 500 seeds, so a rarer race is found
+        // at the default seed count too.
+        let caught = (0..seeds().max(500)).find_map(|seed| {
             broken(&simulate(seed, variant, Duration::from_secs(120))).map(|why| (seed, why))
         });
         eprintln!("{variant:?}: caught at {caught:?}");
         assert!(caught.is_some(), "{variant:?} was never caught");
     }
+}
+
+/// A fixed scenario (ADR 0020, amendment of 2026-11-27): two removers end
+/// one mark that stayed. The first reads the mark, then is held 12 s
+/// before its delete leaves the process; the second deletes the mark at
+/// once, and node `a`, starting under that id, creates its lease. The
+/// first's deadline (2.67 s, taken before its read) passed long before it
+/// could send: it sends nothing, and `a` keeps its lease. Without the
+/// deadline, its delete removes the lease `a` wrote.
+fn held_remover(fault: Fault) -> bool {
+    let rt = Runtime::with_seed_and_config(1, madsim::Config::default());
+    let lost = Arc::new(AtomicBool::new(false));
+    let out = Arc::clone(&lost);
+    rt.block_on(async move {
+        let _modified = bucket::reset_modified();
+        bucket::clear_delays();
+        let handle = Handle::current();
+        let env = SimEnv(Instant::now());
+        let store = Store::default();
+        {
+            let mut s = store.lock().unwrap();
+            s.insert(
+                floor::relative_key("acme", "shop"),
+                (floor::encode(Minor { major: 0, minor: 9 }), SEEDED),
+            );
+            s.insert(
+                format!("{NODES}a"),
+                (encode_forgotten(EPOCH_MS - 60_000), SEEDED + 1),
+            );
+        }
+        let _bucket = handle
+            .create_node()
+            .name("bucket")
+            .ip("10.0.0.1".parse().unwrap())
+            .init({
+                let store = Arc::clone(&store);
+                move || bucket_node_with(Arc::clone(&store), bucket::Faults::default())
+            })
+            .build();
+        let bound = forget_delete_bound_ms(&config());
+        let remover = |name: &str, ip: &str, after_ms: u64, stall_ms: u64, fault: Fault| {
+            handle
+                .create_node()
+                .name(name)
+                .ip(ip.parse().unwrap())
+                .init(move || async move {
+                    sleep(Duration::from_millis(after_ms)).await;
+                    let clock = SkewedClock {
+                        global: move || env.now(),
+                        skew_ms: 0,
+                    };
+                    let bucket = Removal {
+                        ep: EpBucket::connect_with_timeout(Duration::from_millis(1_000)).await,
+                        die_one_in: 0,
+                        dies: Arc::new(AtomicBool::new(false)),
+                        stall_ms,
+                    };
+                    let _ = Remover::with_fault(fault)
+                        .round(
+                            &bucket,
+                            &clock,
+                            APP,
+                            &settings(),
+                            || sleep(Duration::from_millis(bound)),
+                            || true,
+                        )
+                        .await;
+                })
+                .build()
+        };
+        // Once the mark lists as old enough to be read (written at 0).
+        let _held = remover("held", "10.0.2.1", 5_000, 12_000, fault);
+        let _other = remover("other", "10.0.2.2", 5_500, 0, Fault::None);
+        let a_lost = Arc::clone(&out);
+        let _a = handle
+            .create_node()
+            .name("a")
+            .ip("10.0.1.1".parse().unwrap())
+            .init(move || {
+                let lost = Arc::clone(&a_lost);
+                async move {
+                    sleep(Duration::from_millis(6_000)).await;
+                    let clock = SkewedClock {
+                        global: move || env.now(),
+                        skew_ms: 0,
+                    };
+                    let setup = NodeSetup {
+                        id: "a".into(),
+                        peers: Vec::new(),
+                        nodes_prefix: NODES.into(),
+                        config: config(),
+                        attempt_ms: ATTEMPT_MS,
+                        breaks: Breaks::default(),
+                    };
+                    let client = async || {
+                        EpBucket::connect_with_timeout(Duration::from_millis(ATTEMPT_MS)).await
+                    };
+                    let buckets = NodeBuckets {
+                        lease: client().await,
+                        task_records: client().await,
+                        peers: client().await,
+                        records: client().await,
+                    };
+                    let (node, task) =
+                        LeaseNode::start(setup, "i2", clock, buckets, payload("a"), &env).await;
+                    madsim::task::spawn_local(task.run(env));
+                    for _ in 0..400 {
+                        sleep(Duration::from_millis(50)).await;
+                        if node.lost() {
+                            lost.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            })
+            .build();
+        sleep(Duration::from_secs(30)).await;
+        let s = store.lock().unwrap();
+        let live = s.get(&format!("{NODES}a")).is_some_and(|(body, _)| {
+            NodeLeaseObject::decode(body).is_some_and(|o| o.state == NodeState::Live)
+        });
+        if !live {
+            out.store(true, Ordering::SeqCst);
+        }
+    });
+    lost.load(Ordering::SeqCst)
+}
+
+#[test]
+fn a_held_remover_never_deletes_a_lease_a_node_wrote_after_the_mark() {
+    assert!(!held_remover(Fault::None), "the node lost its lease");
+    assert!(
+        held_remover(Fault::NoDeadline),
+        "without the deadline the held delete was never caught"
+    );
+}
+
+/// A node lease read as a script says: `bodies` in turn, `None` absent.
+struct Scripted {
+    record: Vec<u8>,
+    bodies: Vec<Option<Vec<u8>>>,
+    next: std::sync::atomic::AtomicUsize,
+    acquired: Arc<AtomicBool>,
+}
+
+impl Bucket for &Scripted {
+    async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+        if key == "owners/t/c/x" {
+            return Ok(Some((self.record.clone(), Version("r1".into()))));
+        }
+        let i = self.next.fetch_add(1, Ordering::SeqCst);
+        Ok(self.bodies[i % self.bodies.len()]
+            .clone()
+            .map(|b| (b, Version(format!("n{i}")))))
+    }
+    async fn create(&self, _key: &str, _body: Vec<u8>) -> Result<Version, BucketError> {
+        self.acquired.store(true, Ordering::SeqCst);
+        Ok(Version("r2".into()))
+    }
+    async fn replace(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+        _expected: &Version,
+    ) -> Result<Version, BucketError> {
+        self.acquired.store(true, Ordering::SeqCst);
+        Ok(Version("r2".into()))
+    }
+}
+
+/// A fixed scenario (ADR 0020, amendment of 2026-11-27): node `b` runs as
+/// `i2` and holds the actor; this process read `i2`'s live body once.
+/// Then, for three times ttl plus grace, every read of `b`'s lease answers
+/// absent or with `i1`'s last live body (a stale replica around a delete),
+/// in turn, while this process tries to acquire the actor every 250 ms.
+/// The stale bodies keep the absence from ever spanning the window, so
+/// the newest held stays `i2`'s and the record is never judged free on
+/// `i1`'s body. With only newer bodies ending the absence (the first form
+/// of the pruning), the entry is dropped and the next stale body frees it;
+/// with no table at all, at once.
+fn stale_between_absent(fault: ReadFault) -> bool {
+    let rt = Runtime::with_seed_and_config(1, madsim::Config::default());
+    rt.block_on(async move {
+        let env = SimEnv(Instant::now());
+        let clock = SkewedClock {
+            global: move || env.now(),
+            skew_ms: 0,
+        };
+        let cfg = config();
+        let live = |instance: &str, at: u64| {
+            NodeLeaseObject {
+                state: NodeState::Live,
+                instance: Some(instance.into()),
+                written_at_ms: at,
+            }
+            .encode_with(&payload("b"))
+        };
+        let record = OwnerRecord {
+            holder: Some(("b".into(), "i2".into())),
+            generation: 3,
+            recorded: None,
+        }
+        .encode();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let scripted = Scripted {
+            record,
+            bodies: vec![None, Some(live("i1", EPOCH_MS - 30_000))],
+            next: std::sync::atomic::AtomicUsize::new(0),
+            acquired: Arc::clone(&acquired),
+        };
+        let reads = Arc::new(wasmkeep_cluster::node_lease::NewestReads::with_fault(fault));
+        let i2 = NodeLeaseObject::decode(&live("i2", EPOCH_MS - 10_000)).unwrap();
+        reads.observe("b", &i2, &cfg);
+        let owners = Owners::new(&scripted, clock, "a", "ia", NODES, cfg).with_reads(reads);
+        let window = cfg.ttl_ms() + cfg.grace_ms();
+        let until = env.now() + 3 * window;
+        while env.now() < until && !acquired.load(Ordering::SeqCst) {
+            let _ = owners
+                .acquire("owners/t/c/x", || true, async || Ok(1))
+                .await;
+            sleep(Duration::from_millis(250)).await;
+        }
+        acquired.load(Ordering::SeqCst)
+    })
+}
+
+#[test]
+fn stale_bodies_between_absent_answers_never_free_a_held_record() {
+    assert!(
+        !stale_between_absent(ReadFault::None),
+        "a held record was freed"
+    );
+    assert!(
+        stale_between_absent(ReadFault::GoneIgnoresOlder),
+        "the first form of the pruning was never caught"
+    );
+    assert!(
+        stale_between_absent(ReadFault::Off),
+        "no table was never caught"
+    );
 }

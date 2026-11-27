@@ -92,7 +92,6 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         return;
     }
     let renewals = c.renewals;
-    let attempt_limit = Duration::from_millis(renewals.attempt_ms);
     drop(c);
     // When (this node's clock, ms) the next renewal is due, made an
     // instant of the runtime's: one already due goes at once.
@@ -113,9 +112,12 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
             let Some(c) = cluster.upgrade() else {
                 return;
             };
+            // Never past a renewal that is due: the read is dropped, made
+            // again after the renewal.
             let read = tokio::select! {
-                read = c.read_floor() => Some(read),
+                read = c.read_floor() => Some(Some(read)),
                 _ = stop.wait_for(|s| *s) => None,
+                () = tokio::time::sleep_until(next) => Some(None),
             };
             match read {
                 // A clean stop meanwhile: release what was written.
@@ -123,33 +125,36 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
                     c.release_node_lease(&mut lease).await;
                     return;
                 }
-                Some(super::identity::FloorRead::Allowed(_)) => {
-                    floor_read = true;
-                    // A verdict reached meanwhile (a twin found by the
-                    // listing) stands: Unique only over Checking.
-                    let unique = c.identity.send_if_modified(|s| {
-                        let checking = *s == Identity::Checking;
-                        if checking {
-                            *s = Identity::Unique;
+                Some(None) => {}
+                Some(Some(read)) => match read {
+                    super::identity::FloorRead::Allowed(_) => {
+                        floor_read = true;
+                        // A verdict reached meanwhile (a twin found by the
+                        // listing) stands: Unique only over Checking.
+                        let unique = c.identity.send_if_modified(|s| {
+                            let checking = *s == Identity::Checking;
+                            if checking {
+                                *s = Identity::Unique;
+                            }
+                            checking
+                        });
+                        if !unique || c.identity_taken() {
+                            c.invalidate_node_lease(false);
+                            return;
                         }
-                        checking
-                    });
-                    if !unique || c.identity_taken() {
-                        c.invalidate_node_lease(false);
+                        tracing::info!("{}", super::identity::checked_message(&c.node_id));
+                    }
+                    super::identity::FloorRead::Refused(why) => {
+                        tracing::error!("{why}");
+                        // It held nothing: acquisitions wait for the verdict.
+                        c.release_node_lease(&mut lease).await;
+                        c.identity.send_replace(Identity::BelowFloor(why));
                         return;
                     }
-                    tracing::info!("{}", super::identity::checked_message(&c.node_id));
-                }
-                Some(super::identity::FloorRead::Refused(why)) => {
-                    tracing::error!("{why}");
-                    // It held nothing: acquisitions wait for the verdict.
-                    c.release_node_lease(&mut lease).await;
-                    c.identity.send_replace(Identity::BelowFloor(why));
-                    return;
-                }
-                Some(super::identity::FloorRead::NoAnswer(e)) => {
-                    tracing::warn!(error = %e, "reading the app's upgrade floor after the first lease write failed; renewing the lease and reading it again");
-                }
+                    super::identity::FloorRead::NoAnswer(e) => {
+                        tracing::warn!(error = %e, "reading the app's upgrade floor after the first lease write failed; renewing the lease and reading it again");
+                    }
+                },
             }
         }
         let asked = tokio::select! {
@@ -177,7 +182,9 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         let mut stopping = false;
         let sent = std::time::Instant::now();
         let attempt = {
-            let attempt = tokio::time::timeout(attempt_limit, lease.renew());
+            let limit =
+                Duration::from_millis(renewals.attempt_for(lease.valid_until_ms(), sent_ms));
+            let attempt = tokio::time::timeout(limit, lease.renew());
             tokio::pin!(attempt);
             tokio::select! {
                 biased;
@@ -325,7 +332,10 @@ impl Cluster {
     ) -> Result<(), ()> {
         loop {
             lease.set_payload(self.membership.lease_payload());
-            match tokio::time::timeout(self.lease_attempt, lease.start(expected)).await {
+            // Bounded as a renewal: a first write slower than that leaves
+            // the next renewal too little of the lease.
+            let attempt = Duration::from_millis(self.renewals.attempt_ms);
+            match tokio::time::timeout(attempt, lease.start(expected)).await {
                 Ok(Ok(())) => {
                     self.node_lease_written(lease);
                     return Ok(());

@@ -199,7 +199,11 @@ pub fn forget_delete_bound_ms(config: &LeaseConfig) -> u64 {
 }
 
 /// `work`'s output, or `None` once `give_up` ends first; `work` is then
-/// dropped, which ends its retries.
+/// dropped, which ends its retries. `give_up` is polled first, every
+/// time: a deadline already passed (the timer is made before the
+/// request that comes first, the mark's write or the read of the key)
+/// sends nothing at all, however long the steps before took or the
+/// process was held.
 async fn before<T>(
     work: impl std::future::Future<Output = T>,
     give_up: impl std::future::Future<Output = ()>,
@@ -208,10 +212,10 @@ async fn before<T>(
     let mut work = std::pin::pin!(work);
     let mut give_up = std::pin::pin!(give_up);
     std::future::poll_fn(|cx| {
-        if let Poll::Ready(done) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(done));
+        if give_up.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
         }
-        give_up.as_mut().poll(cx).map(|()| None)
+        work.as_mut().poll(cx).map(Some)
     })
     .await
 }
@@ -228,8 +232,11 @@ async fn before<T>(
 /// ([`crate::upgrade::forget_gate`]): an older node would write over it.
 ///
 /// The delete is given up when `give_up` ends, a timer of
-/// [`forget_delete_bound_ms`] ([`Forgot::Unfinished`]): the mark stays
-/// until the command is run again.
+/// [`forget_delete_bound_ms`] made before the call, so before the mark's
+/// write ([`Forgot::Unfinished`]): no delete is sent past it, and the
+/// mark stays until the command is run again. A store's DELETE takes no
+/// condition (`object_store` 0.14.2 has no conditional delete), so a
+/// delete already sent and held by the network is not recalled.
 ///
 /// # Errors
 /// No answer. The mark may have been written: run the command again,
@@ -259,7 +266,10 @@ pub async fn forget_released<B: Bucket + crate::control::Keys>(
 /// Two of these at once, with a node starting under that id between
 /// them, can still delete that node's new lease: the second delete lands
 /// after the first one and the node's create. The node then stops at its
-/// next write and is started again.
+/// next write and is started again. The deadline (`give_up`, made before
+/// the read) keeps a remover that was held between its read and its
+/// delete from sending the delete late; a delete already sent and held
+/// by the network is not covered.
 ///
 /// # Errors
 /// No answer.
@@ -268,8 +278,31 @@ pub async fn forget_finish<B: Bucket + crate::control::Keys>(
     key: &str,
     give_up: impl std::future::Future<Output = ()>,
 ) -> Result<Forgot, BucketError> {
-    match bucket.get(key).await? {
-        Some((body, _)) if forgotten(&body).is_some() => {
+    forget_finish_mark(bucket, key, None, give_up).await
+}
+
+/// [`forget_finish`] of the very mark a caller selected: the key read
+/// right before the delete must still hold a mark at `selected` (its
+/// version), or nothing is deleted ([`Forgot::Changed`]). `None`: any
+/// mark.
+///
+/// # Errors
+/// No answer.
+pub async fn forget_finish_mark<B: Bucket + crate::control::Keys>(
+    bucket: &B,
+    key: &str,
+    selected: Option<&Version>,
+    give_up: impl std::future::Future<Output = ()>,
+) -> Result<Forgot, BucketError> {
+    let mut give_up = std::pin::pin!(give_up);
+    let read = match before(bucket.get(key), give_up.as_mut()).await {
+        Some(read) => read?,
+        None => return Ok(Forgot::Unfinished),
+    };
+    match read {
+        Some((body, version))
+            if forgotten(&body).is_some() && selected.is_none_or(|v| *v == version) =>
+        {
             match before(bucket.delete(key), give_up).await {
                 Some(deleted) => deleted.map(|()| Forgot::Removed),
                 None => Ok(Forgot::Unfinished),
@@ -413,6 +446,10 @@ pub enum ReadFault {
     /// A read that finds the object absent leaves the unpin window running
     /// (the rule before), so stale bodies read around it unpin the newest.
     AbsentKeepsWindow,
+    /// Only a body not older than the newest ends a run of absent answers
+    /// (the first form of the pruning): stale bodies between them let the
+    /// entry be dropped, and the next stale body is judged as a first read.
+    GoneIgnoresOlder,
 }
 
 /// What [`NewestReads::with_report`] calls.
@@ -536,6 +573,11 @@ impl NewestReads {
         let mut newest = self.lock();
         match newest.get_mut(node) {
             Some(held) => {
+                // Any body read, older ones too, shows the key is there:
+                // the absence that would drop the entry starts again.
+                if self.fault != ReadFault::GoneIgnoresOlder {
+                    held.gone_since_ms = None;
+                }
                 if older_than(&held.body, body, window_ms) {
                     held.body = body.clone();
                 }
@@ -587,12 +629,16 @@ impl NewestReads {
             );
             return false;
         };
+        // Any body read, older ones too, ends a run of absent answers.
+        if self.fault != ReadFault::GoneIgnoresOlder {
+            held.gone_since_ms = None;
+        }
         if !older_than(body, &held.body, window_ms) {
+            held.gone_since_ms = None;
             if older_than(&held.body, body, window_ms) {
                 held.body = body.clone();
             }
             held.behind_since_ms = None;
-            held.gone_since_ms = None;
             return false;
         }
         // The first behind read starts the window; a reader's clock that
@@ -642,7 +688,8 @@ impl NewestReads {
     /// that found node `node`'s lease gone: a judging read, or a heartbeat
     /// round's read by key. The entry is dropped once every answer for the
     /// unpin window (`config`'s ttl plus grace) said gone, with no body read
-    /// in between: a lease removed for good (`cluster forget`, or the live
+    /// in between (any body, an older one too, and any listing that shows
+    /// the key, starts the run again): a lease removed for good (`cluster forget`, or the live
     /// nodes' removal of released leases) leaves nothing here. Until then
     /// the stale bodies a replica serves around the delete stay behind.
     /// After it, the node is one this process never read: a later first
@@ -676,14 +723,21 @@ impl NewestReads {
     }
 
     /// A listing of every node lease made at `now_ms`: each node held here
-    /// that `listed` leaves out is gone ([`Self::gone_at`]).
+    /// that `listed` leaves out is gone ([`Self::gone_at`]); one it shows
+    /// is there, whatever body the listing read.
     pub fn listed(&self, listed: impl Fn(&str) -> bool, now_ms: u64, config: &LeaseConfig) {
-        let missing: Vec<String> = self
-            .lock()
-            .keys()
-            .filter(|node| !listed(node))
-            .cloned()
-            .collect();
+        let missing: Vec<String> = {
+            let mut newest = self.lock();
+            let mut missing = Vec::new();
+            for (node, held) in newest.iter_mut() {
+                if listed(node) {
+                    held.gone_since_ms = None;
+                } else {
+                    missing.push(node.clone());
+                }
+            }
+            missing
+        };
         for node in missing {
             self.gone_at(&node, now_ms, config);
         }
@@ -919,6 +973,20 @@ impl<B: Bucket, C: Clock> NodeLease<B, C> {
                         if o.state == NodeState::Live
                             && o.instance.as_deref() == Some(self.instance.as_str()) =>
                     {
+                        // Only a write newer than the one held is progress.
+                        // Otherwise the next write is conditioned on what
+                        // is stored, the validity stays the held one's, and
+                        // this counts as a failed write (tried again soon,
+                        // not at once).
+                        if let Some((held, at)) = &self.last
+                            && (version == *held || o.written_at_ms <= *at)
+                        {
+                            let at = *at;
+                            self.last = Some((version, at));
+                            return Err(NodeLeaseError::Unavailable(
+                                "the write found was not newer than the one held".into(),
+                            ));
+                        }
                         self.last = Some((version, o.written_at_ms));
                         Ok(())
                     }
@@ -1012,6 +1080,24 @@ impl Renewals {
         Self {
             spacing_ms: quarter.min(heartbeat_ms).max(1),
             attempt_ms: quarter.max(1),
+        }
+    }
+
+    /// How long the renewal sent at `now_ms` may take, the lease valid
+    /// until `valid_until_ms` (`None`: before the first write): the
+    /// attempt, or, for the last one that fits before the lease runs out
+    /// (no whole attempt left after it), the rest of the validity. That
+    /// last write may then take longer than a quarter without being cut,
+    /// since no other write could land in time anyway.
+    pub fn attempt_for(&self, valid_until_ms: Option<u64>, now_ms: u64) -> u64 {
+        let Some(until) = valid_until_ms else {
+            return self.attempt_ms;
+        };
+        let left = until.saturating_sub(now_ms);
+        if left.saturating_sub(self.attempt_ms) < self.attempt_ms {
+            left.max(self.attempt_ms)
+        } else {
+            self.attempt_ms
         }
     }
 
@@ -3358,12 +3444,24 @@ mod tests {
         next: impl Fn(Option<u64>, u64, u64, bool) -> u64,
         fates: &[Fate],
     ) -> bool {
+        renewals_keep_the_lease_from(0, attempt_ms, next, fates)
+    }
+
+    /// [`renewals_keep_the_lease`] after a first write sent at 0 and
+    /// answered at `first_ms`.
+    fn renewals_keep_the_lease_from(
+        first_ms: u64,
+        attempt_ms: u64,
+        next: impl Fn(Option<u64>, u64, u64, bool) -> u64,
+        fates: &[Fate],
+    ) -> bool {
         use crate::lease::tests::{At, Mem, run};
         let mem = Mem::default();
         let t = std::cell::Cell::new(0);
         let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
         assert_eq!(run(lease.start(None)), Ok(()));
-        let mut at = next(lease.written_at_ms(), 0, 0, false);
+        t.set(first_ms);
+        let mut at = next(lease.written_at_ms(), 0, first_ms, false);
         for fate in fates {
             let valid = lease.valid_until_ms().unwrap();
             if at >= valid {
@@ -3461,9 +3559,122 @@ mod tests {
         assert_eq!(tiny.next_ms(Some(0), 10, 10, true), 11);
     }
 
+    /// A slow first write, answered 2.6 s after its send: the first
+    /// renewal is due at once (a spacing after the write's date has
+    /// passed), and a timeout then a slow retry still keep the lease.
+    #[test]
+    fn a_slow_first_write_then_a_timeout_keeps_the_lease() {
+        let r = Renewals::new(&cfg(), 3_000);
+        assert_eq!(r.next_ms(Some(0), 0, 2_600, false), 2_600);
+        let fates = [Fate::TimesOut, Fate::Slow, Fate::Slow];
+        assert!(renewals_keep_the_lease_from(
+            2_600,
+            r.attempt_ms,
+            |w, s, n, f| r.next_ms(w, s, n, f),
+            &fates
+        ));
+        // Spaced a period after the send, as before: the first renewal at
+        // 3 s, its timeout at 5.67 s, the retry answered after 8 s.
+        let before = |_: Option<u64>, sent: u64, _: u64, _: bool| sent + 3_000;
+        assert!(!renewals_keep_the_lease_from(2_600, 2_666, before, &fates));
+    }
+
+    /// The last renewal that fits before the lease runs out may take the
+    /// rest of the validity; the others a quarter of `ttl - safety`.
+    #[test]
+    fn the_last_attempt_that_fits_runs_to_the_end_of_the_validity() {
+        let r = Renewals::new(&cfg(), 3_000);
+        assert_eq!(r.attempt_for(None, 0), 2_000);
+        assert_eq!(r.attempt_for(Some(8_000), 2_000), 2_000);
+        assert_eq!(r.attempt_for(Some(8_000), 4_000), 2_000);
+        // At 4.5 s, 3.5 s left: no whole attempt after this one.
+        assert_eq!(r.attempt_for(Some(8_000), 4_500), 3_500);
+        assert_eq!(r.attempt_for(Some(8_000), 6_000), 2_000);
+        assert_eq!(r.attempt_for(Some(8_000), 7_500), 2_000);
+    }
+
+    /// A conflict whose re-read shows this process's own write, but not a
+    /// newer one than held (the same date under another version): no
+    /// progress, so a failure. The validity stays the held one's and the
+    /// next write is conditioned on what is stored, which then lands.
+    #[test]
+    fn an_adopted_write_that_is_not_newer_is_a_failure() {
+        use crate::lease::tests::{At, Mem, run};
+        let mem = Mem::default();
+        let t = std::cell::Cell::new(1_000);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        assert_eq!(run(lease.start(None)), Ok(()));
+        let valid = lease.valid_until_ms();
+        // The stored object rewritten with this process's own body, at the
+        // date already held.
+        let same = NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some("i1".into()),
+            written_at_ms: 1_000,
+        }
+        .encode();
+        *mem.steal_next.borrow_mut() = Some(("nodes/a".into(), same));
+        t.set(3_000);
+        assert!(matches!(
+            run(lease.renew()),
+            Err(NodeLeaseError::Unavailable(_))
+        ));
+        assert_eq!(lease.valid_until_ms(), valid);
+        assert_eq!(lease.written_at_ms(), Some(1_000));
+        // Progress again: the next write lands on the stored version.
+        t.set(3_500);
+        assert_eq!(run(lease.renew()), Ok(()));
+        assert_eq!(lease.written_at_ms(), Some(3_500));
+        // A write that landed late, newer than held, is progress.
+        mem.lose_next_reply.set(true);
+        t.set(5_000);
+        assert!(run(lease.renew()).is_err());
+        t.set(6_000);
+        assert_eq!(run(lease.renew()), Ok(()));
+        assert_eq!(lease.written_at_ms(), Some(5_000));
+    }
+
+    /// ADR 0020, amendment of 2026-11-27: a lease answering absent between
+    /// stale reads of an older body is not dropped from the table, however
+    /// long that goes on (each body, older ones too, starts the absence
+    /// again), so a record naming the current instance is never judged on
+    /// the older body: b runs as i2 and holds the actor; reads alternate
+    /// absent and i1's last live body for more than ttl plus grace; then
+    /// a judging read of i1's body is still behind.
+    #[test]
+    fn absent_answers_between_stale_bodies_never_drop_the_newest() {
+        let c = cfg();
+        let body = |instance: &str, at| NodeLeaseObject {
+            state: NodeState::Live,
+            instance: Some(instance.into()),
+            written_at_ms: at,
+        };
+        let reads = NewestReads::new();
+        reads.observe("b", &body("i2", 50_000), &c);
+        let window = c.ttl_ms() + c.grace_ms();
+        let mut at = 60_000;
+        while at < 60_000 + 3 * window {
+            reads.gone_at("b", at, &c);
+            assert!(reads.behind("b", &body("i1", 40_000), at + 500, &c));
+            at += 1_000;
+        }
+        assert_eq!(reads.newest("b").unwrap().instance.as_deref(), Some("i2"));
+        // The record naming i2, judged on i1's stale live body: behind,
+        // read again, never free.
+        assert!(reads.behind("b", &body("i1", 40_000), at, &c));
+        // A listing that shows the key starts the absence again too.
+        reads.gone_at("b", at, &c);
+        reads.listed(|n| n == "b", at + window - 1, &c);
+        reads.gone_at("b", at + window, &c);
+        assert!(reads.newest("b").is_some());
+        // Only a whole window of absent answers drops it.
+        reads.gone_at("b", at + 2 * window, &c);
+        assert_eq!(reads.newest("b"), None);
+    }
+
     /// A lease gone for the unpin window, every answer saying so, is
-    /// dropped from the table; a body read meanwhile (not an older one)
-    /// keeps it, and so does a listing that shows the node. Until the
+    /// dropped from the table; a body read meanwhile keeps it, and so does
+    /// a listing that shows the node. Until the
     /// window ends, stale bodies of the removed lease stay behind.
     #[test]
     fn a_lease_gone_for_the_window_is_dropped() {
@@ -3478,13 +3689,6 @@ mod tests {
         reads.observe("b", &body(10_000), &c);
         reads.observe("keep", &body(10_000), &c);
         reads.gone_at("b", 20_000, &c);
-        // An older body read meanwhile does not end the absence, and is
-        // still behind.
-        let older = NodeLeaseObject {
-            state: NodeState::Live,
-            ..body(9_000)
-        };
-        assert!(reads.behind("b", &older, 20_500, &c));
         reads.gone_at("b", 20_000 + window - 1, &c);
         assert!(reads.newest("b").is_some());
         reads.gone_at("b", 20_000 + window, &c);
@@ -4224,6 +4428,101 @@ mod tests {
             std::future::pending()
         }
 
+        /// A remover held between its read and its delete: the delete is
+        /// sent only once `gate` opens.
+        struct Held(ObjectStoreBucket, std::sync::Arc<tokio::sync::Notify>);
+
+        impl Bucket for Held {
+            async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+                self.0.get(key).await
+            }
+            async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+                self.0.create(key, body).await
+            }
+            async fn replace(
+                &self,
+                key: &str,
+                body: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BucketError> {
+                self.0.replace(key, body, expected).await
+            }
+        }
+
+        impl crate::control::Keys for Held {
+            async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+                self.0.list_keys(prefix).await
+            }
+            async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+                self.0.put_empty(key).await
+            }
+            async fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+                self.0.put_body(key, body).await
+            }
+            async fn get_body(&self, key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+                self.0.get_body(key).await
+            }
+            async fn delete(&self, key: &str) -> Result<(), BucketError> {
+                self.1.notified().await;
+                crate::control::Keys::delete(&self.0, key).await
+            }
+        }
+
+        /// Two removers end one mark that stayed (ADR 0020, amendment of
+        /// 2026-11-27). The first is held between its read of the mark and
+        /// its delete; the second deletes it, and a node starting under
+        /// that id creates its lease. The first one's deadline, taken
+        /// before its read, has passed by the time it could send its
+        /// delete: it sends nothing, and the node keeps its lease. A
+        /// remover that reads after the node wrote, or finds another mark
+        /// than the one it selected, deletes nothing.
+        #[tokio::test]
+        async fn a_held_remover_never_deletes_a_lease_written_after_the_mark() {
+            let b = bucket();
+            let mark = b.create("nodes/a", encode_forgotten(5)).await.unwrap();
+            let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+            let held = Held(b.clone(), std::sync::Arc::clone(&gate));
+            let (deadline, passed) = tokio::sync::oneshot::channel::<()>();
+            let first = {
+                let mark = mark.clone();
+                tokio::spawn(async move {
+                    let give_up = async move {
+                        let _ = passed.await;
+                    };
+                    forget_finish_mark(&held, "nodes/a", Some(&mark), give_up).await
+                })
+            };
+            // The first remover has read the mark and waits to send.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                forget_finish_mark(&b, "nodes/a", Some(&mark), never()).await,
+                Ok(Forgot::Removed)
+            );
+            let live = lease(NodeState::Live, "i2");
+            b.create("nodes/a", live.clone()).await.unwrap();
+            // Its deadline passes, and it could now send its delete.
+            gate.notify_one();
+            deadline.send(()).unwrap();
+            assert_eq!(first.await.unwrap(), Ok(Forgot::Unfinished));
+            assert_eq!(b.get("nodes/a").await.unwrap().unwrap().0, live);
+            // A remover reading after the node wrote: nothing deleted.
+            assert_eq!(
+                forget_finish_mark(&b, "nodes/a", Some(&mark), never()).await,
+                Ok(Forgot::Changed)
+            );
+            // Another mark than the one selected: nothing deleted.
+            b.put_body("nodes/c", encode_forgotten(7)).await.unwrap();
+            let (_, selected) = b.get("nodes/c").await.unwrap().unwrap();
+            b.put_body("nodes/c", encode_forgotten(8)).await.unwrap();
+            assert_eq!(
+                forget_finish_mark(&b, "nodes/c", Some(&selected), never()).await,
+                Ok(Forgot::Changed)
+            );
+            assert!(b.get("nodes/c").await.unwrap().is_some());
+        }
+
         /// A bucket whose DELETE gets no answer: a client that keeps
         /// sending it again.
         struct NoDelete(ObjectStoreBucket);
@@ -4266,8 +4565,8 @@ mod tests {
         /// The mark's delete is bounded: one that gets no answer before
         /// the timer ends is given up (no retry lands much later, on a
         /// lease a node created meanwhile), the mark stays, and the next
-        /// run reads the key first. A delete that answers is not cut by
-        /// a timer that has already ended.
+        /// run reads the key first. A timer that has already ended sends
+        /// no request at all.
         #[tokio::test]
         async fn a_delete_of_the_mark_that_gets_no_answer_is_given_up() {
             let cfg = LeaseConfig::default_safe();
@@ -4291,9 +4590,15 @@ mod tests {
                 Ok(Forgot::Unfinished)
             );
             assert!(b.0.get("nodes/a").await.unwrap().is_some());
-            // A bucket that answers: removed, whatever the timer.
+            // A deadline already passed sends nothing, even to a bucket
+            // that answers; before it, removed.
             assert_eq!(
                 forget_finish(&b.0, "nodes/a", std::future::ready(())).await,
+                Ok(Forgot::Unfinished)
+            );
+            assert!(b.0.get("nodes/a").await.unwrap().is_some());
+            assert_eq!(
+                forget_finish(&b.0, "nodes/a", never()).await,
                 Ok(Forgot::Removed)
             );
             assert_eq!(b.0.get("nodes/a").await, Ok(None));

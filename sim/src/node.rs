@@ -24,7 +24,7 @@ use wasmkeep_cluster::holds::{self, Parked, PendingEntry, Validity};
 use wasmkeep_cluster::lease::{Bucket, Clock, LeaseConfig, Version};
 use wasmkeep_cluster::node_lease::{
     AcquireError, Fence, FenceWatch, Hold, NewestReads, NodeLease, NodeLeaseError, NodeLeaseObject,
-    NodeState, Owners, ReadFault, Released, fence,
+    NodeState, Owners, ReadFault, Released, Renewals, fence,
 };
 
 use crate::driver::Env;
@@ -702,13 +702,17 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
     /// validity (a lapse ends every hold into the pending releases), peers
     /// watched and fenced when due, pending entries tried again.
     pub async fn run(mut self, env: impl Env) {
-        let period = self.setup.config.ttl_ms() / 3;
+        // The server's schedule (ADR 0020, amendment of 2026-11-27), with a
+        // heartbeat period of a third of the ttl: a spacing after the last
+        // acknowledged write, a failed renewal tried again soon.
+        let renewals = Renewals::new(&self.setup.config, self.setup.config.ttl_ms() / 3);
         loop {
-            let sent = env.global_ms();
+            let sent = self.clock.now_ms();
             if lock(&self.shared).stop {
                 return self.stop().await;
             }
-            if matches!(self.lease.renew().await, Err(NodeLeaseError::Lost(_))) {
+            let renewed = self.lease.renew().await;
+            if matches!(renewed, Err(NodeLeaseError::Lost(_))) {
                 let mut s = lock(&self.shared);
                 s.validity.invalidate();
                 s.holds.clear();
@@ -736,8 +740,13 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             }
             self.fence_stale_peers(&env).await;
             self.retry_pending().await;
-            let next = sent.saturating_add(period);
-            env.sleep_ms(next.saturating_sub(env.global_ms())).await;
+            let next = renewals.next_ms(
+                self.lease.written_at_ms(),
+                sent,
+                self.clock.now_ms(),
+                renewed.is_err(),
+            );
+            env.sleep_ms(next.saturating_sub(self.clock.now_ms())).await;
         }
     }
 
