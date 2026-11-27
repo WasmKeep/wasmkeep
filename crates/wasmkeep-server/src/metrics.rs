@@ -725,15 +725,20 @@ pub(crate) enum Refusal {
     /// names another app (503 "not this app's node"), or none (a node of
     /// an older version).
     WrongApp,
+    /// A WebSocket upgrade for an actor whose sockets a move or a drain's
+    /// hand-over is closing on this node (503 with `Retry-After: 1`; ADR
+    /// 0040, section 14).
+    Moving,
 }
 
 impl Refusal {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Access,
         Self::Capacity,
         Self::Overloaded,
         Self::Unavailable,
         Self::WrongApp,
+        Self::Moving,
     ];
 
     fn label(self) -> &'static str {
@@ -743,6 +748,7 @@ impl Refusal {
             Self::Overloaded => "overloaded",
             Self::Unavailable => "unavailable",
             Self::WrongApp => "wrong_app",
+            Self::Moving => "moving",
         }
     }
 }

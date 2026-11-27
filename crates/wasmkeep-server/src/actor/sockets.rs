@@ -414,7 +414,14 @@ impl ServiceInner {
             if restoring.contains_key(&address) {
                 return Err(crate::websocket::OpenError::RestorePending);
             }
-            self.sockets.open_as(address.clone(), opener)?
+            // And with the closing mark: an upgrade that passed its early
+            // check just before a move marked the actor is refused here,
+            // or registered before the move closes the sockets. Still
+            // pending then, it is not among the first it closes: the move
+            // waits while the actor has a socket reserved, and closes it
+            // once accepted (`moving::close_sockets_and_wait`).
+            self.rebalance
+                .open_unless_closing(&address, || self.sockets.open_as(address.clone(), opener))?
         };
         let id = opened.id;
         let registration = Arc::new(Registration {

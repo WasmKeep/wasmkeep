@@ -163,6 +163,9 @@ pub(crate) enum SendError {
 #[derive(Debug)]
 pub(crate) enum OpenError {
     RestorePending,
+    /// A move or a drain's hand-over is closing the actor's sockets here
+    /// (ADR 0040, section 14).
+    Moving,
     ActorFull,
     NodeFull,
 }

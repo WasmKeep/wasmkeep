@@ -934,10 +934,32 @@ apart_sent() { # apart_sent R
 # placed, so no peer is marked as having just taken one. Placement picks
 # the lighter of b's peers: when that is not R, the attempt is noted and
 # made again (the peer that took it is then left out for a few periods).
-apart_refused() { # apart_refused R
-  local r=$1 x=b attempt before after h p resident got=""
+# With THIRD, b's other peer is asked to drain first, and undrained after:
+# a node asked to drain is no placement target, so R is b's only one. The
+# lighter peer otherwise takes the wake-up every time (a new node beside
+# the old R holding room/legacy). The actors THIRD held stay where the
+# drain put them for the steps after (no rebalance while versions mix).
+apart_refused() { # apart_refused R [THIRD]
+  local r=$1 third=${2:-} x=b
   if [ "$(label "${bin[$r]}")" = "$(label "${bin[$x]}")" ]; then fail "apart, refusal: $x and $r run one version"; return; fi
   pin b || return
+  if [ -n "$third" ]; then
+    if ! new cluster drain "$third" --bucket "$BUCKET" >/dev/null; then fail "apart, refusal: drain $third refused"; return; fi
+    if ! wait_state "$third" drained 90; then
+      new cluster undrain "$third" --bucket "$BUCKET" >/dev/null 2>&1 || true
+      wait_state "$third" serving 60 || true
+      return
+    fi
+    note "apart, refusal: $third drained, so that b places on $r alone"
+  fi
+  apart_refused_attempts "$r" "$x"
+  if [ -n "$third" ]; then
+    new cluster undrain "$third" --bucket "$BUCKET" >/dev/null 2>&1 || fail "undrain $third refused"
+    wait_state "$third" serving 60 || true
+  fi
+}
+apart_refused_attempts() { # apart_refused_attempts R X
+  local r=$1 x=$2 attempt before after h p resident got=""
   for attempt in 1 2 3 4 5 6; do
     if ! released 90 room/legacy pusher/legacy; then fail "apart, refusal: room/legacy or pusher/legacy still held:$HELD"; return; fi
     req_retry 20 GET "$r" "/r6/history?room=legacy&n=0"
@@ -1374,10 +1396,11 @@ for spec in "97 10" "120 10" "60 1000"; do
 done
 
 # Kept apart on the mixed cluster: sent on by the new node, and refused by
-# the new node to an old sender.
+# the new node to an old sender. c, b's other peer, is drained for the
+# refusal, so that b places on a.
 begin apart-new-receives
 apart_sent a
-apart_refused a
+apart_refused a c
 check_placement
 
 begin drain-new-with-room
@@ -1401,10 +1424,11 @@ begin idle-new-pusher-new-room
 idle_check 1 "new pusher, new room, nodes $(versions)"
 
 # Kept apart the other way: sent on by the old node, and refused by the
-# old node to a new sender (b).
+# old node to a new sender (b). a, the lighter of b's peers, is drained
+# for the refusal, so that b places on c.
 begin apart-old-receives
 apart_sent c
-apart_refused c
+apart_refused c a
 check_placement
 
 if [ $gated = 1 ]; then

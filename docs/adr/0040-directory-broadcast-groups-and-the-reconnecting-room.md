@@ -1126,12 +1126,23 @@ holds, or that is backed off after a move that did not finish here
 
 A move is the owner's sequence of ADR 0017, started from memory: close
 the actor's sockets with 1012, flush, record the move, release, send the
-target a signed take call. It writes no move key and reads none. While it
-closes the sockets, the actor is marked closing on its node: an upgrade
-for it there is answered `503` with `Retry-After: 1`. Without the mark, a
-client that reconnects at once is relayed back by a node that still
-names this one as the owner, reopens a socket, and the move finds it
-busy, every time. A move ends:
+target a signed take call. It writes no move key and reads none. From
+before it closes the sockets until the release (for a parked room,
+until its take), the actor is marked
+closing on its node: an upgrade for it there is answered `503` with
+`Retry-After: 1` (counted as `moving` in
+`wasmkeep_admission_refused_total`). After the release, the move is
+recorded and upgrades there are relayed to the target. Without the mark, a client that reconnects at once is
+relayed back by a node that still names this one as the owner, reopens a
+socket, and the move finds it busy, every time. An operator's move (ADR
+0017) and a drain's hand-over (ADR 0014) close sockets the same way and
+take the same mark. A socket's registration checks the mark again under
+its lock, so an upgrade that passed the first check just before the mark
+is either refused, or registered before the move closes the sockets. A
+socket registered then may still be pending (not yet accepted), so the
+first close does not list it; the move keeps waiting while any socket of
+the actor is reserved, and closes each one as it is accepted. A move
+ends:
 
 - `moved`, or `taken_elsewhere` (another node took it in the gap): done;
 - `busy`, for a cause of this node's (a socket still closing, the
@@ -1230,10 +1241,16 @@ moves there, and stays with `--no-rebalance` or `--no-placement`; an
 operator's move off home is undone after the stay; an edge with 30
 clients that reconnect after a random wait below 2 s moves home without
 being held up by reopened sockets (and is not moved home without the
-closing mark); a parked edge with a socket is moved as a parked room. Not tested here: a
-peer a minor version apart in a cluster test (the unit tests and the
-mixed-version check cover it), the node-lease simulation with rebalance
-moves as an event, and what a move costs an edge at its socket cap.
+closing mark); a parked edge with a socket is moved as a parked room; a
+drain, and an operator's move, of two edges with 30 clients each that
+reconnect after 1 ms or after a random wait below 2 s end within 15 s,
+each client closed at most twice (without the mark the drain stays
+`draining` and the move never lands at 1 ms, and clients are closed three
+times at the random wait). `madsim_node_lease` has the rebalance move and
+the cold socket's take among its events, and one holder at a time holds
+through them. Not tested here: a peer a minor version apart in a cluster
+test (the unit tests and the mixed-version check cover it), and what a
+move costs an edge at its socket cap.
 
 ## Consequences
 

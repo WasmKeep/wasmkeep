@@ -208,8 +208,12 @@ A draining node hands over its resident actors, up to 16 at a time
    up to 5 s, until their `on-websocket-close` events have run, each with
    its upload. They run on this node, while it still holds the lease. A
    close event queued after the release would find no lease and never
-   run. Upgrades arriving meanwhile go through `ensure_owner`, as on any
-   node. The job checks again when it runs: a socket still open or
+   run. From before the sockets close until the hand-over job ends, the
+   actor is marked closing, as a move's is ([ADR 0040, section
+   14](0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)):
+   an upgrade for it here, relayed back by a node that still names this
+   one, is answered `503` with `Retry-After: 1` instead of reopening a
+   socket. The job checks again when it runs: a socket still open or
    closing (accepted since, or a client slow to answer the close) makes
    it keep the lease, close the socket and leave the actor for the next
    pass.

@@ -76,6 +76,32 @@ The text under a version's heading is its GitHub release text
   its id.
 - **A conflict on announcing an `actor restore` is retried too**, rather
   than withdrawing the request.
+- **A drain and `wasmkeep actor move` are no longer held up by clients
+  that reconnect at once.** While a drain's hand-over or an operator's
+  move closes an actor's sockets, an upgrade for it on that node is now
+  answered `503` with `Retry-After: 1`, as for a rebalance move. Before,
+  a client reconnecting within a few milliseconds, relayed back by a node
+  that still named the owner, reopened a socket behind the hand-over or
+  the move, which then waited a heartbeat period and found another one,
+  so the drain stayed `draining` and the move did not land. A socket's
+  registration checks the mark again, so an upgrade already past its
+  first check is refused too, or registered in time for the move to
+  wait for it and close it once it is accepted. The mark ends at the
+  release; upgrades after it go to the new owner. The refusals are
+  counted as `moving` in `wasmkeep_admission_refused_total`
+  ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
+- **The mixed-version check's apart refusal by the old node no longer
+  depends on luck.** Placement sent the wake-up to the lighter new peer
+  every time; that peer is now asked to drain for the attempts, so the
+  old node is the only target.
+
+### Known limits
+
+- **An operator's move can end on a third node.** Between the owner's
+  release and the target's take, an event landing on another node wakes
+  the actor there (for a spread actor with rebalancing on, at its home;
+  ADR 0017's "another node took it first"). That node moves it on to the
+  target only if it still sees the request.
 
 ## 0.9.0
 

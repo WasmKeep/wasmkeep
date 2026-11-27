@@ -42,6 +42,20 @@
 //! body the process never saw past, is not modelled: the rule does not
 //! close it.
 //!
+//! With moves (`rebalance_moves_and_cold_takes_keep_one_holder`, ADR 0040,
+//! section 14), two more events run beside the others. A holder now and
+//! then moves the actor as the rebalance pass does: it stops acting (its
+//! sockets closed, instance and database dropped), releases its hold, and
+//! once the release landed sends another node a take call, which that
+//! node's process answers by acquiring, as any acquisition. And a process
+//! holding nothing now and then sends a take call to another node first
+//! (a cold socket asking its home), and acquires itself only if that take
+//! was refused, lost or not answered in time. Take calls may be lost or
+//! late, and land on whichever process runs that node id (the twin
+//! included). The same checks hold; a mover that releases before it stops
+//! acting, and a target that takes the call for a grant (the record
+//! written whoever holds it), are caught.
+//!
 //! Ignoring the node's epoch rule is never caught here, and a test says
 //! why (`ignoring_the_epoch_is_never_caught_here`).
 //!
@@ -172,6 +186,17 @@ enum Variant {
     /// The hot operator's stale reads, with a read that finds a lease
     /// absent leaving the unpin window running (the rule before).
     StaleAbsentKeepsWindow,
+    /// The correct rules, with rebalance moves and cold takes (ADR 0040,
+    /// section 14).
+    Moves,
+    /// Moves whose owner keeps acting a moment after its release, as if
+    /// the move released before it dropped the instance. This tests the
+    /// move's stop-then-release order: any acquirer in that moment catches
+    /// it, the move's target or not.
+    MoveActsAfterRelease,
+    /// Moves whose target takes a take call for a grant: the record is
+    /// written whoever holds it (the take not going through the free rule).
+    TakeAsGrant,
 }
 
 /// When the clocks step back in [`Variant::StaleClockStep`] (global ms).
@@ -180,6 +205,13 @@ const CLOCK_STEP_AT_MS: u64 = EPOCH_MS + 5_000;
 const CLOCK_STEP_MS: u64 = 2_000;
 
 impl Variant {
+    fn moves(self) -> bool {
+        matches!(
+            self,
+            Self::Moves | Self::MoveActsAfterRelease | Self::TakeAsGrant
+        )
+    }
+
     fn waiters(self) -> bool {
         matches!(self, Self::Waiters | Self::HintAsGrant | Self::GiveUp)
     }
@@ -374,6 +406,78 @@ struct Shared {
     /// Lease reads found behind the process's newest and read again, by
     /// process (slot, instance).
     behind: HashMap<(usize, u64), u64>,
+    /// Take calls sent and not yet answered.
+    takes: Vec<Take>,
+    moves: Moves,
+}
+
+/// What the moves and cold takes of a simulation did.
+#[derive(Clone, Debug, Default)]
+struct Moves {
+    /// Rebalance moves whose release landed and that sent their take.
+    moved: u64,
+    /// Rebalance moves whose release did not land (no take sent).
+    unreleased: u64,
+    /// Take calls answered by acquiring the actor.
+    taken: u64,
+    /// Cold takes sent, answered held, and given up (refused, lost, late):
+    /// the asking process then acquires itself.
+    cold: u64,
+    cold_held: u64,
+    cold_fallback: u64,
+}
+
+/// A take call (ADR 0017) on its way to node `to`, delivered from
+/// `at_ms` (global), dropped unanswered past `until_ms`. A cold one
+/// carries the cell its sender waits on.
+struct Take {
+    to: u32,
+    at_ms: u64,
+    until_ms: u64,
+    answer: Option<Arc<Mutex<Option<bool>>>>,
+}
+
+/// How long a cold take's sender waits for the answer before it acquires
+/// itself: it stands for the server's 10 s take timeout, scaled to this
+/// simulation's 1 s ttl.
+const COLD_WAIT_MS: u64 = 500;
+
+/// Sends a take call to `to`: lost one time in ten, delivered after up
+/// to 200 ms otherwise. Only the call is lost or late: an answer, once a
+/// process gives it, always reaches the cell its sender waits on (a lost
+/// answer looks to the sender like a late one, which the wait covers).
+fn send_take(
+    shared: &Mutex<Shared>,
+    rng: &mut Rng,
+    now: u64,
+    to: u32,
+    answer: Option<Arc<Mutex<Option<bool>>>>,
+) {
+    if rng.chance(10) {
+        return;
+    }
+    let at_ms = now + rng.below(200);
+    shared.lock().unwrap().takes.push(Take {
+        to,
+        at_ms,
+        until_ms: at_ms + COLD_WAIT_MS,
+        answer,
+    });
+}
+
+/// The next take call delivered to node `i` by `now`, if any; calls past
+/// their time are dropped unanswered.
+fn next_take(shared: &Mutex<Shared>, i: u32, now: u64) -> Option<Take> {
+    let mut s = shared.lock().unwrap();
+    s.takes.retain(|t| t.until_ms > now);
+    let k = s.takes.iter().position(|t| t.to == i && t.at_ms <= now)?;
+    Some(s.takes.remove(k))
+}
+
+/// Another node than `i`, at random.
+fn other_node(rng: &mut Rng, i: u32) -> u32 {
+    let k = u32::try_from(rng.below(2)).unwrap() + 1;
+    (i + k - 1) % 3 + 1
 }
 
 /// What node `i` writes after its lease lines: the heartbeat's fields,
@@ -449,7 +553,7 @@ async fn acquire_broken<B: Bucket, C: Clock>(
                     .and_then(|(b, _)| NodeLeaseObject::decode(&b));
                 let free = match (variant, &obj) {
                     (Variant::FreeOnFenceAtOnce, Some(o)) if o.state != NodeState::Live => true,
-                    (Variant::HintAsGrant, _) => true,
+                    (Variant::HintAsGrant | Variant::TakeAsGrant, _) => true,
                     _ => frees(i, obj.as_ref(), clock.now_ms(), &cfg),
                 };
                 if !free {
@@ -641,7 +745,40 @@ async fn run_node(
                 shared.lock().unwrap().clean_stops += 1;
                 break;
             }
+            // A take call reaching the holder is answered "held".
+            if variant.moves() && acting {
+                while let Some(t) = next_take(&shared, i, env.now()) {
+                    if let Some(answer) = t.answer {
+                        *answer.lock().unwrap() = Some(true);
+                    }
+                }
+            }
             match hold.take() {
+                // A rebalance move (ADR 0040, section 14): the owner's side
+                // of ADR 0017's move, from memory. It stops acting (sockets
+                // closed, instance and database dropped), releases, and
+                // only once the release landed sends the target its take.
+                Some(h) if variant.moves() && acting && rng.chance(10) => {
+                    end(&shared);
+                    let to = other_node(&mut rng, i);
+                    let released = node.release(&h).await;
+                    if variant == Variant::MoveActsAfterRelease {
+                        let now = env.now();
+                        shared.lock().unwrap().claims.push(Claim {
+                            node: i,
+                            instance: process,
+                            generation: h.generation,
+                            from_ms: now,
+                            until_ms: now + 100 + rng.below(400),
+                        });
+                    }
+                    if released {
+                        shared.lock().unwrap().moves.moved += 1;
+                        send_take(&shared, &mut rng, env.now(), to, None);
+                    } else {
+                        shared.lock().unwrap().moves.unreleased += 1;
+                    }
+                }
                 Some(h) if !scenario && rng.chance(8) => {
                     end(&shared);
                     node.release(&h).await;
@@ -670,7 +807,13 @@ async fn run_node(
                     // holder was killed, once only.
                     let now = clock.now_ms();
                     let mut tried_as = None;
-                    let ask = if !variant.waiters() {
+                    // A take call delivered here: acquire as asked.
+                    let take = if variant.moves() {
+                        next_take(&shared, i, env.now())
+                    } else {
+                        None
+                    };
+                    let ask = if take.is_some() || !variant.waiters() {
                         true
                     } else if let Some(w) = &mut wait {
                         let verdict = watch.verdict(&w.owner, now, Some(w.waiter.held_since_ms()));
@@ -716,11 +859,34 @@ async fn run_node(
                             None => rng.chance(30),
                         }
                     };
-                    if ask {
+                    // A cold socket (ADR 0040, section 14): ask another
+                    // node to take the actor first; acquire here only if
+                    // that take was refused, lost or not answered in time.
+                    let mut asked_home = false;
+                    if ask && take.is_none() && variant.moves() && rng.chance(25) {
+                        let cell = Arc::new(Mutex::new(None));
+                        let home = other_node(&mut rng, i);
+                        shared.lock().unwrap().moves.cold += 1;
+                        send_take(&shared, &mut rng, env.now(), home, Some(Arc::clone(&cell)));
+                        let until = env.now() + COLD_WAIT_MS;
+                        while env.now() < until && cell.lock().unwrap().is_none() {
+                            sleep(Duration::from_millis(20)).await;
+                        }
+                        let held = *cell.lock().unwrap() == Some(true);
+                        let mut s = shared.lock().unwrap();
+                        if held {
+                            s.moves.cold_held += 1;
+                        } else {
+                            s.moves.cold_fallback += 1;
+                        }
+                        asked_home = held;
+                    }
+                    if ask && !asked_home {
                         let reason = takeover_reason(&bucket, &id, &instance).await;
                         let broken = match variant {
                             Variant::ReuseGeneration | Variant::FreeOnFenceAtOnce => true,
                             Variant::HintAsGrant => tried_as == Some(Verdict::Free),
+                            Variant::TakeAsGrant => take.is_some(),
                             _ => false,
                         };
                         let got = if broken {
@@ -795,6 +961,15 @@ async fn run_node(
                                 s.waits.spun += 1;
                             }
                         }
+                        if let Some(t) = take {
+                            let held = got.as_ref().is_ok_and(|h| node.may_act(h));
+                            if held {
+                                shared.lock().unwrap().moves.taken += 1;
+                            }
+                            if let Some(answer) = t.answer {
+                                *answer.lock().unwrap() = Some(held);
+                            }
+                        }
                         if let Ok(h) = got
                             && node.may_act(&h)
                         {
@@ -852,6 +1027,7 @@ struct Outcome {
     killed: Option<(u64, u32)>,
     /// Lease reads found behind and read again, over every process.
     behind: u64,
+    moves: Moves,
 }
 
 fn simulate(seed: u64, variant: Variant, duration: Duration) -> Outcome {
@@ -1073,6 +1249,7 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
         waits: s.waits.clone(),
         killed: s.killed_at.map(|at| (at, s.killed_node)),
         behind: s.behind.values().sum(),
+        moves: s.moves.clone(),
     }
 }
 
@@ -1184,6 +1361,78 @@ fn each_broken_variant_is_caught() {
             caught.is_some(),
             "{variant:?} was never caught in {} seeds",
             seeds()
+        );
+    }
+}
+
+/// Rebalance moves and cold takes (ADR 0040, section 14) as events, under
+/// the same faults: one holder at a time and one generation per hold, and
+/// the runs do move the actor, have take calls acquire it, and have cold
+/// takes both answered held and given up.
+#[test]
+fn rebalance_moves_and_cold_takes_keep_one_holder() {
+    let mut moves = Moves::default();
+    let mut acquired = 0;
+    let only = only_seed();
+    for seed in only.map_or(0..seeds(), |s| s..s + 1) {
+        let o = simulate(seed, Variant::Moves, Duration::from_secs(30));
+        if let Some(d) = double_ownership(&o.claims) {
+            panic!("seed {seed}: two owners with moves: {d:?}");
+        }
+        if let Some(pair) = shared_generation(&o.holds) {
+            panic!("seed {seed}: one generation, two holds with moves: {pair:?}");
+        }
+        acquired += o.acquired;
+        moves.moved += o.moves.moved;
+        moves.unreleased += o.moves.unreleased;
+        moves.taken += o.moves.taken;
+        moves.cold += o.moves.cold;
+        moves.cold_held += o.moves.cold_held;
+        moves.cold_fallback += o.moves.cold_fallback;
+    }
+    if only.is_some() {
+        return;
+    }
+    eprintln!(
+        "{} seeds with moves: {acquired} acquisitions, {moves:?}",
+        seeds()
+    );
+    let floor = (seeds() / 20).max(1);
+    assert!(acquired > seeds() * 5, "{acquired} acquisitions");
+    assert!(moves.moved >= floor * 5, "{} moves", moves.moved);
+    assert!(moves.taken >= floor, "{} takes acquired", moves.taken);
+    assert!(
+        moves.cold_held >= floor,
+        "{} cold takes held",
+        moves.cold_held
+    );
+    assert!(
+        moves.cold_fallback >= floor,
+        "{} cold takes given up",
+        moves.cold_fallback
+    );
+}
+
+/// A move whose owner acts after its release, and a target that takes a
+/// take call for a grant, are each caught on some seed.
+#[test]
+fn a_broken_move_or_take_is_caught() {
+    for variant in [Variant::MoveActsAfterRelease, Variant::TakeAsGrant] {
+        let caught = (0..seeds().max(200)).find_map(|seed| {
+            let o = simulate(seed, variant, Duration::from_secs(30));
+            if double_ownership(&o.claims).is_some() {
+                Some((seed, "two owners"))
+            } else if shared_generation(&o.holds).is_some() {
+                Some((seed, "one generation, two holds"))
+            } else {
+                None
+            }
+        });
+        eprintln!("{variant:?}: caught by {caught:?}");
+        assert!(
+            caught.is_some(),
+            "{variant:?} was never caught in {} seeds",
+            seeds().max(200)
         );
     }
 }

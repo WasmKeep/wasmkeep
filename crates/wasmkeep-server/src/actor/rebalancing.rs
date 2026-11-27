@@ -9,7 +9,8 @@
 //! period, per app on this node; paused while a node drains, a live node is
 //! not `serving`, or two minor versions run.
 //!
-//! While a move closes an actor's sockets, the actor is marked closing:
+//! While a move (this pass's, an operator's) or a drain's hand-over closes
+//! an actor's sockets, the actor is marked closing ([`State::mark_closing`]):
 //! an upgrade for it here is answered `503` with `Retry-After: 1`, so a
 //! client that reconnects at once (relayed back by a node that still names
 //! this one) does not reopen a socket the move must wait for. A move that
@@ -69,8 +70,9 @@ pub(super) struct State {
     /// The move jobs' attempt tokens, by a key of their own (never an
     /// operator's request key).
     active: super::moving::Active,
-    /// Actors whose sockets a rebalance move is closing.
-    closing: Mutex<HashSet<ActorAddress>>,
+    /// Actors whose sockets a move or a drain's hand-over is closing, each
+    /// with the number of marks held on it.
+    closing: Mutex<HashMap<ActorAddress, usize>>,
     /// Targets a move or a cold take failed on.
     targets: Mutex<HashMap<String, Backoff>>,
     /// Cold takes under way, one per actor.
@@ -92,6 +94,24 @@ impl Default for State {
             closing: Mutex::default(),
             targets: Mutex::default(),
             cold: Mutex::default(),
+        }
+    }
+}
+
+/// A held closing mark ([`State::mark_closing`]).
+pub(super) struct ClosingMark<'a> {
+    state: &'a State,
+    address: ActorAddress,
+}
+
+impl Drop for ClosingMark<'_> {
+    fn drop(&mut self) {
+        let mut closing = lock(&self.state.closing);
+        if let Some(n) = closing.get_mut(&self.address) {
+            *n -= 1;
+            if *n == 0 {
+                closing.remove(&self.address);
+            }
         }
     }
 }
@@ -127,9 +147,37 @@ impl State {
         (n != u64::MAX).then_some(n)
     }
 
-    /// Whether a rebalance move is closing `address`'s sockets now.
+    /// Whether a move or a drain's hand-over is closing `address`'s
+    /// sockets now.
     pub(super) fn closing(&self, address: &ActorAddress) -> bool {
-        lock(&self.closing).contains(address)
+        lock(&self.closing).contains_key(address)
+    }
+
+    /// Runs `open` (a socket's registration) unless `address` is marked
+    /// closing, under the mark's lock: a mark taken after it sees the
+    /// socket registered, so the move closes it.
+    pub(super) fn open_unless_closing<T>(
+        &self,
+        address: &ActorAddress,
+        open: impl FnOnce() -> Result<T, crate::websocket::OpenError>,
+    ) -> Result<T, crate::websocket::OpenError> {
+        let closing = lock(&self.closing);
+        if closing.contains_key(address) {
+            return Err(crate::websocket::OpenError::Moving);
+        }
+        open()
+    }
+
+    /// Marks `address` closing until the mark is dropped: a move's or a
+    /// drain's hand-over, from before it closes the sockets until its
+    /// release (a parked room's move: until its take), an early return or
+    /// a cancelled future included. Marks nest.
+    pub(super) fn mark_closing(&self, address: &ActorAddress) -> ClosingMark<'_> {
+        *lock(&self.closing).entry(address.clone()).or_insert(0) += 1;
+        ClosingMark {
+            state: self,
+            address: address.clone(),
+        }
     }
 
     /// Whether `target` is backed off after a failed move or cold take.
@@ -384,7 +432,8 @@ async fn move_home(
     }
     let sockets = u64::try_from(inner.sockets.of(address, None).len()).unwrap_or(u64::MAX);
     tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, sockets, parked, "rebalance: moving a spread actor to its home");
-    lock(&inner.rebalance.closing).insert(address.clone());
+    // The closing mark is held by the move itself (`move_parked`,
+    // `move_resident`).
     let (end, closed) = if parked {
         super::moving::move_parked(inner, cluster, awaiting, target, address).await
     } else {
@@ -408,7 +457,6 @@ async fn move_home(
         }
         ended
     };
-    lock(&inner.rebalance.closing).remove(address);
     let outcome = match end {
         MoveEnd::Moved => "moved",
         MoveEnd::Elsewhere => "taken_elsewhere",

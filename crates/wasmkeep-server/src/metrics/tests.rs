@@ -444,6 +444,7 @@ fn the_alert_rules_use_only_metrics_that_exist() {
         ("wasmkeep_admission_refused_total", "reason=\"overloaded\""),
         ("wasmkeep_admission_refused_total", "reason=\"wrong_app\""),
         ("wasmkeep_admission_refused_total", "reason=\"unavailable\""),
+        ("wasmkeep_admission_refused_total", "reason=\"moving\""),
     ] {
         assert!(
             page.lines()
