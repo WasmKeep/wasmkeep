@@ -425,6 +425,11 @@ struct Newest {
     /// record returned an older body, with no read returning this one (or
     /// one not older) since: `None` while it is confirmed.
     behind_since_ms: Option<u64>,
+    /// Since when (the reader's clock, ms) every answer about this lease
+    /// said it is gone (absent, or left out of a listing), with no body
+    /// read since: `None` while bodies are read. Once that lasts the unpin
+    /// window the entry is dropped ([`NewestReads::gone_at`]).
+    gone_since_ms: Option<u64>,
 }
 
 /// The newest body of each node's lease that a process has read, from any
@@ -536,6 +541,7 @@ impl NewestReads {
                 }
                 if !older_than(body, &held.body, window_ms) {
                     held.behind_since_ms = None;
+                    held.gone_since_ms = None;
                 }
             }
             None => {
@@ -544,6 +550,7 @@ impl NewestReads {
                     Newest {
                         body: body.clone(),
                         behind_since_ms: None,
+                        gone_since_ms: None,
                     },
                 );
             }
@@ -575,6 +582,7 @@ impl NewestReads {
                 Newest {
                     body: body.clone(),
                     behind_since_ms: None,
+                    gone_since_ms: None,
                 },
             );
             return false;
@@ -584,6 +592,7 @@ impl NewestReads {
                 held.body = body.clone();
             }
             held.behind_since_ms = None;
+            held.gone_since_ms = None;
             return false;
         }
         // The first behind read starts the window; a reader's clock that
@@ -627,6 +636,67 @@ impl NewestReads {
         if let Some(held) = self.lock().get_mut(node) {
             held.behind_since_ms = None;
         }
+    }
+
+    /// [`Self::absent`] at `now_ms` (this process's clock), from any read
+    /// that found node `node`'s lease gone: a judging read, or a heartbeat
+    /// round's read by key. The entry is dropped once every answer for the
+    /// unpin window (`config`'s ttl plus grace) said gone, with no body read
+    /// in between: a lease removed for good (`cluster forget`, or the live
+    /// nodes' removal of released leases) leaves nothing here. Until then
+    /// the stale bodies a replica serves around the delete stay behind.
+    /// After it, the node is one this process never read: a later first
+    /// read is judged as read, the limit the table already has for a first
+    /// read (ADR 0020, amendment on lease reads). Such a removal checked
+    /// that no ownership record names the node, and a process starting
+    /// again under the id writes its lease no sooner than ttl plus grace
+    /// after it found the key absent, so its records come after a body
+    /// its peers' listings show.
+    pub fn gone_at(&self, node: &str, now_ms: u64, config: &LeaseConfig) {
+        if self.fault == ReadFault::Off {
+            return;
+        }
+        let window = config.ttl_ms().saturating_add(config.grace_ms());
+        let mut newest = self.lock();
+        let Some(held) = newest.get_mut(node) else {
+            return;
+        };
+        if self.fault != ReadFault::AbsentKeepsWindow {
+            held.behind_since_ms = None;
+        }
+        // A clock that stepped back starts it again now.
+        let since = match held.gone_since_ms {
+            Some(since) if since <= now_ms => since,
+            _ => now_ms,
+        };
+        held.gone_since_ms = Some(since);
+        if now_ms - since >= window {
+            newest.remove(node);
+        }
+    }
+
+    /// A listing of every node lease made at `now_ms`: each node held here
+    /// that `listed` leaves out is gone ([`Self::gone_at`]).
+    pub fn listed(&self, listed: impl Fn(&str) -> bool, now_ms: u64, config: &LeaseConfig) {
+        let missing: Vec<String> = self
+            .lock()
+            .keys()
+            .filter(|node| !listed(node))
+            .cloned()
+            .collect();
+        for node in missing {
+            self.gone_at(&node, now_ms, config);
+        }
+    }
+
+    /// How many nodes it holds a body for.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether it holds no body.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
     }
 
     /// Reports that every read of one judgement of node `node` was behind.
@@ -1519,7 +1589,7 @@ impl<B: Bucket, C: Clock> Owners<B, C> {
                 return LeaseRead::Unknown;
             };
             let Some((body, _)) = read else {
-                self.reads.absent(node);
+                self.reads.gone_at(node, self.clock.now_ms(), &self.config);
                 return LeaseRead::Read(None);
             };
             let obj = NodeLeaseObject::decode(&body);
@@ -3204,6 +3274,48 @@ mod tests {
                 "{fault:?}"
             );
         }
+    }
+
+    /// A lease gone for the unpin window, every answer saying so, is
+    /// dropped from the table; a body read meanwhile (not an older one)
+    /// keeps it, and so does a listing that shows the node. Until the
+    /// window ends, stale bodies of the removed lease stay behind.
+    #[test]
+    fn a_lease_gone_for_the_window_is_dropped() {
+        let body = |at| NodeLeaseObject {
+            state: NodeState::Released,
+            instance: Some("k".into()),
+            written_at_ms: at,
+        };
+        let c = cfg();
+        let window = c.ttl_ms() + c.grace_ms();
+        let reads = NewestReads::new();
+        reads.observe("b", &body(10_000), &c);
+        reads.observe("keep", &body(10_000), &c);
+        reads.gone_at("b", 20_000, &c);
+        // An older body read meanwhile does not end the absence, and is
+        // still behind.
+        let older = NodeLeaseObject {
+            state: NodeState::Live,
+            ..body(9_000)
+        };
+        assert!(reads.behind("b", &older, 20_500, &c));
+        reads.gone_at("b", 20_000 + window - 1, &c);
+        assert!(reads.newest("b").is_some());
+        reads.gone_at("b", 20_000 + window, &c);
+        assert_eq!(reads.newest("b"), None);
+        assert_eq!(reads.len(), 1);
+        // The same body read again during the absence starts it again.
+        reads.listed(|n| n != "keep", 100_000, &c);
+        reads.observe("keep", &body(10_000), &c);
+        reads.listed(|n| n != "keep", 100_000 + window, &c);
+        assert!(reads.newest("keep").is_some());
+        reads.listed(|n| n != "keep", 100_000 + 2 * window, &c);
+        assert!(reads.is_empty());
+        // Remembering nothing, it drops nothing either.
+        let off = NewestReads::off();
+        off.gone_at("b", 0, &c);
+        assert!(off.is_empty());
     }
 
     /// A stale read of a predecessor's body never frees a record its

@@ -804,6 +804,34 @@ fn idle_compaction_is_a_process_switch_on_by_default() {
     assert!(!serve(&[]).unwrap().no_idle_compaction);
 }
 
+/// ADR 0020, amendment of 2026-11-27: `[process] lease-removal = false`
+/// keeps released node leases for every app of the process, as `serve
+/// --no-lease-removal` does; on by default, and a value that is not a
+/// boolean is refused.
+#[test]
+fn lease_removal_is_a_process_switch_on_by_default() {
+    let on = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert_eq!(on.process.lease_removal, None);
+    assert!(!through_file(&on).no_lease_removal);
+    let off = parse(
+        &format!(
+            "[process]\nlease-removal = false\n{LISTEN}{}",
+            app("acme/shop", "shop-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(off.process.lease_removal, Some(false));
+    assert!(through_file(&off).no_lease_removal);
+    let e = err(&format!(
+        "[process]\nlease-removal = 0\n{LISTEN}{}",
+        app("acme/shop", "shop-1", "")
+    ));
+    assert!(e.contains("lease-removal"), "{e}");
+    assert!(serve(&["--no-lease-removal"]).unwrap().no_lease_removal);
+    assert!(!serve(&[]).unwrap().no_lease_removal);
+}
+
 /// ADR 0041, section 9: `[process] placement = false` turns placement off
 /// for every app of the process, as `serve --no-placement` does; on by
 /// default, and a value that is not a boolean is refused.

@@ -99,6 +99,11 @@ pub struct Breaks {
     /// on lease reads): off (every body judged as read, the rule before),
     /// the read back judging as read, or an exhausted read judged anyway.
     pub read_fault: ReadFault,
+    /// The start check takes the mark of a lease's removal (`cluster
+    /// forget`, or the live nodes' removal of released leases) for an
+    /// object like any other: read twice unchanged, its first write
+    /// replaces it, and the removal's delete then removes that lease.
+    pub start_over_mark: bool,
 }
 
 /// How long the resolver waits for an unresolved acquire's unchanged record
@@ -236,7 +241,23 @@ impl<B: Bucket, C: Clock + Copy> LeaseNode<B, C> {
         let mut lease = NodeLease::new(buckets.lease, clock, &key, instance, cfg);
         lease.set_payload(payload);
         loop {
-            let expected = start_check(&buckets.peers, &clock, &key, &cfg, env).await;
+            let expected = match start_check(
+                &buckets.peers,
+                &clock,
+                &key,
+                &cfg,
+                env,
+                setup.breaks.start_over_mark,
+            )
+            .await
+            {
+                Checked::Write(expected) => expected,
+                // The server's start stops; a supervisor starts it again.
+                Checked::MarkStayed => {
+                    MARKS_STAYED.with(|m| m.set(m.get() + 1));
+                    continue;
+                }
+            };
             if lease.start(expected.as_ref()).await.is_ok() {
                 break;
             }
@@ -745,7 +766,9 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
             // raises the process's newest reads, and an absent one (or one
             // they cannot read) is a current answer.
             if matches!(read, Ok(None)) {
-                self.owners.reads().absent(&peer);
+                self.owners
+                    .reads()
+                    .gone_at(&peer, self.clock.now_ms(), &cfg);
             }
             let seen = read
                 .ok()
@@ -890,15 +913,66 @@ impl<B: Bucket, C: Clock + Copy> LeaseTask<B, C> {
     }
 }
 
+thread_local! {
+    /// Start checks that found a removal's mark still there after their
+    /// bound (a simulation runs on one thread): what [`take_marks_stayed`]
+    /// returns.
+    static MARKS_STAYED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The start checks that gave up on a mark that stayed, in this
+/// simulation so far, and a reset.
+pub fn take_marks_stayed() -> u64 {
+    MARKS_STAYED.with(|m| m.replace(0))
+}
+
+/// What a start check concluded.
+enum Checked {
+    /// Write the first lease over this version (`None`: create).
+    Write(Option<Version>),
+    /// A removal's mark stayed past the bound: this start stops.
+    MarkStayed,
+}
+
+/// Whether a read found a removal's mark.
+fn mark<E>(read: &Result<Option<(Vec<u8>, Version)>, E>) -> bool {
+    matches!(read, Ok(Some((body, _))) if wasmkeep_cluster::node_lease::forgotten(body).is_some())
+}
+
+/// The server's rule for a mark found by the start check (ADR 0043, the
+/// mark of `cluster forget`): nothing is judged; the key is read every
+/// half period until it is absent, then the whole check runs again. A
+/// mark still there four times ttl plus grace after it was first read
+/// stops the start.
+async fn wait_for_no_mark<B: Bucket>(
+    bucket: &B,
+    key: &str,
+    cfg: &LeaseConfig,
+    env: &impl Env,
+) -> bool {
+    let bound = (cfg.ttl_ms() + cfg.grace_ms()) * 4;
+    let started = env.global_ms();
+    loop {
+        env.sleep_ms(cfg.ttl_ms() / 2).await;
+        if matches!(bucket.get(key).await, Ok(None)) {
+            return true;
+        }
+        if env.global_ms() - started >= bound {
+            return false;
+        }
+    }
+}
+
 /// The start check (see [`LeaseNode::start`]): the version to condition the
-/// first write on, `None` to create the object.
+/// first write on (`None` to create the object), or a mark that stayed.
 async fn start_check<B: Bucket, C: Clock>(
     bucket: &B,
     clock: &C,
     key: &str,
     cfg: &LeaseConfig,
     env: &impl Env,
-) -> Option<Version> {
+    over_mark: bool,
+) -> Checked {
     let wait = cfg.ttl_ms() + cfg.grace_ms();
     let window = wasmkeep_cluster::node_lease::fence_window_ms(cfg);
     loop {
@@ -909,6 +983,12 @@ async fn start_check<B: Bucket, C: Clock>(
                 continue;
             }
         };
+        if !over_mark && mark(&Ok::<_, ()>(first.clone())) {
+            if !wait_for_no_mark(bucket, key, cfg, env).await {
+                return Checked::MarkStayed;
+            }
+            continue;
+        }
         let first_live = first
             .as_ref()
             .and_then(|(b, _)| NodeLeaseObject::decode(b))
@@ -916,6 +996,12 @@ async fn start_check<B: Bucket, C: Clock>(
             .and_then(|o| o.instance);
         env.sleep_ms(wait).await;
         let second = bucket.get(key).await;
+        if !over_mark && mark(&second) {
+            if !wait_for_no_mark(bucket, key, cfg, env).await {
+                return Checked::MarkStayed;
+            }
+            continue;
+        }
         // An operator's created fence, read first and unchanged: the first
         // write lands no earlier than its `written_at` plus twice the skew
         // on this clock (ADR 0020, amendment on lease reads). One written
@@ -932,17 +1018,19 @@ async fn start_check<B: Bucket, C: Clock>(
                 .saturating_add(window)
                 .saturating_sub(clock.now_ms());
             if left == 0 {
-                return Some(version.clone());
+                return Checked::Write(Some(version.clone()));
             }
             env.sleep_ms(left).await;
             if matches!(bucket.get(key).await, Ok(Some((again, _))) if &again == now) {
-                return Some(version.clone());
+                return Checked::Write(Some(version.clone()));
             }
             continue;
         }
         match (first, second) {
-            (None, Ok(None)) => return None,
-            (Some((was, _)), Ok(Some((now, version)))) if now == was => return Some(version),
+            (None, Ok(None)) => return Checked::Write(None),
+            (Some((was, _)), Ok(Some((now, version)))) if now == was => {
+                return Checked::Write(Some(version));
+            }
             // A fence or a release over the process first read: it lapsed
             // once its kept written_at is ttl plus grace old.
             (Some(_), Ok(Some((now, version)))) => {
@@ -955,7 +1043,7 @@ async fn start_check<B: Bucket, C: Clock>(
                     let left = stale.saturating_sub(clock.now_ms());
                     env.sleep_ms(left).await;
                     if matches!(bucket.get(key).await, Ok(Some((again, _))) if again == now) {
-                        return Some(version);
+                        return Checked::Write(Some(version));
                     }
                 }
             }

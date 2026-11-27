@@ -633,6 +633,7 @@ async fn run_node(
         release_before_stop: false,
         act_on_cell_only: false,
         read_fault: variant.read_fault(),
+        start_over_mark: false,
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());

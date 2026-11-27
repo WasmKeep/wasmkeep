@@ -1285,7 +1285,12 @@ The bucket adapter still has no conditional delete (`object_store`
    mark. A failed condition means the object changed: nothing is
    deleted, and the command says to run it again.
 3. **The rule for a node.** Only `forget` writes over a mark or deletes
-   it. A node's lease writes are all conditional, so none lands over a
+   it, and, since the amendment of ADR 0020 of 2026-11-27, the live
+   nodes' removal of released leases, which writes and deletes it the
+   same way
+   ([ADR 0020](0020-one-lease-per-node.md#amendment-of-2026-11-27-released-leases-removed-by-the-live-nodes)).
+   A live node also ends a mark older than ttl plus grace plus the skew,
+   as a second run of the command would. A node's lease writes are all conditional, so none lands over a
    mark by accident; the start check adds the rest. A node that reads
    the mark under its id, at the check's first read or at any later
    one, judges nothing, waits until the key is absent (a read every
@@ -1361,7 +1366,8 @@ Limits, kept as documented:
   lease a full ttl plus grace after it first read the key absent, later
   than the last delete sent. What is left is a single request that the
   network holds for longer than that after it was sent.
-- **Two `forget` of one node at once.** Each deletes the mark it read.
+- **Two `forget` of one node at once** (or two removers, of two apps
+  on one prefix, ending one mark that stayed). Each deletes the mark it read.
   If the first delete, a node's create and the second delete land in
   that order, the node's new lease is deleted: it stops at its next
   write and is started again. Availability only, and it needs two
@@ -1406,7 +1412,10 @@ node-lease simulation was run again over the changed module.
    of section 8 does not pass until it is.
 2. **The cost of `cluster status` and of the two new commands with many
    released node leases** (Context, 2): to measure, then bound or
-   document.
+   document. Since the amendment of ADR 0020 of 2026-11-27 the live nodes
+   remove released leases a day after their release, so they no longer
+   pile up on a finalized app with a live node; what else those commands
+   wait for is not settled here.
 3. *Settled by reading* (section 6): a serving `0.8.1` node of one app
    sends a forward with no proof while its cluster secret is not
    loaded, and when the client's address is unknown. The branch stays.

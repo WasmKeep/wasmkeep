@@ -67,6 +67,13 @@
   first; over TLS, the name on an unknown certificate is read by key; the
   hellos wait for a live peer of this app. No lease rule changes. See
   "Amendment of 2026-11-24: availability" at the end.
+- Amended 2026-11-27: released leases removed by the live nodes. The
+  lowest-id live node of an app removes its app's `released` node leases
+  a day after their release, through the mark of `cluster forget`, once
+  the app is finalized at 0.9; a mark a removal left behind is ended; the
+  newest-reads table drops a node gone for ttl plus grace. See
+  "Amendment of 2026-11-27:
+  released leases removed by the live nodes" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -1115,7 +1122,8 @@ not taken: every node would delete lease state, racing a process starting
 under that id (its start check reads that object) and each other, to save
 what is now nothing per period (rounds no longer read stopped nodes). An
 operator command, run when wanted, with the record check, is the
-conservative choice.
+conservative choice. (Superseded by the amendment of 2026-11-27: with the
+mark of 0.9 and one remover per app, the nodes remove them.)
 
 #### Tests (second part)
 
@@ -1632,3 +1640,154 @@ are.
 - `sim/tests/madsim_node_lease.rs`: the waiters' reads are per node, and a
   node whose read fails is passed to the watch as kept, as the server's
   rounds do. Before, any failed read left the whole round unlearnt.
+
+## Amendment of 2026-11-27: released leases removed by the live nodes
+
+A node id whose process stops cleanly leaves its lease `released`, and
+nothing removed it but `wasmkeep cluster forget`, run by an operator. A
+cluster whose nodes start under new ids (a scheduler that names each
+start, a test harness) piles them up, and every reader of `nodes/` reads
+them all: the heartbeat listing, `cluster status`, `cluster upgrade
+status` and `finalize`. A node id that is started again under the same id
+writes over its own released lease, so it leaves nothing behind.
+
+The second part of the amendment of 2026-11-20 rejected nodes removing
+those leases themselves: they would race a process starting under that id
+and each other. Two things changed. The removal is now safe against a
+start under that id: since 0.9 `cluster forget` replaces the lease with a
+mark by a write conditioned on the version it checked, then deletes the
+mark, and a starting node that reads the mark waits until the key is
+absent ([ADR 0043](0043-rolling-upgrades.md#the-mark-of-cluster-forget)).
+And two removers at once are safe through that same condition: the second
+one's write fails on the version the first one replaced. What is left to
+choose is who removes, and when.
+
+### The rule
+
+- **Who.** The lowest-id live node of each app that serves (not
+  draining, not suspected, its lease valid), as idle expiry chooses its
+  collector, among the nodes that run the removal: this node's minor
+  version or a later one, so an older node beside it is passed over. The
+  choice is each node's own view; two nodes that each take themselves for
+  the remover for a heartbeat period are safe, as said.
+- **When.** A round every ttl plus grace (15 s at the defaults). A round
+  lists the keys of `nodes/` (one LIST, keys and last-modified times, no
+  bodies) and reads only the keys it has not read at that time yet and
+  that were not written in the last ttl plus grace plus the skew (a live
+  lease is rewritten every few seconds), at most 64 per round. A key read
+  stays judged until a listing shows it written again. A round with
+  nothing to do is that one listing.
+- **What.** A `released` lease of the remover's app whose `written_at`
+  is older than the removal period (a day by default, and never less than
+  the window `cluster forget` waits, the heartbeat horizon plus ttl and
+  grace), oldest first, at most 16 per round. Each goes exactly as
+  `cluster forget` removes it, in its order: the lease read with its
+  version; the gate of the mark (`upgrade::forget_gate`: the app's floor
+  at 0.9 or later, and no live node of the app older than 0.9); no
+  ownership record of any app under the prefix naming the node, any
+  instance (one listing per tenant and app, one read per record, once per
+  round and only in a round with a lease to remove; a record that cannot
+  be read keeps every lease, a migration tombstone names nobody); then the
+  mark, `If-Match` on the version read, and its delete, given up after two
+  thirds of ttl plus grace. When the gate blocks, nothing is written: a
+  node never falls back to the read-twice-and-delete the command uses
+  before the finalize.
+- **A mark that stayed.** A mark dated more than ttl plus grace plus the
+  skew ago (16 s at the defaults), on the remover's clock, was left by a
+  removal that did not finish: a remover or a `cluster forget` that
+  stopped between its two requests, or whose delete was given up. The
+  remover deletes it, read right before the delete, as the command's
+  second run does. That age is past the bound after which the removal
+  that wrote it no longer sends its delete (10 s), and the skew covers a
+  writer whose clock was behind. A starting node gives up on a mark after
+  four times ttl plus grace (60 s): a remover that dies right after its
+  mark is replaced within a horizon, and the mark ended within a round
+  and the age, about 40 s at worst.
+- **The switch.** On by default. `serve --no-lease-removal`, or
+  `[process] lease-removal = false` in a node file, turns it off for every
+  app of the process; `cluster forget` then stays the way to remove them.
+  A node with it off still counts in the choice of the remover: set it the
+  same on every node.
+- **What a process reads.** The newest-reads table (amendment of
+  2026-11-24) drops a node's entry once every answer for ttl plus grace,
+  with no body read in between, said its lease is gone (absent to a read,
+  or left out of a listing). It was never pruned: an entry stayed for each
+  node id the process had ever read. Until then the stale bodies a replica
+  serves around the delete stay behind, as before. After it the node is
+  one the process never read, so a first read of a stale body is judged as
+  read: the limit the table already had for a first read. A removal
+  checked that no record names the node, and a process starting again
+  under the id writes its lease no sooner than ttl plus grace after it
+  found the key absent, so its records come after a body the listings
+  show.
+- Counted: `wasmkeep_node_lease_removals_total{outcome}` (`removed`,
+  `ended`, `changed`, `unfinished`, `named`, `blocked`, `failed`), and
+  logged.
+
+### Why it is safe
+
+The same argument as `cluster forget` after the finalize, made by a node:
+
+- No lease a node wrote is deleted. The mark is written only over the
+  version read; a process that wrote its lease first fails the condition.
+  One that reads the mark waits for the key to be absent, then runs its
+  whole check again and creates its lease over no object, ttl plus grace
+  after the first absent read: past the last delete any remover sends.
+- No actor is stranded. The released lease is what frees a record still
+  naming its node (section 3: an absent object frees nothing), so it stays
+  while any record names the node. No new record can name it after the
+  records were read: only its own process writes records naming it, and
+  that process released; a new process under the id replaces the lease
+  first, which fails the condition.
+- No node of 0.8.1 is exposed. It does not know the mark; the gate keeps
+  the removal until the app's floor is at 0.9 and no older node of the app
+  is live.
+
+### Limits, kept as documented
+
+- **Two removers ending one mark.** A mark names no app, so the removers
+  of two apps on one prefix may both end a mark that stayed. If one's
+  delete lands, a node starts under that id and the other's delete lands
+  after that node's create, the new lease is deleted: it stops at its
+  next write and is started again. Each delete is given up after 10 s and
+  the create comes no sooner than 15 s after the key was found absent, so
+  this needs a request the network holds for longer than that, the limit
+  `cluster forget` already has.
+- **Only where a node runs.** An app with no live node, or whose upgrade
+  to 0.9 is not finalized, has no remover: its released leases stay until
+  it has one, or until `cluster forget`.
+- **The cost of the record check.** A round with a lease to remove reads
+  every ownership record under the prefix once. At most once a round, and
+  only while leases older than the period are there: on a large app with
+  frequent new ids, a round every 15 s with one removal each is the worst
+  case. Turn the removal off and run `cluster forget` at a quieter time if
+  that matters.
+- **A mark dated ahead** of the remover's clock waits until that clock
+  passes its date plus the age.
+
+### Tests
+
+- `lease_removal::tests`: a released lease removed only after the
+  finalize and only past the period (`an_old_released_lease_is_removed_after_the_finalize`),
+  a live older node blocking it (`a_live_older_node_blocks_the_removal`),
+  records naming the node, an unreadable one, a tombstone
+  (`a_record_naming_the_node_keeps_its_lease`), a mark that stayed ended
+  and a young one left (`a_mark_that_stayed_is_ended_and_a_young_one_is_left`),
+  the bounds per round (`a_round_is_bounded`,
+  `keys_are_read_once_and_a_bounded_number_per_round`) and the command's
+  window (`never_younger_than_the_window_of_cluster_forget`).
+- `node_lease::tests::a_lease_gone_for_the_window_is_dropped`.
+- `tests/cluster/upgrade.rs`:
+  `released_leases_are_removed_by_the_live_nodes_after_the_finalize`
+  (a node stopped cleanly, its lease removed by the other, a mark left
+  behind ended, the node started again under its id over no object).
+- `sim/tests/madsim_lease_removal.rs`: one node id stopping and starting
+  again over and over beside removers, one of which now and then dies
+  right after its mark landed, now and then two at once, slow requests
+  and late replies. No lease a node wrote is deleted, a lease whose node
+  a record names stays, and no mark is left once a remover runs alone. The
+  start check of the simulations' node now follows the server's rule for
+  a mark. Broken, each is caught: the delete without the mark, a start
+  check that takes the mark for an object, no read of the records, marks
+  never ended.
+

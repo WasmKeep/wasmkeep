@@ -525,3 +525,90 @@ async fn a_node_forgotten_after_the_finalize_starts_again_with_its_lease() {
         Err(upgrade::Blocked::OlderNodes { .. })
     ));
 }
+
+/// The live nodes remove released node leases themselves (ADR 0020,
+/// amendment of 2026-11-27), through the mark of `cluster forget`, once
+/// the app is finalized at 0.9: `a` stops cleanly, and `b`, now the app's
+/// lowest-id live node, removes its lease once it is older than the
+/// removal period (here the least, the window of `cluster forget`). A
+/// mark a removal left behind (its remover stopped between its two
+/// requests) is deleted once it is old enough. `a` then starts again
+/// under its id, over no object, and keeps its new lease: a live lease is
+/// never removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn released_leases_are_removed_by_the_live_nodes_after_the_finalize() {
+    use wasmkeep_cluster::control::Keys as _;
+    use wasmkeep_cluster::lease::Bucket as _;
+    use wasmkeep_cluster::node_lease::encode_forgotten;
+    let minor = upgrade::this_minor()
+        .unwrap()
+        .max(floor::Minor { major: 0, minor: 9 });
+    let version = format!("{minor}.0");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let bucket = ObjectStoreBucket::new(Arc::clone(&store), "");
+    let start = async |id: &str, dir: &Path| {
+        let version = version.clone();
+        node_configured(
+            id,
+            dir,
+            &store,
+            Duration::from_secs(60),
+            &["counter"],
+            counter_wasm(),
+            Duration::from_secs(30),
+            "",
+            |config| {
+                let cluster = config.cluster.as_mut().unwrap();
+                cluster.version = Some(version);
+                cluster.lease_removal = Some(Duration::from_millis(1));
+                cluster.lease_removal_every = Some(Duration::from_millis(200));
+            },
+        )
+        .await
+    };
+    let gone_within = async |key: &str, limit: Duration| {
+        let until = std::time::Instant::now() + limit;
+        while bucket.get(key).await.unwrap().is_some() {
+            assert!(std::time::Instant::now() < until, "{key} still there");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = start("a", da.path()).await;
+    a.service.node_id_checked().await.unwrap();
+    let b = start("b", db.path()).await;
+    b.service.node_id_checked().await.unwrap();
+    settle().await;
+    let r = send(a.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"));
+    a.service.shutdown(Duration::from_secs(2)).await;
+    stop_listening(a).await;
+    let (released, _) = bucket.get("nodes/a").await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&released).contains("\nreleased "));
+    // The mark of a removal that stopped half-way, under another id.
+    bucket
+        .put_body("nodes/c", encode_forgotten(now_ms() - 5_000))
+        .await
+        .unwrap();
+    gone_within("nodes/a", Duration::from_secs(15)).await;
+    gone_within("nodes/c", Duration::from_secs(15)).await;
+    let r = send(b.addr, "POST", "/actor/counter/bob", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "1"));
+
+    // `a` starts again over no object, and serves its actor.
+    let again = start("a", da.path()).await;
+    again.service.node_id_checked().await.unwrap();
+    settle().await;
+    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "2"));
+    // Past several rounds and the period: its live lease stays.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (live, _) = bucket.get("nodes/a").await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&live).starts_with("wasmkeep-node 3\nlive "),
+        "{}",
+        String::from_utf8_lossy(&live)
+    );
+    let r = send(again.addr, "POST", "/actor/counter/alice", "").await;
+    assert_eq!((r.status, r.body.trim()), (200, "3"));
+}
