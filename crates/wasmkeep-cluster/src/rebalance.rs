@@ -294,7 +294,7 @@ pub fn decide<'a>(
 
 /// ADR 0041, section 4's candidate conditions: a fresh load with both room
 /// fields, resident room above 0, socket fill below 800.
-fn has_room(load: Option<RoomLoad>) -> bool {
+pub fn has_room(load: Option<RoomLoad>) -> bool {
     let Some(l) = load else {
         return false;
     };

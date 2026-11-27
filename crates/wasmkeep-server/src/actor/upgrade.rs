@@ -136,26 +136,51 @@ impl ActorService {
             return None;
         }
         let home = cluster.spread_home(address)?;
-        if !cluster.can_take(&home) {
+        // A home that cannot take it now: not answering take calls, a take
+        // that failed a moment ago (backed off, doubling), or no room by
+        // ADR 0041's candidate conditions.
+        let room = cluster
+            .rebalance_peers()
+            .into_iter()
+            .find(|p| p.node == home)
+            .and_then(|p| p.load);
+        if !cluster.can_take(&home)
+            || self.inner.rebalance.target_backed_off(&home)
+            || !wasmkeep_cluster::rebalance::has_room(room)
+        {
             return None;
         }
-        let app = &self.inner.app_labels;
-        match cluster.take(&home, address).await {
-            crate::cluster::TakeAnswer::Held => {
-                crate::metrics::placement_spread(app, "home");
-                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, "socket: its home took the spread actor");
-                Some(home)
-            }
-            crate::cluster::TakeAnswer::HeldBy(holder) if holder != cluster.node_id => {
-                crate::metrics::placement_spread(app, "home");
-                Some(holder)
-            }
-            answer => {
-                crate::metrics::placement_spread(app, "home_failed");
-                tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, ?answer, "socket: its home did not take the spread actor; woken here");
-                None
-            }
-        }
+        // One take per actor: the sockets reconnecting to one cold edge
+        // at once wait for the first one's answer.
+        let inner = Arc::clone(&self.inner);
+        self.inner
+            .rebalance
+            .cold_take(address, async move {
+                let app = &inner.app_labels;
+                let horizon = Duration::from_millis(cluster.heartbeat_horizon());
+                match cluster.take(&home, address).await {
+                    crate::cluster::TakeAnswer::Held => {
+                        crate::metrics::placement_spread(app, "home");
+                        inner.rebalance.target_took(&home);
+                        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, "socket: its home took the spread actor");
+                        Some(home)
+                    }
+                    crate::cluster::TakeAnswer::HeldBy(holder) if holder != cluster.node_id => {
+                        crate::metrics::placement_spread(app, "home");
+                        Some(holder)
+                    }
+                    answer => {
+                        crate::metrics::placement_spread(app, "home_failed");
+                        if matches!(answer, crate::cluster::TakeAnswer::Failed(_)) {
+                            inner.rebalance.target_failed(&home, horizon);
+                            cluster.suspect(&home);
+                        }
+                        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, ?answer, "socket: its home did not take the spread actor; woken here");
+                        None
+                    }
+                }
+            })
+            .await
     }
 
     /// Opens a socket on `class/name` for `opener`, here or on its owner.
@@ -174,6 +199,18 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        // A rebalance move is closing this actor's sockets here (ADR 0040,
+        // section 14): a client reconnecting at once, perhaps relayed back
+        // by a node that still names this one, tries again in a second
+        // instead of reopening a socket the move waits for.
+        if self.inner.rebalance.closing(&address) {
+            let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor moving; reconnect\n");
+            r.headers_mut().insert(
+                hyper::header::RETRY_AFTER,
+                hyper::header::HeaderValue::from_static("1"),
+            );
+            return r;
+        }
         // Only a validated replacement closes this gate. Merely discovering
         // or checking a restore request must leave upgrade admission alone.
         if self

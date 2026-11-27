@@ -701,3 +701,231 @@ async fn an_operators_move_off_home_is_undone_after_the_stay() {
     );
     drop((a, b, c));
 }
+
+/// A pseudo-random delay in [0, 2 s), as ADR 0040's reconnecting client
+/// draws its first one (rule 5), from `seed` and the attempt.
+fn jitter(seed: u64, attempt: u64) -> Duration {
+    let mut z = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(attempt.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    z = (z ^ (z >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    Duration::from_millis(z % 2000)
+}
+
+/// A client of `edge/<name>` through `addr` that waits a random [0, 2 s)
+/// before every connection, the first included, and after every close or
+/// refused upgrade; `connected` counts the clients connected now. Its
+/// answer: how many times it was closed with 1012.
+fn crowd_client(
+    addr: SocketAddr,
+    name: String,
+    seed: u64,
+    connected: Arc<AtomicUsize>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let mut stop = stop;
+        let (mut closes, mut attempt) = (0, 0);
+        let url = format!("ws://{addr}/actor/edge/{name}");
+        loop {
+            attempt += 1;
+            tokio::time::sleep(jitter(seed, attempt)).await;
+            if *stop.borrow() {
+                return closes;
+            }
+            let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&url).await else {
+                continue;
+            };
+            connected.fetch_add(1, Ordering::SeqCst);
+            let stopped = loop {
+                tokio::select! {
+                    _ = stop.changed() => break true,
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Close(frame))) => {
+                            if frame.is_some_and(|f| u16::from(f.code) == 1012) {
+                                closes += 1;
+                            }
+                            while let Some(Ok(_)) = ws.next().await {}
+                            break false;
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break false,
+                    },
+                }
+            };
+            drop(ws);
+            connected.fetch_sub(1, Ordering::SeqCst);
+            if stopped {
+                return closes;
+            }
+        }
+    })
+}
+
+const BUSY: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="busy"}"#;
+
+/// An edge away from its home with 30 clients, connected through another
+/// node and reconnecting after a random [0, 2 s) wait (ADR 0040, section
+/// 7, rule 5), is moved home while they come back: an upgrade that reaches
+/// its old node while the move closes its sockets is refused with `503`
+/// and tried again, so the move is not held up by sockets reopening behind
+/// it. It ends home, every client connected again, each closed with 1012
+/// at most twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crowded_edge_moves_home_while_its_clients_reconnect_at_once() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // Its home is not a target for 6 s: the clients connect first.
+    let [a, b, c] = three(&store, &dirs, |_, config| {
+        let cluster = config.cluster.as_mut().unwrap();
+        cluster.rebalance_settings = Some(wasmkeep_cluster::rebalance::Settings {
+            settle: Duration::from_secs(6),
+            ..wasmkeep_cluster::rebalance::Settings::for_period(cluster.heartbeat)
+        });
+    })
+    .await;
+    let edge = edge_on("b", &[]);
+    let path = format!("/actor/edge/{edge}/durable");
+    let r = send_reachable(c.addr, "POST", &path, "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("c")),
+        "{}",
+        r.body
+    );
+    let (moved, busy) = (metric(MOVED), metric(BUSY));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let clients: Vec<_> = (0..30)
+        .map(|k| {
+            crowd_client(
+                a.addr,
+                edge.clone(),
+                k,
+                Arc::clone(&connected),
+                stop_rx.clone(),
+            )
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while holder(&store, "edge", &edge).await.as_deref() != Some("b") {
+        assert!(std::time::Instant::now() < deadline, "never moved home");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while connected.load(Ordering::SeqCst) < 30 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of 30 clients connected again",
+            connected.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(metric(MOVED) > moved, "moved by the rebalance");
+    assert!(
+        metric(BUSY) - busy <= 1,
+        "the move was held up by reopened sockets {} times",
+        metric(BUSY) - busy
+    );
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("b"));
+    stop_tx.send(true).unwrap();
+    for client in clients {
+        let closes = client.await.unwrap();
+        assert!(closes <= 2, "closed {closes} times with 1012");
+    }
+    drop((a, b, c));
+}
+
+/// An edge away from its home that hibernated with a socket open keeps its
+/// record parked on its node (ADR 0024); the pass moves it as a parked
+/// room: the record released, the socket closed with 1012, the home taking
+/// it. The client reconnects, through the old node, to the home.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_edge_with_a_socket_moves_home() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // c's residents hibernate soon after their last event, and the home
+    // is not a target for 4 s: the edge parks on c first.
+    let [a, b, c] = three(&store, &dirs, |id, config| {
+        if id == "c" {
+            config.mailbox.idle_timeout = Duration::from_millis(200);
+        }
+        let cluster = config.cluster.as_mut().unwrap();
+        cluster.rebalance_settings = Some(wasmkeep_cluster::rebalance::Settings {
+            settle: Duration::from_secs(4),
+            ..wasmkeep_cluster::rebalance::Settings::for_period(cluster.heartbeat)
+        });
+    })
+    .await;
+    let edge = edge_on("b", &[]);
+    let path = format!("/actor/edge/{edge}/durable");
+    let r = send_reachable(c.addr, "POST", &path, "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("c")),
+        "{}",
+        r.body
+    );
+    // A socket on c, where it is held (relayed upgrades included).
+    let url = format!("ws://{}/actor/edge/{edge}", c.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let parked_moves = {
+        let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+        page.lines()
+            .find_map(|l| {
+                l.strip_prefix(r#"wasmkeep_websocket_owner_closes_total{reason="move"}"#)?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    let closed = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Close(frame) = msg {
+                return frame.map(|f| u16::from(f.code));
+            }
+        }
+        None
+    })
+    .await
+    .expect("closed by the move in time");
+    assert_eq!(closed, Some(1012));
+    // The sockets close before the take: it lands a moment later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while holder(&store, "edge", &edge).await.as_deref() != Some("b") {
+        assert!(std::time::Instant::now() < deadline, "never taken home");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let after = {
+        let page = wasmkeep_server::metrics::render(wasmkeep_server::metrics::Gauges::default());
+        page.lines()
+            .find_map(|l| {
+                l.strip_prefix(r#"wasmkeep_websocket_owner_closes_total{reason="move"}"#)?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    assert!(after > parked_moves, "closed as a parked room's move");
+    // Reconnected through c, it reaches the edge on b.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws.send(Message::text("back")).await.unwrap();
+    let echoed = loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => break t.to_string(),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no echo: {other:?}"),
+        }
+    };
+    assert_eq!(echoed, "back");
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("b"));
+    drop((a, b, c, ws));
+}

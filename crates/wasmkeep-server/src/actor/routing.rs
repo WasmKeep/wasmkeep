@@ -131,6 +131,14 @@ impl ServiceInner {
                 .is_some_and(|c| c.spread)
     }
 
+    /// Whether this node is `address`'s home in its own view: a spread
+    /// class, rebalancing on, and the rendezvous choice this node.
+    pub(super) fn is_home_here(&self, address: &ActorAddress) -> bool {
+        self.cluster
+            .as_ref()
+            .is_some_and(|c| self.goes_home(c, address) && c.spread_home(address).is_none())
+    }
+
     /// Whether this node holds an actor `address` is kept apart from (ADR
     /// 0041, amendment of 2026-11-22), by the class it takes now: from
     /// memory, no read.
