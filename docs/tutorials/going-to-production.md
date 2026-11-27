@@ -384,7 +384,8 @@ Two kinds, with different rules:
   and the GitHub release, says whether its upgrade is rolling (one node
   at a time) or stops the cluster. From 0.8.1 to 0.9.0 rolling is
   supported and safe for data, and stopping every node is recommended
-  ([Upgrade a cluster to 0.9.0](../deploy/upgrading-to-0.9.md)). Every
+  ([Upgrade a cluster to 0.9.0](../deploy/upgrading-to-0.9.md); for 0.9.x to
+  0.10.0, [Upgrade a cluster to 0.10.0](../deploy/upgrading-to-0.10.md)). Every
   upgrade before that stops the cluster: stop
   every node, wait until `cluster status` exits with 1, install the new
   binary everywhere, start them all

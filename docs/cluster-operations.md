@@ -353,6 +353,32 @@ stopped nodes stay, and `wasmkeep_node_lease_removals_total{outcome="blocked"}`
 rises on the node that would remove them. `cluster forget` is still the
 way for an app with no live node, or with `--no-lease-removal`.
 
+## After an upgrade
+
+When every node runs the new version, check these, in this order. The
+release's upgrading page says which apply
+([0.10.0](deploy/upgrading-to-0.10.md)).
+
+- **Finalize.** `wasmkeep cluster upgrade status` shows `finalize
+  pending`; run `wasmkeep cluster upgrade finalize --yes`. Leases and
+  markers below wait for it.
+- **Leases.** Released node leases are removed by the live nodes a day
+  after their release, once the app is finalized at 0.9 or later. Until
+  then they stay, and `wasmkeep_node_lease_removals_total{outcome="blocked"}`
+  rises. For an app with no live node, or with `--no-lease-removal`, run
+  `wasmkeep cluster forget <node>` ([above](#fencing-and-forgetting-a-node)).
+- **Markers.** From 0.10, after the finalize, run `wasmkeep cluster
+  markers clean --app TENANT/APP --yes`, then `wasmkeep cluster verify`:
+  `lease markers left: 0`, and the generation floor `markers none`
+  ([removing them](#removing-the-per-actor-lease-markers)).
+- **Edges.** `cluster status` shows `REBALANCE` `paused (mixed versions)`
+  until the last node runs the new version, then `rebalancing`, then
+  `balanced`.
+- **Idle histories.** An actor released by a node that then restarted
+  keeps its uncompacted history until it next writes and rests for a
+  window ([history in the bucket](cluster.md#history-in-the-bucket)); nothing
+  to run.
+
 ## Draining a node
 
 To take a node out of service without stopping it first (to replace the

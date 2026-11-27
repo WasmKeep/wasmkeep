@@ -14,14 +14,20 @@ side projects and staging.
 `0.10.0`: **a cluster that looks after itself between upgrades.**
 `0.9.0` made an upgrade rolling (what it brings is under [Built](#built);
 the limits known at release are in the [changelog](CHANGELOG.md) and on
-its [upgrading page](docs/deploy/upgrading-to-0.9.md)).
+its [upgrading page](docs/deploy/upgrading-to-0.9.md)). What `0.10.0`
+adds is built and described on its
+[upgrading page](docs/deploy/upgrading-to-0.10.md); what is left before
+the release is below.
 
-1. **Less left behind** (L): the leases of stopped nodes removed without
-   an operator, an idle actor's history compacted even when its node
-   restarted, and one bucket write less when an actor is first created.
+1. **Less left behind**: built are released node leases removed by the
+   live nodes, and no per-actor lease marker written once an app's
+   floor is 0.10 (one bucket write less when an actor is first created).
+   Left: an idle actor's history compacted even when its node restarted.
 2. **The second rolling upgrade** (M): `0.9` to `0.10` one node at a
-   time, proved as the first was, with a room's edges rebalanced after a
-   node rejoins, so that the latency goal is met after the upgrade.
+   time. Built is a room's edges rebalanced after a node rejoins, so
+   that a rolling upgrade does not leave the last node with few edges;
+   left is proving that the latency goal is met after the upgrade, as
+   was done for the first.
 3. **A measured envelope** (M): what three small nodes and a real bucket
    carry, as one table with its workload and limits.
 4. **A write acknowledged once another node holds it**: measured and
@@ -29,7 +35,9 @@ its [upgrading page](docs/deploy/upgrading-to-0.9.md)).
 
 ## Next
 
-After 0.10.0, the items below, not before it.
+After 0.10.0, the items below, not before it. `0.10.0` itself is closed
+by the measured envelope and the second rolling upgrade's proof (items 2
+and 3 above); nothing new is added to it.
 
 ## After that
 
@@ -357,6 +365,19 @@ Started alongside M3; what is left of it is under [Now](#now) and
   ([how](docs/cluster-operations.md#verifying-a-bucket)); optional traces
   over OTLP ([ADR 0044](docs/adr/0044-traces.md)); and `wasmkeep cluster
   migrate` removed, with `0.8.1` the last version that carries it
+  ([changelog](CHANGELOG.md)).
+- In `0.10.0` (not yet released), a cluster that cleans up after
+  itself: released node leases removed by the live nodes a day after
+  their release ([ADR 0020](docs/adr/0020-one-lease-per-node.md),
+  amendment of 2026-11-27); a generation floor per restored app, with no
+  per-actor lease marker written and `wasmkeep cluster markers clean`
+  ([ADR 0045](docs/adr/0045-the-generation-floor-of-a-restored-app.md)); and a big
+  room's edges returned to their home node after a node rejoins
+  ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home),
+  [upgrading](docs/deploy/upgrading-to-0.10.md)). Also a lease renewal
+  that no longer runs a node's lease out, `cluster status` and
+  `cluster upgrade status` reading concurrently, and fixes to
+  `actor move` and `cluster drain --process`
   ([changelog](CHANGELOG.md)).
 
 ## Stretch goal: the benchmark showdown

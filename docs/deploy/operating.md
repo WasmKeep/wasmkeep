@@ -17,7 +17,7 @@ that stopped half-way is
 ## 1. An upgrade, from 0.8.1 to 0.9.0
 
 [Upgrade a cluster to 0.9.0](upgrading-to-0.9.md) is the rule for this
-pair, with what must be true before you start. This is one pass through
+pair (the next one, [0.9 to 0.10](upgrading-to-0.10.md), follows the same steps), with what must be true before you start. This is one pass through
 its rolling way, one node at a time. For 0.9.0 the recommended way is to
 stop every node and start them all on 0.9.0, then finalize as below: a
 rolling upgrade is safe for data but, under load, not yet proven to meet

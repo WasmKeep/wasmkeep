@@ -211,7 +211,8 @@ it exits with 1 if no node is live. See
   upgrading page first. From 0.8.1 to 0.9.0, stop every node and start
   them all on 0.9.0 (recommended), or upgrade one node at a time
   (supported and safe for data), then finalize
-  ([upgrading to 0.9.0](upgrading-to-0.9.md)). For any other pair of
+  ([upgrading to 0.9.0](upgrading-to-0.9.md)); from 0.9.x to 0.10.0, see
+  [upgrading to 0.10.0](upgrading-to-0.10.md). For any other pair of
   versions, upgrade every node together, not one at a time.
   `systemctl stop wasmkeep` on all three, wait
   until `wasmkeep cluster status --bucket s3://acme-wasmkeep/prod` exits

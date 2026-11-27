@@ -854,7 +854,8 @@ from 0.8.1 to 0.9.0 the recommended way is to stop every node and start
 them all on 0.9.0, then finalize; one node at a time is supported and
 safe for data, but under load it is not yet proven to meet the latency
 goal and leaves a big room's edges unbalanced until 0.10.0
-([upgrading to 0.9.0](deploy/upgrading-to-0.9.md#measured)); between
+([upgrading to 0.9.0](deploy/upgrading-to-0.9.md#measured)); 0.10.0 moves them
+back ([upgrading to 0.10.0](deploy/upgrading-to-0.10.md)); between
 any other pair of versions, stop every node, upgrade them all and start
 them all, unless that release's upgrading page says otherwise.
 
