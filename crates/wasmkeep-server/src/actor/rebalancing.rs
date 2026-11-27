@@ -169,8 +169,9 @@ impl State {
     }
 
     /// Marks `address` closing until the mark is dropped: a move's or a
-    /// drain's hand-over, from before it closes the sockets until it ends
-    /// (an early return or a cancelled future included). Marks nest.
+    /// drain's hand-over, from before it closes the sockets until its
+    /// release (a parked room's move: until its take), an early return or
+    /// a cancelled future included. Marks nest.
     pub(super) fn mark_closing(&self, address: &ActorAddress) -> ClosingMark<'_> {
         *lock(&self.closing).entry(address.clone()).or_insert(0) += 1;
         ClosingMark {

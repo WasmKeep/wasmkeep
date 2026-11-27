@@ -1067,10 +1067,10 @@ async fn a_drain_hands_over_crowded_edges_whose_clients_reconnect_at_once() {
 /// b within 15 s, every client is connected again and each was closed with
 /// 1012 at most twice. Rebalancing is off, so b keeps them.
 ///
-/// The clients go through the target: through a third node, one of them
-/// may wake the edge there between c's release and b's take (ADR 0017: the
-/// move is then moot, and a moves it on only if it still sees the
-/// request).
+/// The clients go through the target: between c's release and b's take,
+/// an event landing on another node wakes the actor there (ADR 0017: the
+/// move is then moot), and that node moves it on only if it still sees
+/// the request.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operators_move_of_crowded_edges_whose_clients_reconnect_at_once() {
     for (case, delay) in CROWDS {

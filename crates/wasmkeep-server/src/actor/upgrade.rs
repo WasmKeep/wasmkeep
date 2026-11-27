@@ -565,6 +565,7 @@ impl ActorService {
 /// `503`, `Retry-After: 1`: a move or a drain's hand-over is closing the
 /// actor's sockets here.
 fn moving_response() -> Response<HyperOutgoingBody> {
+    crate::metrics::refused(crate::metrics::Refusal::Moving);
     let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor moving; reconnect\n");
     r.headers_mut().insert(
         hyper::header::RETRY_AFTER,

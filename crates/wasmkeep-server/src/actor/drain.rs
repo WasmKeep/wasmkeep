@@ -292,26 +292,16 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
 /// mailbox, then its alarm to the peer. An alarm whose hand-off failed
 /// stays in this node's timer, for the next pass.
 async fn hand_over_one(inner: Arc<ServiceInner>, cluster: Arc<Cluster>, address: ActorAddress) {
-    // Marked closing until the hand-over ends, as a move is: a client
+    // Marked closing until the hand-over job ends, as a move is: a client
     // reconnecting at once, relayed back here by a node that still names
     // this one, is refused with `503`, `Retry-After: 1`, instead of
     // reopening a socket the hand-over job would find (and the drain
-    // waiting a pass for it, again and again).
-    let _closing = inner.rebalance.mark_closing(&address);
+    // waiting a pass for it, again and again). Once released, upgrades
+    // here go to the chosen peer.
+    let closing = inner.rebalance.mark_closing(&address);
     // Sockets close first, so their close events run here, each with its
     // upload, before the lease goes. The job checks again.
-    let open = inner.sockets.of(&address, None);
-    if !open.is_empty() {
-        for conn in open {
-            inner
-                .sockets
-                .close(&address, conn, 1012, "actor moving; reconnect".into());
-        }
-        let started = tokio::time::Instant::now();
-        while inner.sockets.reserved_by(&address) > 0 && started.elapsed() < SOCKETS_CLOSE_WAIT {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
+    moving::close_sockets_and_wait(&inner, &address, SOCKETS_CLOSE_WAIT).await;
     // Only to a mailbox that is still here: never creates one.
     let job = inner
         .mailboxes
@@ -323,6 +313,7 @@ async fn hand_over_one(inner: Arc<ServiceInner>, cluster: Arc<Cluster>, address:
         // Busy past the wait, or the mailbox went away.
         Ok(Err(_)) | Err(_) => return,
     };
+    drop(closing);
     match outcome {
         HandOver::Done { alarm } => {
             inner.mailboxes.hibernate(&address);

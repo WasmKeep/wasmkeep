@@ -689,6 +689,32 @@ async fn look_at_awaiting(inner: &ServiceInner, cluster: &Cluster, awaiting: &Aw
     .await;
 }
 
+/// Closes `address`'s sockets with 1012 and waits, up to `wait`, until
+/// none is left reserved, closing each tick the ones accepted since: a
+/// socket registered just before the closing mark is still pending when
+/// the first ones close (not listed yet), and is closed once it is
+/// accepted. How many it closed.
+pub(super) async fn close_sockets_and_wait(
+    inner: &ServiceInner,
+    address: &ActorAddress,
+    wait: Duration,
+) -> u64 {
+    let mut closed = 0u64;
+    let started = tokio::time::Instant::now();
+    loop {
+        for conn in inner.sockets.of(address, None) {
+            inner
+                .sockets
+                .close(address, conn, 1012, "actor moving; reconnect".into());
+            closed = closed.saturating_add(1);
+        }
+        if inner.sockets.reserved_by(address) == 0 || started.elapsed() >= wait {
+            return closed;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The owner's side of a move. Whether the request is finished (done, or
 /// another node won); `false` keeps it for a later pass.
 pub(super) async fn move_resident(
@@ -700,25 +726,14 @@ pub(super) async fn move_resident(
     address: &ActorAddress,
     token: u64,
 ) -> (MoveEnd, u64) {
-    // Marked closing until the move ends (ADR 0040, section 14): a client
+    // Marked closing until the release (ADR 0040, section 14): a client
     // reconnecting at once, perhaps relayed back by a node that still names
     // this one, is refused with `503`, `Retry-After: 1`, instead of
-    // reopening a socket the move job would find.
-    let _closing = inner.rebalance.mark_closing(address);
+    // reopening a socket the move job would find. Once released, the move
+    // is recorded and upgrades here are relayed to the target.
+    let closing = inner.rebalance.mark_closing(address);
     // Sockets first: their close events run here, with the lease.
-    let open = inner.sockets.of(address, None);
-    let closed = u64::try_from(open.len()).unwrap_or(u64::MAX);
-    if !open.is_empty() {
-        for conn in open {
-            inner
-                .sockets
-                .close(address, conn, 1012, "actor moving; reconnect".into());
-        }
-        let started = tokio::time::Instant::now();
-        while inner.sockets.reserved_by(address) > 0 && started.elapsed() < SOCKETS_CLOSE_WAIT {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
+    let closed = close_sockets_and_wait(inner, address, SOCKETS_CLOSE_WAIT).await;
     let (to, active_job) = (target.to_owned(), Arc::clone(active));
     let job = inner
         .mailboxes
@@ -732,6 +747,7 @@ pub(super) async fn move_resident(
         // later, does nothing.
         Ok(Err(_)) | Err(_) => return (MoveEnd::Busy, closed),
     };
+    drop(closing);
     let alarm = match outcome {
         MoveOut::Released { alarm } => alarm,
         MoveOut::Expiring => {
