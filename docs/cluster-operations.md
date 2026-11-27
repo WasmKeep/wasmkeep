@@ -184,8 +184,12 @@ What it checks:
   lags by up to an hour, so a difference is shown and is not a problem.
 - **Nodes.** Each node lease decodes. A heartbeat in a format from before
   node leases is counted, not a problem.
-- **Lease markers.** The per-actor markers left under `leases/` from
-  before node leases are counted. They are never read or deleted.
+- **Lease markers and the generation floor.** The per-actor markers
+  left under `leases/` are counted, never read or deleted
+  ([removing them](#removing-the-per-actor-lease-markers)). The app's
+  generation floor (`state/<tenant>/<app>/generation-floor`, ADR 0045)
+  decodes in its exact form, and one that says no marker is left while
+  one is, is a problem.
 
 What it does not check:
 
@@ -291,6 +295,38 @@ What it keeps in memory:
 - 16 bytes per actor with history, up to 4 million actors per app
   (about 100 MiB). Past that, each further ownership record and alarm
   entry costs one listing request instead.
+
+## Removing the per-actor lease markers
+
+Up to 0.9, creating an actor wrote one small object beside its ownership
+record, `state/<tenant>/<app>/leases/<class>/<name>`, and a whole-app
+restore wrote one per actor to keep each actor's next generation above
+its deleted history. From 0.10, once an app's upgrade is finalized at
+0.10, a node writes none, and a restore writes one object per app
+instead, the app's generation floor
+([ADR 0045](adr/0045-the-generation-floor-of-a-restored-app.md)). The
+markers that exist are still read when an actor is first acquired,
+until they are removed:
+
+```bash
+wasmkeep cluster markers clean --bucket s3://my-bucket --app acme/shop       # counts, writes nothing
+wasmkeep cluster markers clean --bucket s3://my-bucket --app acme/shop --yes
+wasmkeep cluster verify --bucket s3://my-bucket --app acme/shop              # lease markers left: 0
+```
+
+- It is refused while the app's upgrade floor is below 0.10, and while a
+  live node of the app does not announce `genfloor` (a node older than
+  0.10).
+- A marker the actor's ownership record carries is deleted. One that is
+  the only carrier of a generation (left by a restore before 0.10) is
+  first folded into the app's generation floor, then deleted. A per-actor
+  lease from before 0.4 that is still live by its own rules stops the
+  command, naming it.
+- When none is left, the generation floor says so, and nodes no longer
+  read markers. A marker written meanwhile by a node that had not yet
+  read the finalized floor is reported: run the command again.
+- It may run with nodes live, and be interrupted and run again at any
+  point. Without `--yes` it prints the counts and exits with 2.
 
 ## Fencing and forgetting a node
 

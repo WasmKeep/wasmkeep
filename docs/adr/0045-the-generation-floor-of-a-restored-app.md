@@ -1,6 +1,7 @@
 # 0045. The generation floor of a restored app
 
-- Status: accepted (2026-11-27).
+- Status: accepted (2026-11-27), built: see
+  ["Built"](#built).
 - Milestone: `0.10.0` (see [Now](../../ROADMAP.md#now) in ROADMAP.md)
 - Follows: [ADR 0020](0020-one-lease-per-node.md) (ownership records
   under a node lease; section 6, the per-actor lease marker),
@@ -320,3 +321,39 @@ restore's fence check makes.
   upgrade floor it read at start.
 - The gate: the row's test, and a restore refused beside a live node
   without `genfloor`.
+
+## Built
+
+As decided, with these notes:
+
+- **Where the code is.** `crates/wasmkeep-cluster/src/generation_floor.rs`
+  holds the object, its exact decoding and its raise, the seed of
+  section 2 (`seed`, with `mark_from_read` for `0.9`'s path, which
+  `mark_old_lease` now calls) and the cleanup (`plan_clean`, `clean`).
+  The server's `seed_generation` calls `seed`; the node keeps the highest
+  upgrade floor it has read, set only from a read. A node whose own
+  version is below `0.10` never reads the floor again there, so a build
+  of `0.9` makes the requests it made before.
+- **The marker's row** (`wasmkeep-lease 2`) stays `Frozen` in
+  `upgrade::FORMATS`: a `0.10` node below the floor still writes it,
+  byte for byte, so it is not read-only yet. The comment on the row says
+  it is read only once the floor is `0.10`.
+- **The gate table's test** allowed no row newer than the build's own
+  minor version; it now allows the next one, so that a format of `0.10`
+  can land before the release raises the workspace version. Such a
+  format is written only by a build that reports `0.10`.
+- **A restore beside a live node without `genfloor`.** A restore refuses
+  every live node of the app before it writes, so the gate's half on the
+  live nodes cannot block it there; the row's own test covers that half,
+  and `cluster markers clean`, which runs with nodes live, is refused by
+  it (a test).
+- **The journal** keeps the target's own generation floor as
+  `generation_floor`, beside `seeds` and not in it: a resume by a `0.9`
+  `wasmkeep` writes one marker per name in `seeds`.
+- **The simulation** is a bounded interleaving model
+  (`sim/tests/support/generation_floor.rs`, run from
+  `madsim_node_lease.rs` and `madsim_restore.rs`) that calls the crate's
+  decisions: two nodes serving through the finalize, the cleanup racing
+  their first acquisitions, up to two restores in place, and an actor's
+  delete and recreate. Each of the five mutations is caught.
+- **The cleanup's name** is `wasmkeep cluster markers clean`.
