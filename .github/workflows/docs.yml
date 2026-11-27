@@ -27,9 +27,26 @@ jobs:
     name: build the site
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
+      # The copy of this file that runs is the one on the ref it started on:
+      # a run by hand on a branch would publish with its own steps. Refuse
+      # every ref but a release tag and main, as release.yml does.
+      - name: This run is on a release tag or on main
+        env:
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            [[ $REF =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] && exit 0
+          elif [ "$REF" = refs/heads/main ]; then
+            exit 0
+          fi
+          echo "::error::run on $REF: start this workflow on a release tag (vX.Y.Z) or on main" >&2
+          exit 1
       - name: the ref is a release tag
         run: |
           # vX.Y.Z, or vX.Y.Z-pre.1: nothing after the digits but a
@@ -37,6 +54,25 @@ jobs:
           # v1.2.3 followed by anything, or a path-like name).
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
             || { echo "not a release tag: $TAG" >&2; exit 1; }
+      # The site is built only from an annotated tag whose signature GitHub
+      # verifies (the check release.yml makes before it builds).
+      - name: The tag is signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object | "\(.type) \(.sha)"')
+          read -r type object <<<"$ref"
+          [ "$type" = tag ] || {
+            echo "::error::$TAG is a lightweight tag: tag the release with git tag -s" >&2; exit 1; }
+          tag=$(gh api "repos/$GH_REPO/git/tags/$object" \
+            --jq '"\(.verification.verified) \(.verification.reason) \(.object.type)"')
+          read -r verified reason kind <<<"$tag"
+          [ "$kind" = commit ] || {
+            echo "::error::$TAG points at a $kind, not a commit" >&2; exit 1; }
+          [ "$verified" = true ] || {
+            echo "::error::$TAG has no signature GitHub verifies ($reason)" >&2; exit 1; }
+          echo "$TAG: signed tag, verified ($reason)"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ env.TAG }}

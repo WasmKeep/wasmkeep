@@ -47,14 +47,16 @@ registry.
 3. **Publish the draft.** Read it, then publish it. That starts
    `publish.yml`.
 4. **Approve the registries.** `publish.yml` first checks the release (the
-   tag is the version of every manifest, CI passed on its commit, the
+   tag is annotated and signed, with a signature GitHub verifies, and is the
+   version of every manifest, CI passed on its commit, the
    `registries` environment is protected), builds every package from that
    commit and asks each registry what it already has. Only then does each
    registry that lacks the version wait for a reviewer. Before approving,
    look at the run: it is `publish.yml`, started by the release, on the
    tag. Approving publishes: a version on a registry stays there for good.
 5. **Check from outside.** https://docs.wasmkeep.dev shows the new
-   version's docs once `docs.yml` has run. In an empty directory: `cargo add wasmkeep-sdk`,
+   version's docs once `docs.yml` has run (it builds only from a verified
+   signed release tag). In an empty directory: `cargo add wasmkeep-sdk`,
    `npm install @wasmkeep/sdk`, `pip install wasmkeep` and
    `go get github.com/wasmkeep/wasmkeep/sdks/go@v<version>` each give the
    new version, and each registry's page names this repository as the

@@ -68,6 +68,27 @@ jobs:
         run: |
           [ "$REF_TYPE" = tag ] || {
             echo "::error::run this workflow on the release's tag, not on a branch"; exit 1; }
+      # release.yml builds a release only from an annotated tag whose
+      # signature GitHub verifies; a release made by hand on another tag
+      # does not publish either.
+      - name: the tag is signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object | "\(.type) \(.sha)"')
+          read -r type object <<<"$ref"
+          [ "$type" = tag ] || {
+            echo "::error::$TAG is a lightweight tag: tag the release with git tag -s"; exit 1; }
+          tag=$(gh api "repos/$GH_REPO/git/tags/$object" \
+            --jq '"\(.verification.verified) \(.verification.reason) \(.object.type) \(.object.sha)"')
+          read -r verified reason kind target <<<"$tag"
+          [ "$kind $target" = "commit $SHA" ] || {
+            echo "::error::$TAG points at $kind $target, not at commit $SHA"; exit 1; }
+          [ "$verified" = true ] || {
+            echo "::error::$TAG has no signature GitHub verifies ($reason)"; exit 1; }
+          echo "$TAG: signed tag, verified ($reason)"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
