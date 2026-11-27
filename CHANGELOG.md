@@ -106,7 +106,7 @@ The text under a version's heading is its GitHub release text
   node was live again. With no node of an app live it is now accepted
   when every lease the app's nodes left is `released` or `fenced` and
   names the target version or a later one, and no object under `nodes/`
-  fails to decode; the write and the second listing are unchanged. A
+  fails to decode; the write itself is unchanged. A
   lease of an older version refuses it, and the message names the way
   out for its state (a released lease can be forgotten, a fenced one
   cannot). A fence counts as a stop after the default lease timings.
