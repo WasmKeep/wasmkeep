@@ -11,10 +11,10 @@ The text under a version's heading is its GitHub release text
 
 ### Fixed
 
-- **`wasmkeep actor move` returns in well under a second.** It made its
-  last check on a second runtime while the first still held the bucket's
-  pooled connection, and that request waited for object_store's 30 s
-  timeout: a move took 30 s or more against a bucket that keeps its
+- **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
+  its last check on a second runtime while the first still held the
+  bucket's pooled connection, and that request waited for object_store's
+  30 s timeout: a move took 30 s or more against a bucket that keeps its
   connections open. `actor move` and `actor delete` now make every
   request on one runtime.
 - **Parallel moves no longer warn "telling the nodes failed

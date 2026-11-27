@@ -23,8 +23,12 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 #[derive(Default)]
 struct Bucket {
     objects: Mutex<HashMap<String, Vec<u8>>>,
-    /// Overwrites of `control/changed` answered 409 before any is taken.
-    conflicts_left: Mutex<usize>,
+    /// Whether each writer's first overwrite of `control/changed` is
+    /// answered 409 (writers told apart by the pid in the body,
+    /// `cli <pid> <nanos>`).
+    conflict_first: bool,
+    /// The writers that met their conflict.
+    conflicted_pids: Mutex<std::collections::HashSet<String>>,
     /// Overwrites of `control/changed` taken.
     announced: AtomicUsize,
     /// Overwrites of `control/changed` answered 409.
@@ -105,10 +109,13 @@ fn answer(bucket: &Bucket, method: &str, target: &str, body: Vec<u8>) -> (&'stat
         },
         "PUT" => {
             if key.ends_with("/control/changed") {
-                let conflict = {
-                    let mut left = bucket.conflicts_left.lock().unwrap();
-                    left.checked_sub(1).map(|n| *left = n).is_some()
-                };
+                let pid = String::from_utf8_lossy(&body)
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_owned();
+                let conflict =
+                    bucket.conflict_first && bucket.conflicted_pids.lock().unwrap().insert(pid);
                 if conflict {
                     bucket.conflicted.fetch_add(1, Ordering::SeqCst);
                     return (
@@ -215,8 +222,8 @@ fn a_move_reuses_its_connections_without_waiting_for_a_timeout() {
 fn parallel_moves_all_succeed_when_the_bucket_answers_a_conflict() {
     const MOVES: usize = 6;
     let bucket = Arc::new(Bucket {
-        // As many as there are moves: each first announce may meet one.
-        conflicts_left: Mutex::new(MOVES),
+        // Each move's first announce meets one, as if another were in flight.
+        conflict_first: true,
         ..Bucket::default()
     });
     let addr = stand_in(Arc::clone(&bucket));
