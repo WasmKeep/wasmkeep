@@ -80,6 +80,10 @@ pub(super) enum ClusterCommand {
     /// what blocks a finalize; `finalize` ends the upgrade.
     #[command(subcommand)]
     Upgrade(crate::upgrade_cmd::UpgradeCommand),
+    /// Remove the per-actor lease markers an app still has once its
+    /// upgrade to 0.10 is finalized (ADR 0045): `clean`.
+    #[command(subcommand)]
+    Markers(wasmkeep_cli::markers::MarkersCommand),
     /// Check that a bucket does what WasmKeep needs from it: conditional
     /// creates and replaces, reads and listings that follow writes and
     /// deletes, large objects, last-modified times and the clock. Runs

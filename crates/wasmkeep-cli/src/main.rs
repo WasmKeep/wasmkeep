@@ -736,6 +736,7 @@ fn main() -> anyhow::Result<()> {
         Command::Cluster(ClusterCommand::Fence(args)) => cluster_fence(&args),
         Command::Cluster(ClusterCommand::Forget(args)) => cluster_forget(&args),
         Command::Cluster(ClusterCommand::Upgrade(command)) => upgrade_cmd::run(command),
+        Command::Cluster(ClusterCommand::Markers(command)) => wasmkeep_cli::markers::run(command),
         Command::Cluster(ClusterCommand::Diagnose(args)) => {
             let code = diagnose::command(&args);
             use std::io::Write as _;

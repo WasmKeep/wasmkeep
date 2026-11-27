@@ -788,9 +788,18 @@ pub(super) async fn execute_settled(
                     undo.as_bytes().to_vec()).await?;
             }
             let mut seeds = BTreeMap::<String, u64>::new();
+            // The target's own generation floor (ADR 0045, section 3): kept
+            // in the journal beside `seeds`, never in it (a resume by an
+            // older `wasmkeep` writes one marker per name there).
+            let mut kept_floor = None;
             if args.in_place {
                 for (rel, _) in list_bounded(target, &state).await? {
-                    if let Some(tail) = rel.strip_prefix("actors/") {
+                    if rel == wasmkeep_cluster::generation_floor::NAME {
+                        let body = history::get(target, &Key::parse(key(&state, &rel))?, None, META_MAX).await?;
+                        let found = wasmkeep_cluster::generation_floor::decode(Some(&body))
+                            .map_err(|e| anyhow::anyhow!("{}: {e}; it has no repair command: rewrite it by hand", key(&state, &rel)))?;
+                        kept_floor = Some(found.generation);
+                    } else if let Some(tail) = rel.strip_prefix("actors/") {
                         let mut parts = tail.splitn(3, '/');
                         let class = parts.next().context("invalid history class")?;
                         let actor = parts.next().context("invalid history actor")?;
@@ -828,6 +837,9 @@ pub(super) async fn execute_settled(
                 for value in seeds.values_mut() { *value = value.checked_add(1).context("generation exhausted")?; }
             }
             journal["seeds"] = json!(seeds);
+            if let Some(generation) = kept_floor {
+                journal["generation_floor"] = json!(generation);
+            }
             journal["phase"] = json!(if args.in_place { "clear" } else { "copy" });
             save_journal(target, &fence, &journal).await?;
         }
@@ -878,10 +890,45 @@ pub(super) async fn execute_settled(
                 same_or_create(target, &key(&state, &format!("actors/{name}/{tail}")), bytes).await?;
             }
         }
-        // Then all generation floors, including actors absent from the run.
-        for (name, seed) in journal["seeds"].as_object().context("missing seeds")? {
-            same_or_create(target, &key(&state, &format!("leases/{name}")),
-                encode_marker(seed.as_u64().context("invalid seed")?)).await?;
+        // Then all generation floors, including actors absent from the run:
+        // the app's one object once its upgrade floor is 0.10 (ADR 0045,
+        // section 3), one marker per actor below, byte for byte as 0.9.
+        let seeds = journal["seeds"].as_object().context("missing seeds")?;
+        match gated.readers().await?.gate(&wasmkeep_cluster::upgrade::GENERATION_FLOOR) {
+            Ok(()) => {
+                let mut collected = 0u64;
+                for seed in seeds.values() {
+                    collected = collected.max(seed.as_u64().context("invalid seed")?);
+                }
+                // In place every seed carries its one already; into another
+                // prefix it is added here. The target's own floor was read
+                // as collected.
+                if !args.in_place {
+                    collected = collected.checked_add(1).context("generation exhausted")?;
+                }
+                if let Some(kept) = journal["generation_floor"].as_u64() {
+                    collected = collected.max(kept.checked_add(1).context("generation exhausted")?);
+                }
+                use wasmkeep_cluster::generation_floor::{self as gf, GenerationFloor, Markers};
+                // Read again on every run, a resume included.
+                let markers = if list_bounded(target, &format!("{state}leases/")).await?.is_empty() {
+                    Markers::None
+                } else {
+                    Markers::Kept
+                };
+                let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(target), tp);
+                let floor_key = gf::key(&wasmkeep_cluster::state_root::StateRoot::new("", &args.app.0, &args.app.1));
+                gf::raise(&keys, &floor_key, GenerationFloor { generation: collected, markers })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            }
+            Err(wasmkeep_cluster::upgrade::Blocked::Floor { .. }) => {
+                for (name, seed) in seeds {
+                    same_or_create(target, &key(&state, &format!("leases/{name}")),
+                        encode_marker(seed.as_u64().context("invalid seed")?)).await?;
+                }
+            }
+            Err(blocked) => anyhow::bail!("{name}: {blocked}; nothing of the generation floor was written"),
         }
         // Then the alarm index derived from the verified committed databases.
         for path in &run.actors {

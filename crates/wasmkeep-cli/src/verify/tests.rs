@@ -1152,3 +1152,35 @@ async fn a_forget_mark_is_not_a_node_and_an_old_one_is_a_note() {
         report.to_text()
     );
 }
+
+/// ADR 0045, section 4: the generation floor is read in its exact form,
+/// and one that says no marker is left while a marker is is a problem.
+#[tokio::test]
+async fn a_generation_floor_that_says_none_beside_a_marker_is_a_problem() {
+    use wasmkeep_cluster::generation_floor::{self as gf, GenerationFloor, Markers};
+    let store = whole_bucket().await;
+    let key = format!("{PREFIX}/{}", gf::key(&root()));
+    let kept = GenerationFloor {
+        generation: 9,
+        markers: Markers::Kept,
+    };
+    put(&store, &key, kept.encode()).await;
+    let report = check(&store, false).await;
+    assert!(report.whole(), "{}", report.to_text());
+    assert_eq!(report.apps[0].generation_floor, Some((9, false)));
+    assert!(
+        report
+            .to_text()
+            .contains("generation floor: 9, markers kept")
+    );
+    let none = GenerationFloor {
+        markers: Markers::None,
+        ..kept
+    };
+    put(&store, &key, none.encode()).await;
+    let report = check(&store, false).await;
+    assert_eq!(only(&report), (key.as_str(), "ownership"));
+    put(&store, &key, b"junk".to_vec()).await;
+    let report = check(&store, false).await;
+    assert_eq!(only(&report), (key.as_str(), "ownership"));
+}
