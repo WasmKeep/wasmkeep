@@ -336,7 +336,10 @@ impl Cluster {
         match read {
             Ok(Ok(body)) => match floor::decode(body.as_deref()) {
                 Ok(found) => match floor::allows(found, this) {
-                    Ok(()) => FloorRead::Allowed(found),
+                    Ok(()) => {
+                        self.floor_read(found);
+                        FloorRead::Allowed(found)
+                    }
                     Err(why) => FloorRead::Refused(why),
                 },
                 Err(e) => FloorRead::Refused(format!(
@@ -346,6 +349,45 @@ impl Cluster {
             },
             Ok(Err(e)) => FloorRead::NoAnswer(e.to_string()),
             Err(_) => FloorRead::NoAnswer("no answer".to_owned()),
+        }
+    }
+
+    /// Notes a floor read: the one this node knows only rises.
+    fn floor_read(&self, found: Option<wasmkeep_cluster::app_format::floor::Minor>) {
+        let mut known = self.known_floor.lock().unwrap_or_else(|p| p.into_inner());
+        if found > *known {
+            *known = found;
+        }
+    }
+
+    /// Whether the app's upgrade floor is at `since` (ADR 0045, section
+    /// 2, step 3): from the floor this node knows when that is at it,
+    /// otherwise from a read of the floor now, within one lease attempt.
+    /// A node whose own version is below `since` never reads: the floor
+    /// cannot be above it while it serves, and it writes as before.
+    ///
+    /// # Errors
+    /// `Unavailable` without an answer; `Corrupt` for a floor this node
+    /// may not serve under or cannot read.
+    pub(super) async fn floor_at(
+        &self,
+        since: wasmkeep_cluster::app_format::floor::Minor,
+    ) -> Result<bool, wasmkeep_cluster::node_lease::AcquireError> {
+        use wasmkeep_cluster::node_lease::AcquireError;
+        if self.own_minor.as_ref().map_or(true, |this| *this < since) {
+            return Ok(false);
+        }
+        let known = *self.known_floor.lock().unwrap_or_else(|p| p.into_inner());
+        if known.is_some_and(|k| k >= since) {
+            return Ok(true);
+        }
+        match self.read_floor().await {
+            FloorRead::Allowed(found) => Ok(found.is_some_and(|f| f >= since)),
+            FloorRead::Refused(why) => {
+                tracing::warn!("{why}");
+                Err(AcquireError::Corrupt)
+            }
+            FloorRead::NoAnswer(_) => Err(AcquireError::Unavailable),
         }
     }
 

@@ -106,6 +106,7 @@ fn only_nodes_of_the_version_before_are_refused() {
         can_multi_app: false,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     };
@@ -3324,6 +3325,7 @@ async fn a_node_lease_dated_ahead_is_logged() {
         can_multi_app: false,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     };
@@ -3497,6 +3499,7 @@ fn listed(id: &str, state: wasmkeep_cluster::node_lease::NodeState, age: Duratio
         can_multi_app: false,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     }
@@ -5495,6 +5498,7 @@ fn node_info(id: &str) -> NodeInfo {
         can_multi_app: false,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     }

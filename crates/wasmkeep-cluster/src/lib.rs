@@ -42,6 +42,7 @@ pub mod bucket_check;
 pub mod control;
 pub mod expiry;
 pub mod failover;
+pub mod generation_floor;
 pub mod hold_cell;
 pub mod holds;
 pub mod lease;

@@ -1367,10 +1367,12 @@ fn every_format_constant_has_a_row_in_the_gate_table() {
             row.name,
             row.unknown
         );
-        // No format is newer than this build, and its words are ones a
-        // node can announce.
+        // No format is newer than the next minor version (a format of
+        // the next one lands before the release bumps the version, and is
+        // written only by a build that reports it), and its words are
+        // ones a node can announce.
         assert!(
-            row.since <= this_minor().unwrap().max(v(0, 9)),
+            row.since <= this_minor().unwrap().max(v(0, 9)).next(),
             "{}",
             row.name
         );
@@ -1603,4 +1605,40 @@ mod forgotten {
             Err(Blocked::Floor { .. })
         ));
     }
+}
+
+/// ADR 0045, section 5: the generation floor is written only at the floor
+/// 0.10, with every live node at 0.10 or later announcing `genfloor`.
+#[test]
+fn the_generation_floor_is_gated_on_the_floor_and_genfloor() {
+    let row = format("wasmkeep-generation-floor 1").unwrap();
+    assert_eq!(*row, GENERATION_FLOOR);
+    let new = node("a", "0.10.0", "live", "take genfloor");
+    let blind = node("b", "0.10.0", "live", "take");
+    let old = node("c", "0.9.0", "live", "take genfloor");
+    assert!(matches!(
+        gate(row, Ok(Some(v(0, 9))), [&new]),
+        Err(Blocked::Floor { .. })
+    ));
+    assert!(matches!(
+        gate(row, Ok(None), [&new]),
+        Err(Blocked::Floor { .. })
+    ));
+    assert!(matches!(
+        gate(row, Ok(Some(v(0, 10))), [&new, &blind]),
+        Err(Blocked::Nodes { word: "genfloor", ref nodes, .. }) if nodes == &["b".to_owned()]
+    ));
+    assert!(matches!(
+        gate(row, Ok(Some(v(0, 10))), [&new, &old]),
+        Err(Blocked::OlderNodes { .. })
+    ));
+    assert!(matches!(
+        gate(row, Err(Unknown { len: 3 }), [&new]),
+        Err(Blocked::FloorUnreadable { len: 3 })
+    ));
+    assert_eq!(gate(row, Ok(Some(v(0, 10))), [&new]), Ok(()));
+    assert_eq!(
+        gate(row, Ok(Some(v(0, 10))), std::iter::empty::<&NodeInfo>()),
+        Ok(())
+    );
 }

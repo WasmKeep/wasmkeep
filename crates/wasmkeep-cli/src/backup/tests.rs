@@ -2849,6 +2849,7 @@ fn node_lease_of(
         can_multi_app: true,
         can_place: false,
         can_apart: false,
+        can_genfloor: false,
         can_trace: false,
         process: None,
     };

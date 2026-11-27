@@ -129,6 +129,11 @@ pub struct NodeInfo {
     /// that writes one is refused while a live node lacks it. `false` from
     /// nodes that predate it.
     pub can_apart: bool,
+    /// It reads an app's generation floor (heartbeat line 11, `genfloor`,
+    /// ADR 0045, section 5): a restore or `cluster markers clean` that
+    /// writes one is refused while a live node of the app lacks it.
+    /// `false` from nodes that predate it.
+    pub can_genfloor: bool,
     /// It has tracing on, so every hop it sends carries a `traceparent` it
     /// set itself, or none (heartbeat line 11, `traces`, ADR 0044, section
     /// 4): only such a sender's sampled flag is followed. `false` from
@@ -494,6 +499,7 @@ impl NodeInfo {
             can_multi_app: words.can_multi_app,
             can_place: words.can_place,
             can_apart: words.can_apart,
+            can_genfloor: words.can_genfloor,
             can_trace: words.can_trace,
             process: words.process,
             instance: lease.instance,
@@ -507,7 +513,7 @@ impl NodeInfo {
     /// The capability words this node announces on line 11, in order
     /// (`take`, `front`, `handoff`, `ends`, `flush`, `rate_limits`, `restore`,
     /// `actor-restore`, `recorded-head`, `multi-app`, `assets`, `blobs`,
-    /// `place`, `apart`, `traces`). Readers ignore words they do not
+    /// `place`, `apart`, `genfloor`, `traces`). Readers ignore words they do not
     /// know.
     pub fn capabilities(&self) -> impl Iterator<Item = &'static str> {
         [
@@ -525,6 +531,7 @@ impl NodeInfo {
             (self.can_blobs, "blobs"),
             (self.can_place, "place"),
             (self.can_apart, "apart"),
+            (self.can_genfloor, "genfloor"),
             (self.can_trace, "traces"),
         ]
         .into_iter()
@@ -570,6 +577,7 @@ impl NodeInfo {
             can_multi_app: words.contains(&"multi-app"),
             can_place: words.contains(&"place"),
             can_apart: words.contains(&"apart"),
+            can_genfloor: words.contains(&"genfloor"),
             can_trace: words.contains(&"traces"),
             process: words.iter().find_map(|w| {
                 let id = w.strip_prefix("process=")?;
@@ -871,6 +879,7 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_multi_app: true,
             can_place: self.place,
             can_apart: true,
+            can_genfloor: true,
             can_trace: self.traces,
             process: self.process.clone(),
             instance: self.instance.clone(),
@@ -1227,6 +1236,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         };
@@ -1275,6 +1285,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         };
@@ -1359,6 +1370,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         }
@@ -1744,6 +1756,7 @@ mod tests {
             can_multi_app: false,
             can_place: false,
             can_apart: false,
+            can_genfloor: false,
             can_trace: false,
             process: None,
         })
@@ -1862,7 +1875,7 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs apart"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs apart genfloor"
             ),
             "{payload}"
         );
@@ -2285,6 +2298,7 @@ mod tests {
             load: Some(load),
             can_place: true,
             can_apart: true,
+            can_genfloor: true,
             can_trace: false,
             ..loaded_node()
         };
@@ -2328,6 +2342,8 @@ mod tests {
 
         assert!(NodeInfo::words(Some("take apart")).can_apart);
         assert!(!NodeInfo::words(Some("take place")).can_apart);
+        assert!(NodeInfo::words(Some("take genfloor")).can_genfloor);
+        assert!(!NodeInfo::words(Some("take apart")).can_genfloor);
         assert!(node.capabilities().any(|w| w == "place"));
         assert!(!loaded_node().capabilities().any(|w| w == "place"));
         // `traces` likewise: announced only with tracing on, last on the

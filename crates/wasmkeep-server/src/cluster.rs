@@ -464,6 +464,14 @@ pub(crate) struct Cluster {
     /// the create showed an older node of the app: why this node must
     /// not start (ADR 0043, section 3).
     born_late: std::sync::Mutex<Option<String>>,
+    /// The highest upgrade floor this node has read (ADR 0045, section 2):
+    /// set only from a read, and only upward. A first acquisition reads
+    /// the floor again while this is below the generation floor's
+    /// version and this node's own version is not.
+    known_floor: std::sync::Mutex<Option<wasmkeep_cluster::app_format::floor::Minor>>,
+    /// This node read `markers none` in the app's generation floor: no
+    /// per-actor marker is left, and a first acquisition skips its read.
+    markers_none: std::sync::atomic::AtomicBool,
     /// How long after its due time an alarm counts as abandoned: a lease
     /// period plus grace, by which its owner fired it or lost the actor.
     pub(crate) alarm_overdue: Duration,
@@ -960,6 +968,8 @@ impl Cluster {
                 .clone()
                 .unwrap_or_else(|| crate::VERSION.to_owned()),
             born_late: std::sync::Mutex::new(None),
+            known_floor: std::sync::Mutex::new(None),
+            markers_none: std::sync::atomic::AtomicBool::new(false),
             alarm_overdue: Duration::from_millis(
                 config
                     .lease

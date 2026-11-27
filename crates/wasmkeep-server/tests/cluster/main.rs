@@ -87,6 +87,8 @@ mod front;
 mod front_deploys;
 #[path = "front_sockets.rs"]
 mod front_sockets;
+#[path = "generation_floor.rs"]
+mod generation_floor;
 #[path = "golden_trace.rs"]
 mod golden_trace;
 #[path = "idle_pass.rs"]

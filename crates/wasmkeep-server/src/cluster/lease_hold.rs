@@ -1114,23 +1114,43 @@ impl Cluster {
     }
 
     /// The first generation of an actor's first ownership record: above
-    /// the generation of its per-actor lease from before ADR 0020 and above
-    /// every generation its keys carry, so no hold reuses one. The old
-    /// lease is replaced by a marker an old binary never takes over, and
-    /// one still live refuses the acquisition (section 6).
+    /// the generation of its per-actor lease from before ADR 0020, above
+    /// every generation its keys carry and, once the app's upgrade floor
+    /// is 0.10, above the app's generation floor (ADR 0045, section 2), so
+    /// no hold reuses one. Below that floor the old lease is replaced by a
+    /// marker an old binary never takes over, as before; at it nothing is
+    /// written. One still live refuses the acquisition (section 6).
     async fn seed_generation(&self, address: &ActorAddress) -> Result<u64, AcquireError> {
+        use std::sync::atomic::Ordering;
+        use wasmkeep_cluster::generation_floor;
         let keys = crate::replica::highest_generation_in_bucket(self, address)
             .await
             .map_err(|_| AcquireError::Unavailable)?;
-        let seed = wasmkeep_cluster::node_lease::mark_old_lease(
+        let floor_key = generation_floor::key(&self.root);
+        let seeded = generation_floor::seed(
             &self.control_keys,
             &SystemClock,
             &self.lease_config,
             &self.lease_key(address),
+            &floor_key,
             keys,
+            self.markers_none.load(Ordering::Relaxed),
+            async || self.floor_at(generation_floor::SINCE).await,
         )
-        .await?;
-        seed.checked_add(1).ok_or(AcquireError::Corrupt)
+        .await;
+        if seeded == Err(AcquireError::Corrupt) {
+            tracing::warn!(
+                key = %self.lease_key(address),
+                floor = %floor_key,
+                "an actor's marker or the app's generation floor is unreadable: its first \
+                 ownership record is not written"
+            );
+        }
+        let seeded = seeded?;
+        if seeded.markers_none {
+            self.markers_none.store(true, Ordering::Relaxed);
+        }
+        seeded.seed.checked_add(1).ok_or(AcquireError::Corrupt)
     }
 
     /// [`wasmkeep_cluster::holds::retry`], bounded by an attempt timeout (no
