@@ -10,7 +10,8 @@ pub(super) struct DrainArgs {
     node: Option<String>,
 
     /// Every node id this process runs (ADR 0038: the `process=` its
-    /// heartbeats name), instead of one node.
+    /// heartbeats name), instead of one node. A process started without a
+    /// node file names none: its node id stands for it.
     #[arg(long, value_name = "ID")]
     process: Option<String>,
 
@@ -124,21 +125,34 @@ pub(super) struct StatusArgs {
 }
 
 /// The live node ids among `nodes` whose heartbeats name `process`, sorted.
+/// A process started by `wasmkeep serve` without a node file names none
+/// (no `process=`): it runs one node id, which then stands for its
+/// process, so `--process` given that id finds it.
 pub(crate) fn process_node_ids(
     nodes: &[wasmkeep_cluster::membership::NodeInfo],
     process: &str,
     now_ms: u64,
     horizon_ms: u64,
 ) -> Vec<String> {
+    let live = |n: &&wasmkeep_cluster::membership::NodeInfo| {
+        wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
+    };
     let mut ids: Vec<String> = nodes
         .iter()
-        .filter(|n| {
-            n.process.as_deref() == Some(process)
-                && wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
-        })
+        .filter(live)
+        .filter(|n| n.process.as_deref() == Some(process))
         .map(|n| n.id.clone())
         .collect();
+    if ids.is_empty() {
+        ids = nodes
+            .iter()
+            .filter(live)
+            .filter(|n| n.process.is_none() && n.id == process)
+            .map(|n| n.id.clone())
+            .collect();
+    }
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -171,7 +185,9 @@ pub(super) fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()>
             let ids = process_node_ids(&all, process, status::now_ms(), horizon_ms);
             anyhow::ensure!(
                 !ids.is_empty(),
-                "no live node id names the process {process} (see `wasmkeep cluster status`)"
+                "no live node names the process {process}, nor has it as its id (see the \
+                 PROCESS table of `wasmkeep cluster status`; a node started without a node \
+                 file names no process: give its node id, with or without --process)"
             );
             ids
         }

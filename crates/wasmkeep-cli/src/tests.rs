@@ -1461,6 +1461,26 @@ fn a_process_is_drained_through_every_node_id_it_runs() {
         super::process_node_ids(&nodes, "edge-1", now, 30_000),
         ["blog-1", "shop-1"]
     );
+    // A node started without a node file (one `wasmkeep serve` under a
+    // plain unit) names no process: its id stands for it.
+    let nodes = [
+        n("plain-1", None, now),
+        n("plain-2", None, now - 600_000),
+        n("shop-1", Some("edge-1"), now),
+        n("edge-1", None, now),
+    ];
+    assert_eq!(
+        super::process_node_ids(&nodes, "plain-1", now, 30_000),
+        ["plain-1"]
+    );
+    // Not one that is no longer live, nor one that names a process.
+    assert!(super::process_node_ids(&nodes, "plain-2", now, 30_000).is_empty());
+    assert!(super::process_node_ids(&nodes, "shop-1", now, 30_000).is_empty());
+    // A process's name wins over a node id that happens to equal it.
+    assert_eq!(
+        super::process_node_ids(&nodes, "edge-1", now, 30_000),
+        ["shop-1"]
+    );
 }
 
 #[test]
