@@ -94,14 +94,15 @@ pub(super) struct MoveArgs {
 
 /// Writes the actor's move request (ADR 0017), under its app's root.
 pub(super) fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
-    actor_move_on(args, || open_bucket(&args.bucket))
+    actor_move_on(args, || open_bucket_unchecked(&args.bucket))
 }
 
 /// [`actor_move`] on the bucket `open` gives (opened once the request is
 /// valid): the start check `serve` runs
 /// first (ADR 0022), so that a request for a tenant left in the layout
 /// before 0.4.0 is refused (migrate with 0.8.x first) rather than written
-/// where no node reads it.
+/// where no node reads it. That check refuses a migration in progress as
+/// well, so `open` need not.
 pub(super) fn actor_move_on(
     args: &MoveArgs,
     open: impl FnOnce() -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)>,
@@ -119,33 +120,39 @@ pub(super) fn actor_move_on(
         &args.to,
     )?;
     let (store, prefix) = open()?;
-    check_layout(&args.bucket, &store, &prefix, tenant)?;
-    refuse_deleted(&store, &prefix, tenant, &app)?;
-    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
-    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
+        std::sync::Arc::clone(&store),
+        prefix.clone(),
+    );
+    // One runtime for every request: see `refuse_deleted_async`.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let to = &args.to;
-    match rt.block_on(live_node(&keys, to))? {
-        None if !args.force => anyhow::bail!(
-            "no live node has the id {to} (see `wasmkeep cluster status`). Pass --force to \
-             write the request anyway (it expires in 5 minutes)"
-        ),
-        None => {}
-        Some(node) => {
-            for warning in move_warnings(&node, &format!("{tenant}/{app}")) {
-                eprintln!("warning: {warning}");
+    rt.block_on(async {
+        check_layout_async(&args.bucket, &store, &prefix, tenant).await?;
+        refuse_deleted_async(&store, &prefix, tenant, &app).await?;
+        match live_node(&keys, to).await? {
+            None if !args.force => anyhow::bail!(
+                "no live node has the id {to} (see `wasmkeep cluster status`). Pass --force to \
+                 write the request anyway (it expires in 5 minutes)"
+            ),
+            None => {}
+            Some(node) => {
+                for warning in move_warnings(&node, &format!("{tenant}/{app}")) {
+                    eprintln!("warning: {warning}");
+                }
             }
         }
-    }
-    rt.block_on(keys.put_empty(&key))?;
-    // Deleted meanwhile (ADR 0028): the request is taken back.
-    if let Err(e) = refuse_deleted(&app_store, &app_prefix, tenant, &app) {
-        let _ = rt.block_on(keys.delete(&key));
-        return Err(e);
-    }
-    announce_intent(&rt, &keys);
+        keys.put_empty(&key).await?;
+        // Deleted meanwhile (ADR 0028): the request is taken back.
+        if let Err(e) = refuse_deleted_async(&store, &prefix, tenant, &app).await {
+            let _ = keys.delete(&key).await;
+            return Err(e);
+        }
+        announce_intent_async(&keys).await;
+        anyhow::Ok(())
+    })?;
     println!(
         "Asked the owner of {tenant}/{class}/{name} to move it to {} (expires in 5 minutes).",
         args.to
@@ -158,14 +165,15 @@ pub(super) fn actor_move_on(
 pub(super) fn actor_delete(args: &DeleteArgs) -> anyhow::Result<()> {
     actor_delete_on(
         args,
-        || open_bucket(&args.bucket),
+        || open_bucket_unchecked(&args.bucket),
         std::time::Duration::from_millis(500),
     )
 }
 
 /// [`actor_delete`] on the bucket `open` gives, looking every `poll`.
 /// Refuses an actor with no history in the bucket (nothing is written),
-/// and a tenant left in the layout before 0.4.0. Done once the request's
+/// and a tenant left in the layout before 0.4.0 (that check refuses a
+/// migration in progress as well, so `open` need not). Done once the request's
 /// key is gone: a node deletes it only after the delete is recorded.
 pub(super) fn actor_delete_on(
     args: &DeleteArgs,
@@ -181,15 +189,16 @@ pub(super) fn actor_delete_on(
     let id = args.resume.clone().unwrap_or_else(control::new_request_id);
     let key = control::checked_delete_key(&root, &class, &name, &id)?;
     let (store, prefix) = open()?;
-    check_layout(&args.bucket, &store, &prefix, &tenant)?;
-    if args.resume.is_none() {
-        refuse_deleted(&store, &prefix, &tenant, &app)?;
-    }
-    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
-    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
+    // One runtime for every request: see `refuse_deleted_async`.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    rt.block_on(check_layout_async(&args.bucket, &store, &prefix, &tenant))?;
+    if args.resume.is_none() {
+        rt.block_on(refuse_deleted_async(&store, &prefix, &tenant, &app))?;
+    }
+    let (app_store, app_prefix) = (std::sync::Arc::clone(&store), prefix.clone());
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, prefix);
     let actor = format!("{class}/{name} of {tenant}/{app}");
     let history = wasmkeep_server::history_folder(&root, &class, &name);
     // Listed by its folder: a listing of a key itself shows only what is
@@ -206,13 +215,13 @@ pub(super) fn actor_delete_on(
         rt.block_on(keys.put_empty(&key))?;
 
         // Deleted meanwhile (ADR 0028): the request is taken back.
-        if let Err(e) = refuse_deleted(&app_store, &app_prefix, &tenant, &app) {
+        if let Err(e) = rt.block_on(refuse_deleted_async(&app_store, &app_prefix, &tenant, &app)) {
             let _ = rt.block_on(keys.delete(&key));
             return Err(e);
         }
         // Nodes list the requests when `control/changed` changes (ADR 0014,
         // amendment of 2026-11-14).
-        announce_intent(&rt, &keys);
+        rt.block_on(announce_intent_async(&keys));
     }
     println!("Operation ID: {id}");
     let written = listed(&keys)?

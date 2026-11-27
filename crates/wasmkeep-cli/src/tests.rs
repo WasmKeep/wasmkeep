@@ -1747,3 +1747,52 @@ fn actor_where_shows_the_owner_and_writes_nothing() {
     // Read-only: not one key was written, changed or removed.
     assert_eq!(keys_of(&store), before);
 }
+
+/// `control/changed` is overwritten without a condition, but a bucket may
+/// answer 409 or 412 to one of two overwrites at once (parallel `actor
+/// move`s): the CLI writes it again after a pause, then gives up and
+/// warns. Any other error is not retried.
+#[test]
+fn an_announce_is_written_again_after_a_conflict() {
+    use std::sync::Mutex;
+    use wasmkeep_cluster::lease::BucketError;
+    struct Answers(Mutex<Vec<Result<(), BucketError>>>, Mutex<usize>);
+    impl wasmkeep_cluster::control::Keys for Answers {
+        async fn list_keys(&self, _: &str) -> Result<Vec<(String, u64)>, BucketError> {
+            unreachable!()
+        }
+        async fn put_empty(&self, _: &str) -> Result<(), BucketError> {
+            unreachable!()
+        }
+        async fn put_body(&self, key: &str, _: Vec<u8>) -> Result<(), BucketError> {
+            assert_eq!(key, wasmkeep_cluster::control::CHANGED);
+            *self.1.lock().unwrap() += 1;
+            self.0.lock().unwrap().remove(0)
+        }
+        async fn get_body(&self, _: &str) -> Result<Option<Vec<u8>>, BucketError> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<(), BucketError> {
+            unreachable!()
+        }
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pauses = [std::time::Duration::ZERO; 2];
+    let run = |answers: Vec<Result<(), BucketError>>| {
+        let keys = Answers(Mutex::new(answers), Mutex::new(0));
+        let r = rt.block_on(super::announce_with_retry(&keys, pauses));
+        (r.map_err(|e| e.to_string()), *keys.1.lock().unwrap())
+    };
+    let conflict = || Err(BucketError::Conflict);
+    assert_eq!(run(vec![conflict(), conflict(), Ok(())]), (Ok(()), 3));
+    assert_eq!(
+        run(vec![conflict(), conflict(), conflict()]),
+        (Err("precondition failed".into()), 3)
+    );
+    let unavailable = || Err(BucketError::Unavailable("down".into()));
+    assert_eq!(run(vec![unavailable()]).1, 1);
+    assert_eq!(run(vec![conflict(), unavailable()]).1, 2);
+}
