@@ -117,6 +117,72 @@ impl ActorService {
         self.open_socket(class, name, req, Opener::Front).await
     }
 
+    /// For an upgrade that found nobody holding `address` (ADR 0040,
+    /// section 14): if its class spreads and its home is a peer, asks the
+    /// home to take it (a take call, ADR 0017), and returns the node to
+    /// relay the socket to. `None` wakes it here as before: not a spread
+    /// class, rebalancing off, this node the home or draining, a relayed
+    /// upgrade (it is never sent on), or the take refused or failed.
+    async fn take_at_home<B>(
+        &self,
+        cluster: &Cluster,
+        address: &ActorAddress,
+        req: &Request<B>,
+    ) -> Option<String> {
+        if crate::cluster::never_forward(req)
+            || cluster.draining()
+            || !self.inner.goes_home(cluster, address)
+        {
+            return None;
+        }
+        let home = cluster.spread_home(address)?;
+        // A home that cannot take it now: not answering take calls, a take
+        // that failed a moment ago (backed off, doubling), or no room by
+        // ADR 0041's candidate conditions.
+        let room = cluster
+            .rebalance_peers()
+            .into_iter()
+            .find(|p| p.node == home)
+            .and_then(|p| p.load);
+        if !cluster.can_take(&home)
+            || self.inner.rebalance.target_backed_off(&home)
+            || !wasmkeep_cluster::rebalance::has_room(room)
+        {
+            return None;
+        }
+        // One take per actor: the sockets reconnecting to one cold edge
+        // at once wait for the first one's answer.
+        let inner = Arc::clone(&self.inner);
+        self.inner
+            .rebalance
+            .cold_take(address, async move {
+                let app = &inner.app_labels;
+                let horizon = Duration::from_millis(cluster.heartbeat_horizon());
+                match cluster.take(&home, address).await {
+                    crate::cluster::TakeAnswer::Held => {
+                        crate::metrics::placement_spread(app, "home");
+                        inner.rebalance.target_took(&home);
+                        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, "socket: its home took the spread actor");
+                        Some(home)
+                    }
+                    crate::cluster::TakeAnswer::HeldBy(holder) if holder != cluster.node_id => {
+                        crate::metrics::placement_spread(app, "home");
+                        Some(holder)
+                    }
+                    answer => {
+                        crate::metrics::placement_spread(app, "home_failed");
+                        if matches!(answer, crate::cluster::TakeAnswer::Failed(_)) {
+                            inner.rebalance.target_failed(&home, horizon);
+                            cluster.suspect(&home);
+                        }
+                        tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, ?answer, "socket: its home did not take the spread actor; woken here");
+                        None
+                    }
+                }
+            })
+            .await
+    }
+
     /// Opens a socket on `class/name` for `opener`, here or on its owner.
     async fn open_socket<B: Send + 'static>(
         &self,
@@ -133,6 +199,18 @@ impl ActorService {
             Ok(a) => a,
             Err(e) => return text_response(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        // A rebalance move is closing this actor's sockets here (ADR 0040,
+        // section 14): a client reconnecting at once, perhaps relayed back
+        // by a node that still names this one, tries again in a second
+        // instead of reopening a socket the move waits for.
+        if self.inner.rebalance.closing(&address) {
+            let mut r = text_response(StatusCode::SERVICE_UNAVAILABLE, "actor moving; reconnect\n");
+            r.headers_mut().insert(
+                hyper::header::RETRY_AFTER,
+                hyper::header::HeaderValue::from_static("1"),
+            );
+            return r;
+        }
         // Only a validated replacement closes this gate. Merely discovering
         // or checking a restore request must leave upgrade admission alone.
         if self
@@ -182,10 +260,17 @@ impl ActorService {
             .filter(|_| !crate::cluster::never_forward(&req));
         let kind = crate::cluster::Kept::WebSocket;
         let mut ticket = None;
+        // A spread actor's home is asked to take it once per upgrade.
+        let mut home_asked = false;
         // Once, unless the upgrade is kept: then again from here each time
         // it asks for the actor.
         loop {
-            if let Some(owner) = self.inner.remote_owner(&address).await
+            let route = self.inner.cold_route(&address).await;
+            let remote = match &route {
+                super::routing::Cold::Owner(owner) => Some(owner.clone()),
+                super::routing::Cold::Nobody | super::routing::Cold::Here => None,
+            };
+            if let Some(owner) = remote
                 && let Some(cluster) = &self.inner.cluster
             {
                 match self
@@ -241,6 +326,22 @@ impl ActorService {
                 _ => {
                     crate::metrics::refused(crate::metrics::Refusal::Unavailable);
                     return crate::cluster::unavailable("actor unavailable\n");
+                }
+            }
+            // A spread actor nobody holds (ADR 0040, section 14): its home
+            // takes it first, and the socket is relayed there as to any
+            // other owner, so a socket no longer decides where an edge
+            // runs. A take refused, failed or not sent wakes it here, as
+            // before: a wake-up is never refused for it.
+            if route == super::routing::Cold::Nobody
+                && !home_asked
+                && let Some(cluster) = &self.inner.cluster
+            {
+                home_asked = true;
+                if let Some(owner) = self.take_at_home(cluster, &address, &req).await {
+                    self.inner.mailboxes.hibernate(&address);
+                    self.inner.remember_owner(&address, &owner);
+                    continue;
                 }
             }
             // In a cluster the socket must live on the actor's owner: find out

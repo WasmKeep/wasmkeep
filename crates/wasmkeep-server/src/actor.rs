@@ -59,6 +59,7 @@ mod host;
 mod load;
 mod memory;
 mod moving;
+mod rebalancing;
 mod requests;
 mod restores;
 mod routing;
@@ -475,6 +476,8 @@ struct ServiceInner {
     secrets_blocked: Arc<std::sync::atomic::AtomicBool>,
     /// Moves under way (ADR 0017), shared with every actor's state.
     moves: drain::Moves,
+    /// Spread actors returning home (ADR 0040, section 14).
+    rebalance: rebalancing::State,
     /// Whether the data directory's disk was nearly full at the last
     /// sample, and when that was (ms; 0: not sampled yet). Sampled off the
     /// request path by `sample_disk`.

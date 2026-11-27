@@ -265,6 +265,11 @@ fn no_placement(config: &mut ActorConfig) {
     config.cluster.as_mut().unwrap().placement = false;
 }
 
+/// Spread actors are not moved home (`serve --no-rebalance`).
+fn no_rebalance(config: &mut ActorConfig) {
+    config.cluster.as_mut().unwrap().rebalance = false;
+}
+
 /// Like `node_with`, with placement at wake-up off ([`no_placement`]).
 async fn node_unplaced(
     id: &str,

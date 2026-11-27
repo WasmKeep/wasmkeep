@@ -9,6 +9,50 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+### Added
+
+- **A big room's edges return home after a node rejoins**
+  ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
+  Each spread actor (the built-in `edge`, or a class with `spread =
+  true`) has a home, the node its rendezvous choice names over the nodes
+  that serve. A node holding one away from its home moves it there, with
+  the move of ADR 0017 and without a move request, once no node drains,
+  every live node serves and runs one minor version, and the home has
+  served for three heartbeat periods and has room. At most two moves in
+  flight and 500 sockets closed per heartbeat period, per app on each
+  node; an actor moved off its home by a take (an operator's move) stays
+  a minute. While a move closes an edge's sockets, an upgrade for it on
+  that node is answered `503` with `Retry-After: 1`, so clients that
+  reconnect at once do not hold the move up. A rolling restart therefore ends with
+  the edges where a cold start puts them, at the cost of one more
+  reconnect for the clients of the restarted node's edges.
+- **A socket for an edge nobody holds wakes it at its home**: the home
+  takes the edge first and the socket is relayed there; if that take is
+  refused or fails, the edge wakes where the socket landed, as before.
+- `serve --no-rebalance` and `rebalance = false` under `[process]` in a
+  node file turn the rebalance off (it is off with placement). A 0.9
+  `serve` refuses the node file key: remove it before going back.
+- `cluster status` shows each node's `AWAY` count (`misplaced` in
+  `--json`) and each app's `REBALANCE`: `balanced`, `rebalancing` or
+  `paused` with why. The heartbeat's load line gains `misplaced=<n>`,
+  which older nodes and CLIs skip.
+- Metrics: `wasmkeep_rebalance_misplaced`, `wasmkeep_rebalance_moves_total{outcome}`,
+  `wasmkeep_rebalance_sockets_closed_total`, `wasmkeep_rebalance_paused{reason}`,
+  and the outcomes `home` and `home_failed` of
+  `wasmkeep_placement_spread_total`.
+
+### Changed
+
+- Placement's load rule no longer applies to spread classes while the
+  rebalance is on: their wake-ups follow the spread rule alone
+  ([ADR 0041, amendment of 2026-11-26](docs/adr/0041-placement-at-wake-up.md#amendment-2026-11-26-spread-actors-go-home-and-the-load-rule-leaves-them)).
+- `wasmkeep actor move` of an edge off its home is undone a minute after
+  its take. To place edges by hand, turn the rebalance off.
+- A rolling restart's step now waits for `REBALANCE` `balanced` (or
+  `paused (mixed versions)` during an upgrade) before draining the next
+  node, at most two minutes
+  ([draining a node](docs/cluster-operations.md#draining-a-node)).
+
 ### Fixed
 
 - **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made

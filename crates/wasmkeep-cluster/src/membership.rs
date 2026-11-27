@@ -178,12 +178,16 @@ pub struct Load {
     /// How many more socket sessions its app could open on this node now,
     /// its ceiling and the process's counted; `None` as `actor_room`.
     pub socket_room: Option<u64>,
+    /// The spread actors it holds whose home is another node (ADR 0040,
+    /// section 14, amendment of 2026-11-26), counted whether or not its
+    /// rebalance pass may run; `None` from a node of a version before it.
+    pub misplaced: Option<u64>,
 }
 
 impl Load {
     /// The line: `load actors=<n> sockets=<n> events_per_min=<n|->
-    /// front_per_min=<n|-> actor_room=<n> socket_room=<n>`, each room
-    /// only when known.
+    /// front_per_min=<n|-> actor_room=<n> socket_room=<n>
+    /// misplaced=<n>`, each room and the misplaced count only when known.
     fn line(&self) -> String {
         let rate = |r: Option<u64>| r.map_or_else(|| "-".to_owned(), |n| n.to_string());
         let mut line = format!(
@@ -198,6 +202,7 @@ impl Load {
         for (key, room) in [
             ("actor_room", self.actor_room),
             ("socket_room", self.socket_room),
+            ("misplaced", self.misplaced),
         ] {
             if let Some(n) = room {
                 line.push_str(&format!(" {key}={n}"));
@@ -218,7 +223,7 @@ impl Load {
             return None;
         }
         let (mut actors, mut sockets, mut events, mut front) = (None, None, None, None);
-        let (mut actor_room, mut socket_room) = (None, None);
+        let (mut actor_room, mut socket_room, mut misplaced) = (None, None, None);
         for word in words {
             let Some((key, value)) = word.split_once('=') else {
                 continue;
@@ -230,6 +235,7 @@ impl Load {
                 "front_per_min" => &mut front,
                 "actor_room" => &mut actor_room,
                 "socket_room" => &mut socket_room,
+                "misplaced" => &mut misplaced,
                 _ => continue,
             };
             if slot.is_some() {
@@ -249,6 +255,7 @@ impl Load {
             front_per_min: front.flatten(),
             actor_room: actor_room.flatten(),
             socket_room: socket_room.flatten(),
+            misplaced: misplaced.flatten(),
         })
     }
 }
@@ -1757,6 +1764,7 @@ mod tests {
                 front_per_min: Some(90),
                 actor_room: None,
                 socket_room: None,
+                misplaced: None,
             }),
             ..tls_node()
         }
@@ -2125,6 +2133,7 @@ mod tests {
                 front_per_min: None,
                 actor_room: None,
                 socket_room: None,
+                misplaced: None,
             })
         };
         assert_eq!(read("load actors=1 sockets=2"), ok(1, 2, None));
@@ -2191,6 +2200,64 @@ mod tests {
         Some((actors??, sockets??, events.flatten(), front.flatten()))
     }
 
+    /// The load line as a 0.9 reader parses it (rooms, no `misplaced`):
+    /// unknown keys skipped. Frozen; never update it.
+    fn frozen_parse_0_9(line: &str) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+        let mut words = line.split_whitespace();
+        if words.next()? != "load" {
+            return None;
+        }
+        let (mut actors, mut sockets, mut ar, mut sr) = (None, None, None, None);
+        for word in words {
+            let Some((key, value)) = word.split_once('=') else {
+                continue;
+            };
+            let slot = match key {
+                "actors" => &mut actors,
+                "sockets" => &mut sockets,
+                "actor_room" => &mut ar,
+                "socket_room" => &mut sr,
+                "events_per_min" | "front_per_min" => continue,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(number(value)?);
+        }
+        Some((actors?, sockets?, ar, sr))
+    }
+
+    #[test]
+    fn the_load_line_carries_misplaced_and_older_readers_skip_it() {
+        let load = Load {
+            actors: 5,
+            sockets: 70,
+            events_per_min: None,
+            front_per_min: None,
+            actor_room: Some(95),
+            socket_room: Some(930),
+            misplaced: Some(3),
+        };
+        let line = load.line();
+        assert_eq!(
+            line,
+            "load actors=5 sockets=70 events_per_min=- front_per_min=- actor_room=95 socket_room=930 misplaced=3"
+        );
+        assert_eq!(Load::parse(&line), Some(load));
+        assert_eq!(frozen_parse_0_9(&line), Some((5, 70, Some(95), Some(930))));
+        assert_eq!(frozen_parse_before_rooms(&line), Some((5, 70, None, None)));
+        // A node of an earlier version writes none: unknown, not 0.
+        let old = "load actors=1 sockets=2 actor_room=3 socket_room=4";
+        assert_eq!(Load::parse(old).map(|l| l.misplaced), Some(None));
+        for bad in [
+            "load actors=1 sockets=2 misplaced=x",
+            "load actors=1 sockets=2 misplaced=1 misplaced=2",
+        ] {
+            assert_eq!(Load::parse(bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn the_load_line_carries_the_rooms_and_older_readers_skip_them() {
         let load = Load {
@@ -2200,6 +2267,7 @@ mod tests {
             front_per_min: None,
             actor_room: Some(88),
             socket_room: Some(997),
+            misplaced: None,
         };
         let line = load.line();
         assert_eq!(
@@ -2294,6 +2362,7 @@ mod tests {
             front_per_min: None,
             actor_room: None,
             socket_room: None,
+            misplaced: None,
         };
         a.set_load(load);
         let body = format3(
@@ -2327,6 +2396,7 @@ mod tests {
             front_per_min: None,
             actor_room: None,
             socket_room: None,
+            misplaced: None,
         }));
         let line = |a: &Membership<&Mem, At<'_>>| {
             String::from_utf8(a.lease_payload())

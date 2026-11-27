@@ -305,6 +305,14 @@ pub(super) struct ServeArgs {
     #[arg(long)]
     pub(super) no_placement: bool,
 
+    /// Never move a spread actor (a big room's edge) to its home node
+    /// after a node rejoins (ADR 0040, section 14): it stays where it
+    /// woke until it wakes again. Rebalancing is on by default and off
+    /// with --no-placement; `[process] rebalance = false` in a node file
+    /// says the same.
+    #[arg(long)]
+    pub(super) no_rebalance: bool,
+
     /// How a class given with --actor writes, as CLASS=MODE: `strict` (the
     /// default) or `batched` (ADR 0034: plain writes are uploaded
     /// behind the events). Not with --app: a deployed version names its classes' modes.
@@ -826,6 +834,7 @@ pub(super) fn serve(mut args: ServeArgs) -> anyhow::Result<()> {
             cluster.follows_app = args.app.is_some();
             cluster.reads_secrets = !args.no_secrets;
             cluster.placement = !args.no_placement;
+            cluster.rebalance = !args.no_rebalance;
             if let Some((tenant, name)) = &args.app {
                 cluster.app = format!("{tenant}/{name}");
             }

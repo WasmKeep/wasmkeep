@@ -204,6 +204,7 @@ Usage: `wasmkeep serve [OPTIONS] [COMPONENT]`
 | `--blob-link-base <URL>` |  | Where node links point, `https://HOST[:PORT]` (no path): by default `https://` and the app's first hostname, else --advertise. |
 | `--no-alarms` |  | Never fire an actor's alarms on this node: no delivery, no sweep of the cluster's alarm index. |
 | `--no-placement` |  | Never send a wake-up of an actor nobody holds to a lighter node, nor receive one (ADR 0041): this process's node ids keep every actor they wake and do not announce `place`. |
+| `--no-rebalance` |  | Never move a spread actor (a big room's edge) to its home node after a node rejoins (ADR 0040, section 14): it stays where it woke until it wakes again. |
 | `--writes <CLASS=MODE>` |  | How a class given with --actor writes, as CLASS=MODE: `strict` (the default) or `batched` (ADR 0034: plain writes are uploaded behind the events). |
 | `--max-unsent-age <MS>` | `500` | How long a committed write of a batched class may wait unsent behind the segment in flight, in milliseconds, before its actor stops starting events (ADR 0034, section 3): 100 to 5000 |
 | `--front-cpu-budget-ms <MS>` | `50` | The front's CPU time per request, in milliseconds (apart from --cpu-budget-ms, the actors'). |

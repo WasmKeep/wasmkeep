@@ -46,6 +46,8 @@ fn peer(place: bool, seen: Option<Load>, written_at: u64) -> Peer {
             beat: (Some("beef".into()), written_at),
             at: tokio::time::Instant::now(),
         }),
+        version: String::new(),
+        serving_since: None,
     }
 }
 

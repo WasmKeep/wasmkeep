@@ -218,6 +218,8 @@ async fn sender(base: &str) -> Arc<Cluster> {
             can_place: false,
             traces: false,
             seen: None,
+            version: String::new(),
+            serving_since: None,
         },
     )]);
     c

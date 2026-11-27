@@ -744,6 +744,30 @@ pub(super) fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) 
             "This node id's fill in thousandths, by tenant, app and kind.",
             &m.placement_fill,
         ),
+        (
+            "wasmkeep_rebalance_misplaced",
+            "gauge",
+            "Spread actors this node holds whose home is another node (ADR 0040), by tenant and app.",
+            &m.rebalance_misplaced,
+        ),
+        (
+            "wasmkeep_rebalance_moves_total",
+            "counter",
+            "Rebalance moves of spread actors to their home, by tenant, app and outcome.",
+            &m.rebalance_moves,
+        ),
+        (
+            "wasmkeep_rebalance_sockets_closed_total",
+            "counter",
+            "Sockets closed with 1012 by rebalance moves, by tenant and app.",
+            &m.rebalance_sockets_closed,
+        ),
+        (
+            "wasmkeep_rebalance_paused",
+            "gauge",
+            "1 for the reason the rebalance pass is paused, by tenant, app and reason.",
+            &m.rebalance_paused,
+        ),
     ] {
         head(&mut out, name, kind, help);
         family.each(|labels, value| {

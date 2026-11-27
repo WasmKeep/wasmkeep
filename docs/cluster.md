@@ -75,9 +75,13 @@ status`, `cluster verify`, draining, moving and deleting) and
   request with no body or one declared at 64 KiB or less, and
   `actors.call`, are placed: never a WebSocket upgrade, an alarm, a
   streamed body, a take or a drain's hand-over, and never an actor whose
-  record names a node. A running actor never moves because of it. Turn
+  record names a node. A running actor never moves because of it, and a
+  big room's edges are not placed by load: each has a home node, where
+  it is moved back after a node rejoins
+  ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)). Turn
   it off per process with `--no-placement` or `[process] placement =
-  false` ([node file](reference/node-file.md)).
+  false` ([node file](reference/node-file.md)); `--no-rebalance` turns
+  off only the moves home.
 - A node that stops cleanly (`SIGTERM` or Ctrl-C) finishes its in-flight
   events, then releases its actors: the next request for one of them
   starts it on another node at once. Last, it writes its heartbeat

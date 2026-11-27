@@ -503,7 +503,7 @@ impl Asked {
 
 /// The highest rendezvous weight, ties by node id: server
 /// `cluster.rs::rendezvous`'s choice.
-fn best<'a>(key: &str, nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn best<'a>(key: &str, nodes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     nodes.max_by_key(|node| (weight(key, node), *node))
 }
 
@@ -516,7 +516,7 @@ fn ratio(count: u128, capacity: u128) -> u128 {
 
 /// Byte-for-byte algorithm of server cluster.rs::rendezvous. Kept local so
 /// P2 does not refactor/wire that caller; golden unit vectors guard parity.
-fn weight(key: &str, node: &str) -> u64 {
+pub(crate) fn weight(key: &str, node: &str) -> u64 {
     let mut h = key
         .bytes()
         .chain([0])

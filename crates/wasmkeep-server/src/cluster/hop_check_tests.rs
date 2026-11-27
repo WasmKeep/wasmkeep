@@ -56,6 +56,8 @@ async fn receiver(refuse: bool, secret: bool) -> Arc<Cluster> {
         can_place: false,
         traces: false,
         seen: None,
+        version: String::new(),
+        serving_since: None,
     };
     *c.peers.write().unwrap() = HashMap::from([
         ("a".to_owned(), peer("t/default")),

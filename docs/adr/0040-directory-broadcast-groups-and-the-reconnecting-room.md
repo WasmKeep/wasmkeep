@@ -957,8 +957,9 @@ and pusher rule, through the same path:
   node runs from its copy in memory (after the load rule's placed hop was
   refused, or a hop sent apart was not run). A request whose body streams,
   the ordinary case, is never spread; the SDK's edge is `internal`, so in
-  practice no request from outside reaches it. Never a socket handed to
-  the edge: an upgrade wakes it where it arrives (ADR 0041, section 1);
+  practice no request from outside reaches it. A socket for an edge
+  nobody holds is the one exception (amendment of 2026-11-26 below): its
+  home takes the edge first;
 - the route read answered "nobody holds it": a record naming a node, or
   any "try here" (a takeover, a stub, a failed read), is the ordinary path;
 - the edge is not parked here (ADR 0024), and placement is on
@@ -994,39 +995,40 @@ refused is not sent straight back to it. So:
   room's record on each cold wake (the waking node, the pusher's, does
   not hold the room), and on three nodes avoiding both the room's and the
   pusher's node would leave one node for every edge.
-- **Past the floor, the load rule still applies first.** A call that
-  placement's load rule (ADR 0041, sections 1 to 5) sends to a lighter
-  node is a placed hop; its receiver does not spread it again.
+- **The load rule does not apply to an edge** (amendment of 2026-11-26).
+  Until then, past the floor, a call that placement's load rule (ADR
+  0041, sections 1 to 5) sent to a lighter node was a placed hop, not
+  spread again by its receiver. With a home, the rebalance would move
+  that edge back at its next quiet pass: two rules cannot both be one
+  actor's fixed point, and the name rule is the one every node agrees on.
+  The receiver's own limits stay: a node with no resident slot answers
+  `503` before the actor, and the edge wakes where it was called. With
+  rebalancing off, the load rule applies first, as before.
 
-**What does not move.** The rule decides only where an edge nobody holds
-wakes. A running edge never moves for it, and an edge that hibernates
-with sockets keeps its socket home (ADR 0024): its record still names its
-node, so the next push goes to it. An edge without sockets that releases
-its record wakes on the same choice while the live set is the same, if a
-push wakes it first, or where a client's socket arrives. So
-spreading adds no reconnects after an edge's first wake: clients
-reconnect only for what section 7 already says (splits, merges, drains,
-a dead node).
+**What does not move** (rewritten 2026-11-26). The rule gives each edge a
+**home**: the choice above, over this node and the peers that serve its
+app. An edge on its home never moves while the live set is the same, and
+an edge that hibernates with sockets keeps its socket home (ADR 0024):
+its record still names its node, so the next push goes to it. An edge
+away from its home, because it woke while the live set was smaller (a
+drain, a dead node) or a socket woke it on a node that could not reach
+its home, is moved there once the cluster is quiet (below). So clients
+reconnect for what section 7 already says (splits, merges, drains, a dead
+node), and once more for an edge that comes home.
 
-**A rolling restart.** A draining node closes its edges' sockets (1012),
-releases each edge's record and hibernates it: it hands no edge to a
-peer (only alarms are handed off). The first event for a released edge
-decides where it wakes, and two race:
-
-- a reconnecting client's socket, handed to the edge by the front, wakes
-  it on the node where the client's request landed (an upgrade is never
-  spread or placed);
-- the pusher's next push, a call, wakes it on the spread choice over the
-  nodes still live. A client's join pokes the pusher in the same
-  `call-many` as its lookup, so either can come first.
-
-The edges on the other nodes stay. When the drained node comes back,
-nothing moves to it until an edge wakes cold again. So on three nodes the
-drained node's edges land on the two others, by name or by where clients
-reconnect, and those keep their own: the tree stays on two nodes unless
-every edge lands on the same one (likely with many edges, not guaranteed
-with few). With two nodes, every edge is on the remaining node while the
-other restarts, and stays there until it wakes cold again.
+**A rolling restart** (rewritten 2026-11-26). A draining node closes its
+edges' sockets (1012), releases each edge's record and hibernates it: it
+hands no edge to a peer (only alarms are handed off). The first event
+for a released edge wakes it on its home over the nodes still live:
+the pusher's next push by the rule above, and a reconnecting client's
+socket because its home takes the edge before the socket is relayed
+(below). When the drained node serves again, the edges whose home it is
+(about one in N on N nodes) are moved back to it by the nodes holding
+them, once it has served for the settle delay. Rendezvous gives that
+property: when a node leaves the set, only the edges whose home it was
+change home, and when it returns, exactly those get it back. With two
+nodes, every edge is on the remaining node while the other restarts, and
+half return.
 
 **Measuring it.** The release's fleet check: three nodes with default
 placement, clients connected through every node (as a balancer spreads
@@ -1036,7 +1038,9 @@ for the edges; record `wasmkeep_placement_spread_total{outcome}` from
 each node beside it. Then restart one node at a time: after a node
 reports `serving` again, wait at least one heartbeat refresh (so the
 others see it serving) before draining the next, and repeat `actor where`
-and the metric after the last.
+and the metric after the last. Since 2026-11-26, the step waits for the
+app's `cluster status` to say `balanced` (or `paused (mixed versions)`
+during an upgrade between minor versions) instead of one refresh.
 
 Not spread: the room, the pusher, the directory and relays (relays exist
 only past 16 edges, and wake beside the pusher). For other class names,
@@ -1050,7 +1054,8 @@ before, and it ignores the mark.
 
 **Metrics.** `wasmkeep_placement_spread_total{outcome}`: wake-ups of a
 spread edge, `sent` to its node or woken `here` (this node is the choice,
-or no peer can take it).
+or no peer can take it), and, since 2026-11-26, a socket's edge taken by
+its `home` or not (`home_failed`).
 
 **Tests.** `placement::spreads` and `placement::spread`, and the peer
 answer classifiers with the mark (unit tests); `tests/cluster/spread.rs`,
@@ -1070,6 +1075,165 @@ three nodes with default placement:
 
 Not tested: a placed hop refused and then spread (the backoff rule), and
 a client's socket racing the push through a drain.
+
+#### Amendment 2026-11-26: edges return home
+
+A rolling restart left the edges where they woke during it: the
+restarted nodes came back with few edges or none, and the others kept
+the rest, so the tree's send loops ended unevenly spread. Nothing looked at a held edge again; the only tools were a drain and
+`wasmkeep actor move`. The same happens on one version; an upgrade is
+only where it shows most.
+
+**Home.** For an actor of a class that spreads (the built-in `edge`, or
+a class with `spread = true`), its home is the choice of the rule above,
+computed over this node and the peers of its app that serve on heartbeat
+line 9, are not asked to drain and can be reached. Peers in placement's
+backoff, and suspected ones, stay in the set: those say a hop failed a
+moment ago, not that the peer should lose its edges.
+
+**The pass.** Once per heartbeat period, in the loop that acts on move
+requests, and again each time one of its moves ends, a node that is not
+draining, whose lease is valid and that can open the app's secrets moves
+the spread actors it holds (resident, or parked with sockets) whose home
+is another node, in the order of their addresses. It starts nothing
+unless:
+
+1. placement and rebalancing are on;
+2. the cluster is quiet in this node's view: no node of the app is asked
+   to drain, and every live one shows `serving` (a drain shrinks the set,
+   so homes change for its length);
+3. every live node runs this node's minor version (patches of one minor
+   do not pause it): during an upgrade a move toward a node about to be
+   restarted is a wasted reconnect.
+
+Then, per actor, its home must have been seen `serving` by this node
+without a break for three heartbeat periods on its own clock (a new
+process starts the count again), answer take calls, and have room by ADR
+0041, section 4's candidate conditions (a fresh load with both room
+fields, resident room above 0, socket fill below 800); it must not be
+backed off after a failed take (below); and an actor this node acquired
+through a take call while it is not the actor's home in its own view (an
+operator's move off home, or a move or cold socket whose sender saw
+another home) stays a minute before it is moved again. A take at the
+actor's home in the receiver's view arms no stay: nothing would move it
+from there while the views agree. An actor acquired any other way (a
+wake-up, a takeover, a drain's release) has no wait of its own: the edges
+a restarted node should get back were acquired by the others during its
+drain, less than a minute before it serves. An actor that a move is
+under way for, that an operator's move request names, that a restore
+holds, or that is backed off after a move that did not finish here
+(below) is left alone.
+
+A move is the owner's sequence of ADR 0017, started from memory: close
+the actor's sockets with 1012, flush, record the move, release, send the
+target a signed take call. It writes no move key and reads none. While it
+closes the sockets, the actor is marked closing on its node: an upgrade
+for it there is answered `503` with `Retry-After: 1`. Without the mark, a
+client that reconnects at once is relayed back by a node that still
+names this one as the owner, reopens a socket, and the move finds it
+busy, every time. A move ends:
+
+- `moved`, or `taken_elsewhere` (another node took it in the gap): done;
+- `busy`, for a cause of this node's (a socket still closing, the
+  release pending, the actor no longer held here): that actor is backed
+  off, 10 s doubling up to 160 s; the target is not blamed;
+- `failed`, the target refused the take or did not answer: the target is
+  suspected and backed off, a heartbeat horizon doubling on each failure
+  in a row up to 160 s, for moves and cold sockets alike.
+
+What a move closed is charged to the period's budget, not what it was
+expected to close.
+
+**Why it cannot cycle.** A move goes from A to the node B of highest
+weight in A's set, which includes A, so the weight of B is above A's for
+that actor. Every move raises the weight of the actor's node; a return
+would need the opposite. Views that differ cannot change that: weights
+depend on the actor and the node only. The minute after a take bounds a
+node that flaps in and out of the set to one move per actor a minute.
+
+**Pacing.** Per app on each node: at most two rebalance moves in flight
+(operators' moves have sixteen), the next starting when one ends; at most 500
+sockets closed per heartbeat period per node (one full edge), a move
+that goes over putting the next period in deficit. On N nodes: at most
+2(N - 1) moves in flight and 500(N - 1) sockets closed per period in the
+cluster.
+
+**A socket no longer decides an edge's node.** When a WebSocket upgrade
+finds that nobody holds a spread actor and its home is another node, the
+node asks the home to take it (the take call of ADR 0017), then relays
+the socket to the owner that leaves, as it relays one to any remote
+owner. A take refused, failed or not answered within its 10 s wakes the
+actor where the socket landed, as before: **a wake-up is never refused**.
+A relayed upgrade is never asked again. One take runs per actor at a
+time: the sockets reconnecting to one cold edge at once wait for its
+answer. A home without room (ADR 0041, section 4), or backed off after a
+failed take, is not asked; a take that fails suspects and backs it off. ADR 0041's reasons against a take
+at wake-up do not hold here: an edge exists before any socket reaches it
+(the room's `init` creates it before the directory names it), and a
+socket for an edge held elsewhere is relayed already. Without it, during
+a drain a reconnecting client that wins the race against the push would
+put an edge on the balancer's node, and a client reconnecting through a
+third node in the gap between a move's release and its take would wake
+the edge there.
+
+**Drains and deaths.** A draining node runs no pass, and any node
+draining pauses every node's. A node that leaves for good leaves nothing
+to move: its edges woke at their homes over the smaller set. A dead
+node's edges are taken over where a request lands (a record naming a
+dead node is "try here", not "nobody"), and those not at home are moved
+once the cluster is quiet: their clients reconnect a second time. A node
+stuck not serving pauses the pass for as long as it shows.
+
+**Upgrades.** Nothing is gated, because nothing new is written: the take
+call and its body are frozen since 0.9 (ADR 0043, section 2), no header
+is added, no bucket key. The load line gains `misplaced=<n>` (older
+readers skip unknown load keys). The pass waits for one minor version
+among the live nodes, not for `finalize`: after the last node of an
+upgrade serves, it runs before `finalize`, and a node of the older
+version that comes back pauses it again. While two minor versions run,
+nothing moves, so the cluster is as uneven between steps as 0.9 left it.
+A node of the new version asks a home of the older one to take a cold
+edge: the call is the frozen one, so it works both ways.
+
+**Switch.** On by default, off with placement (`--no-placement`), and off
+alone with `serve --no-rebalance` or `rebalance = false` under
+`[process]` in a node file. An operator who places edges by hand turns it
+off; to keep edges off a node, drain it.
+
+**What an operator sees.** `misplaced=<n>` on the heartbeat's load line,
+counted whether or not the pass may run, and left out by a node with
+rebalancing off; `cluster status` shows it per
+node (`AWAY`) and one word per app: `balanced` when every live node
+publishes 0, `rebalancing`, or `paused` with the node that drains or is
+not serving, or `mixed versions`. It is read from heartbeats, so it lags
+a node that just started serving by up to two periods, and a drain
+intent by one. Metrics, by tenant and
+app: `wasmkeep_rebalance_misplaced`, `wasmkeep_rebalance_moves_total{outcome}`,
+`wasmkeep_rebalance_sockets_closed_total` and
+`wasmkeep_rebalance_paused{reason}` (`off`, `draining`, `not_serving`,
+`versions`, `lease`).
+
+**Tests.** `rebalance::decide` and `home` (unit tests, each rule at its
+edge); `sim/tests/madsim_rebalance.rs` runs the real rule over modelled
+nodes that drain, die, restart (sometimes as the next minor version) and
+flap out of reach, with views that lag and sockets that reconnect at
+random, and checks convergence once quiet, monotone moves with the
+minute's stay, pacing, no move while a node drains or two minor versions
+run, spread classes only, and that a cold socket's edge is taken by its
+home or by the waking node, never a third, each with a mutation that
+fails it; `tests/cluster/spread.rs`, plain and over TLS: a node with
+clients on every edge drains, is stopped and starts again, nothing moves
+during the drain, every edge is back home after and each client was
+closed at most twice; a socket for an edge nobody holds wakes it at its
+home (where it lands with `--no-rebalance`); an edge woken away from home
+moves there, and stays with `--no-rebalance` or `--no-placement`; an
+operator's move off home is undone after the stay; an edge with 30
+clients that reconnect after a random wait below 2 s moves home without
+being held up by reopened sockets (and is not moved home without the
+closing mark); a parked edge with a socket is moved as a parked room. Not tested here: a
+peer a minor version apart in a cluster test (the unit tests and the
+mixed-version check cover it), the node-lease simulation with rebalance
+moves as an event, and what a move costs an edge at its socket cap.
 
 ## Consequences
 

@@ -41,6 +41,8 @@ pub(super) fn peer(app: &str) -> Peer {
         can_place: false,
         traces: false,
         seen: None,
+        version: String::new(),
+        serving_since: None,
     }
 }
 

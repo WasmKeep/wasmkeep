@@ -832,6 +832,36 @@ fn placement_is_a_process_switch_on_by_default() {
     assert!(!serve(&[]).unwrap().no_placement);
 }
 
+/// ADR 0040, section 14: `[process] rebalance = false` stops spread actors
+/// being moved home for every app of the process, as `serve
+/// --no-rebalance` does; on by default, and a value that is not a boolean
+/// is refused.
+#[test]
+fn rebalance_is_a_process_switch_on_by_default() {
+    let on = parse(&format!("{LISTEN}{}", app("acme/shop", "shop-1", "")), at()).unwrap();
+    assert_eq!(on.process.rebalance, None);
+    assert!(!through_file(&on).no_rebalance);
+    let off = parse(
+        &format!(
+            "[process]\nrebalance = false\n{LISTEN}{}",
+            app("acme/shop", "shop-1", "")
+        ),
+        at(),
+    )
+    .unwrap();
+    assert_eq!(off.process.rebalance, Some(false));
+    let args = through_file(&off);
+    assert!(args.no_rebalance);
+    assert!(!args.no_placement, "placement stays on");
+    let e = err(&format!(
+        "[process]\nrebalance = 1\n{LISTEN}{}",
+        app("acme/shop", "shop-1", "")
+    ));
+    assert!(e.contains("rebalance"), "{e}");
+    assert!(serve(&["--no-rebalance"]).unwrap().no_rebalance);
+    assert!(!serve(&[]).unwrap().no_rebalance);
+}
+
 #[test]
 fn traces_node_file_settings_and_ratio_validation() {
     let text = "[process]\notlp-endpoint = 'http://localhost:4318'\ntrace-sample = 0.5\ntrace-trust-incoming = true\n[[app]]\nname = 'acme/shop'\n";

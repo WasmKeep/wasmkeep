@@ -19,15 +19,15 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 ```text
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
-NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  FILL   VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
-a     yes   979ms  serving  12      3        840     310        1.2%   0.9.0    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head place
-b     yes   2.2s   serving  4       0        95      288        -      0.9.0    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
-c     no    14m    -        -       -        -       -          -      0.9.0    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  FILL   AWAY  VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
+a     yes   979ms  serving  12      3        840     310        1.2%   0     0.10.0   acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head place
+b     yes   2.2s   serving  4       0        95      288        -      2     0.10.0   acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
+c     no    14m    -        -       -        -       -          -      -     0.10.0   acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
 
-APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT
-acme/shop  9cf4de9152d8dd29  1    16      yes    3
+APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT  REBALANCE
+acme/shop  9cf4de9152d8dd29  1    16      yes    3       rebalancing
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.9.0
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.10.0
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 
@@ -74,7 +74,10 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   `events_per_min`, `front_per_min`, `actor_room`, `socket_room` and
   `fill` (thousandths), `null` when unknown. Events and
   front requests are counted per process, so nodes sharing one process
-  (tests) share one count.
+  (tests) share one count. **AWAY** is how many spread actors (a big
+  room's edges) the node holds whose home is another node
+  ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)), `misplaced`
+  in `--json`; `-` from a version before 0.10.0.
 - **Apps** come from `apps/<tenant>/<app>/current`: the deployed version and
   its `seq`, and **front** (`yes` or `no`) from that version's manifest:
   whether the app has a front (`-` when the manifest cannot be read;
@@ -82,7 +85,17 @@ warning: mixed plain and TLS nodes: b still plain while a use the cluster listen
   their load (`-` if none does; `actors` in `--json`): while some of its
   live nodes do not say it (an older version, or a node just started),
   the sum leaves them out. Which version each node has picked up is not
-  in the bucket (nodes follow within a few seconds).
+  in the bucket (nodes follow within a few seconds). **Rebalance** says
+  whether the app's spread actors are on their homes: `balanced` when
+  every live node shows `AWAY` 0, `rebalancing` while one does not, or
+  `paused` with why (a node that drains or is not serving, or `mixed
+  versions` during an upgrade between minor versions); `-` when no live
+  node publishes the count. In `--json`: `rebalance` and
+  `rebalance_paused`. A node started with `--no-rebalance` publishes no
+  count (`AWAY` `-`), so it never reads `rebalancing`. The drain it names
+  is read from the nodes' heartbeats (`STATE`), which follow a `cluster
+  drain` within a heartbeat period: right after one, the word can still
+  say `balanced`.
 - **Warnings**: no live node; live nodes still plain while others use the
   cluster listener (the state [ADR 0011](adr/0011-node-to-node-mtls.md)
   says not to stay in, and not to refuse plain HTTP from); live nodes on
@@ -347,6 +360,21 @@ During each actor's hand-over its requests may get a 503 with
 skipped for about 10 s. A request that hits a dead peer before that gets
 its one error.
 
+**A rolling restart.** Drain, stop, restart and undrain one node at a
+time. While any node drains, no node moves a big room's edges; the
+drained node's edges wake on the others. When it serves again, the
+edges whose home it is come back to it once it has served for three
+heartbeat periods (9 s), two at a time from each node, their clients
+reconnecting once more ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
+Before draining the next node, wait two heartbeat periods (6 s) after
+the node reports `serving` (until then the others' counts were written
+before they saw it, so `balanced` can be stale), then until `cluster
+status` shows the app's `REBALANCE` as `balanced` (during an upgrade
+between minor versions, `paused (mixed versions)`: nothing moves until
+the last node runs the new version), for at most two minutes; then go on
+and note it. The pacing is per app on each node: two moves in flight and
+500 sockets closed a heartbeat period.
+
 ## Moving one actor
 
 ```bash
@@ -388,6 +416,11 @@ never an actor is not created.
 - **Not a pin.** Once idle, the actor hibernates on `node-c`, and its next
   event claims it wherever that event lands. A draining node does not act
   on move requests; its drain moves everything.
+- **Spread actors go back.** A big room's edge moved off its home is
+  moved back a minute after the move
+  ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)). To keep
+  actors off a node, drain it; to place edges by hand, start the nodes
+  with `--no-rebalance`.
 - **Big rooms.** For a large room, move its pusher so it does not share a
   node with the room; placement does not yet keep them apart. See
   [Place a large room's pusher on another node](designing-for-hot-actors.md#place-a-large-rooms-pusher-on-another-node).

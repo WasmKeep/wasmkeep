@@ -117,6 +117,13 @@ pub(super) fn load_source(
         Load {
             events_per_min,
             front_per_min,
+            // None with rebalancing off: nothing would ever bring the
+            // count down, and `cluster status` would say `rebalancing`.
+            misplaced: inner
+                .cluster
+                .as_ref()
+                .filter(|c| c.rebalance_on())
+                .and_then(|_| inner.rebalance.misplaced()),
             ..load
         }
     })
@@ -143,6 +150,7 @@ pub(super) fn rooms(inner: &ServiceInner) -> Load {
             n(share.process),
         )),
         socket_room: Some(inner.sockets.session_room()),
+        misplaced: None,
     }
 }
 

@@ -92,18 +92,12 @@ impl ServiceInner {
     /// bucket, as the per-actor hint was before relaying stopped keeping a
     /// local mailbox: a stale one costs one relay that the old owner sends
     /// back as "ownership is changing", which also drops the hint.
-    pub(super) async fn remote_owner(&self, address: &ActorAddress) -> Option<String> {
-        match self.cold_route(address).await {
-            Cold::Owner(owner) => Some(owner),
-            Cold::Nobody | Cold::Here => None,
-        }
-    }
-
-    /// [`Self::remote_owner`] in three answers, from the same single read
-    /// (ADR 0041, section 1): another node holds it, nobody does, or try
-    /// here (resident or parked here, a record naming a node this read
-    /// does not send to, or a read that failed or timed out). Only
-    /// [`Cold::Nobody`] may lead to a placement.
+    ///
+    /// Three answers, from the same single read (ADR 0041, section 1):
+    /// another node holds it, nobody does, or try here (resident or parked
+    /// here, a record naming a node this read does not send to, or a read
+    /// that failed or timed out). Only [`Cold::Nobody`] may lead to a
+    /// placement, or to a spread actor's home taking it.
     pub(super) async fn cold_route(&self, address: &ActorAddress) -> Cold {
         let Some(cluster) = self.cluster.as_ref() else {
             return Cold::Here;
@@ -123,6 +117,26 @@ impl ServiceInner {
             Ok(Ok(Route::Nobody)) => Cold::Nobody,
             _ => Cold::Here,
         }
+    }
+
+    /// Whether `address`'s class spreads and rebalancing is on: its node is
+    /// its home (ADR 0040, section 14), and the load rule of placement does
+    /// not apply to it (ADR 0041, amendment of 2026-11-26). Without that
+    /// exemption a placed hop would send it to a lighter node, and the
+    /// rebalance would move it back at its next quiet pass.
+    pub(super) fn goes_home(&self, cluster: &Cluster, address: &ActorAddress) -> bool {
+        cluster.rebalance_on()
+            && read(&self.classes)
+                .get(address.class())
+                .is_some_and(|c| c.spread)
+    }
+
+    /// Whether this node is `address`'s home in its own view: a spread
+    /// class, rebalancing on, and the rendezvous choice this node.
+    pub(super) fn is_home_here(&self, address: &ActorAddress) -> bool {
+        self.cluster
+            .as_ref()
+            .is_some_and(|c| self.goes_home(c, address) && c.spread_home(address).is_none())
     }
 
     /// Whether this node holds an actor `address` is kept apart from (ADR
@@ -298,6 +312,7 @@ impl ServiceInner {
             // read again.
             if route == Cold::Nobody
                 && let Some(cluster) = &self.cluster
+                && !self.goes_home(cluster, &target)
             {
                 match self
                     .place_call(cluster, &target, &waiting, req, budget, head)

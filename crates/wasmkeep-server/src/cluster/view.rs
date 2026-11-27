@@ -1495,3 +1495,99 @@ impl Cluster {
         Ok(older_nodes(&self.node_id, &nodes))
     }
 }
+
+/// A live peer of this node's app as the rebalance pass reads it (ADR
+/// 0040, section 14): owned, so the view's lock is not held while the
+/// pass decides.
+#[derive(Debug, Clone)]
+pub(crate) struct RebalancePeer {
+    pub(crate) node: String,
+    pub(crate) version: String,
+    pub(crate) drain: Option<DrainState>,
+    pub(crate) drain_requested: bool,
+    pub(crate) reachable: bool,
+    pub(crate) serving_for: Option<Duration>,
+    pub(crate) can_take: bool,
+    pub(crate) load: Option<wasmkeep_cluster::placement::RoomLoad>,
+    pub(crate) suspected: bool,
+}
+
+impl Cluster {
+    /// Whether spread actors are moved home ([`ClusterConfig::rebalance`],
+    /// off with placement).
+    pub(crate) fn rebalance_on(&self) -> bool {
+        self.rebalance
+    }
+
+    /// How long a heartbeat stays live (ms): a failed rebalance target is
+    /// left out that long.
+    pub(crate) fn heartbeat_horizon(&self) -> u64 {
+        self.heartbeat_horizon_ms
+    }
+
+    /// The rebalance pass's constants.
+    pub(crate) fn rebalance_settings(&self) -> wasmkeep_cluster::rebalance::Settings {
+        self.rebalance_settings
+    }
+
+    /// The live peers of this node's app, with what the rebalance pass
+    /// reads of each.
+    pub(crate) fn rebalance_peers(&self) -> Vec<RebalancePeer> {
+        let draining = self
+            .control
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .draining
+            .clone();
+        let now = now_ms();
+        let suspects: Vec<String> = {
+            let mut s = self.suspects.lock().unwrap_or_else(|p| p.into_inner());
+            s.retain(|_, until| *until > now);
+            s.keys().cloned().collect()
+        };
+        let period = self.heartbeat_every;
+        let peers: Vec<RebalancePeer> = self
+            .peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(id, peer)| **id != self.node_id && peer.app == self.serves)
+            .map(|(id, peer)| RebalancePeer {
+                node: id.clone(),
+                version: peer.version.clone(),
+                drain: peer.drain,
+                drain_requested: draining.contains(id),
+                reachable: true,
+                serving_for: peer.serving_since.map(|s| s.elapsed()),
+                can_take: peer.can_take,
+                load: peer
+                    .seen
+                    .as_ref()
+                    .and_then(|s| s.fresh(period))
+                    .map(|l| wasmkeep_cluster::placement::RoomLoad::from(*l)),
+                suspected: suspects.contains(id),
+            })
+            .collect();
+        peers
+            .into_iter()
+            .map(|mut p| {
+                p.reachable = self.address_of(&p.node).is_some();
+                p
+            })
+            .collect()
+    }
+
+    /// A spread actor's home (ADR 0040, section 14): the rendezvous choice
+    /// over this node and the peers of its app that serve, are not asked
+    /// to drain and can be reached. `None`: this node.
+    pub(crate) fn spread_home(&self, address: &ActorAddress) -> Option<String> {
+        let peers = self.rebalance_peers();
+        let set: Vec<&str> = peers
+            .iter()
+            .filter(|p| p.drain == Some(DrainState::Serving) && !p.drain_requested && p.reachable)
+            .map(|p| p.node.as_str())
+            .collect();
+        wasmkeep_cluster::rebalance::home(&self.node_id, &set, &encode_address(address))
+            .map(str::to_owned)
+    }
+}
