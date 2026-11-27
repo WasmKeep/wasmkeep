@@ -121,4 +121,5 @@ are designs, not available capabilities. -->
 - [0042 Compacting an idle actor's history](adr/0042-compacting-an-idle-actors-history.md)
 - [0043 Rolling upgrades of WasmKeep (accepted, built in part)](adr/0043-rolling-upgrades.md)
 - [0044 Traces (accepted, not built)](adr/0044-traces.md)
+- [0045 The generation floor of a restored app](adr/0045-the-generation-floor-of-a-restored-app.md)
 
