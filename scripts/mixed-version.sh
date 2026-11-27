@@ -30,6 +30,10 @@
 #   runs, with --trace-sample 0. A client's `traceparent ...-01` forwarded
 #   by a node of the old release is not followed; through a new node that
 #   trusts it, it is, on both nodes;
+# - edges return home (ADR 0040, section 14, from 0.10.0): after every
+#   step each new node's rebalance pass is paused for versions while a
+#   node of the old release runs a minor version apart, and its moves and
+#   the cold sockets its edges' homes took (old homes included) are noted;
 # - CLI skew: the old CLI against the finalized cluster (`deploy`,
 #   `secrets set`, `cluster status`, `cluster drain`, `backup create`):
 #   each works and is read rightly, or is refused and changes nothing.
@@ -635,6 +639,31 @@ check_placement() {
       | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/; s/\{\}//' | tr '\n' ' ')"
   done
 }
+# Spread actors return home (ADR 0040, section 14) on the new nodes: while
+# a node of the old release runs beside them and the two are a minor
+# version apart, the pass is paused for versions, so no rebalance move
+# starts. Noted with it: the moves so far, and the sockets for an edge
+# nobody held that its home (old or new) took, or did not.
+check_rebalance() {
+  local n page old=0 paused moves home
+  for n in "${NODES[@]}"; do
+    [ "${bin[$n]}" = "$new_bin" ] || old=1
+  done
+  for n in "${NODES[@]}"; do
+    [ "${bin[$n]}" = "$new_bin" ] || continue
+    page=$(curl -s "http://127.0.0.1:${mport[$n]}/metrics")
+    paused=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{.*reason="versions"' | awk '{s+=$2} END {print s+0}')
+    moves=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_moves_total' \
+      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ')
+    home=$(printf '%s\n' "$page" | grep -E '^wasmkeep_placement_spread_total\{.*outcome="home(_failed)?"' \
+      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ')
+    note "node $n rebalance: paused for versions $paused; moves ${moves:-none}; cold sockets ${home:-none}"
+    if [ "$old" = 1 ] && [ "$gated" = 1 ]; then
+      if [ "$paused" -ge 1 ]; then pass "node $n: rebalance paused while two minor versions are live"
+      else fail "node $n: rebalance not paused for versions while a node of $old_short runs"; fi
+    fi
+  done
+}
 check_room() { # check_room WHAT: every client holds every acknowledged number
   # Missing: acknowledged numbers a client was never handed, live or by
   # the history.
@@ -675,6 +704,7 @@ check_all() {
   check_room "live"
   check_apart
   check_placement
+  check_rebalance
 }
 
 # #266: right after a node starts, wake-ups through its peers (fresh actors,
