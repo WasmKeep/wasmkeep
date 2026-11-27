@@ -1366,8 +1366,9 @@ Limits, kept as documented:
   lease a full ttl plus grace after it first read the key absent, later
   than the last delete sent. What is left is a single request that the
   network holds for longer than that after it was sent.
-- **Two `forget` of one node at once** (or two removers, of two apps
-  on one prefix, ending one mark that stayed). Each deletes the mark it read.
+- **Two `forget` of one node at once** (or a node's removal sending a
+  mark's delete twice, ADR 0020's amendment of 2026-11-27). Each deletes
+  the mark it read.
   If the first delete, a node's create and the second delete land in
   that order, the node's new lease is deleted: it stops at its next
   write and is started again. Availability only, and it needs two

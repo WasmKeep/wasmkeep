@@ -1696,7 +1696,8 @@ choose is who removes, and when.
   mark, `If-Match` on the version read, and its delete, given up after two
   thirds of ttl plus grace. When the gate blocks, nothing is written: a
   node never falls back to the read-twice-and-delete the command uses
-  before the finalize.
+  before the finalize. A lease a record names, and the leases of a
+  blocked round, wait ten minutes before they are tried again.
 - **A mark that stayed.** A mark dated more than ttl plus grace plus the
   skew ago (16 s at the defaults), on the remover's clock, was left by a
   removal that did not finish: a remover or a `cluster forget` that
@@ -1750,23 +1751,30 @@ The same argument as `cluster forget` after the finalize, made by a node:
 
 ### Limits, kept as documented
 
-- **Two removers ending one mark.** A mark names no app, so the removers
-  of two apps on one prefix may both end a mark that stayed. If one's
-  delete lands, a node starts under that id and the other's delete lands
-  after that node's create, the new lease is deleted: it stops at its
-  next write and is started again. Each delete is given up after 10 s and
-  the create comes no sooner than 15 s after the key was found absent, so
-  this needs a request the network holds for longer than that, the limit
-  `cluster forget` already has.
+- **A mark's delete sent twice.** A remover whose delete got no answer
+  in time ends its own mark a round later, once the mark is 16 s old; and
+  a mark names no app, so the removers of two apps on one prefix may both
+  end one that stayed. If the first delete is held by the network until
+  after the second was read and sent, lands, and a node starts under that
+  id, the second delete then landing after that node's create deletes
+  the new lease: it stops at its next write and is started again. The
+  first delete must be held past the mark's age (16 s) and the second one
+  past the node's create (15 s after the key was found absent), the limit
+  `cluster forget` already has for a delete that lands late. The
+  simulation runs with requests held at most 2.5 s, below those bounds
+  in its scaled timings; at timings where they were above it (a 1 s ttl),
+  the correct rule lost a node's lease on one seed in a few thousand.
 - **Only where a node runs.** An app with no live node, or whose upgrade
   to 0.9 is not finalized, has no remover: its released leases stay until
   it has one, or until `cluster forget`.
 - **The cost of the record check.** A round with a lease to remove reads
-  every ownership record under the prefix once. At most once a round, and
-  only while leases older than the period are there: on a large app with
-  frequent new ids, a round every 15 s with one removal each is the worst
-  case. Turn the removal off and run `cluster forget` at a quieter time if
-  that matters.
+  every ownership record under the prefix once, and the gate lists the
+  heartbeats. A lease kept because a record names its node, and the
+  leases of a round the gate blocked, are held back for ten minutes, so a
+  record that keeps naming a stopped node costs one such read every ten
+  minutes, not every round. On a large app with frequent new ids, a round
+  every 15 s with one removal each is the worst case. Turn the removal
+  off and run `cluster forget` at a quieter time if that matters.
 - **A mark dated ahead** of the remover's clock waits until that clock
   passes its date plus the age.
 
@@ -1798,8 +1806,10 @@ The same argument as `cluster forget` after the finalize, made by a node:
 
 ### Second part (same amendment): the renewal's budget
 
-A node that had just started now and then reported "this node's lease ran
-out" after a single slow renewal. The arithmetic of section 5, as built:
+The renewal's budget left a gap in which a single slow renewal runs a
+lease out, one way to the "this node's lease ran out" warning (seen now
+and then on a node that had just started; that this was its cause there
+is not established). The arithmetic of section 5, as built:
 renewals a heartbeat period apart from the previous send (3 s), each
 bounded by a third of `ttl - safety` (2.67 s), the lease valid 8 s after
 the send of the last acknowledged write. After a write acknowledged at

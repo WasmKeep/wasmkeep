@@ -26,15 +26,21 @@
 //!   forget` that stopped between its two requests, or whose delete was
 //!   given up): it is deleted, read right before the delete
 //!   ([`crate::node_lease::forget_finish`]). That is longer than any
-//!   remover sends its own delete for ([`forget_delete_bound_ms`]), so it
+//!   remover sends its own delete for ([`forget_delete_bound_ms`](crate::node_lease::forget_delete_bound_ms)), so it
 //!   is the second run of the command, made by a node.
 //!
 //! Two removers at once (two nodes that each take themselves for the
 //! lowest, for a heartbeat period) are safe through the conditional write
 //! alone: the second one's write fails on the version the first one
-//! replaced. Only the end of a mark that stayed can be done twice, by two
-//! apps' removers on one prefix, and it is then bounded as two runs of
-//! the command are.
+//! replaced. Only a mark's delete can be sent twice: a remover whose
+//! delete got no answer in time and that ends its own mark a round later,
+//! or two removers (two apps on one prefix) ending one mark that stayed.
+//! That is bounded as two runs of the command are: the first delete was
+//! given up at least the mark's age minus the bound before the second
+//! one is sent.
+//!
+//! A lease kept because a record names its node, and the leases of a
+//! round the gate blocked, are held back for [`HOLD_BACK_MS`].
 //!
 //! [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 
@@ -44,8 +50,7 @@ use crate::control::Keys;
 use crate::lease::{Bucket, BucketError, LeaseConfig, Version};
 use crate::membership::{Directory, NODES_PREFIX, NodeInfo};
 use crate::node_lease::{
-    Forgot, NodeState, OwnerObject, forget_delete_bound_ms, forget_finish, forget_released,
-    forgotten,
+    Forgot, NodeState, OwnerObject, forget_finish, forget_released, forgotten,
 };
 use crate::store::Store;
 
@@ -60,6 +65,12 @@ pub const MAX_PER_ROUND: usize = 16;
 /// released leases reads them over several rounds.
 pub const READS_PER_ROUND: usize = 64;
 
+/// How long a lease kept because a record names its node, or every lease
+/// of a round the gate of the mark blocked, waits before it is tried
+/// again (ms): ten minutes. Until then it takes no place in a round and
+/// costs no read of the records or of the gate.
+pub const HOLD_BACK_MS: u64 = 10 * 60 * 1000;
+
 /// How often the remover runs a round: a lease's ttl plus grace (15 s at
 /// the defaults). A round with nothing to do is one listing of `nodes/`,
 /// keys only.
@@ -69,7 +80,7 @@ pub fn round_every_ms(config: &LeaseConfig) -> u64 {
 
 /// How old a mark must be, by its own date on this node's clock, before a
 /// node ends it: a lease's ttl plus grace plus the skew allowed (16 s at
-/// the defaults). Longer than [`forget_delete_bound_ms`], after which the
+/// the defaults). Longer than [`forget_delete_bound_ms`](crate::node_lease::forget_delete_bound_ms), after which the
 /// removal that wrote it no longer sends its delete, and the skew covers a
 /// writer whose clock was behind this one.
 pub fn stale_mark_ms(config: &LeaseConfig) -> u64 {
@@ -253,6 +264,9 @@ async fn delete_unmarked<B: Bucket + Keys>(
 pub struct Remover {
     /// Each key read, with the last-modified time it was read at.
     seen: HashMap<String, (u64, Seen)>,
+    /// Keys held back until then (this node's clock, ms): a record named
+    /// their node, or the gate blocked ([`HOLD_BACK_MS`]).
+    held: HashMap<String, u64>,
     fault: Fault,
 }
 
@@ -273,7 +287,7 @@ impl Remover {
 
     /// One round at `now_ms` (this node's clock) for the app `app`
     /// (`tenant/app`), this node being its remover. `give_up` is the timer
-    /// of a mark's delete ([`forget_delete_bound_ms`] of `settings`' lease
+    /// of a mark's delete ([`forget_delete_bound_ms`](crate::node_lease::forget_delete_bound_ms) of `settings`' lease
     /// timing), made anew for each.
     ///
     /// # Errors
@@ -302,6 +316,8 @@ impl Remover {
             .collect();
         let keys: HashSet<&str> = listed.iter().map(|(k, _)| k.as_str()).collect();
         self.seen.retain(|key, _| keys.contains(key.as_str()));
+        self.held
+            .retain(|key, until| keys.contains(key.as_str()) && *until > now_ms);
         let recent = stale_mark_ms(&settings.config);
         let mut reads = 0;
         for (key, modified) in &listed {
@@ -364,6 +380,7 @@ impl Remover {
         let mut due: Vec<(u64, String, Version)> = self
             .seen
             .iter()
+            .filter(|(key, _)| !self.held.contains_key(key.as_str()))
             .filter_map(|(key, (_, seen))| match seen {
                 Seen::Released {
                     app: of,
@@ -390,6 +407,10 @@ impl Remover {
                 Ok(Ok(())) => {}
                 Ok(Err(blocked)) => {
                     round.blocked = Some(blocked.to_string());
+                    let until = now_ms.saturating_add(HOLD_BACK_MS);
+                    for (_, key, _) in &due {
+                        self.held.insert(key.clone(), until);
+                    }
                     return Ok(round);
                 }
                 Err(e) => {
@@ -418,6 +439,7 @@ impl Remover {
             let node = id(&key);
             if named.names(&node) {
                 round.named.push(node);
+                self.held.insert(key, now_ms.saturating_add(HOLD_BACK_MS));
                 continue;
             }
             // Whatever the outcome, the key is read again at its next
@@ -440,12 +462,6 @@ impl Remover {
         }
         Ok(round)
     }
-}
-
-/// How long a mark's delete may take, for `settings`: re-exported so a
-/// caller builds its `give_up` timer from the same bound as the command.
-pub fn delete_bound_ms(settings: &Settings) -> u64 {
-    forget_delete_bound_ms(&settings.config)
 }
 
 #[cfg(test)]

@@ -437,14 +437,7 @@ impl Transport {
             }
         };
         match &read {
-            Heartbeats::Listed(listed) => {
-                listed.iter().for_each(|n| observe(&n.id, n));
-                // A node no longer listed is gone: its entry goes once it
-                // stays so for the unpin window (a removed lease).
-                let ids: std::collections::HashSet<&str> =
-                    listed.iter().map(|n| n.id.as_str()).collect();
-                self.lease_reads.listed(|id| ids.contains(id), now, lease);
-            }
+            Heartbeats::Listed(listed) => listed.iter().for_each(|n| observe(&n.id, n)),
             Heartbeats::Read(reads) => {
                 for (id, r) in reads {
                     match r {
@@ -513,6 +506,20 @@ impl Transport {
                         bodies.insert(id, (issued, None));
                     }
                 }
+                // A node this listing leaves out is gone to the newest
+                // lease reads, unless a read issued after it found a body:
+                // its entry goes once it stays gone for the unpin window
+                // (a removed lease).
+                self.lease_reads.listed(
+                    |id| {
+                        listed_ids.contains(id)
+                            || bodies
+                                .get(id)
+                                .is_some_and(|(at, body)| body.is_some() && *at > issued)
+                    },
+                    now,
+                    lease,
+                );
             }
             Heartbeats::Read(reads) => {
                 for (id, read) in reads {

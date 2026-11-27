@@ -99,8 +99,8 @@ The text under a version's heading is its GitHub release text
 - **A single slow lease renewal no longer runs a node's lease out.**
   Renewals went a heartbeat period after the previous send, each allowed
   2.67 s, so after one that timed out the next could be answered after
-  the lease's 8 s of validity, and a node reported "this node's lease ran
-  out" (seen just after a start). A renewal is now due 2 s after the last
+  the lease's 8 s of validity, one way to the "this node's lease ran
+  out" warning. A renewal is now due 2 s after the last
   acknowledged write, each allowed 2 s, a failed one is tried again at
   once, and one that adopted this process's own write that landed late
   (an older date) is followed at once: after a timeout another whole

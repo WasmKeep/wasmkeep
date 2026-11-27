@@ -1,6 +1,6 @@
 use super::*;
 use crate::app_format::floor::{self, Minor};
-use crate::node_lease::{OwnerRecord, encode_forgotten};
+use crate::node_lease::{OwnerRecord, encode_forgotten, forget_delete_bound_ms};
 use crate::object_store::ObjectStoreBucket;
 
 const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -99,6 +99,11 @@ async fn an_old_released_lease_is_removed_after_the_finalize() {
     );
     assert!(present(&b, "nodes/old").await);
     finalized(&b).await;
+    // Held back after a blocked round: not tried again at once.
+    let held = round(&mut r, &b, now + 1).await;
+    assert!(held.is_idle() && held.blocked.is_none(), "{held:?}");
+    let now = now + HOLD_BACK_MS;
+    put(&b, "nodes/a", body("acme/shop", "a", "0.10.0", "live", now)).await;
     let done = round(&mut r, &b, now).await;
     assert_eq!(done.removed, ["old"], "{done:?}");
     assert_eq!(done.blocked, None);
@@ -167,7 +172,10 @@ async fn a_record_naming_the_node_keeps_its_lease() {
     assert_eq!(done.removed, ["free"], "{done:?}");
     assert_eq!(done.named, ["held"]);
     assert!(present(&b, "nodes/held").await);
+    // Held back: the next rounds read no record for it.
+    assert_eq!(round(&mut r, &b, now + 1).await, Round::default());
     // An unreadable record: kept, whatever it may name.
+    let now = now + HOLD_BACK_MS;
     put(
         &b,
         "nodes/free",
@@ -177,7 +185,7 @@ async fn a_record_naming_the_node_keeps_its_lease() {
     put(&b, "state/acme/shop/owners/c/junk", b"junk".to_vec()).await;
     let done = round(&mut r, &b, now).await;
     assert!(done.removed.is_empty(), "{done:?}");
-    assert_eq!(done.named, ["free", "held"]);
+    assert_eq!(done.named, ["held", "free"]);
 }
 
 /// A mark older than the bound is a removal that did not finish: ended. A

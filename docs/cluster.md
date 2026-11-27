@@ -266,8 +266,8 @@ What the wait does not cover, with the defaults:
   for that node's actors are kept instead of sent, even over connections
   to it that still work. They are released when a heartbeat listing shows
   a lease write of that node more than 2 s (twice the allowed clock skew)
-  after the failure: about 2 to 8 s later, since a node writes its lease
-  every 3 s and this node reads the heartbeats every 3 s. They are then sent to the
+  after the failure: about 2 to 7 s later, since a node writes its lease
+  every 2 s and this node reads the heartbeats every 3 s. They are then sent to the
   owner as usual, and get its answer or the 503 they would have got at
   once. Nobody takes the actors. The node is then not suspected again for
   10 s; while the fault lasts, the next failed connection after that

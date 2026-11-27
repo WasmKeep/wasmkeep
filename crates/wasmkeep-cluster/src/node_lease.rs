@@ -1017,7 +1017,9 @@ impl Renewals {
 
     /// When (the lease's clock, ms) the next renewal is sent, after one
     /// sent at `sent_ms` ended at `now_ms`, `failed` or not, leaving the
-    /// last acknowledged write dated `written_at_ms`.
+    /// last acknowledged write dated `written_at_ms`. Never more than a
+    /// spacing from `now_ms`: a clock stepped back since those dates
+    /// does not hold the next renewal back.
     pub fn next_ms(
         &self,
         written_at_ms: Option<u64>,
@@ -1027,9 +1029,9 @@ impl Renewals {
     ) -> u64 {
         let due = match written_at_ms {
             Some(at) if !failed => at.saturating_add(self.spacing_ms),
-            _ => sent_ms.saturating_add(self.spacing_ms / 4),
+            _ => sent_ms.saturating_add((self.spacing_ms / 4).max(1)),
         };
-        due.max(now_ms)
+        due.max(now_ms).min(now_ms.saturating_add(self.spacing_ms))
     }
 }
 
@@ -3450,6 +3452,13 @@ mod tests {
         assert_eq!(r.next_ms(Some(0), 2_000, 4_000, true), 4_000);
         // The spacing is never above a heartbeat period.
         assert_eq!(Renewals::new(&c, 500).spacing_ms, 500);
+        // A clock stepped back 60 s since the last write: still a spacing
+        // from now, not 62 s.
+        assert_eq!(r.next_ms(Some(100_000), 100_000, 40_000, false), 42_000);
+        assert_eq!(r.next_ms(Some(100_000), 100_000, 40_000, true), 42_000);
+        // A spacing of a few ms still waits after a quick error.
+        let tiny = Renewals::new(&c, 3);
+        assert_eq!(tiny.next_ms(Some(0), 10, 10, true), 11);
     }
 
     /// A lease gone for the unpin window, every answer saying so, is
