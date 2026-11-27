@@ -852,6 +852,12 @@ impl<B: Bucket, C: Clock> NodeLease<B, C> {
         })
     }
 
+    /// The `written_at` of the last acknowledged (or adopted) `live` write,
+    /// which its validity counts from; `None` before the first.
+    pub fn written_at_ms(&self) -> Option<u64> {
+        self.last.as_ref().map(|(_, at)| *at)
+    }
+
     /// Whether it may act as owner now.
     pub fn is_valid(&self) -> bool {
         self.valid_until_ms()
@@ -970,6 +976,60 @@ impl<B: Bucket, C: Clock> NodeLease<B, C> {
         Err(NodeLeaseError::Unavailable(
             "released twice in conflict".into(),
         ))
+    }
+}
+
+/// When a node lease is renewed ([ADR 0020], section 5, amendment of
+/// 2026-11-27): a spacing and an attempt of a quarter of `ttl - safety`
+/// each (2 s at the defaults), so that after one renewal that times out
+/// another fits whole before the lease runs out, with a quarter to spare:
+/// `spacing + 2 * attempt < ttl - safety`.
+///
+/// The next renewal is due a spacing after the `written_at` of the last
+/// acknowledged write, the date its validity counts from: after a write
+/// acknowledged at `t`, at `t + spacing`, and not a spacing after the last
+/// send, which after a timeout left the retry less than one attempt
+/// before the end. A conflict that adopted this process's own write that
+/// landed late keeps that write's (older) date, so the next one is due at
+/// once. A failed renewal is followed at once once its attempt ended (a
+/// timeout), and a quarter of a spacing after its send otherwise (a quick
+/// error), never in a tighter loop.
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Renewals {
+    /// Between an acknowledged write's date and the next send (ms).
+    pub spacing_ms: u64,
+    /// How long one write may take (ms).
+    pub attempt_ms: u64,
+}
+
+impl Renewals {
+    /// For `config`, with heartbeats every `heartbeat_ms`: the spacing is
+    /// at most a heartbeat period.
+    pub fn new(config: &LeaseConfig, heartbeat_ms: u64) -> Self {
+        let quarter = config.ttl_ms().saturating_sub(config.safety_ms()) / 4;
+        Self {
+            spacing_ms: quarter.min(heartbeat_ms).max(1),
+            attempt_ms: quarter.max(1),
+        }
+    }
+
+    /// When (the lease's clock, ms) the next renewal is sent, after one
+    /// sent at `sent_ms` ended at `now_ms`, `failed` or not, leaving the
+    /// last acknowledged write dated `written_at_ms`.
+    pub fn next_ms(
+        &self,
+        written_at_ms: Option<u64>,
+        sent_ms: u64,
+        now_ms: u64,
+        failed: bool,
+    ) -> u64 {
+        let due = match written_at_ms {
+            Some(at) if !failed => at.saturating_add(self.spacing_ms),
+            _ => sent_ms.saturating_add(self.spacing_ms / 4),
+        };
+        due.max(now_ms)
     }
 }
 
@@ -3274,6 +3334,122 @@ mod tests {
                 "{fault:?}"
             );
         }
+    }
+
+    /// One renewal's fate in [`renewals_keep_the_lease`].
+    #[derive(Clone, Copy)]
+    enum Fate {
+        /// Answered just before its attempt ends.
+        Slow,
+        /// No answer, and it did not land.
+        TimesOut,
+        /// It landed; its answer did not come.
+        LandsAnswerLost,
+    }
+
+    /// Runs a node lease written at 0 through `fates`, one renewal each,
+    /// sent when `next` says (written_at, sent, now, failed), each attempt
+    /// `attempt_ms` long: whether the lease stayed valid throughout (no
+    /// send, and no answer, at or after the validity of the write before).
+    fn renewals_keep_the_lease(
+        attempt_ms: u64,
+        next: impl Fn(Option<u64>, u64, u64, bool) -> u64,
+        fates: &[Fate],
+    ) -> bool {
+        use crate::lease::tests::{At, Mem, run};
+        let mem = Mem::default();
+        let t = std::cell::Cell::new(0);
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        assert_eq!(run(lease.start(None)), Ok(()));
+        let mut at = next(lease.written_at_ms(), 0, 0, false);
+        for fate in fates {
+            let valid = lease.valid_until_ms().unwrap();
+            if at >= valid {
+                return false;
+            }
+            t.set(at);
+            let failed = match fate {
+                Fate::Slow => {
+                    assert_eq!(run(lease.renew()), Ok(()));
+                    t.set(at + attempt_ms - 1);
+                    false
+                }
+                Fate::TimesOut => {
+                    mem.refuse_next_write.set(true);
+                    assert!(run(lease.renew()).is_err());
+                    t.set(at + attempt_ms);
+                    true
+                }
+                Fate::LandsAnswerLost => {
+                    mem.lose_next_reply.set(true);
+                    assert!(run(lease.renew()).is_err());
+                    t.set(at + attempt_ms);
+                    true
+                }
+            };
+            if !failed && t.get() >= valid {
+                return false;
+            }
+            at = next(lease.written_at_ms(), at, t.get(), failed);
+        }
+        true
+    }
+
+    /// ADR 0020, section 5, amendment of 2026-11-27: a renewal that times
+    /// out is followed by one that may take its whole attempt, before the
+    /// lease runs out. Spaced a period after each send (3 s, attempts of
+    /// 2.67 s), the retry went at 6 s and could be answered at 8.67 s,
+    /// past the 8 s of validity: one timeout, then the lease ran out.
+    #[test]
+    fn a_timeout_then_a_slow_retry_keeps_the_lease() {
+        let c = cfg();
+        let r = Renewals::new(&c, 3_000);
+        assert_eq!((r.spacing_ms, r.attempt_ms), (2_000, 2_000));
+        let valid = c.ttl_ms() - c.safety_ms();
+        assert!(r.spacing_ms + 2 * r.attempt_ms < valid);
+        let fates = [
+            Fate::TimesOut,
+            Fate::Slow,
+            Fate::Slow,
+            Fate::TimesOut,
+            Fate::Slow,
+        ];
+        assert!(renewals_keep_the_lease(
+            r.attempt_ms,
+            |w, s, n, f| r.next_ms(w, s, n, f),
+            &fates
+        ));
+        // The schedule before: a period after each send.
+        let before = |_: Option<u64>, sent: u64, _: u64, _: bool| sent + 3_000;
+        assert!(!renewals_keep_the_lease(valid / 3, before, &fates));
+    }
+
+    /// A renewal that landed with its answer lost is adopted by the next
+    /// one's conflict, at its own, older date: the next renewal goes at
+    /// once, so a slow one after it still lands in time. Spaced a period
+    /// after each send, the adopted date left the next slow renewal
+    /// answered after the lease ran out.
+    #[test]
+    fn a_timeout_then_a_conflict_that_adopts_keeps_the_lease() {
+        let c = cfg();
+        let r = Renewals::new(&c, 3_000);
+        let fates = [Fate::LandsAnswerLost, Fate::Slow, Fate::Slow, Fate::Slow];
+        assert!(renewals_keep_the_lease(
+            r.attempt_ms,
+            |w, s, n, f| r.next_ms(w, s, n, f),
+            &fates
+        ));
+        let valid = c.ttl_ms() - c.safety_ms();
+        let before = |_: Option<u64>, sent: u64, _: u64, _: bool| sent + 3_000;
+        assert!(!renewals_keep_the_lease(valid / 3, before, &fates));
+        // Adopted: due at once, not a spacing after the send.
+        assert_eq!(r.next_ms(Some(2_000), 4_000, 4_100, false), 4_100);
+        // A quick error: a quarter of a spacing after its send.
+        assert_eq!(r.next_ms(Some(0), 2_000, 2_010, true), 2_500);
+        // A timeout: at once.
+        assert_eq!(r.next_ms(Some(0), 2_000, 4_000, true), 4_000);
+        // The spacing is never above a heartbeat period.
+        assert_eq!(Renewals::new(&c, 500).spacing_ms, 500);
     }
 
     /// A lease gone for the unpin window, every answer saying so, is

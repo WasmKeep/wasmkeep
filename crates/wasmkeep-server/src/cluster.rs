@@ -51,7 +51,7 @@ pub(crate) use handoff::*;
 pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::{heartbeat_read_attempt, lease_attempt};
-use node_lease_task::{lease_every, node_lease_loop};
+use node_lease_task::{lease_every, node_lease_loop, renewals};
 pub(crate) use placing::*;
 pub use process::NodeProcess;
 pub(crate) use signing::*;
@@ -564,8 +564,11 @@ pub(crate) struct Cluster {
     placing: placing::Placing,
     /// The lease timing (ttl, grace, safety, skew).
     pub(crate) lease_config: LeaseConfig,
-    /// How often the node lease is written ([`lease_every`]).
+    /// Between two tries of the node lease's first write ([`lease_every`]).
     lease_every: Duration,
+    /// When the node lease is renewed, and how long a renewal may take
+    /// ([`renewals`]).
+    renewals: wasmkeep_cluster::node_lease::Renewals,
     /// How long one node lease write may take ([`lease_attempt`]).
     pub(crate) lease_attempt: Duration,
     /// This node's lease validity, shared with every hold.
@@ -1026,6 +1029,7 @@ impl Cluster {
             secrets_blocked: std::sync::atomic::AtomicBool::new(false),
             lease_config: config.lease,
             lease_every: lease_every(config.heartbeat, &config.lease),
+            renewals: renewals(config.heartbeat, &config.lease),
             lease_attempt: lease_attempt(&config.lease),
             validity: Arc::new(NodeValidity::new()),
             lapse_hook: std::sync::OnceLock::new(),

@@ -71,8 +71,10 @@
   lowest-id live node of an app removes its app's `released` node leases
   a day after their release, through the mark of `cluster forget`, once
   the app is finalized at 0.9; a mark a removal left behind is ended; the
-  newest-reads table drops a node gone for ttl plus grace. See
-  "Amendment of 2026-11-27:
+  newest-reads table drops a node gone for ttl plus grace. And the
+  renewal's budget: renewals are spaced from the last acknowledged write,
+  a quarter of `ttl - safety` apart and as long, so one that times out
+  leaves room for another whole one. See "Amendment of 2026-11-27:
   released leases removed by the live nodes" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
@@ -498,7 +500,10 @@ lease is valid `ttl - safety` (8 s) after the send of the last acknowledged
 write. After a write acknowledged at `t`, the next go at `t + 3` and
 `t + 6`: the first has its whole attempt, the second must be answered
 within 2 s. So a node has two retries in practice before its lease runs
-out; a third would need writes every `(ttl - safety) / 3`. A node whose lease writes keep failing loses
+out; a third would need writes every `(ttl - safety) / 3`. (Since the
+amendment of 2026-11-27: a renewal every 2 s from the last acknowledged
+write, each bounded by 2 s, and a failed one followed at once, so after
+a timeout another whole attempt still lands before the lease runs out.) A node whose lease writes keep failing loses
 every actor at once instead of one by one;
 `wasmkeep_node_lease_failures_total` replaced
 `wasmkeep_lease_renew_failures_total` (removed with per-actor leases) as that node
@@ -1791,3 +1796,41 @@ The same argument as `cluster forget` after the finalize, made by a node:
   check that takes the mark for an object, no read of the records, marks
   never ended.
 
+### Second part (same amendment): the renewal's budget
+
+A node that had just started now and then reported "this node's lease ran
+out" after a single slow renewal. The arithmetic of section 5, as built:
+renewals a heartbeat period apart from the previous send (3 s), each
+bounded by a third of `ttl - safety` (2.67 s), the lease valid 8 s after
+the send of the last acknowledged write. After a write acknowledged at
+0, the renewal at 3 s times out at 5.67 s; the next goes at 6 s and may
+take until 8.67 s, past the 8 s of validity. One timeout, and the lease
+runs out about 2.3 s later whenever the retry is slow too. And a renewal
+that landed with its answer lost is adopted by the next one's conflict at
+its stored date, which is older than that next send: that left less
+again.
+
+- **The spacing counts from the last acknowledged write**, not from the
+  last send: the next renewal is due a spacing after the `written_at` of
+  the write the lease's validity counts from. After an adopted write of
+  this process that landed late, that date is older, so the next renewal
+  goes at once.
+- **A failed renewal is followed at once** once its attempt ended (a
+  timeout), and a quarter of a spacing after its send otherwise (a quick
+  error), never in a tighter loop.
+- **The budget.** The spacing and the attempt are each a quarter of
+  `ttl - safety` (2 s at the defaults; the spacing never above a
+  heartbeat period), so `spacing + 2 * attempt < ttl - safety`: after a
+  renewal that times out, another may take its whole attempt and still
+  land 2 s before the lease runs out. A lease write every 2 s instead of
+  every 3 s: half again as many writes to `nodes/<id>`.
+- Unchanged: the validity of a write (`written_at + ttl - safety` on the
+  node's own clock, so a lease that cannot be renewed still runs out and
+  every hold ends, fail-closed), the heartbeat period, the horizon and
+  every other read's attempt (`lease_attempt`, 2.67 s), which judge
+  peers.
+
+Tests: `node_lease::tests::a_timeout_then_a_slow_retry_keeps_the_lease`
+and `a_timeout_then_a_conflict_that_adopts_keeps_the_lease` run a lease
+through those renewals with this schedule (kept) and with the one before
+(it runs out).

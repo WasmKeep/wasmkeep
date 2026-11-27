@@ -96,6 +96,17 @@ The text under a version's heading is its GitHub release text
 
 ### Fixed
 
+- **A single slow lease renewal no longer runs a node's lease out.**
+  Renewals went a heartbeat period after the previous send, each allowed
+  2.67 s, so after one that timed out the next could be answered after
+  the lease's 8 s of validity, and a node reported "this node's lease ran
+  out" (seen just after a start). A renewal is now due 2 s after the last
+  acknowledged write, each allowed 2 s, a failed one is tried again at
+  once, and one that adopted this process's own write that landed late
+  (an older date) is followed at once: after a timeout another whole
+  attempt still lands 2 s before the lease runs out
+  ([ADR 0020, amendment of 2026-11-27](docs/adr/0020-one-lease-per-node.md#second-part-same-amendment-the-renewals-budget)).
+  A node writes its lease every 2 s instead of every 3 s.
 - **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
   its last check on a second runtime while the first still held the
   bucket's pooled connection, and that request waited for object_store's
