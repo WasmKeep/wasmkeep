@@ -1152,10 +1152,19 @@ pub async fn status_of<B: Bucket>(
     now_ms: u64,
     horizon_ms: u64,
 ) -> Result<AppUpgrade, BucketError> {
+    let floor = read_floor(bucket, app).await?;
+    Ok(assess(app, floor, nodes, now_ms, horizon_ms))
+}
+
+async fn read_floor<B: Bucket>(
+    bucket: &B,
+    app: &str,
+) -> Result<Result<Option<floor::Minor>, floor::Unknown>, BucketError> {
     let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
     let floor = bucket.get(&floor::relative_key(tenant, name)).await?;
-    let floor = floor::decode(floor.as_ref().map(|(body, _)| body.as_slice()));
-    Ok(assess(app, floor, nodes, now_ms, horizon_ms))
+    Ok(floor::decode(
+        floor.as_ref().map(|(body, _)| body.as_slice()),
+    ))
 }
 
 /// The apps `nodes` name, sorted: those with registered nodes.
@@ -1186,13 +1195,12 @@ pub async fn read_statuses<B: Bucket + Directory>(
     horizon_ms: u64,
 ) -> Result<Vec<AppUpgrade>, BucketError> {
     if let Some(app) = only {
-        let (tenant, name) = app.split_once('/').unwrap_or((app, ""));
-        let key = floor::relative_key(tenant, name);
         // Node keys carry no app name: all bodies are needed to discover
         // this app's nodes. Only its floor is read, alongside that discovery.
-        let (nodes, floor) =
-            futures_util::try_join!(crate::membership::all_heartbeats(bucket), bucket.get(&key),)?;
-        let floor = floor::decode(floor.as_ref().map(|(body, _)| body.as_slice()));
+        let (nodes, floor) = futures_util::try_join!(
+            crate::membership::all_heartbeats(bucket),
+            read_floor(bucket, app),
+        )?;
         return Ok(vec![assess(app, floor, &nodes, now_ms, horizon_ms)]);
     }
     let nodes = crate::membership::all_heartbeats(bucket).await?;

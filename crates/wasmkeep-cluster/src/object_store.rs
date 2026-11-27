@@ -15,6 +15,7 @@ use crate::membership::Directory;
 pub struct ObjectStoreBucket {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    reads_at_once: usize,
 }
 
 impl ObjectStoreBucket {
@@ -24,7 +25,17 @@ impl ObjectStoreBucket {
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            reads_at_once: READS_AT_ONCE,
+        }
+    }
+
+    /// Override concurrent directory body reads for an operator view.
+    pub fn with_read_concurrency(mut self, reads: std::num::NonZeroUsize) -> Self {
+        self.reads_at_once = reads.get();
+        self
     }
 
     fn path(&self, key: &str) -> Path {
@@ -194,11 +205,11 @@ impl Directory for ObjectStoreBucket {
 
 /// Reads a listing or a set of keys sends at once: one slow object costs
 /// one read's time, not one more read per object before it.
-const READS_AT_ONCE: usize = 32;
+const READS_AT_ONCE: usize = 16;
 
 impl ObjectStoreBucket {
     /// The bodies of `objects` (each its key and its location), read up to
-    /// [`READS_AT_ONCE`] at a time, in the order given; one that is gone
+    /// the configured concurrency (default [`READS_AT_ONCE`]) at a time, in the order given; one that is gone
     /// (deleted between a listing and its read, or by `cluster forget`) is
     /// left out. Any other failure fails the whole read.
     async fn bodies(
@@ -227,7 +238,7 @@ impl ObjectStoreBucket {
             })
             .collect();
         let found: Vec<Option<(usize, String, Vec<u8>)>> = futures_util::stream::iter(reads)
-            .buffer_unordered(READS_AT_ONCE)
+            .buffer_unordered(self.reads_at_once)
             .try_collect()
             .await?;
         let mut found: Vec<_> = found.into_iter().flatten().collect();

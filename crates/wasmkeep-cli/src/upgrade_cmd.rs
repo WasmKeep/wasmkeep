@@ -95,7 +95,12 @@ pub(crate) fn run(command: UpgradeCommand) -> anyhow::Result<()> {
     let (out, code) = match command {
         UpgradeCommand::Status(args) => {
             let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
-            let bucket = ObjectStoreBucket::new(store, prefix);
+            let bucket = ObjectStoreBucket::new(store, prefix).with_read_concurrency(
+                const {
+                    std::num::NonZeroUsize::new(crate::status::STATUS_READS_AT_ONCE)
+                        .expect("status concurrency is nonzero")
+                },
+            );
             let apps = rt
                 .block_on(upgrade::read_statuses(
                     &bucket,

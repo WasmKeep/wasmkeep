@@ -17,6 +17,9 @@ use wasmkeep_cluster::node_lease::NodeState;
 use wasmkeep_cluster::object_store::ObjectStoreBucket;
 use wasmkeep_server::apps::Current;
 
+/// Concurrent reads for CLI status views.
+pub(crate) const STATUS_READS_AT_ONCE: usize = 32;
+
 /// This machine's clock, in ms since the epoch.
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -389,6 +392,11 @@ async fn read_with_limit(
     horizon_ms: u64,
     max: Option<usize>,
 ) -> anyhow::Result<Report> {
+    enum NodeBody {
+        Forgotten(u64),
+        Heartbeat(Box<NodeInfo>),
+        Skip,
+    }
     let node_prefix = format!("{}/nodes", prefix.trim_end_matches('/'))
         .trim_start_matches('/')
         .to_owned();
@@ -397,9 +405,19 @@ async fn read_with_limit(
         futures_util::stream::iter(objects.into_keys().map(|key| {
             let location = StorePath::from(format!("{node_prefix}/{key}"));
             let store = &store;
-            async move { metadata(store, &location).await.map(|body| (key, body)) }
+            async move {
+                let body = metadata(store, &location).await?;
+                let classified = if let Some(at) = wasmkeep_cluster::node_lease::forgotten(&body) {
+                    NodeBody::Forgotten(at)
+                } else if let Some(info) = NodeInfo::decode(&body) {
+                    NodeBody::Heartbeat(Box::new(info))
+                } else {
+                    NodeBody::Skip
+                };
+                Ok::<_, anyhow::Error>((key, classified))
+            }
         }))
-        .buffer_unordered(32)
+        .buffer_unordered(STATUS_READS_AT_ONCE)
         .try_collect::<Vec<_>>()
         .await
     };
@@ -408,7 +426,7 @@ async fn read_with_limit(
     let mut unfinished_forgets = Vec::new();
     for (key, body) in objects {
         // Not a node: shown only when its command left it there.
-        if let Some(at) = wasmkeep_cluster::node_lease::forgotten(&body) {
+        if let NodeBody::Forgotten(at) = body {
             if now_ms.saturating_sub(at) > FORGET_UNFINISHED_MS
                 && wasmkeep_cluster::membership::validate_node_id(&key).is_ok()
             {
@@ -416,11 +434,11 @@ async fn read_with_limit(
             }
             continue;
         }
-        if let Some(info) = NodeInfo::decode(&body)
+        if let NodeBody::Heartbeat(info) = body
             && key == info.id
             && wasmkeep_cluster::membership::validate_node_id(&info.id).is_ok()
         {
-            heartbeats.push(info);
+            heartbeats.push(*info);
         }
     }
     heartbeats.sort_by(|a, b| a.id.cmp(&b.id));
@@ -445,7 +463,7 @@ async fn read_with_limit(
                 }
             }),
     )
-    .buffer_unordered(32)
+    .buffer_unordered(STATUS_READS_AT_ONCE)
     .try_collect()
     .await?;
     upgrades.sort_by(|a, b| a.app.cmp(&b.app));
@@ -494,18 +512,16 @@ async fn read_apps(
             })
             .collect()
     } else {
-        let tenants = store
-            .list_with_delimiter(Some(&root))
+        let tenants = wasmkeep_server::history::list_with_delimiter(store, &root)
             .await?
             .common_prefixes;
-        let listings: Vec<_> = futures_util::stream::iter(
-            tenants
-                .into_iter()
-                .map(|tenant| async move { store.list_with_delimiter(Some(&tenant)).await }),
-        )
-        .buffer_unordered(32)
-        .try_collect()
-        .await?;
+        let listings: Vec<_> =
+            futures_util::stream::iter(tenants.into_iter().map(|tenant| async move {
+                wasmkeep_server::history::list_with_delimiter(store, &tenant).await
+            }))
+            .buffer_unordered(STATUS_READS_AT_ONCE)
+            .try_collect()
+            .await?;
         let base = format!("{root}/");
         listings
             .into_iter()
@@ -538,7 +554,7 @@ async fn read_apps(
             }
         }
     }))
-    .buffer_unordered(32)
+    .buffer_unordered(STATUS_READS_AT_ONCE)
     .collect()
     .await;
 
@@ -2468,6 +2484,9 @@ mod discovery_requests {
         gets: std::sync::atomic::AtomicUsize,
         lists: std::sync::atomic::AtomicUsize,
         entries: std::sync::atomic::AtomicUsize,
+        reverse: bool,
+        completed: std::sync::Mutex<Vec<String>>,
+        stalls: std::sync::atomic::AtomicUsize,
     }
     impl std::fmt::Display for CountingStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2497,6 +2516,20 @@ mod discovery_requests {
             opts: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
             self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.reverse {
+                let rank = path
+                    .as_ref()
+                    .split('/')
+                    .find_map(|part| match part {
+                        "a" => Some(3),
+                        "b" => Some(2),
+                        "c" => Some(1),
+                        _ => None,
+                    })
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(rank * 10)).await;
+                self.completed.lock().unwrap().push(path.to_string());
+            }
             self.inner.get_opts(path, opts).await
         }
 
@@ -2505,7 +2538,11 @@ mod discovery_requests {
             prefix: Option<&StorePath>,
         ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            panic!("app discovery must not recursively list {prefix:?}")
+            assert!(
+                self.reverse,
+                "app discovery must not recursively list {prefix:?}"
+            );
+            self.inner.list(prefix)
         }
 
         fn delete_stream(
@@ -2520,6 +2557,17 @@ mod discovery_requests {
         ) -> object_store::Result<object_store::ListResult> {
             self.lists
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .stalls
+                .try_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                std::future::pending::<()>().await;
+            }
             let listing = self.inner.list_with_delimiter(prefix).await?;
             self.entries.fetch_add(
                 listing.common_prefixes.len() + listing.objects.len(),
@@ -2535,6 +2583,171 @@ mod discovery_requests {
         ) -> object_store::Result<()> {
             panic!("source COPY")
         }
+    }
+
+    fn wrapped(inner: Arc<dyn ObjectStore>, reverse: bool, stalls: usize) -> Arc<CountingStore> {
+        Arc::new(CountingStore {
+            inner,
+            gets: 0.into(),
+            lists: 0.into(),
+            entries: 0.into(),
+            reverse,
+            completed: Default::default(),
+            stalls: stalls.into(),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reverse_reads_keep_all_status_and_directory_outputs_sorted() {
+        use wasmkeep_cluster::membership::Directory;
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        for id in ["a", "b", "c"] {
+            for (key, body) in [
+                (
+                    format!("nodes/{id}"),
+                    format!(
+                        "wasmkeep-node 3\nlive i-{id}\n100\n{id}\nhttp://{id}:8080\n0.9.0\nt/{id}\n"
+                    ),
+                ),
+                (
+                    format!("apps/t/{id}/current"),
+                    "0123456789abcdef 1\n".into(),
+                ),
+                (
+                    format!("apps/t/{id}/0123456789abcdef/manifest"),
+                    "wasmkeep-manifest 1\nclass chat 11\n".into(),
+                ),
+                (
+                    format!("formats/t/{id}/floor"),
+                    "wasmkeep-floor 1\n0.9\n".into(),
+                ),
+            ] {
+                inner
+                    .put(&StorePath::from(key), bytes::Bytes::from(body).into())
+                    .await
+                    .unwrap();
+            }
+        }
+        let wrapped = wrapped(inner, true, 0);
+        let store: Arc<dyn ObjectStore> = wrapped.clone();
+        let report = read(store.clone(), "", "memory", 100, 100).await.unwrap();
+        assert_eq!(
+            report
+                .nodes
+                .iter()
+                .map(|n| n.info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            report
+                .apps
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["t/a", "t/b", "t/c"]
+        );
+        assert_eq!(
+            report
+                .upgrades
+                .iter()
+                .map(|a| a.app.as_str())
+                .collect::<Vec<_>>(),
+            ["t/a", "t/b", "t/c"]
+        );
+        for prefix in ["nodes/", "apps/", "formats/"] {
+            let completed = wrapped.completed.lock().unwrap();
+            let paths: Vec<_> = completed
+                .iter()
+                .filter(|p| p.starts_with(prefix) && !p.ends_with("manifest"))
+                .map(String::as_str)
+                .collect();
+            let expected = match prefix {
+                "nodes/" => vec!["nodes/c", "nodes/b", "nodes/a"],
+                "apps/" => vec!["apps/t/c/current", "apps/t/b/current", "apps/t/a/current"],
+                _ => vec![
+                    "formats/t/c/floor",
+                    "formats/t/b/floor",
+                    "formats/t/a/floor",
+                ],
+            };
+            assert_eq!(paths, expected);
+        }
+        let bucket = ObjectStoreBucket::new(store, "");
+        let keys: Vec<_> = ["nodes/a", "nodes/b", "nodes/c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for bodies in [
+            bucket.read(&keys).await.unwrap(),
+            bucket.list("nodes").await.unwrap(),
+        ] {
+            assert_eq!(
+                bodies
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
+                keys
+            );
+            for (key, body) in bodies {
+                assert_eq!(
+                    NodeInfo::decode(&body).unwrap().id,
+                    key.strip_prefix("nodes/").unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn current_manifest_and_direct_tenant_object_match_bounded_discovery() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        for (key, body) in [
+            ("apps/t/a/current", "0123456789abcdef 7\n"),
+            (
+                "apps/t/a/0123456789abcdef/manifest",
+                "wasmkeep-manifest 1\nclass chat 11\n",
+            ),
+            ("apps/t/x", "file"),
+        ] {
+            store
+                .put(
+                    &StorePath::from(key),
+                    bytes::Bytes::from_static(body.as_bytes()).into(),
+                )
+                .await
+                .unwrap();
+        }
+        for max in [None, Some(10)] {
+            let apps = read_apps(&store, "", "memory", max).await.unwrap();
+            assert_eq!(
+                apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                ["t/a", "t/x"]
+            );
+            assert_eq!(apps[0].current.as_ref().unwrap().as_ref().unwrap().seq, 7);
+            assert_eq!(apps[0].manifest_format, Some(1));
+            assert_eq!(apps[0].front, Some(false));
+            assert!(apps[1].current.as_ref().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delimiter_stalls_are_retried_and_eventually_fail() {
+        use std::sync::atomic::Ordering;
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let retry = wrapped(inner.clone(), false, 1);
+        let store: Arc<dyn ObjectStore> = retry.clone();
+        assert!(
+            read_apps(&store, "", "memory", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(retry.lists.load(Ordering::Relaxed), 2);
+        let stalled = wrapped(inner, false, usize::MAX);
+        let store: Arc<dyn ObjectStore> = stalled.clone();
+        let error = read_apps(&store, "", "memory", None).await.unwrap_err();
+        assert!(error.to_string().contains("listing kept stalling"));
+        assert_eq!(stalled.lists.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -2567,6 +2780,9 @@ mod discovery_requests {
                     gets: AtomicUsize::new(0),
                     lists: AtomicUsize::new(0),
                     entries: AtomicUsize::new(0),
+                    reverse: false,
+                    completed: Default::default(),
+                    stalls: AtomicUsize::new(0),
                 });
                 let store: Arc<dyn ObjectStore> = counting.clone();
                 let apps = read_apps(&store, prefix, "memory", None).await.unwrap();
