@@ -107,9 +107,11 @@ The text under a version's heading is its GitHub release text
   when every lease the app's nodes left is `released` or `fenced` and
   names the target version or a later one, and no object under `nodes/`
   fails to decode; the write and the second listing are unchanged. A
-  lease of an older version refuses it, and the message says to start
-  the app once on the new version, `cluster forget` the lease, or delete
-  the app. Without `--app`, every app that can be is raised, each
+  lease of an older version refuses it, and the message names the way
+  out for its state (a released lease can be forgotten, a fenced one
+  cannot). A fence counts as a stop after the default lease timings.
+  The listing after the write now also reports an object under `nodes/`
+  that does not decode, as an error (exit code 1; the floor stays). Without `--app`, every app that can be is raised, each
   refused app is named with its reason and what to do, and the command
   exits with 1. The dry run (no `--yes`) now gives the same answers.
 - **A single slow lease renewal no longer runs a node's lease out.**

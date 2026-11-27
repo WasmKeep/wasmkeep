@@ -657,12 +657,18 @@ one named):
    that this version cannot read; see "Not settled" 11). A lease that
    names an older version, or one that does not parse, refuses it: that
    node may start again on its own version, and no node of the target
-   may ever have served the app. The message says to start the app once
-   on the target and finalize then, or to remove the lease with
-   `wasmkeep cluster forget` for a node that will not serve the app
-   again, or to delete the app. Without `--app`, each app is judged
-   alone: the others are raised, each refused one is named with its
-   reason, and the command exits with 1.
+   may ever have served the app. The message names a way out per lease
+   state: for a released lease, start the app once on the target and
+   finalize then, or remove the lease with `wasmkeep cluster forget` for
+   a node that will not serve the app again; for a fenced one, which
+   `forget` does not remove, start a node of the app on the target and
+   finalize while it is live, or start a node of the target under that
+   id; or delete the app. Without `--app`, each app is judged alone: the
+   others are raised, each refused one is named with its reason, and the
+   command exits with 1. A fence counts as a stop after the default
+   lease timings (ttl plus grace, 15 s): a lease does not record its
+   node's timings, so the offline finalize, like the rest of this
+   command, assumes the defaults.
 4. Writes the floor by conditional write. A lost race is read again.
 5. Waits one start check (a lease's ttl plus grace, plus a heartbeat
    horizon) and lists again. A `0.8.1` node that was starting meanwhile
@@ -672,7 +678,10 @@ one named):
    reported as an error naming it, with exit code 1. The floor stays:
    gated formats remain refused while that node is live (the second half
    of every gate), and the node must be stopped. This second listing is
-   what closes the race section 3 leaves open; it is not optional.
+   what closes the race section 3 leaves open; it is not optional. It
+   keeps the objects under `nodes/` that do not decode, as the first
+   listing of an offline finalize does: each is reported as an error,
+   with exit code 1, and the floor stays.
 6. Prints the registered nodes whose lease is released or fenced and
    still name an older version. They are not an error: such a node stops
    at its next start. An older lease that is stale without either is
@@ -1468,10 +1477,11 @@ node-lease simulation was run again over the changed module.
     has a registered lease, every one is released or fenced (for a
     lease's ttl plus grace) and names the target version or a later
     one, and no object under `nodes/` fails to decode. A lease of an
-    older version refuses it, naming the way out: start the app once on
-    the target, `cluster forget` the lease, or delete the app. The
+    older version refuses it, naming the way out for its state. The
     write and the second listing are those of a finalize with a live
-    node. Shipped in `0.9.1`.
+    node; the second listing also reports an object that does not
+    decode. It assumes the default lease timings for a fence. Shipped
+    in `0.9.1`.
 11. **An object under `nodes/` that does not decode** is never removed
     by a command: `cluster forget` reads only what it can decode (and
     its own mark, which is not such an object). It

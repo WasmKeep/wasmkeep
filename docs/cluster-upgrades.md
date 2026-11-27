@@ -102,9 +102,10 @@ when:
 
 - a lease names an older version (a node that was not upgraded, or was
   stopped before the upgrade): start the app once on the new version,
-  then finalize; or, for a node that will not serve the app again,
-  remove its lease with `wasmkeep cluster forget <id>`; or delete the
-  app;
+  then finalize; or, for a released lease of a node that will not serve
+  the app again, remove it with `wasmkeep cluster forget <id>` (a fenced
+  lease cannot be forgotten: start a node of the app on the new version
+  and finalize while it is live); or delete the app;
 - a lease is stale but neither released nor fenced: run `wasmkeep
   cluster fence <id>`, wait 15 s, finalize;
 - an object under `nodes/` does not decode (it may be a node of a
@@ -112,6 +113,11 @@ when:
   or delete the object from the bucket by hand once you know no running
   node writes it;
 - the app has no lease at all: start a node of the app, then finalize.
+
+A fence counts as a stop 15 s after the node's last write, the default
+lease timings: the lease does not record a node's own. After the write,
+the second listing also reports any object under `nodes/` that does not
+decode, with exit code 1; the floor stays.
 
 Finalize before you stop the last node of the previous version for the
 next upgrade. A node refuses to start two minor versions above an app's
