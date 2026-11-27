@@ -1641,11 +1641,12 @@ if [ $gated = 1 ]; then
     if pin_actor gf-after a && [ -z "$(marker_of gf-after)" ]; then pass "t/gf-after, created by a after the finalize, has no marker"
     else fail "t/gf-after, created after the finalize: marker '$(marker_of gf-after)'"; fi
     # A restore's marker, the only carrier of its actor's generation.
-    curl -sf -X PUT --data-binary $'wasmkeep-lease 2\n41\n' "http://127.0.0.1:$moto_port/mixed-version/state/$APP/leases/t/gf-seeded" >/dev/null
+    curl -sf -X PUT --data-binary $'wasmkeep-lease 2\n41\n' "http://127.0.0.1:$moto_port/mixed-version/state/$APP/leases/t/gf-seeded" >/dev/null \
+      || fail "writing a restore's marker for t/gf-seeded to moto failed"
     run_cli markers-clean new cluster markers clean --bucket "$BUCKET" --app "$APP" --yes
     if [ "$RC" = 0 ] && [ -z "$(marker_of gf-seeded)" ] && [ -z "$(marker_of gf-new)" ]; then pass "cluster markers clean (exit 0): $OUT"
     else fail "cluster markers clean: exit $RC, gf-seeded's marker '$(marker_of gf-seeded)': $OUT"; fi
-    left=$(new cluster verify --bucket "$BUCKET" --app "$APP" --json 2>/dev/null | jq -r '.apps[0].lease_markers' 2>/dev/null)
+    left=$( (new cluster verify --bucket "$BUCKET" --app "$APP" --json 2>/dev/null || true) | jq -r '.apps[0].lease_markers' 2>/dev/null || true)
     if [ "$left" = 0 ]; then pass "cluster verify counts no lease marker left"
     else fail "cluster verify after the cleanup: lease markers left '$left'"; fi
     if pin_actor gf-seeded a && [ "$(owner_gen gf-seeded)" -gt 41 ]; then pass "t/gf-seeded starts at generation $(owner_gen gf-seeded), above its removed marker's 41"

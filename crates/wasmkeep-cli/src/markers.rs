@@ -153,13 +153,26 @@ pub async fn clean(
     Ok(Outcome { out, code: 0 })
 }
 
-/// `wasmkeep cluster markers`: runs the command and exits with its code.
+impl MarkersCommand {
+    /// The bucket the command names.
+    pub fn bucket(&self) -> &str {
+        let Self::Clean(args) = self;
+        &args.bucket
+    }
+}
+
+/// `wasmkeep cluster markers` on the bucket `store` (opened by the caller,
+/// with the checks every writing command makes), under `prefix`: runs the
+/// command and exits with its code.
 ///
 /// # Errors
 /// What [`clean`] gives.
-pub fn run(command: MarkersCommand) -> anyhow::Result<()> {
+pub fn run(
+    command: MarkersCommand,
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+) -> anyhow::Result<()> {
     let MarkersCommand::Clean(args) = command;
-    let (store, prefix) = crate::open_bucket_unchecked(&args.bucket)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

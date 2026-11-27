@@ -838,6 +838,94 @@ mod tests {
             assert_eq!((s.seed, s.markers_none), (8, true));
         }
 
+        /// The order of section 2, on the code: the marker is read before
+        /// the upgrade floor. A cleanup that runs between them (it raises
+        /// the floor, then deletes the marker) leaves a seed above the
+        /// marker; below the floor, the marker read is used as is, and none
+        /// is created from the keys.
+        #[tokio::test]
+        async fn the_marker_is_read_before_the_floors() {
+            let b = bucket();
+            let clock = At(1_000);
+            let fk = key(&root());
+            let lk = "state/t/a/leases/c/x";
+            for at in [true, false] {
+                crate::store::Store::put(&b, lk, encode_marker(6))
+                    .await
+                    .unwrap();
+                crate::store::Store::delete(&b, &fk).await.unwrap();
+                let cleanup = async || {
+                    raise(&b, &fk, floor(6, Markers::Kept)).await.unwrap();
+                    crate::store::Store::delete(&b, lk).await.unwrap();
+                    Ok(at)
+                };
+                let s = seed(&b, &clock, &config(), lk, &fk, 3, false, cleanup)
+                    .await
+                    .unwrap();
+                assert_eq!(s.seed, 6, "at the floor: {at}");
+                assert_eq!(body(&b, lk).await, None, "no marker from the keys");
+            }
+        }
+
+        /// A bucket whose deletes fail: the cleanup stops after its raise.
+        struct NoDeletes(ObjectStoreBucket);
+        impl Bucket for NoDeletes {
+            async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+                self.0.get(key).await
+            }
+            async fn create(&self, key: &str, body: Vec<u8>) -> Result<Version, BucketError> {
+                self.0.create(key, body).await
+            }
+            async fn replace(
+                &self,
+                key: &str,
+                body: Vec<u8>,
+                expected: &Version,
+            ) -> Result<Version, BucketError> {
+                self.0.replace(key, body, expected).await
+            }
+        }
+        impl crate::store::Store for NoDeletes {
+            async fn list(
+                &self,
+                prefix: &str,
+            ) -> Result<Vec<crate::store::ObjectMeta>, BucketError> {
+                crate::store::Store::list(&self.0, prefix).await
+            }
+            async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, BucketError> {
+                self.0.list_dirs(prefix).await
+            }
+            async fn copy(&self, from: &str, to: &str) -> Result<(), BucketError> {
+                self.0.copy(from, to).await
+            }
+            async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), BucketError> {
+                crate::store::Store::put(&self.0, key, body).await
+            }
+            async fn delete(&self, _key: &str) -> Result<(), BucketError> {
+                Err(BucketError::Unavailable("refused".into()))
+            }
+        }
+
+        /// The cleanup raises before it deletes: interrupted at its first
+        /// delete, the floor already covers the only carrier, and every
+        /// marker is still there.
+        #[tokio::test]
+        async fn the_cleanup_raises_before_its_first_delete() {
+            use crate::store::Store as _;
+            let b = NoDeletes(bucket());
+            let r = root();
+            b.put("state/t/a/leases/c/only", encode_marker(9))
+                .await
+                .unwrap();
+            let plan = plan_clean(&b, &r, &At(0), &config()).await.unwrap();
+            assert!(clean(&b, &r, &plan).await.is_err());
+            assert_eq!(read(&b, &key(&r)).await.unwrap().0, floor(9, Markers::Kept));
+            assert_eq!(
+                body(&b.0, "state/t/a/leases/c/only").await.unwrap(),
+                encode_marker(9)
+            );
+        }
+
         /// A per-actor lease from before node leases: live refuses on both
         /// paths; not live is replaced by a marker below the floor and
         /// read and left at it.
@@ -891,6 +979,16 @@ mod tests {
             b.put("state/t/a/leases/c/only", encode_marker(9))
                 .await
                 .unwrap();
+            // A name the key escapes (`bg:lobby`), carried by its record.
+            b.put("state/t/a/leases/c/bg%3Alobby", encode_marker(2))
+                .await
+                .unwrap();
+            b.put(
+                "state/t/a/owners/c/bg%3Alobby",
+                b"wasmkeep-owner 1\n- -\n3\n".to_vec(),
+            )
+            .await
+            .unwrap();
             b.put(
                 "state/t/a/leases/c/old",
                 b"wasmkeep-lease 1\nn1\n12\n2000\n".to_vec(),
@@ -898,7 +996,7 @@ mod tests {
             .await
             .unwrap();
             let plan = plan_clean(&b, &r, &clock, &config()).await.unwrap();
-            assert_eq!(plan.counts(), (1, 2));
+            assert_eq!(plan.counts(), (2, 2));
             assert_eq!(plan.raise_to(), Some(12));
             // Interrupted after the floor's write: the markers are still
             // there and the floor covers them.
@@ -908,7 +1006,7 @@ mod tests {
             let plan = plan_clean(&b, &r, &clock, &config()).await.unwrap();
             assert_eq!(plan.raise_to(), None);
             let done = clean(&b, &r, &plan).await.unwrap();
-            assert_eq!(done.deleted, 3);
+            assert_eq!(done.deleted, 4);
             assert_eq!(done.left, 0);
             assert_eq!(done.floor, floor(12, Markers::None));
             assert!(b.list("state/t/a/leases/").await.unwrap().is_empty());
