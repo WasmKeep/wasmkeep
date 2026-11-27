@@ -1481,6 +1481,13 @@ fn a_process_is_drained_through_every_node_id_it_runs() {
         super::process_node_ids(&nodes, "edge-1", now, 30_000),
         ["shop-1"]
     );
+    // Even when that process is down: its stale heartbeats still name
+    // it, so the plain node with its name is not drained in its place.
+    let nodes = [
+        n("shop-1", Some("edge-1"), now - 600_000),
+        n("edge-1", None, now),
+    ];
+    assert!(super::process_node_ids(&nodes, "edge-1", now, 30_000).is_empty());
 }
 
 #[test]

@@ -948,7 +948,7 @@ pub(crate) async fn announce_intent_async<K: wasmkeep_cluster::control::Keys>(ke
 /// The pause before each further announce after a conflict. Some buckets
 /// answer 409 or 412 to one of two overwrites of the same key at once
 /// (parallel `actor move`s), though neither write has a condition.
-const ANNOUNCE_RETRY: [std::time::Duration; 3] = [
+pub(crate) const ANNOUNCE_RETRY: [std::time::Duration; 3] = [
     std::time::Duration::from_millis(100),
     std::time::Duration::from_millis(300),
     std::time::Duration::from_millis(900),
@@ -959,7 +959,7 @@ const ANNOUNCE_RETRY: [std::time::Duration; 3] = [
 /// condition, so a conflict only means that another writer's overwrite
 /// was in flight; the body written last differs from what the nodes
 /// listed with either way. Any other error is returned at once.
-async fn announce_with_retry<K: wasmkeep_cluster::control::Keys>(
+pub(crate) async fn announce_with_retry<K: wasmkeep_cluster::control::Keys>(
     keys: &K,
     retry: impl IntoIterator<Item = std::time::Duration>,
 ) -> Result<(), wasmkeep_cluster::lease::BucketError> {
@@ -976,8 +976,10 @@ async fn announce_with_retry<K: wasmkeep_cluster::control::Keys>(
                     return Err(BucketError::Conflict);
                 };
                 // Up to 100 ms more, so that writers that collided once
-                // do not again.
-                let jitter = u64::try_from(nanos % 100).unwrap_or(0);
+                // do not again: from microseconds and the pid, since a
+                // clock coarser than 100 ns leaves `nanos % 100` at 0.
+                let jitter = u64::try_from((nanos / 1_000 + u128::from(std::process::id())) % 100)
+                    .unwrap_or(0);
                 tokio::time::sleep(pause + std::time::Duration::from_millis(jitter)).await;
             }
             r => return r,

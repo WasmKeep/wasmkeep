@@ -22,11 +22,16 @@ The text under a version's heading is its GitHub release text
   condition, but a bucket may answer 409 to one of two writes of the same
   key at once. The CLI now writes it again after a short pause, up to
   three times, before it warns; the request itself was always written.
-- **`wasmkeep cluster drain --process ID` works on a node started
-  without a node file.** Such a node names no process in its heartbeat,
-  so the drain was refused. When no live node names the process,
-  `--process` now takes the live node whose id is `ID`; the same holds
-  for `undrain`.
+- **`wasmkeep cluster drain --process ID` works for a process that names
+  none.** A node started without a node file, or from one without
+  `[process] id`, names no process in its heartbeat, so the drain was
+  refused. When no heartbeat, live or stale, names the process,
+  `--process` now takes the live node whose id is `ID` and that names no
+  process; each such node is drained on its own. The same holds for
+  `undrain`, which needs the node live; a stopped node is undrained by
+  its id.
+- **A conflict on announcing an `actor restore` is retried too**, rather
+  than withdrawing the request.
 
 ## 0.9.0
 

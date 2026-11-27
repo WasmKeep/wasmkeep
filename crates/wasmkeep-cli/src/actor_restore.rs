@@ -189,7 +189,8 @@ async fn execute(
         let _ = keys.delete(&format!("{key}.ltx")).await;
         return Err(e.into());
     }
-    if let Err(e) = control::announce(&keys, &id).await {
+    // Written again after a conflict, as for a move (`announce_with_retry`).
+    if let Err(e) = crate::announce_with_retry(&keys, crate::ANNOUNCE_RETRY).await {
         let _ = keys.delete(&key).await;
         let _ = keys.delete(&format!("{key}.ltx")).await;
         bail!("announcing restore failed: {e}");

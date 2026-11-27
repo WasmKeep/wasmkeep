@@ -294,7 +294,7 @@ Usage: `wasmkeep cluster drain [OPTIONS] --bucket <BUCKET> [NODE]`
 | Flag or argument | Default | Meaning |
 |---|---|---|
 | `[NODE]  The node's id` | |  |
-| `--process <ID>` |  | Every node id this process runs (ADR 0038: the `process=` its heartbeats name), instead of one node |
+| `--process <ID>` |  | Every node id this process runs (ADR 0038: the `process=` its heartbeats name), instead of one node. |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
 | `--force` |  | Write (or withdraw) the request even though no live node has the id (and, for `undrain`, no request names it) |
 
@@ -307,7 +307,7 @@ Usage: `wasmkeep cluster undrain [OPTIONS] --bucket <BUCKET> [NODE]`
 | Flag or argument | Default | Meaning |
 |---|---|---|
 | `[NODE]  The node's id` | |  |
-| `--process <ID>` |  | Every node id this process runs (ADR 0038: the `process=` its heartbeats name), instead of one node |
+| `--process <ID>` |  | Every node id this process runs (ADR 0038: the `process=` its heartbeats name), instead of one node. |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX] (credentials from the AWS_* environment variables) |
 | `--force` |  | Write (or withdraw) the request even though no live node has the id (and, for `undrain`, no request names it) |
 

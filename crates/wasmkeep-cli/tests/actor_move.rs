@@ -4,7 +4,7 @@
 //!
 //! A request sent on a connection pooled by another runtime of the same
 //! process, one that runs nothing while the command waits, hangs until
-//! object_store's 30 s timeout: a move took 30 to 90 s that way. And a
+//! object_store's 30 s timeout: a move took 30 s that way. And a
 //! bucket may answer 409 to one of two overwrites of `control/changed` at
 //! once, which parallel moves must not report as a failure.
 
@@ -33,6 +33,10 @@ struct Bucket {
     announced: AtomicUsize,
     /// Overwrites of `control/changed` answered 409.
     conflicted: AtomicUsize,
+    /// Connections accepted.
+    connections: AtomicUsize,
+    /// Requests answered, on every connection.
+    requests: AtomicUsize,
 }
 
 /// One connection, kept open for as many requests as the client sends.
@@ -69,7 +73,11 @@ async fn serve(sock: tokio::net::TcpStream, bucket: Arc<Bucket>) {
         if read.read_exact(&mut body).await.is_err() {
             return;
         }
+        bucket.requests.fetch_add(1, Ordering::SeqCst);
         let (status, reply) = answer(&bucket, &method, &target, body);
+        // A HEAD answer carries no body: one would be read as the start
+        // of the next answer on this connection.
+        let reply = if method == "HEAD" { Vec::new() } else { reply };
         let head = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/xml\r\n\
              ETag: \"e\"\r\nLast-Modified: Thu, 26 Nov 2026 00:00:00 GMT\r\n\r\n",
@@ -94,14 +102,7 @@ fn answer(bucket: &Bucket, method: &str, target: &str, body: Vec<u8>) -> (&'stat
                 .to_vec(),
         ),
         "GET" | "HEAD" => match bucket.objects.lock().unwrap().get(&key) {
-            Some(body) => (
-                "200 OK",
-                if method == "GET" {
-                    body.clone()
-                } else {
-                    Vec::new()
-                },
-            ),
+            Some(body) => ("200 OK", body.clone()),
             None => (
                 "404 Not Found",
                 b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>".to_vec(),
@@ -152,6 +153,7 @@ fn stand_in(bucket: Arc<Bucket>) -> SocketAddr {
             tx.send(listener.local_addr().unwrap()).unwrap();
             loop {
                 let (sock, _) = listener.accept().await.unwrap();
+                bucket.connections.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(serve(sock, Arc::clone(&bucket)));
             }
         });
@@ -175,6 +177,15 @@ fn move_cmd(addr: SocketAddr, name: &str) -> Command {
     ])
     .env_remove("AWS_SESSION_TOKEN")
     .env_remove("AWS_PROFILE")
+    .env_remove("AWS_ENDPOINT_URL")
+    .env_remove("HTTP_PROXY")
+    .env_remove("HTTPS_PROXY")
+    .env_remove("http_proxy")
+    .env_remove("https_proxy")
+    .env_remove("ALL_PROXY")
+    .env_remove("all_proxy")
+    .env("NO_PROXY", "127.0.0.1")
+    .env("no_proxy", "127.0.0.1")
     .env("AWS_ACCESS_KEY_ID", "test")
     .env("AWS_SECRET_ACCESS_KEY", "test")
     .env("AWS_REGION", "us-east-1")
@@ -195,7 +206,7 @@ fn succeeded_quietly(out: &Output) {
 
 /// About ten requests on one bucket: well under a second here. The bound
 /// leaves room for a loaded machine, and none for a 30 s timeout.
-const BOUND: Duration = Duration::from_secs(10);
+const BOUND: Duration = Duration::from_secs(20);
 
 #[test]
 fn a_move_reuses_its_connections_without_waiting_for_a_timeout() {
@@ -206,6 +217,17 @@ fn a_move_reuses_its_connections_without_waiting_for_a_timeout() {
     let took = started.elapsed();
     succeeded_quietly(&out);
     assert!(took < BOUND, "actor move took {took:?}");
+    // The point of the test: every request after the first went on the
+    // connection the first one opened (one per runtime before the fix).
+    let (connections, requests) = (
+        bucket.connections.load(Ordering::SeqCst),
+        bucket.requests.load(Ordering::SeqCst),
+    );
+    assert!(requests > 1, "{requests} requests");
+    assert_eq!(
+        connections, 1,
+        "{connections} connections for {requests} requests"
+    );
     assert_eq!(bucket.announced.load(Ordering::SeqCst), 1);
     assert!(
         bucket
