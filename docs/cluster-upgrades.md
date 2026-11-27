@@ -65,10 +65,10 @@ page says; these are the checks and the commands it uses.
   refused, naming them, while a live node of the app is older. After the
   write it waits about 25 s and lists the nodes again; an older node live
   then is reported as an error and must be stopped. Without `--yes` it
-  prints what it would do. Without `--app` it raises the floor of every
-  app that has a live node, and exits with 1 if any app has no live
-  node, even after raising the others: finalize the live ones with
-  `--app`, or remove the leftover leases with `wasmkeep cluster forget`.
+  prints what it would do, with the same checks. Without `--app` it
+  raises the floor of every app it can, names each app it refused with
+  the reason and what to do, and exits with 1 if any was refused, even
+  after raising the others.
 
 ```sh
 wasmkeep cluster upgrade status --bucket s3://wasmkeep-demo
@@ -91,9 +91,27 @@ case and go on.
 `finalize` counts an older node as stopped only when its lease is
 `released` or `fenced`. A lease that is merely stale (the machine
 vanished, or is cut off) is refused: run `wasmkeep cluster fence <id>`
-first; a fence counts 15 s after the node's last write. It also needs a
-live node: after an upgrade done with every node stopped, start the
-nodes, then finalize.
+first; a fence counts 15 s after the node's last write.
+
+`finalize` also works with every node of the app stopped (from 0.9.1;
+0.9.0 refuses an app with no live node). It is then accepted only when
+every lease the app's nodes left is `released` or `fenced` and names the
+version of the `wasmkeep` that finalizes or a later one: those leases
+are the only record of which version last served the app. It is refused
+when:
+
+- a lease names an older version (a node that was not upgraded, or was
+  stopped before the upgrade): start the app once on the new version,
+  then finalize; or, for a node that will not serve the app again,
+  remove its lease with `wasmkeep cluster forget <id>`; or delete the
+  app;
+- a lease is stale but neither released nor fenced: run `wasmkeep
+  cluster fence <id>`, wait 15 s, finalize;
+- an object under `nodes/` does not decode (it may be a node of a
+  version this one cannot read): start a node of the app and finalize,
+  or delete the object from the bucket by hand once you know no running
+  node writes it;
+- the app has no lease at all: start a node of the app, then finalize.
 
 Finalize before you stop the last node of the previous version for the
 next upgrade. A node refuses to start two minor versions above an app's
