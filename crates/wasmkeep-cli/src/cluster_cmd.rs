@@ -10,7 +10,10 @@ pub(super) struct DrainArgs {
     node: Option<String>,
 
     /// Every node id this process runs (ADR 0038: the `process=` its
-    /// heartbeats name), instead of one node.
+    /// heartbeats name), instead of one node. For a process that names
+    /// none (no `[process] id`), `ID` is a node id: each such node is
+    /// drained on its own. `undrain --process` needs the nodes live; a
+    /// stopped node is undrained by its id.
     #[arg(long, value_name = "ID")]
     process: Option<String>,
 
@@ -124,21 +127,38 @@ pub(super) struct StatusArgs {
 }
 
 /// The live node ids among `nodes` whose heartbeats name `process`, sorted.
+/// A process that names none (no `process=`: `wasmkeep serve` without a
+/// node file, or a node file without `[process] id`) is found by each of
+/// its node ids on its own: when no heartbeat, live or stale, names
+/// `process`, the live node with that id and no process.
 pub(crate) fn process_node_ids(
     nodes: &[wasmkeep_cluster::membership::NodeInfo],
     process: &str,
     now_ms: u64,
     horizon_ms: u64,
 ) -> Vec<String> {
+    let live = |n: &&wasmkeep_cluster::membership::NodeInfo| {
+        wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
+    };
     let mut ids: Vec<String> = nodes
         .iter()
-        .filter(|n| {
-            n.process.as_deref() == Some(process)
-                && wasmkeep_cluster::membership::is_live(n, now_ms, horizon_ms)
-        })
+        .filter(live)
+        .filter(|n| n.process.as_deref() == Some(process))
         .map(|n| n.id.clone())
         .collect();
+    // Only when no heartbeat at all, stale ones included, names the
+    // process: a process that is down must not stand for a node of the
+    // same id.
+    if !nodes.iter().any(|n| n.process.as_deref() == Some(process)) {
+        ids = nodes
+            .iter()
+            .filter(live)
+            .filter(|n| n.process.is_none() && n.id == process)
+            .map(|n| n.id.clone())
+            .collect();
+    }
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -171,7 +191,9 @@ pub(super) fn cluster_drain(args: &DrainArgs, drain: bool) -> anyhow::Result<()>
             let ids = process_node_ids(&all, process, status::now_ms(), horizon_ms);
             anyhow::ensure!(
                 !ids.is_empty(),
-                "no live node id names the process {process} (see `wasmkeep cluster status`)"
+                "no live node names the process {process}, nor is a live node that names no \
+                 process called {process} (see the PROCESS table of `wasmkeep cluster \
+                 status`; a stopped node is undrained by its node id)"
             );
             ids
         }

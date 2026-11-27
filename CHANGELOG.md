@@ -7,6 +7,32 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
+## Unreleased
+
+### Fixed
+
+- **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
+  its last check on a second runtime while the first still held the
+  bucket's pooled connection, and that request waited for object_store's
+  30 s timeout: a move took 30 s or more against a bucket that keeps its
+  connections open. `actor move` and `actor delete` now make every
+  request on one runtime.
+- **Parallel moves no longer warn "telling the nodes failed
+  (precondition failed)".** The rewrite of `control/changed` has no
+  condition, but a bucket may answer 409 to one of two writes of the same
+  key at once. The CLI now writes it again after a short pause, up to
+  three times, before it warns; the request itself was always written.
+- **`wasmkeep cluster drain --process ID` works for a process that names
+  none.** A node started without a node file, or from one without
+  `[process] id`, names no process in its heartbeat, so the drain was
+  refused. When no heartbeat, live or stale, names the process,
+  `--process` now takes the live node whose id is `ID` and that names no
+  process; each such node is drained on its own. The same holds for
+  `undrain`, which needs the node live; a stopped node is undrained by
+  its id.
+- **A conflict on announcing an `actor restore` is retried too**, rather
+  than withdrawing the request.
+
 ## 0.9.0
 
 **0.9 can be upgraded one node at a time: a cluster moves from 0.8.1 to

@@ -932,15 +932,58 @@ fn announce_intent(
     rt: &tokio::runtime::Runtime,
     keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
 ) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let token = format!("cli {} {nanos}", std::process::id());
-    if let Err(e) = rt.block_on(wasmkeep_cluster::control::announce(keys, &token)) {
+    rt.block_on(announce_intent_async(keys));
+}
+
+/// [`announce_intent`] on the caller's runtime.
+pub(crate) async fn announce_intent_async<K: wasmkeep_cluster::control::Keys>(keys: &K) {
+    if let Err(e) = announce_with_retry(keys, ANNOUNCE_RETRY).await {
         eprintln!(
             "warning: the request is written, but telling the nodes failed ({e}): they read it \
              within a minute instead of a few seconds"
         );
+    }
+}
+
+/// The pause before each further announce after a conflict. Some buckets
+/// answer 409 or 412 to one of two overwrites of the same key at once
+/// (parallel `actor move`s), though neither write has a condition.
+pub(crate) const ANNOUNCE_RETRY: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(900),
+];
+
+/// Rewrites `control/changed` with a new token, again after each pause of
+/// `retry` while the bucket answers with a conflict. The write has no
+/// condition, so a conflict only means that another writer's overwrite
+/// was in flight; the body written last differs from what the nodes
+/// listed with either way. Any other error is returned at once.
+pub(crate) async fn announce_with_retry<K: wasmkeep_cluster::control::Keys>(
+    keys: &K,
+    retry: impl IntoIterator<Item = std::time::Duration>,
+) -> Result<(), wasmkeep_cluster::lease::BucketError> {
+    use wasmkeep_cluster::lease::BucketError;
+    let mut retry = retry.into_iter();
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let token = format!("cli {} {nanos}", std::process::id());
+        match wasmkeep_cluster::control::announce(keys, &token).await {
+            Err(BucketError::Conflict) => {
+                let Some(pause) = retry.next() else {
+                    return Err(BucketError::Conflict);
+                };
+                // Up to 100 ms more, so that writers that collided once
+                // do not again: from microseconds and the pid, since a
+                // clock coarser than 100 ns leaves `nanos % 100` at 0.
+                let jitter = u64::try_from((nanos / 1_000 + u128::from(std::process::id())) % 100)
+                    .unwrap_or(0);
+                tokio::time::sleep(pause + std::time::Duration::from_millis(jitter)).await;
+            }
+            r => return r,
+        }
     }
 }
 
@@ -952,11 +995,25 @@ pub(crate) fn refuse_deleted(
     tenant: &str,
     app: &str,
 ) -> anyhow::Result<()> {
-    let app_ref = AppRef::new(std::sync::Arc::clone(store), prefix, tenant, app);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(app_ref.check_not_deleted())
+    rt.block_on(refuse_deleted_async(store, prefix, tenant, app))
+}
+
+/// [`refuse_deleted`] on the caller's runtime. A command that holds a
+/// runtime must call this one: a second runtime would find the store's
+/// pooled connections tied to the first, which runs nothing while it
+/// waits, and each such request would hang until its 30 s timeout.
+pub(crate) async fn refuse_deleted_async(
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+    app: &str,
+) -> anyhow::Result<()> {
+    AppRef::new(std::sync::Arc::clone(store), prefix, tenant, app)
+        .check_not_deleted()
+        .await
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -1081,19 +1138,35 @@ pub(crate) fn check_layout(
     prefix: &str,
     tenant: &str,
 ) -> anyhow::Result<bool> {
+    on_own_thread(check_layout_async(url, store, prefix, tenant))
+        .unwrap_or_else(|| anyhow::bail!("bucket {url}: no answer while checking its layout"))
+}
+
+/// [`check_layout`] on the caller's runtime, bounded the same way (see
+/// [`refuse_deleted_async`] for why a command holding a runtime needs it).
+/// It covers [`open_bucket`]'s migration check too.
+pub(crate) async fn check_layout_async(
+    url: &str,
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    tenant: &str,
+) -> anyhow::Result<bool> {
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(
         std::sync::Arc::clone(store),
         prefix,
     );
-    match on_own_thread(wasmkeep_cluster::legacy_layout::start_check(
-        &bucket, tenant,
-    )) {
-        None => anyhow::bail!("bucket {url}: no answer while checking its layout"),
-        Some(Err(e)) => Err(anyhow::anyhow!(
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wasmkeep_cluster::legacy_layout::start_check(&bucket, tenant),
+    )
+    .await
+    {
+        Err(_) => anyhow::bail!("bucket {url}: no answer while checking its layout"),
+        Ok(Err(e)) => Err(anyhow::anyhow!(
             "bucket {url}: {}",
             e.to_string().replace("<this bucket>", url)
         )),
-        Some(Ok(migrated)) => Ok(migrated),
+        Ok(Ok(migrated)) => Ok(migrated),
     }
 }
 
