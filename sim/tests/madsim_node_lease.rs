@@ -1714,7 +1714,7 @@ fn an_absent_read_keeping_the_window_is_caught() {
 }
 
 /// A seed where [`Variant::StaleAbsentKeepsWindow`] gives two owners.
-const KNOWN_ABSENT: u64 = 87_854;
+const KNOWN_ABSENT: u64 = 128_996;
 
 /// Whether `seed` under `variant` gives two owners or one generation for
 /// two holds.
@@ -1730,14 +1730,18 @@ fn caught_by(seed: u64, variant: Variant) -> bool {
 /// `WASMKEEP_SIM_SEEDS` says.
 #[test]
 fn a_read_back_judging_as_read_is_caught() {
-    let caught = (0..seeds().max(1_000)).find(|&seed| {
-        let o = simulate(
-            seed,
-            Variant::StaleReadBackUnchecked,
-            Duration::from_secs(30),
-        );
-        double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
-    });
+    // Seed 4046 showed it once renewals followed the server's schedule
+    // (ADR 0020, amendment of 2026-11-27); checked first.
+    let caught = std::iter::once(4_046)
+        .chain(0..seeds().max(1_000))
+        .find(|&seed| {
+            let o = simulate(
+                seed,
+                Variant::StaleReadBackUnchecked,
+                Duration::from_secs(30),
+            );
+            double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
+        });
     eprintln!("read back judging as read: caught by seed {caught:?}");
     assert!(
         caught.is_some(),

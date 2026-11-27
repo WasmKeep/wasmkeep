@@ -1907,8 +1907,15 @@ Tests: `node_lease::tests::a_timeout_then_a_slow_retry_keeps_the_lease`,
 `an_adopted_write_that_is_not_newer_is_a_failure` and
 `the_last_attempt_that_fits_runs_to_the_end_of_the_validity`. The
 simulations' node renews on this schedule too. Its writes, closer
-together, leave stale reads less room: the two broken variants of the
-amendment on lease reads are now caught about once in 7,500 seeds (a
-created fence judged by date) and once in 90,000 (an absent read keeping
-the window), and the seeds that showed them (7548 and 87854) are checked
-first.
+together, leave stale reads less room: three broken variants of the
+amendment on lease reads are now caught rarely (a created fence judged by
+date at seed 7548, a read back judged as read at 4046, an absent read
+keeping the window at 87854, 127417 and 128996 of the first 130,000), and
+a seed that showed each is checked first. Two of those seeds, 87854 and
+127417, also give two owners with the correct rules under the hot
+operator: on 87854 the operator deletes a live lease, and a fence it
+created earlier, whose create had timed out, lands after that delete with
+its old date and frees the record the running process holds. That is the
+limit this record keeps for a live lease deleted out of band ("What it
+does not close", #303), now reached by the simulation; the known seed of
+that variant is 128996, where the correct rules hold.
