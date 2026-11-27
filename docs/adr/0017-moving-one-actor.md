@@ -123,8 +123,13 @@ counts and the others are deleted. For one key, to target T:
    later passes until it expires: a target may be starting, or briefly
    suspect.
 2. **Close the actor's sockets** with 1012 and wait (5 s), as a drain
-   does. While a move is pending, upgrades for the actor are relayed to T,
-   so clients that reconnect do not land back here.
+   does. From before the sockets close until the move ends, the actor is
+   marked closing on this node: an upgrade for it here, relayed back by a
+   node that still names this one, is answered `503` with
+   `Retry-After: 1` ([ADR 0040, section
+   14](0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
+   Once the move is recorded, upgrades for the actor are relayed to T, so
+   clients that reconnect do not land back here.
 3. **Queue the move job** in the actor's mailbox. It runs after the
    queued events:
    - it does nothing if this attempt was abandoned meanwhile (each
