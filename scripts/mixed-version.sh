@@ -645,8 +645,9 @@ check_placement() {
 # serving), so no rebalance move starts. Noted with it: why it is paused,
 # the moves so far, and the sockets for an edge nobody held that its home
 # (old or new) took, or did not.
+declare -A rb_moves # new node -> its rebalance moves when last read while mixed
 check_rebalance() {
-  local n page old=0 paused why moves home
+  local n page old=0 paused why moves total home
   for n in "${NODES[@]}"; do
     [ "${bin[$n]}" = "$new_bin" ] || old=1
   done
@@ -656,15 +657,32 @@ check_rebalance() {
     paused=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{' \
       | awk '{s+=$2} END {print s+0}' || true)
     why=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{.* 1$' \
-      | grep -Eo 'reason="[^"]*"' | tr '\n' ' ' || true)
+      | grep -Eo 'reason="[^"]*"' | sed -E 's/reason="([^"]*)"/\1/' | tr '\n' ' ' || true)
+    why=${why% }
     moves=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_moves_total' \
       | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ' || true)
+    total=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_moves_total' \
+      | awk '{s+=$2} END {print s+0}' || true)
     home=$(printf '%s\n' "$page" | grep -E '^wasmkeep_placement_spread_total\{.*outcome="home(_failed)?"' \
       | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ' || true)
     note "node $n rebalance: paused ${why:-no}; moves ${moves:-none}; cold sockets ${home:-none}"
     if [ "$old" = 1 ] && [ "$gated" = 1 ]; then
-      if [ "${paused:-0}" -ge 1 ]; then pass "node $n: rebalance paused while two minor versions are live (${why% })"
-      else fail "node $n: rebalance not paused while a node of $old_short runs a minor version apart"; fi
+      # The version skew is the reason, unless a drain or a node not
+      # serving is (those are reported first, and pause it too).
+      case "${paused:-0}:$why" in
+        0:*) fail "node $n: rebalance not paused while a node of $old_short runs a minor version apart" ;;
+        *:versions) pass "node $n: rebalance paused for versions while a node of $old_short runs" ;;
+        *:draining|*:not_serving) note "node $n: rebalance paused for $why (before versions)" ;;
+        *) fail "node $n: rebalance paused for $why, not versions, while a node of $old_short runs" ;;
+      esac
+      # No move starts while the versions are mixed: its count stays
+      # flat (a node restarted since starts again from 0).
+      if [ -n "${rb_moves[$n]:-}" ] && [ "${total:-0}" -gt "${rb_moves[$n]}" ]; then
+        fail "node $n: $((total - rb_moves[$n])) rebalance moves while a node of $old_short ran"
+      fi
+      rb_moves[$n]=${total:-0}
+    else
+      unset 'rb_moves[$n]'
     fi
   done
 }

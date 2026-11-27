@@ -13,10 +13,11 @@
 //!    actor is on its home within a bound from the settle delay, the stay
 //!    and the pacing. Mutation: the settle delay never met.
 //! 2. Monotone: every rebalance move raises the weight of the actor's node
-//!    for that actor, and no actor that a rebalance move brought to a node
-//!    moves again within the stay while it stays there (acquired any
-//!    other way meanwhile, by a drain's release and a wake-up, it has no
-//!    wait). Mutation: no stay (rule 7 removed), with a flapping node.
+//!    for that actor, and no actor moves within the stay of a take that
+//!    armed it: a take on a node that is not the actor's home in its own
+//!    view (an operator's move, which the model makes now and then, or a
+//!    move or cold socket whose sender's view differed). Mutation: no stay
+//!    (rule 7 removed).
 //! 3. Paced: never more than two moves in flight per node, never more
 //!    sockets closed in a period than the budget plus one actor's.
 //!    Mutation: the budget removed.
@@ -109,10 +110,11 @@ struct Actor {
     /// The holder died: its record says "try here".
     dead: bool,
     sockets: u64,
+    /// When a take that armed its stay brought it to its holder: a take
+    /// on a node that is not its home in that node's own view (an
+    /// operator's move, or a move or cold socket whose sender saw another
+    /// home). `None` once it is acquired any other way.
     taken_at: Option<u64>,
-    /// When a rebalance move brought it to its holder (its take); `None`
-    /// once it is acquired any other way.
-    rebalanced_at: Option<u64>,
 }
 
 struct Flight {
@@ -189,7 +191,7 @@ impl World {
         if a.dead || !a.spread {
             // "Try here", or a class that does not spread: taken here.
             let a = &mut self.actors[i];
-            (a.holder, a.dead, a.taken_at, a.rebalanced_at) = (Some(x), false, None, None);
+            (a.holder, a.dead, a.taken_at) = (Some(x), false, None);
             return;
         }
         // Nobody holds it: its home takes it first (section 3.3).
@@ -207,11 +209,11 @@ impl World {
             ));
         }
         let now = self.now;
+        let armed = taken && self.home_from(at, &a.key) != at;
         let a = &mut self.actors[i];
         a.holder = Some(at);
         a.dead = false;
-        a.taken_at = taken.then_some(now);
-        a.rebalanced_at = None;
+        a.taken_at = armed.then_some(now);
     }
 
     /// Node `o`'s pass.
@@ -336,9 +338,9 @@ impl World {
                 self.violations
                     .push((2, format!("{} moved down from {o} to {to}", a.key)));
             }
-            if a.rebalanced_at.is_some_and(|t| now - t < STAY) {
+            if a.taken_at.is_some_and(|t| now - t < STAY) {
                 self.violations
-                    .push((2, format!("{} moved twice within the stay", a.key)));
+                    .push((2, format!("{} moved within the stay of its take", a.key)));
             }
             let sockets = a.sockets;
             let node = &mut self.nodes[o];
@@ -376,6 +378,9 @@ impl World {
         self.flights = rest;
         for f in done {
             let target_ok = self.nodes[f.to].seen.state == State::Serving;
+            // The stay is armed only where the receiver is not the
+            // actor's home in its own view (rule 7).
+            let armed = self.home_from(f.to, &self.actors[f.actor].key) != f.to;
             let a = &mut self.actors[f.actor];
             if a.holder.is_some() {
                 continue; // taken elsewhere in the gap
@@ -383,8 +388,7 @@ impl World {
             if target_ok && rng.chance(90) {
                 a.holder = Some(f.to);
                 a.dead = false;
-                a.taken_at = Some(now);
-                a.rebalanced_at = Some(now);
+                a.taken_at = armed.then_some(now);
             } else {
                 self.nodes[f.from].failed.insert(f.to, now + HORIZON);
             }
@@ -451,6 +455,21 @@ impl World {
             let n = rng.below(count as u64) as usize;
             self.nodes[n].seen.reachable = !self.nodes[n].seen.reachable;
         }
+        // An operator's move of a held spread actor to another serving
+        // node: off its home, usually, so its stay is armed.
+        let up = self.up();
+        if up.len() > 1 && rng.chance(3) {
+            let i = rng.below(self.actors.len() as u64) as usize;
+            let to = up[rng.below(up.len() as u64) as usize];
+            let a = &self.actors[i];
+            let in_flight = self.flights.iter().any(|f| f.actor == i);
+            if a.spread && !a.dead && !in_flight && a.holder.is_some_and(|h| h != to) {
+                let armed = self.home_from(to, &a.key) != to;
+                let a = &mut self.actors[i];
+                a.holder = Some(to);
+                a.taken_at = armed.then_some(now);
+            }
+        }
     }
 
     /// Faults end: every node serving, reachable, on the base version.
@@ -495,7 +514,8 @@ impl World {
 }
 
 /// The bound of property 1, in seconds after the faults end: the settle
-/// delay, the stay of an actor taken just before, and every misplaced
+/// delay, the stay an operator's move just before armed (a take home in
+/// its receiver's view arms none), and every misplaced
 /// actor moved two at a time per node, with a failure's horizon twice.
 fn bound() -> u64 {
     SETTLE + STAY + (ACTORS as u64).div_ceil(2) * 2 + 2 * HORIZON + 2 * PERIOD
@@ -530,7 +550,6 @@ fn schedule(seed: u64, mutation: Mutation) -> Vec<(u8, String)> {
             dead: false,
             sockets: 20 + rng.below(300),
             taken_at: None,
-            rebalanced_at: None,
         })
         .collect();
     let mut w = World {
@@ -627,7 +646,7 @@ fn a_settle_delay_never_met_fails_convergence() {
 }
 
 #[test]
-fn no_stay_with_a_flapping_node_fails_monotone() {
+fn no_stay_fails_monotone() {
     run(Mutation::NoStay, &[1, 2, 3], 2);
 }
 
