@@ -59,6 +59,15 @@
 //! Ignoring the node's epoch rule is never caught here, and a test says
 //! why (`ignoring_the_epoch_is_never_caught_here`).
 //!
+//! The generation floor (ADR 0045) is a bounded interleaving model, not a
+//! seeded run (`support/generation_floor.rs`): first acquisitions on two
+//! nodes that serve through the finalize, racing `cluster markers clean`
+//! over a marker a restore before 0.10 left as the only carrier of a
+//! seed, and an actor's delete and recreate. No record reuses a
+//! generation the actor's history ever carried; the cleanup deleting
+//! before it raises, a node reading either floor before the marker, and a
+//! node keeping the upgrade floor it read at start are each caught.
+//!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --target-dir target/madsim`
 
 #![cfg(madsim)]
@@ -1767,4 +1776,59 @@ fn a_killed_holder_is_taken_over_under_stale_reads_and_a_clock_step() {
         "{} seeds, clocks stepped back: {behind} reads behind",
         seeds()
     );
+}
+
+#[path = "support/generation_floor.rs"]
+mod generation_floor_model;
+
+/// After a restore before 0.10: actor 0's history carried 5, the restore
+/// copied a plan at 3 and left a marker at 6, its only carrier; actor 1 is
+/// new. Two nodes of 0.10 serve through the finalize, and a cleanup runs
+/// once the floor is 0.10.
+fn leftover_marker() -> generation_floor_model::Start {
+    use generation_floor_model::{Start, Task};
+    Start {
+        finalized: false,
+        floor: (0, false),
+        actors: vec![(Some(6), None, 3, 5, 3), (None, None, 0, 0, 0)],
+        nodes: vec![
+            vec![Task::Acquire(0), Task::Delete(0), Task::Acquire(0)],
+            vec![Task::Acquire(0), Task::Acquire(1)],
+        ],
+        restores: 0,
+        clean: true,
+    }
+}
+
+/// ADR 0045, section 2: across every interleaving of the finalize, the
+/// cleanup and first acquisitions, no ownership record reuses a
+/// generation; the runs reach a first record seeded from the generation
+/// floor alone, a folded marker, and a recreated actor.
+#[test]
+fn a_cleanup_racing_first_acquisitions_through_a_finalize_reuses_no_generation() {
+    use generation_floor_model::{Mutation, explore};
+    let reached =
+        explore(&leftover_marker(), Mutation::None).unwrap_or_else(|reused| panic!("{reused:?}"));
+    assert!(reached.from_floor > 0, "{reached:?}");
+    assert!(reached.folded > 0, "{reached:?}");
+    assert!(reached.recreated > 0, "{reached:?}");
+    eprintln!("generation floor: {reached:?}");
+}
+
+/// Each order the cleanup's safety rests on, broken, reuses a generation
+/// on some interleaving.
+#[test]
+fn each_broken_generation_floor_order_is_caught() {
+    use generation_floor_model::{Mutation, explore};
+    for mutation in [
+        Mutation::DeleteBeforeRaise,
+        Mutation::UpgradeFloorFirst,
+        Mutation::GenerationFloorFirst,
+        Mutation::StartFloor,
+    ] {
+        assert!(
+            explore(&leftover_marker(), mutation).is_err(),
+            "{mutation:?} was never caught"
+        );
+    }
 }
