@@ -31,8 +31,8 @@
 #   by a node of the old release is not followed; through a new node that
 #   trusts it, it is, on both nodes;
 # - edges return home (ADR 0040, section 14, from 0.10.0): after every
-#   step each new node's rebalance pass is paused for versions while a
-#   node of the old release runs a minor version apart, and its moves and
+#   step each new node's rebalance pass is paused while a node of the
+#   old release runs a minor version apart, and its moves and
 #   the cold sockets its edges' homes took (old homes included) are noted;
 # - CLI skew: the old CLI against the finalized cluster (`deploy`,
 #   `secrets set`, `cluster status`, `cluster drain`, `backup create`):
@@ -640,27 +640,31 @@ check_placement() {
   done
 }
 # Spread actors return home (ADR 0040, section 14) on the new nodes: while
-# a node of the old release runs beside them and the two are a minor
-# version apart, the pass is paused for versions, so no rebalance move
-# starts. Noted with it: the moves so far, and the sockets for an edge
-# nobody held that its home (old or new) took, or did not.
+# a node of the old release runs beside them, a minor version apart, the
+# pass is paused (for versions, or first for a drain or a node not
+# serving), so no rebalance move starts. Noted with it: why it is paused,
+# the moves so far, and the sockets for an edge nobody held that its home
+# (old or new) took, or did not.
 check_rebalance() {
-  local n page old=0 paused moves home
+  local n page old=0 paused why moves home
   for n in "${NODES[@]}"; do
     [ "${bin[$n]}" = "$new_bin" ] || old=1
   done
   for n in "${NODES[@]}"; do
     [ "${bin[$n]}" = "$new_bin" ] || continue
-    page=$(curl -s "http://127.0.0.1:${mport[$n]}/metrics")
-    paused=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{.*reason="versions"' | awk '{s+=$2} END {print s+0}')
+    page=$(curl -s "http://127.0.0.1:${mport[$n]}/metrics" || true)
+    paused=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{' \
+      | awk '{s+=$2} END {print s+0}' || true)
+    why=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_paused\{.* 1$' \
+      | grep -Eo 'reason="[^"]*"' | tr '\n' ' ' || true)
     moves=$(printf '%s\n' "$page" | grep -E '^wasmkeep_rebalance_moves_total' \
-      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ')
+      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ' || true)
     home=$(printf '%s\n' "$page" | grep -E '^wasmkeep_placement_spread_total\{.*outcome="home(_failed)?"' \
-      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ')
-    note "node $n rebalance: paused for versions $paused; moves ${moves:-none}; cold sockets ${home:-none}"
+      | sed -E 's/\{tenant="[^"]*",app="[^"]*",?/{/' | tr '\n' ' ' || true)
+    note "node $n rebalance: paused ${why:-no}; moves ${moves:-none}; cold sockets ${home:-none}"
     if [ "$old" = 1 ] && [ "$gated" = 1 ]; then
-      if [ "$paused" -ge 1 ]; then pass "node $n: rebalance paused while two minor versions are live"
-      else fail "node $n: rebalance not paused for versions while a node of $old_short runs"; fi
+      if [ "${paused:-0}" -ge 1 ]; then pass "node $n: rebalance paused while two minor versions are live (${why% })"
+      else fail "node $n: rebalance not paused while a node of $old_short runs a minor version apart"; fi
     fi
   done
 }

@@ -166,12 +166,14 @@ for its own name over the live nodes, the pusher's included, one hop at
 most
 ([ADR 0040, section 14](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#14-edges-spread-over-the-nodes-amended-2026-11-22)).
 On three nodes, a room's edges end on two or three of them; about a third
-share the room's node. A running edge never moves for it, so clients
-reconnect no more than before. A drain releases its node's edges; each
-wakes where its first event after takes it: a reconnecting client's
-socket wakes it where that client landed, the pusher's next push on its
-spread choice. With one node alive the edges wake where they are called;
-`--no-placement` turns it off. For a class with another name, write
+share the room's node. That choice is the edge's home. A drain releases
+its node's edges, and each wakes on its home over the nodes left: the
+pusher's next push sends it there, and a reconnecting client's socket has
+the home take it first. When the drained node serves again, its edges
+are moved back to it, a few at a time, their clients reconnecting once
+more ([edges return home](adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
+With one node alive the edges wake where they are called; `--no-placement`
+turns it all off, and `--no-rebalance` only the moves home. For a class with another name, write
 `spread = true` in its `[classes.<name>]` table (`false` turns the
 default off for a class named `edge`); it needs every node on 0.9, as
 `apart-from` does. List the edges with the same command:
@@ -181,7 +183,8 @@ wasmkeep actor where --app acme/chat edge/lobby.e1 edge/lobby.e2 edge/lobby.e3 -
 ```
 
 `wasmkeep_placement_spread_total{outcome}` counts the wake-ups of an edge
-`sent` to its node or woken `here`.
+`sent` to its node or woken `here`, and `wasmkeep_rebalance_misplaced`
+the edges a node holds away from their home.
 
 ## Split independent state
 
