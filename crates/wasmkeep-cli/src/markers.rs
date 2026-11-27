@@ -59,10 +59,24 @@ pub struct Outcome {
     pub code: u8,
 }
 
+/// How long after its expiry a per-actor lease from before node leases
+/// still counts as live to the cleanup: an hour. Such a lease was renewed
+/// every few seconds by its holder, and the grace that binary was run with
+/// is not in the bucket; one an hour past its expiry is held by nobody,
+/// whatever grace it had. Only a lease past that is folded and deleted.
+pub const OLD_LEASE_GRACE_MS: u64 = 3_600_000;
+
 /// The lease configuration a per-actor lease from before node leases is
-/// judged live by: the nodes' defaults.
+/// judged live by: the nodes' defaults, with [`OLD_LEASE_GRACE_MS`].
 fn lease_config() -> wasmkeep_cluster::lease::LeaseConfig {
-    wasmkeep_server::LeaseConfig::default_safe()
+    let safe = wasmkeep_server::LeaseConfig::default_safe();
+    wasmkeep_cluster::lease::LeaseConfig::new(
+        safe.ttl_ms(),
+        OLD_LEASE_GRACE_MS,
+        safe.safety_ms(),
+        safe.max_skew_ms(),
+    )
+    .unwrap_or(safe)
 }
 
 /// The machine's clock.
@@ -296,5 +310,21 @@ mod tests {
         // Again: nothing to do, the same floor.
         let again = run(true, gf::SINCE).await.unwrap();
         assert!(again.out.contains("0 per-actor markers"), "{}", again.out);
+
+        // An old lease ten minutes past its expiry may be held under a
+        // longer grace than the nodes' default: it stops the command, and
+        // nothing is deleted. Two hours past, it is folded.
+        let now = Now.now_ms();
+        let old = |expired_ms: u64| {
+            format!("wasmkeep-lease 1\nold\n30\n{}\n", now - expired_ms).into_bytes()
+        };
+        put(&store, "state/acme/shop/leases/c/old", &old(600_000)).await;
+        let e = run(true, gf::SINCE).await.unwrap_err();
+        assert!(format!("{e:#}").contains("live by the old rules"), "{e:#}");
+        assert!(exists(&store, "state/acme/shop/leases/c/old").await);
+        put(&store, "state/acme/shop/leases/c/old", &old(7_200_000)).await;
+        let done = run(true, gf::SINCE).await.unwrap();
+        assert!(done.out.contains("1 the only carrier"), "{}", done.out);
+        assert!(!exists(&store, "state/acme/shop/leases/c/old").await);
     }
 }

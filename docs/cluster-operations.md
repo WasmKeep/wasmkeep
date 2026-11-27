@@ -314,16 +314,18 @@ wasmkeep cluster markers clean --bucket s3://my-bucket --app acme/shop --yes
 wasmkeep cluster verify --bucket s3://my-bucket --app acme/shop              # lease markers left: 0
 ```
 
-- It is refused while the app's upgrade floor is below 0.10, and while a
-  live node of the app does not announce `genfloor` (a node older than
-  0.10).
+- Run it only after `wasmkeep cluster upgrade status` shows every node of
+  the app on 0.10 or later and the floor at 0.10. It is refused while the
+  app's upgrade floor is below 0.10, and while a live node of the app
+  does not announce `genfloor` (a node older than 0.10).
 - A marker the actor's ownership record carries is deleted. One that is
   the only carrier of a generation (left by a restore before 0.10) is
   first folded into the app's generation floor, then deleted. A per-actor
-  lease from before 0.4 that is still live by its own rules stops the
-  command, naming it.
+  lease from before 0.4 that expired less than an hour ago stops the
+  command, naming it: the grace its binary ran with is not known.
 - When none is left, the generation floor says so, and nodes no longer
-  read markers. A marker written meanwhile by a node that had not yet
+  read markers. A node keeps that in memory: after a restart, its first
+  actor created reads the marker's key once more. A marker written meanwhile by a node that had not yet
   read the finalized floor is reported: run the command again.
 - It may run with nodes live, and be interrupted and run again at any
   point. Without `--yes` it prints the counts and exits with 2.

@@ -150,10 +150,11 @@ Cost of an actor's creation, in bucket requests:
 | `0.9` | 1 | 1 (marker) | 1 (marker) |
 | `0.10` before `finalize` | 1 | 2 (marker, upgrade floor) | 1 (marker) |
 | `0.10` after `finalize` | 1 | 2 (marker, generation floor) | 0 |
-| After the cleanup (section 4) | 1 | 1 (generation floor) | 0 |
+| After the cleanup (section 4), once the node has read `none` | 1 | 1 (generation floor) | 0 |
 
 The first creation on each node after a `finalize` costs both floors'
-GETs once. So between its upgrade and its `finalize`, a cluster pays
+GETs once. `markers none` is cached in memory only, so after a restart a
+node's first creation pays the marker's GET again, once. So between its upgrade and its `finalize`, a cluster pays
 one GET more per created actor than `0.9` does; that is the price of
 needing no restart, and a reason not to stay unfinalized.
 
@@ -357,3 +358,9 @@ As decided, with these notes:
   their first acquisitions, up to two restores in place, and an actor's
   delete and recreate. Each of the five mutations is caught.
 - **The cleanup's name** is `wasmkeep cluster markers clean`.
+- **An old lease's liveness** is judged by the cleanup with a grace of an
+  hour, not the nodes' default: the grace the binary that held it ran
+  with is not in the bucket, and only a lease past any grace is folded
+  and deleted.
+- **`genfloor`** is announced only by a node whose version is `0.10` or
+  later.

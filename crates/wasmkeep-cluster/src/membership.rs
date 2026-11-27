@@ -879,7 +879,11 @@ impl<D: Directory, C: Clock> Membership<D, C> {
             can_multi_app: true,
             can_place: self.place,
             can_apart: true,
-            can_genfloor: true,
+            // Only a node of the version that reads the generation floor
+            // (ADR 0045, section 5): one of an older version, or one whose
+            // version does not parse, does not announce it.
+            can_genfloor: crate::app_format::floor::Minor::of_node_version(&self.version)
+                .is_some_and(|v| v >= crate::generation_floor::SINCE),
             can_trace: self.traces,
             process: self.process.clone(),
             instance: self.instance.clone(),
@@ -1875,10 +1879,32 @@ mod tests {
         assert_eq!(
             payload.lines().nth(8),
             Some(
-                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs apart genfloor"
+                "take front handoff ends flush rate_limits restore actor-restore recorded-head multi-app assets blobs apart"
             ),
             "{payload}"
         );
+    }
+
+    /// ADR 0045, section 5: `genfloor` is announced by a node of 0.10 or
+    /// later only, never by an older one or one whose version does not
+    /// parse.
+    #[test]
+    fn genfloor_is_announced_from_0_10_only() {
+        let mem = Mem::default();
+        let t = Cell::new(0);
+        for (version, announced) in [
+            ("0.9.0", false),
+            ("0.9.9+test.abc", false),
+            ("0.10.0", true),
+            ("0.10.0+test.abc", true),
+            ("1.0.0", true),
+            ("junk", false),
+        ] {
+            let m = Membership::new(&mem, At(&t), "a", "http://x:1", 3_000, 0)
+                .unwrap()
+                .with_version(version);
+            assert_eq!(m.info().can_genfloor, announced, "{version}");
+        }
     }
 
     /// ADR 0038: this binary announces `multi-app` and, when given, its

@@ -1371,9 +1371,10 @@ fn every_format_constant_has_a_row_in_the_gate_table() {
         // the next one lands before the release bumps the version, and is
         // written only by a build that reports it), and its words are
         // ones a node can announce.
+        let this = this_minor().unwrap().max(v(0, 9));
         assert!(
-            row.since <= this_minor().unwrap().max(v(0, 9)).next(),
-            "{}",
+            row.since <= this || (row.since == this.next() && matches!(row.rule, Rule::Gate(_))),
+            "{}: only a gated format of the next minor version may land before the bump",
             row.name
         );
         if let Rule::Gate(words) = row.rule {

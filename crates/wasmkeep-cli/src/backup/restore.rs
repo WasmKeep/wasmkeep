@@ -856,6 +856,14 @@ pub(super) async fn execute_settled(
             ensure!(gated.check_restore(archived_floor, &manifests).await?.raise.is_none(),
                 "the upgrade floor of {name} changed while it was written; run the restore again");
         }
+        // The form the generation floors take (ADR 0045, section 3), on the
+        // floor the target now has, before anything is cleared: the app's
+        // one object at 0.10, markers below; anything else refuses here.
+        let generation_floor = match gated.readers().await?.gate(&wasmkeep_cluster::upgrade::GENERATION_FLOOR) {
+            Ok(()) => true,
+            Err(wasmkeep_cluster::upgrade::Blocked::Floor { .. }) => false,
+            Err(blocked) => anyhow::bail!("{name}: {blocked}; nothing of the app's state was cleared or written"),
+        };
         if journal["phase"] == "clear" {
             nodes(args, target, tp).await?;
             if journal["undoing"] == true {
@@ -894,8 +902,7 @@ pub(super) async fn execute_settled(
         // the app's one object once its upgrade floor is 0.10 (ADR 0045,
         // section 3), one marker per actor below, byte for byte as 0.9.
         let seeds = journal["seeds"].as_object().context("missing seeds")?;
-        match gated.readers().await?.gate(&wasmkeep_cluster::upgrade::GENERATION_FLOOR) {
-            Ok(()) => {
+        if generation_floor {
                 let mut collected = 0u64;
                 for seed in seeds.values() {
                     collected = collected.max(seed.as_u64().context("invalid seed")?);
@@ -906,7 +913,8 @@ pub(super) async fn execute_settled(
                 if !args.in_place {
                     collected = collected.checked_add(1).context("generation exhausted")?;
                 }
-                if let Some(kept) = journal["generation_floor"].as_u64() {
+                if !journal["generation_floor"].is_null() {
+                    let kept = journal["generation_floor"].as_u64().context("invalid generation floor in the journal")?;
                     collected = collected.max(kept.checked_add(1).context("generation exhausted")?);
                 }
                 use wasmkeep_cluster::generation_floor::{self as gf, GenerationFloor, Markers};
@@ -921,14 +929,11 @@ pub(super) async fn execute_settled(
                 gf::raise(&keys, &floor_key, GenerationFloor { generation: collected, markers })
                     .await
                     .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+        } else {
+            for (name, seed) in seeds {
+                same_or_create(target, &key(&state, &format!("leases/{name}")),
+                    encode_marker(seed.as_u64().context("invalid seed")?)).await?;
             }
-            Err(wasmkeep_cluster::upgrade::Blocked::Floor { .. }) => {
-                for (name, seed) in seeds {
-                    same_or_create(target, &key(&state, &format!("leases/{name}")),
-                        encode_marker(seed.as_u64().context("invalid seed")?)).await?;
-                }
-            }
-            Err(blocked) => anyhow::bail!("{name}: {blocked}; nothing of the generation floor was written"),
         }
         // Then the alarm index derived from the verified committed databases.
         for path in &run.actors {

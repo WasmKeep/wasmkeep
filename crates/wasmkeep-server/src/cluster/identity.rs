@@ -368,13 +368,16 @@ impl Cluster {
     ///
     /// # Errors
     /// `Unavailable` without an answer; `Corrupt` for a floor this node
-    /// may not serve under or cannot read.
+    /// may not serve under or cannot read, or for this node's own version
+    /// when it has no minor version.
     pub(super) async fn floor_at(
         &self,
         since: wasmkeep_cluster::app_format::floor::Minor,
     ) -> Result<bool, wasmkeep_cluster::node_lease::AcquireError> {
         use wasmkeep_cluster::node_lease::AcquireError;
-        if self.own_minor.as_ref().map_or(true, |this| *this < since) {
+        // A version with no minor version is never judged by a guess.
+        let this = self.own_minor.as_ref().map_err(|_| AcquireError::Corrupt)?;
+        if *this < since {
             return Ok(false);
         }
         let known = *self.known_floor.lock().unwrap_or_else(|p| p.into_inner());
