@@ -838,6 +838,8 @@ async fn only_serving_peers_of_the_same_app_that_are_not_draining_are_chosen() {
         can_place: false,
         traces: false,
         seen: None,
+        version: String::new(),
+        serving_since: None,
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
@@ -902,6 +904,8 @@ async fn only_nodes_that_deliver_this_apps_alarms_share_the_sweep() {
         can_place: false,
         traces: false,
         seen: None,
+        version: String::new(),
+        serving_since: None,
     };
     let serving = Some(DrainState::Serving);
     *me.peers.write().unwrap() = HashMap::from([
@@ -959,6 +963,8 @@ async fn live_nodes_split_the_alarm_sweep_between_them() {
             can_place: false,
             traces: false,
             seen: None,
+            version: String::new(),
+            serving_since: None,
         };
         *c.peers.write().unwrap() = HashMap::from([
             ("a".to_owned(), peer("http://a")),
@@ -1034,6 +1040,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_place: false,
                     traces: false,
                     seen: None,
+                    version: String::new(),
+                    serving_since: None,
                 },
             ),
             (
@@ -1051,6 +1059,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_place: false,
                     traces: false,
                     seen: None,
+                    version: String::new(),
+                    serving_since: None,
                 },
             ),
             (
@@ -1068,6 +1078,8 @@ async fn a_tls_node_publishes_its_pin_and_is_ready_a_period_later() {
                     can_place: false,
                     traces: false,
                     seen: None,
+                    version: String::new(),
+                    serving_since: None,
                 },
             ),
         ]);
@@ -1169,6 +1181,8 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_place: false,
                 traces: false,
                 seen: None,
+                version: String::new(),
+                serving_since: None,
             },
         ),
         (
@@ -1186,6 +1200,8 @@ async fn refuse_mode_never_reaches_a_peer_in_plaintext() {
                 can_place: false,
                 traces: false,
                 seen: None,
+                version: String::new(),
+                serving_since: None,
             },
         ),
     ]);
@@ -5416,6 +5432,39 @@ async fn a_peer_load_is_fresh_for_three_periods_from_its_first_sighting() {
     let peer = Peer::of(&old).unwrap();
     assert!(!peer.can_place);
     assert_eq!(peer.seen.unwrap().load.actor_room, None);
+}
+
+/// ADR 0040, section 14: a peer's settle time counts from when this node
+/// first saw it `serving`, across refreshes of the same process; another
+/// state, or a new process, starts it again.
+#[tokio::test(start_paused = true)]
+async fn a_peers_serving_time_counts_without_a_break_and_restarts_with_its_process() {
+    let info = |drain: DrainState, instance: &str| NodeInfo {
+        drain: Some(drain),
+        instance: Some(instance.into()),
+        version: "0.10.0".into(),
+        ..node_info("p")
+    };
+    let view = |n: &NodeInfo| HashMap::from([("p".to_owned(), Peer::of(n).unwrap())]);
+    let since = |v: &HashMap<String, Peer>| v["p"].serving_since.map(|s| s.elapsed());
+    let first = view(&info(DrainState::Serving, "one"));
+    assert_eq!(first["p"].version, "0.10.0");
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let mut again = view(&info(DrainState::Serving, "one"));
+    carry_first_seen(&first, &mut again);
+    assert_eq!(since(&again), Some(Duration::from_secs(5)));
+    // A drain breaks it.
+    let mut draining = view(&info(DrainState::Draining, "one"));
+    carry_first_seen(&again, &mut draining);
+    assert_eq!(since(&draining), None);
+    let mut back = view(&info(DrainState::Serving, "one"));
+    carry_first_seen(&draining, &mut back);
+    assert_eq!(since(&back), Some(Duration::ZERO));
+    // A new process between two refreshes starts it again.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let mut restarted = view(&info(DrainState::Serving, "two"));
+    carry_first_seen(&back, &mut restarted);
+    assert_eq!(since(&restarted), Some(Duration::ZERO));
 }
 
 fn node_info(id: &str) -> NodeInfo {

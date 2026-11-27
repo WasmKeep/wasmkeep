@@ -376,6 +376,7 @@ async fn start_runtime(
     cluster.follows_app = true;
     cluster.reads_secrets = !args.no_secrets;
     cluster.placement = !args.no_placement;
+    cluster.rebalance = !args.no_rebalance;
     cluster.app = format!("{tenant}/{name}");
     cluster.cluster_tls = args
         .cluster_advertise

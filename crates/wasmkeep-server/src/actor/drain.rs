@@ -219,6 +219,9 @@ pub(super) async fn drain_loop(service: std::sync::Weak<ServiceInner>, cluster: 
         // Draining or not: a draining node deletes the actors it holds.
         deletes::deletes_pass(&inner, &cluster, &deleting);
         restores::restores_pass(&inner, &cluster, &restoring);
+        // Spread actors return home (ADR 0040, section 14): paused while
+        // this node drains, which still counts its misplaced actors.
+        rebalancing::tick(&inner, &cluster, &awaiting);
         // Not draining: act on move requests instead (a drain already moves
         // every actor).
         if !cluster.draining() {

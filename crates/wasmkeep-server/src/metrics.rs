@@ -492,6 +492,16 @@ pub(crate) struct Metrics {
     pub(crate) placement_spread: Family<AtomicU64>,
     /// This node id's fill in thousandths, by `kind` (a gauge).
     pub(crate) placement_fill: Family<AtomicU64>,
+    /// The spread actors this node holds whose home is another node (ADR
+    /// 0040, section 14; a gauge).
+    pub(crate) rebalance_misplaced: Family<AtomicU64>,
+    /// Rebalance moves that ended, by `outcome`.
+    pub(crate) rebalance_moves: Family<AtomicU64>,
+    /// Sockets rebalance moves closed with 1012.
+    pub(crate) rebalance_sockets_closed: Family<AtomicU64>,
+    /// 1 for the reason the rebalance pass is paused, 0 for the others (a
+    /// gauge, by `reason`).
+    pub(crate) rebalance_paused: Family<AtomicU64>,
     /// Requests kept until a dead node's actor could be taken over, by
     /// kind (`request`, `websocket`) and how the wait ended.
     pub(crate) failover_waits: Family<AtomicU64>,
@@ -1081,6 +1091,33 @@ pub(crate) fn placement_spread(app: &str, outcome: &str) {
     inc(&METRICS
         .placement_spread
         .get_in(app, &[("outcome", outcome)]));
+}
+/// The rebalance pass's view (ADR 0040, section 14): the spread actors
+/// held here away from their home, and why it is paused, if it is.
+pub(crate) fn rebalance_state(
+    app: &str,
+    misplaced: u64,
+    paused: Option<wasmkeep_cluster::rebalance::Pause>,
+) {
+    METRICS
+        .rebalance_misplaced
+        .get_in(app, &[])
+        .store(misplaced, Ordering::Relaxed);
+    for reason in wasmkeep_cluster::rebalance::Pause::ALL {
+        METRICS
+            .rebalance_paused
+            .get_in(app, &[("reason", reason.as_str())])
+            .store(u64::from(paused == Some(reason)), Ordering::Relaxed);
+    }
+}
+/// A rebalance move ended: `moved`, `taken_elsewhere` or `failed`, having
+/// closed `sockets`.
+pub(crate) fn rebalance_move(app: &str, outcome: &str, sockets: u64) {
+    inc(&METRICS.rebalance_moves.get_in(app, &[("outcome", outcome)]));
+    METRICS
+        .rebalance_sockets_closed
+        .get_in(app, &[])
+        .fetch_add(sockets, Ordering::Relaxed);
 }
 /// This node id's fills, in thousandths.
 pub(crate) fn placement_fill(app: &str, residents: u64, sockets: u64) {

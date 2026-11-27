@@ -204,7 +204,7 @@ impl ActorService {
                 && placeable_request(&req)
             {
                 let route = self.inner.cold_route(&address).await;
-                if route == Cold::Nobody {
+                if route == Cold::Nobody && !self.inner.goes_home(cluster, &address) {
                     match self
                         .place_request(cluster, &address, req, &chain, outside)
                         .await

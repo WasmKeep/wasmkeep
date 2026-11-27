@@ -117,6 +117,7 @@ pub(super) fn load_source(
         Load {
             events_per_min,
             front_per_min,
+            misplaced: inner.rebalance.misplaced(),
             ..load
         }
     })
@@ -143,6 +144,7 @@ pub(super) fn rooms(inner: &ServiceInner) -> Load {
             n(share.process),
         )),
         socket_room: Some(inner.sockets.session_room()),
+        misplaced: None,
     }
 }
 

@@ -365,6 +365,7 @@ impl ActorService {
                 secrets: std::sync::RwLock::new(Arc::new(config.secrets.clone())),
                 secrets_blocked,
                 moves,
+                rebalance: Default::default(),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 disk_low: std::sync::atomic::AtomicBool::new(false),
                 disk_sampled_ms: std::sync::atomic::AtomicU64::new(0),

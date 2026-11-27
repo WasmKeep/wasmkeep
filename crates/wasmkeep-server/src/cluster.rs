@@ -221,6 +221,13 @@ pub struct ClusterConfig {
     /// --no-placement` and `[process] placement = false` turn it off for
     /// every app of the process.
     pub placement: bool,
+    /// Spread actors return home after a node rejoins (ADR 0040, section
+    /// 14): on by default, off with placement, and off alone with `serve
+    /// --no-rebalance` or `[process] rebalance = false`.
+    pub rebalance: bool,
+    /// The rebalance pass's settle delay, stay and moves in flight; `None`
+    /// for the defaults of the heartbeat period. Tests shorten them.
+    pub rebalance_settings: Option<wasmkeep_cluster::rebalance::Settings>,
 }
 
 /// Plain HTTP between nodes, for a node with a cluster listener (ADR 0011).
@@ -289,6 +296,8 @@ impl ClusterConfig {
             follows_app: false,
             process: None,
             placement: true,
+            rebalance: true,
+            rebalance_settings: None,
         }
     }
 }
@@ -449,6 +458,8 @@ pub(crate) struct Cluster {
     /// `Err`, with why, for a version that has none: such a node does
     /// not start (nothing is judged by a guess).
     own_minor: Result<wasmkeep_cluster::app_format::floor::Minor, String>,
+    /// The version this node announces ([`ClusterConfig::version`]).
+    pub(crate) own_version: String,
     /// Set when this node created its app's floor and the listing after
     /// the create showed an older node of the app: why this node must
     /// not start (ADR 0043, section 3).
@@ -520,6 +531,10 @@ pub(crate) struct Cluster {
     secrets_blocked: std::sync::atomic::AtomicBool,
     /// Placement at wake-up is on ([`ClusterConfig::placement`]).
     place: bool,
+    /// Rebalancing is on ([`ClusterConfig::rebalance`]).
+    rebalance: bool,
+    /// The rebalance pass's constants.
+    rebalance_settings: wasmkeep_cluster::rebalance::Settings,
     /// Placement's own state (ADR 0041): credits, backoff, no return.
     placing: placing::Placing,
     /// The lease timing (ttl, grace, safety, skew).
@@ -653,6 +668,13 @@ pub(crate) struct Peer {
     /// Its heartbeat's load, and when this node first saw that heartbeat
     /// (ADR 0041, section 3); `None` from a node without a load line.
     pub(crate) seen: Option<Seen>,
+    /// The WasmKeep version its heartbeat names.
+    pub(crate) version: String,
+    /// Since when this node has seen it `serving` on line 9 without a
+    /// break, on its own monotonic clock (a new process starts it again);
+    /// `None` while it shows another state. The rebalance pass's settle
+    /// delay (ADR 0040, section 14).
+    pub(crate) serving_since: Option<tokio::time::Instant>,
 }
 
 /// A peer's load as one heartbeat published it, with the moment this node
@@ -692,6 +714,17 @@ pub(crate) fn carry_first_seen(old: &HashMap<String, Peer>, new: &mut HashMap<St
             seen.at = before.at;
         }
     }
+    for (id, peer) in new.iter_mut() {
+        if peer.serving_since.is_none() {
+            continue;
+        }
+        if let Some(before) = old.get(id)
+            && before.instance == peer.instance
+            && let Some(since) = before.serving_since
+        {
+            peer.serving_since = Some(since);
+        }
+    }
 }
 
 impl Peer {
@@ -718,6 +751,9 @@ impl Peer {
                 beat: (node.instance.clone(), node.written_at_ms),
                 at: tokio::time::Instant::now(),
             }),
+            version: node.version.clone(),
+            serving_since: (node.drain == Some(DrainState::Serving))
+                .then(tokio::time::Instant::now),
         })
     }
 }
@@ -902,6 +938,10 @@ impl Cluster {
             peers: RwLock::new(HashMap::new()),
             heartbeat_horizon_ms: heartbeat_horizon_ms(config.heartbeat, &config.lease),
             place: config.placement,
+            rebalance: config.placement && config.rebalance,
+            rebalance_settings: config.rebalance_settings.unwrap_or_else(|| {
+                wasmkeep_cluster::rebalance::Settings::for_period(config.heartbeat)
+            }),
             placing: placing::Placing::default(),
             conflict_logged_ms: std::sync::atomic::AtomicU64::new(0),
             refuse_plaintext,
@@ -915,6 +955,10 @@ impl Cluster {
             store,
             root: StateRoot::new(&config.prefix, root.tenant(), root.app()),
             own_minor,
+            own_version: config
+                .version
+                .clone()
+                .unwrap_or_else(|| crate::VERSION.to_owned()),
             born_late: std::sync::Mutex::new(None),
             alarm_overdue: Duration::from_millis(
                 config

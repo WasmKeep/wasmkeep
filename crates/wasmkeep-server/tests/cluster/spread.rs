@@ -2,8 +2,13 @@
 //! 2026-11-22): in a version with the classes `room`, `pusher` and
 //! `edge`, a wake-up of an edge nobody holds goes to the rendezvous choice
 //! for the edge's address over the live nodes, the waking node included,
-//! once; with no peer it wakes where it lands. A running edge never moves
-//! for it. Off with placement.
+//! once; with no peer it wakes where it lands. Off with placement.
+//!
+//! Since the amendment of 2026-11-26, that choice is the edge's home: a
+//! node holding an edge whose home is another node moves it there once
+//! the cluster is quiet and the home has served for the settle delay
+//! (`--no-rebalance` turns that off), and a socket for an edge nobody
+//! holds has its home take it first.
 
 use super::*;
 
@@ -259,7 +264,9 @@ async fn a_stale_owner_hint_on_the_chosen_node_neither_refuses_nor_suspects_it()
     let pusher = pusher_node();
     let third = if pusher == "b" { "c" } else { "b" };
     // The third node's actors hibernate soon after their last event.
+    // Rebalancing off: the edge stays where the outside request woke it.
     let [a, b, c] = three(&store, &dirs, |id, config| {
+        no_rebalance(config);
         if id == third {
             config.mailbox.idle_timeout = Duration::from_millis(200);
         }
@@ -313,6 +320,7 @@ async fn an_edge_its_chosen_node_does_not_run_runs_where_it_is_called_once() {
     let pusher = pusher_node();
     let third = if pusher == "b" { "c" } else { "b" };
     let [a, b, c] = three(&store, &dirs, |id, config| {
+        no_rebalance(config);
         if id == third {
             config.mailbox.max_resident = 1;
         }
@@ -367,4 +375,329 @@ async fn alone_or_turned_off_the_edges_wake_where_they_are_called() {
         assert_eq!(holder(&store, "edge", e).await.as_deref(), Some("a"), "{e}");
     }
     assert_eq!(metric(SENT), sent);
+}
+
+const MOVED: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="moved"}"#;
+const HOME: &str =
+    r#"wasmkeep_placement_spread_total{tenant="default",app="default",outcome="home"}"#;
+
+/// Waits until every edge of `edges` is held by its home over `nodes`.
+async fn all_home(
+    store: &Arc<dyn ObjectStore>,
+    edges: &[String],
+    nodes: &[&str],
+    within: Duration,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let mut away = Vec::new();
+        for e in edges {
+            let at = holder(store, "edge", e).await;
+            let home = choice(e, nodes);
+            if at.as_deref() != Some(home.as_str()) {
+                away.push(format!("{e} on {at:?}, home {home}"));
+            }
+        }
+        if away.is_empty() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "not home: {away:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A client of `edge/<name>` that connects through `addr` and connects
+/// again whenever its socket closes, until told to stop; `connected`
+/// counts the clients connected now. Its answer: how many times it was
+/// closed with 1012 ("reconnect").
+fn reconnecting(
+    addr: SocketAddr,
+    name: String,
+    connected: Arc<AtomicUsize>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let mut stop = stop;
+        let mut closes = 0;
+        let url = format!("ws://{addr}/actor/edge/{name}");
+        loop {
+            if *stop.borrow() {
+                return closes;
+            }
+            let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&url).await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            connected.fetch_add(1, Ordering::SeqCst);
+            let stopped = loop {
+                tokio::select! {
+                    _ = stop.changed() => break true,
+                    msg = ws.next() => match msg {
+                        Some(Ok(Message::Close(frame))) => {
+                            if frame.is_some_and(|f| u16::from(f.code) == 1012) {
+                                closes += 1;
+                            }
+                            // Answered, as a client does: read on until the
+                            // close handshake ends.
+                            while let Some(Ok(_)) = ws.next().await {}
+                            break false;
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break false,
+                    },
+                }
+            };
+            drop(ws);
+            connected.fetch_sub(1, Ordering::SeqCst);
+            if stopped {
+                return closes;
+            }
+            // A client's backoff before it reconnects.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+}
+
+/// A rolling restart's step, with a client on every edge (ADR 0040,
+/// section 14, amendment of 2026-11-26): the node that holds neither the
+/// room nor the pusher drains, is stopped and starts again. No rebalance
+/// move starts while it drains; once it serves again, every edge is back
+/// on its home over the three nodes, each client was closed with 1012 at
+/// most twice (by the drain, then by the move home), and the edges'
+/// counts went on without a gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_nodes_edges_return_home_and_nothing_moves_while_it_drains() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let pusher = pusher_node();
+    let third = if pusher == "b" { "c" } else { "b" };
+    let [a, b, c] = three(&store, &dirs, |_, _| {}).await;
+    let (kept, gone) = if third == "b" { (c, b) } else { (b, c) };
+    let edges = edges();
+    let all = ["a", "b", "c"];
+    push(&a, &edges, 1).await;
+    all_home(&store, &edges, &all, Duration::from_secs(5)).await;
+    assert!(edges.iter().any(|e| choice(e, &all) == third));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let clients: Vec<_> = edges
+        .iter()
+        .map(|e| reconnecting(a.addr, e.clone(), Arc::clone(&connected), stop_rx.clone()))
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while connected.load(Ordering::SeqCst) < edges.len() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clients never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let moved = metric(MOVED);
+    drain(&store, third).await;
+    wait_drain_line(&store, third, "drained").await;
+    push(&a, &edges, 2).await;
+    let two = ["a", pusher];
+    all_home(&store, &edges, &two, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        metric(MOVED),
+        moved,
+        "no rebalance move while a node drains"
+    );
+
+    // Stopped, then back as a new process with the same id.
+    let dir = if third == "b" { &dirs[1] } else { &dirs[2] };
+    stop_listening(gone).await;
+    {
+        use object_store::ObjectStoreExt as _;
+        store
+            .delete(&object_store::path::Path::from(format!(
+                "control/drain/{third}"
+            )))
+            .await
+            .unwrap();
+    }
+    announce_intent(&store).await;
+    let back = room_node(third, dir.path(), &store, |_| {}).await;
+    wait_drain_line(&store, third, "serving").await;
+    all_home(&store, &edges, &all, Duration::from_secs(20)).await;
+    assert!(metric(MOVED) > moved, "moved by the rebalance");
+    push(&a, &edges, 3).await;
+    stop_tx.send(true).unwrap();
+    for (e, client) in edges.iter().zip(clients) {
+        let closes = client.await.unwrap();
+        assert!(closes <= 2, "{e}: closed {closes} times with 1012");
+    }
+    drop((kept, back));
+}
+
+/// A socket for an edge nobody holds, landing on a node that is not its
+/// home (ADR 0040, section 14, amendment of 2026-11-26): its home takes the
+/// edge first and the socket is relayed there. With rebalancing off it
+/// wakes the edge where it lands, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_for_an_edge_nobody_holds_wakes_it_at_its_home() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    for on in [true, false] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let [a, b, c] = three(&store, &dirs, |_, config| {
+            config.mailbox.idle_timeout = Duration::from_millis(200);
+            if !on {
+                no_rebalance(config);
+            }
+        })
+        .await;
+        // The edge exists (a room creates its edges before any socket
+        // reaches them), woken on its home, then hibernated: nobody holds
+        // it.
+        let edge = edge_on("b", &[]);
+        let path = format!("/actor/edge/{edge}/durable");
+        let r = send_reachable(b.addr, "POST", &path, "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("b")),
+            "{}",
+            r.body
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while holder(&store, "edge", &edge).await.is_some() {
+            assert!(std::time::Instant::now() < deadline, "never released");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let home = metric(HOME);
+        let url = format!("ws://{}/actor/edge/{edge}", c.addr);
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        ws.send(Message::text("hi")).await.unwrap();
+        let echoed = loop {
+            match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => break t.to_string(),
+                Ok(Some(Ok(_))) => {}
+                other => panic!("no echo: {other:?}"),
+            }
+        };
+        assert_eq!(echoed, "hi");
+        let want = if on { "b" } else { "c" };
+        assert_eq!(
+            holder(&store, "edge", &edge).await.as_deref(),
+            Some(want),
+            "rebalance {on}"
+        );
+        assert_eq!(metric(HOME) - home, u64::from(on));
+        drop((a, b, c, ws));
+    }
+}
+
+/// An edge woken away from its home (a request from outside wakes it
+/// where it lands) is moved there once its home has been serving for the
+/// settle delay, its state with it; with `--no-rebalance`, or with
+/// placement off, it stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edge_away_from_home_moves_there_unless_rebalancing_is_off() {
+    type Adjust = fn(&mut ActorConfig);
+    let cases: [(&str, Adjust); 3] = [
+        ("on", |_| {}),
+        ("--no-rebalance", no_rebalance),
+        ("--no-placement", no_placement),
+    ];
+    for (case, adjust) in cases {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let mut nodes = Vec::new();
+        for (id, dir) in ["a", "b", "c"].into_iter().zip(&dirs) {
+            nodes.push(room_node(id, dir.path(), &store, adjust).await);
+        }
+        for id in ["a", "b", "c"] {
+            wait_drain_line(&store, id, "serving").await;
+        }
+        settle().await;
+        let edge = edge_on("b", &[]);
+        let path = format!("/actor/edge/{edge}/durable");
+        let r = send_reachable(nodes[2].addr, "POST", &path, "").await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("c")),
+            "{case}: {}",
+            r.body
+        );
+        if case == "on" {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while holder(&store, "edge", &edge).await.as_deref() != Some("b") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: never moved home"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Its state came with it.
+            let r = send_reachable(nodes[0].addr, "GET", &path, "").await;
+            assert_eq!(
+                (r.status, r.node.as_deref(), r.body.trim()),
+                (200, Some("b"), "1"),
+                "{case}"
+            );
+        } else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                holder(&store, "edge", &edge).await.as_deref(),
+                Some("c"),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// An operator's move of an edge off its home (ADR 0017) is undone by the
+/// rebalance, but only once the actor has stayed `stay` after its take.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operators_move_off_home_is_undone_after_the_stay() {
+    let stay = Duration::from_secs(3);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let [a, b, c] = three(&store, &dirs, |_, config| {
+        let cluster = config.cluster.as_mut().unwrap();
+        cluster.rebalance_settings = Some(wasmkeep_cluster::rebalance::Settings {
+            stay,
+            ..wasmkeep_cluster::rebalance::Settings::for_period(cluster.heartbeat)
+        });
+    })
+    .await;
+    let edge = edge_on("b", &[]);
+    let r = send_reachable(a.addr, "POST", &format!("/actor/edge/{edge}/durable"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    all_home(
+        &store,
+        std::slice::from_ref(&edge),
+        &["a", "b", "c"],
+        Duration::from_secs(5),
+    )
+    .await;
+    request_move_of(&store, "edge", &edge, "c").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while holder(&store, "edge", &edge).await.as_deref() != Some("c") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the operator's move never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let moved = std::time::Instant::now();
+    while holder(&store, "edge", &edge).await.as_deref() != Some("b") {
+        assert!(
+            moved.elapsed() < stay + Duration::from_secs(10),
+            "never moved back home"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        moved.elapsed() >= stay - Duration::from_millis(300),
+        "moved back before its stay: {:?}",
+        moved.elapsed()
+    );
+    drop((a, b, c));
 }

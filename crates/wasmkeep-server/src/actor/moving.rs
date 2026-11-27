@@ -63,7 +63,7 @@ impl AwaitingRooms {
 }
 
 /// A fresh token per attempt.
-static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
+pub(super) static ATTEMPTS: AtomicU64 = AtomicU64::new(1);
 
 /// What a take job did.
 #[derive(Debug)]
@@ -77,6 +77,25 @@ pub(super) enum Taken {
     /// Refused or failed (draining, secrets blocked, the bucket, the
     /// alarm unreadable).
     Refused(String),
+}
+
+/// How a move ended, for its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MoveEnd {
+    /// The target holds the actor.
+    Moved,
+    /// Another node took it first: the move is moot.
+    Elsewhere,
+    /// Not done (busy, the release pending, the target refused or did not
+    /// answer): tried again later.
+    NotDone,
+}
+
+impl MoveEnd {
+    /// Whether an operator's request is finished.
+    fn finished(self) -> bool {
+        self != Self::NotDone
+    }
 }
 
 /// What a move job did.
@@ -315,7 +334,7 @@ impl ActorService {
     }
 
     /// Runs the take job for `address` on this node.
-    async fn take_here(&self, address: &ActorAddress) -> Taken {
+    pub(super) async fn take_here(&self, address: &ActorAddress) -> Taken {
         self.inner.forget_owner(address);
         let job =
             self.inner
@@ -331,6 +350,11 @@ impl ActorService {
         // name), or that another node holds.
         if matches!(taken, Taken::NoSuchActor | Taken::HeldBy(_)) {
             self.inner.mailboxes.hibernate(address);
+        }
+        // Acquired through a take call (a rebalance move or an operator's):
+        // it stays a while before a rebalance moves it again.
+        if matches!(taken, Taken::Held) {
+            self.inner.rebalance.taken(address);
         }
         taken
     }
@@ -448,7 +472,9 @@ async fn move_one(
         // then ask the target to take it.
         if cluster.is_parked(&address) {
             if cluster.can_take(&intent.target)
-                && move_parked(inner, cluster, awaiting, intent, &address).await
+                && move_parked(inner, cluster, awaiting, &intent.target, &address)
+                    .await
+                    .finished()
             {
                 cluster.delete_move(intent).await;
             }
@@ -467,7 +493,18 @@ async fn move_one(
         tracing::debug!(app = %crate::logging::app(&address), actor = %crate::logging::actor(&address), target = %intent.target, "move: the target cannot take actors now");
         return;
     }
-    if move_resident(inner, cluster, active, intent, &address, token).await {
+    if move_resident(
+        inner,
+        cluster,
+        active,
+        &intent.target,
+        intent.key(),
+        &address,
+        token,
+    )
+    .await
+    .finished()
+    {
         cluster.delete_move(intent).await;
     }
 }
@@ -488,13 +525,13 @@ async fn move_one(
 /// any more (an event woke the room since the caller looked) keeps the
 /// request too: the room is resident again, and a later pass moves it as
 /// such.
-async fn move_parked(
+pub(super) async fn move_parked(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
     awaiting: &Awaiting,
-    intent: &MoveIntent,
+    target: &str,
     address: &ActorAddress,
-) -> bool {
+) -> MoveEnd {
     let until_ms =
         now_ms().saturating_add(u64::try_from(MOVE_DEADLINE.as_millis()).unwrap_or(u64::MAX));
     inner
@@ -504,7 +541,7 @@ async fn move_parked(
         .insert(
             address.clone(),
             drain::Move {
-                target: intent.target.clone(),
+                target: target.to_owned(),
                 until_ms,
             },
         );
@@ -529,39 +566,40 @@ async fn move_parked(
             Ok(false) => {}
             again => {
                 wait();
-                tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, names_this_node = ?again.ok(), "move: the parked record moved on, still naming this node or unread; the move waits");
-                return false;
+                tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, names_this_node = ?again.ok(), "move: the parked record moved on, still naming this node or unread; the move waits");
+                return MoveEnd::NotDone;
             }
         },
         Some(LeaseReturn::Pending) => {
             wait();
-            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "move: the parked record's release is pending; the move waits");
-            return false;
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, "move: the parked record's release is pending; the move waits");
+            return MoveEnd::NotDone;
         }
         None => {
             end_move();
-            return false;
+            return MoveEnd::NotDone;
         }
     }
     let closed = inner
         .sockets
         .close_owner(address, 1012, "actor moving; reconnect");
     crate::metrics::owner_closes("move", closed);
-    let answer = cluster.take(&intent.target, address).await;
+    let answer = cluster.take(target, address).await;
     end_move();
     match answer {
         TakeAnswer::Held => {
-            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "moved (parked)");
-            true
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, "moved (parked)");
+            MoveEnd::Moved
         }
+        TakeAnswer::HeldBy(holder) if holder == target => MoveEnd::Moved,
         // Another node won the race after the release: the move is moot.
         // This node named as holder means the release had not landed yet
         // for the target's read, or this node took the room back: not done.
         TakeAnswer::HeldBy(holder) if holder != cluster.node_id => {
-            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, target = %intent.target, "move: held after the release");
-            true
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, %target, "move: held after the release");
+            MoveEnd::Elsewhere
         }
-        TakeAnswer::HeldBy(_) | TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
+        TakeAnswer::HeldBy(_) | TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => MoveEnd::NotDone,
     }
 }
 
@@ -640,14 +678,15 @@ async fn look_at_awaiting(inner: &ServiceInner, cluster: &Cluster, awaiting: &Aw
 
 /// The owner's side of a move. Whether the request is finished (done, or
 /// another node won); `false` keeps it for a later pass.
-async fn move_resident(
+pub(super) async fn move_resident(
     inner: &Arc<ServiceInner>,
     cluster: &Arc<Cluster>,
     active: &Active,
-    intent: &MoveIntent,
+    target: &str,
+    key: String,
     address: &ActorAddress,
     token: u64,
-) -> bool {
+) -> MoveEnd {
     // Sockets first: their close events run here, with the lease.
     let open = inner.sockets.of(address, None);
     if !open.is_empty() {
@@ -661,31 +700,31 @@ async fn move_resident(
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    let (target, key, active_job) = (intent.target.clone(), intent.key(), Arc::clone(active));
+    let (to, active_job) = (target.to_owned(), Arc::clone(active));
     let job = inner
         .mailboxes
         .submit_if_resident(address, move |state: &mut ActorState| {
-            Box::pin(state.move_out(target, key, token, active_job))
+            Box::pin(state.move_out(to, key, token, active_job))
         });
     let outcome = match tokio::time::timeout(MOVE_WAIT, job).await {
         Ok(Ok(outcome)) => outcome,
         // Busy past the wait, or gone. This attempt is abandoned (its token
         // leaves `active` when the task ends), so the job, if it runs
         // later, does nothing.
-        Ok(Err(_)) | Err(_) => return false,
+        Ok(Err(_)) | Err(_) => return MoveEnd::NotDone,
     };
     let alarm = match outcome {
         MoveOut::Released { alarm } => alarm,
         MoveOut::Expiring => {
             tracing::warn!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), "move: the release is pending (retried in the background); the move is tried again later");
-            return false;
+            return MoveEnd::NotDone;
         }
-        MoveOut::Busy | MoveOut::NotHeld | MoveOut::Kept => return false,
+        MoveOut::Busy | MoveOut::NotHeld | MoveOut::Kept => return MoveEnd::NotDone,
     };
-    let answer = cluster.take(&intent.target, address).await;
+    let answer = cluster.take(target, address).await;
     let done = match &answer {
         TakeAnswer::Held => true,
-        TakeAnswer::HeldBy(holder) => *holder == intent.target,
+        TakeAnswer::HeldBy(holder) => holder.as_str() == target,
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
     };
     if !done {
@@ -705,14 +744,14 @@ async fn move_resident(
     }
     match answer {
         TakeAnswer::Held => {}
-        TakeAnswer::HeldBy(holder) if holder == intent.target => {}
+        TakeAnswer::HeldBy(holder) if holder == target => {}
         TakeAnswer::HeldBy(holder) => {
-            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, target = %intent.target, "move: another node took the actor first");
-            return true;
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, %target, "move: another node took the actor first");
+            return MoveEnd::Elsewhere;
         }
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => {
-            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, ?answer, "move: the target did not take the actor; tried again later");
-            return false;
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, ?answer, "move: the target did not take the actor; tried again later");
+            return MoveEnd::NotDone;
         }
     }
     inner
@@ -723,6 +762,6 @@ async fn move_resident(
     if let Some(at) = alarm {
         inner.alarms.clear_if(address.clone(), at);
     }
-    tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), target = %intent.target, "moved");
-    true
+    tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, "moved");
+    MoveEnd::Moved
 }

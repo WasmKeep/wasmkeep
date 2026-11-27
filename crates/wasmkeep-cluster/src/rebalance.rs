@@ -61,11 +61,8 @@ pub fn home<'a>(here: &str, set: &[&'a str], key: &str) -> Option<&'a str> {
 /// A version's minor line, `(major, minor)`: `0.10.0+abc` and
 /// `0.10.1-rc.1` are both `(0, 10)`. `None` if it does not start with two
 /// numbers.
-pub fn minor(version: &str) -> Option<(u64, u64)> {
-    let mut parts = version.split(['.', '+', '-']);
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
+pub fn minor(version: &str) -> Option<(u32, u32)> {
+    crate::app_format::floor::Minor::of_version(version).map(|m| (m.major, m.minor))
 }
 
 /// This node, as the pass sees it.
