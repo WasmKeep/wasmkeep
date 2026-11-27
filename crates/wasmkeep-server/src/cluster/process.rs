@@ -444,7 +444,7 @@ impl Transport {
                         HeartbeatRead::Found(n) => observe(id, n),
                         // A current answer: the newest lease body held for
                         // it is not merely pinned by its date.
-                        HeartbeatRead::Gone => self.lease_reads.absent(id),
+                        HeartbeatRead::Gone => self.lease_reads.gone_at(id, now, lease),
                         HeartbeatRead::Failed(_) => {}
                     }
                 }
@@ -506,6 +506,20 @@ impl Transport {
                         bodies.insert(id, (issued, None));
                     }
                 }
+                // A node this listing leaves out is gone to the newest
+                // lease reads, unless a read issued after it found a body:
+                // its entry goes once it stays gone for the unpin window
+                // (a removed lease).
+                self.lease_reads.listed(
+                    |id| {
+                        listed_ids.contains(id)
+                            || bodies
+                                .get(id)
+                                .is_some_and(|(at, body)| body.is_some() && *at > issued)
+                    },
+                    now,
+                    lease,
+                );
             }
             Heartbeats::Read(reads) => {
                 for (id, read) in reads {

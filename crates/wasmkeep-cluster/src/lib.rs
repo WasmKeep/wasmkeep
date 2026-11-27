@@ -46,6 +46,7 @@ pub mod generation_floor;
 pub mod hold_cell;
 pub mod holds;
 pub mod lease;
+pub mod lease_removal;
 pub mod legacy_layout;
 pub mod local_heads;
 pub mod membership;

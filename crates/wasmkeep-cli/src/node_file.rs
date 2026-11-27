@@ -38,6 +38,10 @@ pub(crate) struct Process {
     /// off for every app of the process, as `serve --no-idle-compaction`
     /// does; `None`: on.
     pub(crate) idle_compaction: Option<bool>,
+    /// `lease-removal` (ADR 0020, amendment of 2026-11-27): `Some(false)`
+    /// keeps released node leases for every app of the process, as `serve
+    /// --no-lease-removal` does; `None`: removed a day after release.
+    pub(crate) lease_removal: Option<bool>,
     pub(crate) otlp_endpoint: Option<String>,
     pub(crate) trace_sample: Option<f64>,
     pub(crate) trace_trust_incoming: Option<bool>,
@@ -118,6 +122,7 @@ const PROCESS: &[&str] = &[
     "placement",
     "rebalance",
     "idle-compaction",
+    "lease-removal",
     "otlp-endpoint",
     "trace-sample",
     "trace-trust-incoming",
@@ -218,6 +223,9 @@ pub(crate) fn parse_any(text: &str, path: &Path) -> Result<NodeFile, String> {
         }
         if crate::project::get(t, "idle-compaction").is_some() {
             file.process.idle_compaction = Some(boolean(&src, t, "idle-compaction", "[process]")?);
+        }
+        if crate::project::get(t, "lease-removal").is_some() {
+            file.process.lease_removal = Some(boolean(&src, t, "lease-removal", "[process]")?);
         }
     }
 
@@ -790,6 +798,7 @@ impl NodeFile {
                 placement: args.no_placement.then_some(false),
                 rebalance: args.no_rebalance.then_some(false),
                 idle_compaction: args.no_idle_compaction.then_some(false),
+                lease_removal: args.no_lease_removal.then_some(false),
                 otlp_endpoint: args.otlp_endpoint.clone(),
                 trace_sample: Some(args.trace_sample),
                 trace_trust_incoming: Some(args.trace_trust_incoming),
@@ -898,6 +907,10 @@ impl NodeFile {
         // ADR 0042's switch, the same way.
         if self.process.idle_compaction == Some(false) {
             args.no_idle_compaction = true;
+        }
+        // The removal of released node leases, the same way.
+        if self.process.lease_removal == Some(false) {
+            args.no_lease_removal = true;
         }
         args.advertise.clone_from(&self.listen.public_advertise);
         if let Some(public) = self.listen.public {

@@ -475,6 +475,8 @@ fn fast_node(id: &str, store: &Arc<dyn ObjectStore>) -> Arc<Cluster> {
     );
     config.heartbeat = Duration::from_millis(100);
     config.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
+    // The client's request budget scaled to these timings.
+    config.after_removal_wait = Some(Duration::from_millis(2_500));
     Cluster::new(&config, &StateRoot::new("", "t", "default")).unwrap()
 }
 
@@ -1975,9 +1977,12 @@ async fn a_node_starting_while_its_lease_is_forgotten_waits_for_the_delete() {
         store.delete(&key).await.unwrap();
         let deleted = std::time::Instant::now();
         a.identity().await.unwrap();
-        // The whole check ran again, over no object.
+        // The whole check ran again, over no object, for the longer wait
+        // of a start that met a removal (2.5 s here, the client's request
+        // budget plus ttl and grace by default): a delete the network held
+        // lands before the lease is created.
         assert!(
-            deleted.elapsed() >= Duration::from_millis(1_100),
+            deleted.elapsed() >= Duration::from_millis(2_400),
             "{during_the_check}: started {:?} after the delete",
             deleted.elapsed()
         );

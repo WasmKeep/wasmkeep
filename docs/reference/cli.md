@@ -172,6 +172,7 @@ Usage: `wasmkeep serve [OPTIONS] [COMPONENT]`
 | `--cluster-plaintext <MODE>` | `refuse` | Plain HTTP between nodes. One of: accept, refuse. |
 | `--history-retention-secs <SECS>` | `3600` | Seconds an actor's old history stays in the bucket before garbage collection may delete it (ADR 0012); 0 deletes it as soon as the rule allows. |
 | `--no-idle-compaction` |  | Never compact an idle actor's history (ADR 0042): no snapshot at the head when an actor hibernates, and no idle pass a retention window later. |
+| `--no-lease-removal` |  | Never remove released node leases (ADR 0020, amendment of 2026-11-27). |
 | `--failover-wait-secs <SECS>` |  | Seconds a request for an actor whose node died or is stopping is kept until another node can take the actor over, instead of a 503 at once: a GET or HEAD without a body, or a WebSocket upgrade, arriving from outside. |
 | `--bucket <BUCKET>` |  | Bucket shared by the cluster: s3://BUCKET[/PREFIX]. Credentials, region and endpoint come from the AWS_* environment variables (AWS_ENDPOINT for MinIO or R2, AWS_ALLOW_HTTP=true for plain http) |
 | `--cache-dir <CACHE_DIR>` | `.wasmkeep/cache` | Directory for pre-compiled components |

@@ -11,6 +11,25 @@ The text under a version's heading is its GitHub release text
 
 ### Added
 
+- **Released node leases are removed without an operator**
+  ([ADR 0020, amendment of 2026-11-27](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-27-released-leases-removed-by-the-live-nodes)).
+  The lowest-id live node of each app removes its app's `released` node
+  leases a day after their release, with the steps `wasmkeep cluster
+  forget` takes once the app's upgrade to 0.9 is finalized: the mark,
+  written only over the lease it read, then its delete, and never a lease
+  an ownership record still names. Nothing is removed before the finalize
+  or beside a live node older than 0.9. A mark a removal left behind is
+  deleted once it is 16 s old, so a node waiting on it starts; no delete
+  leaves a remover past its deadline, and a node starting after a removal
+  under its id waits 45 s over the absent key before creating its lease. At most 16 removals and ends of
+  marks per round, a round every 15 s (a listing of the keys of
+  `nodes/`), one scan of the ownership records for every due lease; a
+  lease a record names waits ten minutes, and failed rounds back off (a
+  minute at most). On by default; `serve --no-lease-removal` or `[process]
+  lease-removal = false` turns it off. New metric
+  `wasmkeep_node_lease_removals_total{outcome}`. Each process's table of
+  newest lease reads now drops a node whose lease has been gone for ttl
+  plus grace (it kept one entry per node id ever read).
 - **A big room's edges return home after a node rejoins**
   ([ADR 0040, section 14](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
   Each spread actor (the built-in `edge`, or a class with `spread =
@@ -81,6 +100,20 @@ The text under a version's heading is its GitHub release text
 
 ### Fixed
 
+- **A single slow lease renewal no longer runs a node's lease out.**
+  Renewals went a heartbeat period after the previous send, each allowed
+  2.67 s, so after one that timed out the next could be answered after
+  the lease's 8 s of validity, one way to the "this node's lease ran
+  out" warning. A renewal is now due 2 s after the last
+  acknowledged write, each allowed 2 s, a failed one is tried again at
+  once, and one that adopted this process's own write that landed late
+  (an older date) is followed at once, while one that adopted nothing
+  newer counts as a failure. The first write is bounded the same way, the
+  read of the upgrade floor no longer holds a due renewal back, and the
+  last renewal that fits may take the rest of the validity: after a
+  timeout another whole attempt still lands 2 s before the lease runs out
+  ([ADR 0020, amendment of 2026-11-27](docs/adr/0020-one-lease-per-node.md#second-part-same-amendment-the-renewals-budget)).
+  A node writes its lease every 2 s instead of every 3 s.
 - **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
   its last check on a second runtime while the first still held the
   bucket's pooled connection, and that request waited for object_store's

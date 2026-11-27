@@ -597,6 +597,9 @@ pub(crate) struct Metrics {
     /// Idle passes a retention window after a release (ADR 0042, section
     /// 3), by `outcome` ([`IDLE_COMPACTION_OUTCOMES`]).
     pub(crate) idle_compactions: Family<AtomicU64>,
+    /// What the removal of released node leases did (ADR 0020, amendment
+    /// of 2026-11-27), by `outcome` ([`LEASE_REMOVAL_OUTCOMES`]).
+    pub(crate) lease_removals: Family<AtomicU64>,
     /// Idle passes not queued because the queue was full (ADR 0042).
     pub(crate) idle_passes_dropped: AtomicU64,
     /// Node calls refused because the record of used signatures was full,
@@ -1003,6 +1006,41 @@ pub(crate) const IDLE_COMPACTION_OUTCOMES: [&str; 7] = [
     "busy",
 ];
 
+/// `outcome` of `wasmkeep_node_lease_removals_total`: a released lease
+/// removed, a mark that stayed deleted, a lease found written since it
+/// was read, a mark whose delete got no answer, a lease kept because a
+/// record names its node, a round blocked by the gate of the mark (the
+/// app not finalized at 0.9, or a live older node), a round that stopped
+/// on a failed request.
+pub(crate) const LEASE_REMOVAL_OUTCOMES: [&str; 7] = [
+    "removed",
+    "ended",
+    "changed",
+    "unfinished",
+    "named",
+    "blocked",
+    "failed",
+];
+
+/// Counts one round of the removal of released node leases.
+pub(crate) fn lease_removal(round: &wasmkeep_cluster::lease_removal::Round) {
+    let add = |outcome: &str, n: usize| {
+        if n > 0 {
+            METRICS
+                .lease_removals
+                .get(&[("outcome", outcome)])
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
+    };
+    add("removed", round.removed.len());
+    add("ended", round.ended.len());
+    add("changed", round.changed.len());
+    add("unfinished", round.unfinished.len());
+    add("named", round.named.len());
+    add("blocked", usize::from(round.blocked.is_some()));
+    add("failed", usize::from(round.failed.is_some()));
+}
+
 /// One idle pass ended with `outcome` ([`IDLE_COMPACTION_OUTCOMES`]).
 pub(crate) fn idle_compaction(outcome: &str) {
     inc(&METRICS.idle_compactions.get(&[("outcome", outcome)]));
@@ -1249,6 +1287,7 @@ impl Metrics {
         one(&m.signatures_refused_full, "record", &SIGNATURE_RECORDS);
         one(&m.idle_snapshots, "outcome", &IDLE_SNAPSHOT_OUTCOMES);
         one(&m.idle_compactions, "outcome", &IDLE_COMPACTION_OUTCOMES);
+        one(&m.lease_removals, "outcome", &LEASE_REMOVAL_OUTCOMES);
         one(&m.websocket_owner_closes, "reason", &OWNER_CLOSE_REASONS);
         one(&m.actor_deletes, "how", &DELETE_HOWS);
         one(&m.actor_delete_failures, "how", &DELETE_HOWS);

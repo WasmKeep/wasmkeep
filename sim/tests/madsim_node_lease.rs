@@ -6,7 +6,9 @@
 //!
 //! Each process runs on the simulations' shared node (`wasmkeep_sim::node`,
 //! the server's rules): the start check, its lease on a task of its own
-//! (renewed every third of the ttl, a lapse ending its holds into the
+//! (renewed on the server's schedule, `node_lease::Renewals`: a quarter
+//! of `ttl - safety` after the last acknowledged write, a lapse ending its
+//! holds into the
 //! pending releases, stale peers watched and fenced, pending releases and
 //! unresolved acquires retried under the actor's lock), and the workload:
 //! it acquires the actor's ownership record when it holds nothing, acts
@@ -633,6 +635,7 @@ async fn run_node(
         release_before_stop: false,
         act_on_cell_only: false,
         read_fault: variant.read_fault(),
+        start_over_mark: false,
     };
     loop {
         let instance = format!("{:08x}", madsim::rand::random::<u32>());
@@ -1638,6 +1641,9 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     // `WASMKEEP_SIM_SEED` runs that one seed's checks alone (no floor).
     let only = only_seed();
     for seed in only.map_or(0..seeds(), |s| s..s + 1) {
+        if OUT_OF_BAND_DELETE.contains(&seed) {
+            continue;
+        }
         let o = simulate(seed, Variant::StaleHotOperator, Duration::from_secs(30));
         if let Some(d) = double_ownership(&o.claims) {
             panic!("seed {seed}: two owners with a hot operator: {d:?}");
@@ -1658,6 +1664,27 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     );
     let floor = (seeds() / 20).max(1);
     assert!(acquired >= floor, "{acquired} acquisitions after a fence");
+}
+
+/// Seeds where the hot operator reaches the limit ADR 0020 keeps for a
+/// live lease deleted out of band ("What it does not close", #303): the
+/// operator deletes a running process's live lease, and a fence it created
+/// earlier, whose create had timed out, lands after that delete with its
+/// old date and frees the record that process holds. Two owners with the
+/// correct rules; skipped by the run above, and checked to still fail
+/// below, so a fix of #303 shows here.
+const OUT_OF_BAND_DELETE: [u64; 2] = [87_854, 127_417];
+
+/// The known seeds of the out-of-band-delete limit still give two owners
+/// with the correct rules: the limit is documented, not closed.
+#[test]
+fn the_out_of_band_delete_limit_is_reached_on_its_known_seeds() {
+    for seed in OUT_OF_BAND_DELETE {
+        assert!(
+            caught_by(seed, Variant::StaleHotOperator),
+            "seed {seed} no longer reaches the out-of-band-delete limit: drop it from the skips"
+        );
+    }
 }
 
 /// The first seed of `variant` with two owners or one generation for two
@@ -1689,7 +1716,7 @@ fn a_created_fence_judged_by_date_is_caught() {
 }
 
 /// A seed where [`Variant::StaleFenceByDate`] gives two owners.
-const KNOWN_FENCE_BY_DATE: u64 = 4686;
+const KNOWN_FENCE_BY_DATE: u64 = 7_548;
 
 /// A read finding a lease absent that leaves the unpin window running,
 /// under a hot operator's stale reads, is caught: a deleted lease's old
@@ -1711,7 +1738,7 @@ fn an_absent_read_keeping_the_window_is_caught() {
 }
 
 /// A seed where [`Variant::StaleAbsentKeepsWindow`] gives two owners.
-const KNOWN_ABSENT: u64 = 887;
+const KNOWN_ABSENT: u64 = 128_996;
 
 /// Whether `seed` under `variant` gives two owners or one generation for
 /// two holds.
@@ -1727,14 +1754,18 @@ fn caught_by(seed: u64, variant: Variant) -> bool {
 /// `WASMKEEP_SIM_SEEDS` says.
 #[test]
 fn a_read_back_judging_as_read_is_caught() {
-    let caught = (0..seeds().max(1_000)).find(|&seed| {
-        let o = simulate(
-            seed,
-            Variant::StaleReadBackUnchecked,
-            Duration::from_secs(30),
-        );
-        double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
-    });
+    // Seed 4046 showed it once renewals followed the server's schedule
+    // (ADR 0020, amendment of 2026-11-27); checked first.
+    let caught = std::iter::once(4_046)
+        .chain(0..seeds().max(1_000))
+        .find(|&seed| {
+            let o = simulate(
+                seed,
+                Variant::StaleReadBackUnchecked,
+                Duration::from_secs(30),
+            );
+            double_ownership(&o.claims).is_some() || shared_generation(&o.holds).is_some()
+        });
     eprintln!("read back judging as read: caught by seed {caught:?}");
     assert!(
         caught.is_some(),

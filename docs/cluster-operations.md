@@ -342,8 +342,16 @@ lease itself, under [How it works](cluster.md#how-it-works):
   also what `cluster upgrade finalize` asks for when an older node's
   lease is stale without a release.
 - `wasmkeep cluster forget <node>` removes the lease a node left when it
-  stopped cleanly, once no ownership record names it. It is tidying: a
-  released lease costs nothing per heartbeat period.
+  stopped cleanly, once no ownership record names it.
+
+Released leases no longer pile up: the live nodes remove them a day
+after their release, the way `cluster forget` does, once the app's
+upgrade to 0.9 is finalized
+([how it works](cluster.md#how-it-works)). After an upgrade, run
+`wasmkeep cluster upgrade finalize`: until then the leases of the
+stopped nodes stay, and `wasmkeep_node_lease_removals_total{outcome="blocked"}`
+rises on the node that would remove them. `cluster forget` is still the
+way for an app with no live node, or with `--no-lease-removal`.
 
 ## Draining a node
 

@@ -449,6 +449,12 @@ pub(super) fn render_with(m: &Metrics, gauges: Gauges, identities: &[Identity]) 
         "Idle passes a retention window after an actor's release, by outcome.",
         &m.idle_compactions,
     );
+    family(
+        &mut out,
+        "wasmkeep_node_lease_removals_total",
+        "Released node leases removed by this node, and the rest of its removal rounds, by outcome.",
+        &m.lease_removals,
+    );
     counter(
         &mut out,
         "wasmkeep_idle_passes_dropped_total",

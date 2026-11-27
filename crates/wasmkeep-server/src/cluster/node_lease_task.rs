@@ -3,7 +3,7 @@
 //! listing, the cluster secret or `control/`.
 
 use wasmkeep_cluster::lease::Version;
-use wasmkeep_cluster::node_lease::{NodeLease, NodeLeaseError};
+use wasmkeep_cluster::node_lease::{NodeLease, NodeLeaseError, Renewals};
 
 use super::*;
 
@@ -30,11 +30,23 @@ impl Drop for Finished {
     }
 }
 
-/// How often the node lease is written: every heartbeat period, which
-/// [`Cluster::new`] keeps at most a third of the ttl, so a node has three
-/// tries to renew before its lease runs out.
+/// When the node lease is renewed ([`Renewals`]): a spacing of at most a
+/// heartbeat period and a quarter of `ttl - safety` (2 s with the
+/// defaults) after the last acknowledged write, each renewal bounded by a
+/// quarter of `ttl - safety` (2 s), so one that times out leaves room for
+/// another whole one before the lease runs out (ADR 0020, section 5,
+/// amendment of 2026-11-27).
+pub(super) fn renewals(heartbeat: Duration, lease: &LeaseConfig) -> Renewals {
+    Renewals::new(
+        lease,
+        u64::try_from(heartbeat.as_millis()).unwrap_or(u64::MAX),
+    )
+}
+
+/// The spacing of [`renewals`]: how long after the last acknowledged lease
+/// write the next is sent, and between two tries of the first write.
 pub(super) fn lease_every(heartbeat: Duration, lease: &LeaseConfig) -> Duration {
-    heartbeat.min(Duration::from_millis(lease.ttl_ms() / 3))
+    Duration::from_millis(renewals(heartbeat, lease).spacing_ms)
 }
 
 /// How long one lease write may take: a third of `ttl - safety` (2.7 s with
@@ -55,8 +67,9 @@ pub(crate) fn heartbeat_read_attempt(heartbeat: Duration, lease: &LeaseConfig) -
 }
 
 /// Checks the bucket and this node id, writes the node lease's first
-/// `live` write, then renews it every [`lease_every`] from the previous
-/// send, until it is lost or a clean stop asks for its release.
+/// `live` write, then renews it as [`renewals`] says, from the last
+/// acknowledged write, until it is lost or a clean stop asks for its
+/// release.
 pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
     let _finished = Finished(cluster.clone());
     let Some(c) = cluster.upgrade() else {
@@ -78,11 +91,16 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
     if !started {
         return;
     }
-    let every = c.lease_every;
+    let renewals = c.renewals;
     drop(c);
-    // The first renewal a period after the first write. One the floor's
+    // When (this node's clock, ms) the next renewal is due, made an
+    // instant of the runtime's: one already due goes at once.
+    let at = |due_ms: u64| {
+        tokio::time::Instant::now() + Duration::from_millis(due_ms.saturating_sub(now_ms()))
+    };
+    // The first renewal a spacing after the first write. One the floor's
     // read pushed past its time is sent at once.
-    let mut next = tokio::time::Instant::now() + every;
+    let mut next = at(renewals.next_ms(lease.written_at_ms(), now_ms(), now_ms(), false));
     // The upgrade floor, read again now that this node is live: a floor
     // written during the start check (when no listing could see this node)
     // stops it before it serves. Refused only on an answer; without one
@@ -94,9 +112,12 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
             let Some(c) = cluster.upgrade() else {
                 return;
             };
+            // Never past a renewal that is due: the read is dropped, made
+            // again after the renewal.
             let read = tokio::select! {
-                read = c.read_floor() => Some(read),
+                read = c.read_floor() => Some(Some(read)),
                 _ = stop.wait_for(|s| *s) => None,
+                () = tokio::time::sleep_until(next) => Some(None),
             };
             match read {
                 // A clean stop meanwhile: release what was written.
@@ -104,33 +125,36 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
                     c.release_node_lease(&mut lease).await;
                     return;
                 }
-                Some(super::identity::FloorRead::Allowed(_)) => {
-                    floor_read = true;
-                    // A verdict reached meanwhile (a twin found by the
-                    // listing) stands: Unique only over Checking.
-                    let unique = c.identity.send_if_modified(|s| {
-                        let checking = *s == Identity::Checking;
-                        if checking {
-                            *s = Identity::Unique;
+                Some(None) => {}
+                Some(Some(read)) => match read {
+                    super::identity::FloorRead::Allowed(_) => {
+                        floor_read = true;
+                        // A verdict reached meanwhile (a twin found by the
+                        // listing) stands: Unique only over Checking.
+                        let unique = c.identity.send_if_modified(|s| {
+                            let checking = *s == Identity::Checking;
+                            if checking {
+                                *s = Identity::Unique;
+                            }
+                            checking
+                        });
+                        if !unique || c.identity_taken() {
+                            c.invalidate_node_lease(false);
+                            return;
                         }
-                        checking
-                    });
-                    if !unique || c.identity_taken() {
-                        c.invalidate_node_lease(false);
+                        tracing::info!("{}", super::identity::checked_message(&c.node_id));
+                    }
+                    super::identity::FloorRead::Refused(why) => {
+                        tracing::error!("{why}");
+                        // It held nothing: acquisitions wait for the verdict.
+                        c.release_node_lease(&mut lease).await;
+                        c.identity.send_replace(Identity::BelowFloor(why));
                         return;
                     }
-                    tracing::info!("{}", super::identity::checked_message(&c.node_id));
-                }
-                Some(super::identity::FloorRead::Refused(why)) => {
-                    tracing::error!("{why}");
-                    // It held nothing: acquisitions wait for the verdict.
-                    c.release_node_lease(&mut lease).await;
-                    c.identity.send_replace(Identity::BelowFloor(why));
-                    return;
-                }
-                Some(super::identity::FloorRead::NoAnswer(e)) => {
-                    tracing::warn!(error = %e, "reading the app's upgrade floor after the first lease write failed; renewing the lease and reading it again");
-                }
+                    super::identity::FloorRead::NoAnswer(e) => {
+                        tracing::warn!(error = %e, "reading the app's upgrade floor after the first lease write failed; renewing the lease and reading it again");
+                    }
+                },
             }
         }
         let asked = tokio::select! {
@@ -150,11 +174,7 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
             return;
         }
         lease.set_payload(c.membership.lease_payload());
-        // The next send a period after this one, however long this one
-        // takes: a write that hangs until its timeout must not push the
-        // next past the lease's validity (three tries per lease). One
-        // that took longer than a period is followed at once.
-        next = tokio::time::Instant::now() + every;
+        let sent_ms = now_ms();
         // A clean stop asked while the write is in flight makes the lease
         // locally invalid at once, lets the write finish (it is not
         // aborted, and gives the version `released` conditions on), and
@@ -162,7 +182,9 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         let mut stopping = false;
         let sent = std::time::Instant::now();
         let attempt = {
-            let attempt = tokio::time::timeout(c.lease_attempt, lease.renew());
+            let limit =
+                Duration::from_millis(renewals.attempt_for(lease.valid_until_ms(), sent_ms));
+            let attempt = tokio::time::timeout(limit, lease.renew());
             tokio::pin!(attempt);
             tokio::select! {
                 biased;
@@ -183,6 +205,15 @@ pub(super) async fn node_lease_loop(cluster: std::sync::Weak<Cluster>) {
         crate::metrics::METRICS
             .node_lease_write_ms
             .observe(sent.elapsed());
+        // The next one from the last acknowledged write's date: a spacing
+        // after it, at once after an adopted older write of this process
+        // or a timeout, soon after a quick error.
+        next = at(renewals.next_ms(
+            lease.written_at_ms(),
+            sent_ms,
+            now_ms(),
+            !matches!(attempt, Ok(Ok(()))),
+        ));
         match attempt {
             Ok(Ok(())) => c.node_lease_written(&lease),
             Ok(Err(NodeLeaseError::Lost(cause))) => {
@@ -301,7 +332,10 @@ impl Cluster {
     ) -> Result<(), ()> {
         loop {
             lease.set_payload(self.membership.lease_payload());
-            match tokio::time::timeout(self.lease_attempt, lease.start(expected)).await {
+            // Bounded as a renewal: a first write slower than that leaves
+            // the next renewal too little of the lease.
+            let attempt = Duration::from_millis(self.renewals.attempt_ms);
+            match tokio::time::timeout(attempt, lease.start(expected)).await {
                 Ok(Ok(())) => {
                     self.node_lease_written(lease);
                     return Ok(());

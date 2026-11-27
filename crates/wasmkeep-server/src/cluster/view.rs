@@ -635,6 +635,19 @@ impl Cluster {
         self.collects(|peer| peer.can_blobs)
     }
 
+    /// Whether this node removes its app's released node leases (ADR 0020,
+    /// amendment of 2026-11-27): the lowest-id live node of the app, as
+    /// idle expiry chooses, among the peers that run the removal (this
+    /// node's minor version or a later one). Two nodes that each take
+    /// themselves for it are safe: every removal is a conditional write.
+    pub(crate) fn removes_released_leases(&self) -> bool {
+        use wasmkeep_cluster::app_format::floor::Minor;
+        let Some(own) = Minor::of_node_version(&self.own_version) else {
+            return false;
+        };
+        self.collects(|peer| Minor::of_node_version(&peer.version).is_some_and(|v| v >= own))
+    }
+
     fn collects(&self, also: impl Fn(&Peer) -> bool) -> bool {
         if self.draining() || !self.lease_valid_now() {
             return false;

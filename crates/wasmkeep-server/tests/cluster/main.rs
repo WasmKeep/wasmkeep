@@ -640,6 +640,15 @@ async fn start_node_pooled(
     cluster.lease = LeaseConfig::new(1_000, 200, 200, 100).unwrap();
     cluster.heartbeat = Duration::from_millis(100);
     cluster.alarm_sweep = Duration::from_millis(200);
+    // The removal of released leases (ADR 0020, amendment of 2026-11-27)
+    // stays on, at the production pace in heartbeat periods or slower: at
+    // these timings its round would come every 12 periods, a listing of
+    // `nodes/` each, which the cadence test counts. A test that needs it
+    // sooner asks.
+    cluster.lease_removal_every = Some(Duration::from_secs(30));
+    // A start that met a removal watches the absent key the client's
+    // request budget longer: scaled to these timings.
+    cluster.after_removal_wait = Some(Duration::from_millis(2_500));
     // Off unless a test asks (`failover_wait.rs`): every other test sees
     // the answer a node gives at once.
     cluster.failover_wait = Some(Duration::ZERO);

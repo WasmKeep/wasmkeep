@@ -36,6 +36,7 @@ mod handoff;
 mod hello;
 mod identity;
 mod lease_hold;
+mod lease_removal_task;
 mod node_lease_task;
 mod placing;
 mod process;
@@ -50,7 +51,7 @@ pub(crate) use handoff::*;
 pub(crate) use identity::*;
 pub(crate) use lease_hold::*;
 pub(crate) use node_lease_task::{heartbeat_read_attempt, lease_attempt};
-use node_lease_task::{lease_every, node_lease_loop};
+use node_lease_task::{lease_every, node_lease_loop, renewals};
 pub(crate) use placing::*;
 pub use process::NodeProcess;
 pub(crate) use signing::*;
@@ -173,6 +174,19 @@ pub struct ClusterConfig {
     /// hibernation's snapshot at the head (section 2); the pass that
     /// deletes comes later.
     pub idle_compaction: bool,
+    /// How old a `released` node lease of this app must be before the live
+    /// nodes remove it (ADR 0020, amendment of 2026-11-27): a day by
+    /// default; `None` with `serve --no-lease-removal`. The lowest-id live
+    /// node removes, once the app's upgrade to 0.9 is finalized.
+    pub lease_removal: Option<Duration>,
+    /// How often the remover runs a round: `None` for the default, a
+    /// lease's ttl plus grace. Tests shorten it.
+    pub lease_removal_every: Option<Duration>,
+    /// How long a start that met a removal (a mark under its id, or its
+    /// released lease gone) watches the absent key before it creates its
+    /// lease: `None` for the default, the bucket client's request timeout
+    /// (30 s) plus a lease's ttl and grace. Tests shorten it.
+    pub after_removal_wait: Option<Duration>,
     /// The least time between a periodic snapshot whose upload failed and
     /// the next try: 30 s, the longest bounded wait of a caller queued
     /// behind the actor. Tests shorten it.
@@ -283,6 +297,11 @@ impl ClusterConfig {
             migrated: false,
             history_retention: Duration::from_secs(3600),
             idle_compaction: true,
+            lease_removal: Some(Duration::from_millis(
+                wasmkeep_cluster::lease_removal::DEFAULT_AFTER_MS,
+            )),
+            lease_removal_every: None,
+            after_removal_wait: None,
             snapshot_retry_min: crate::replica::SNAPSHOT_RETRY_MIN,
             restore_budget: crate::replica::RESTORE_BUDGET,
             reads_secrets: true,
@@ -483,6 +502,12 @@ pub(crate) struct Cluster {
     pub(crate) history_retention: Duration,
     /// [`ClusterConfig::idle_compaction`].
     pub(crate) idle_compaction: bool,
+    /// [`ClusterConfig::lease_removal`].
+    lease_removal: Option<Duration>,
+    /// [`ClusterConfig::lease_removal_every`], resolved.
+    lease_removal_every: Duration,
+    /// [`ClusterConfig::after_removal_wait`], resolved.
+    pub(super) after_removal_wait: Duration,
     /// Idle snapshots this node takes at once (ADR 0042, section 2): a
     /// hibernation finding none free takes none
     /// ([`crate::replica::IDLE_SNAPSHOTS_AT_ONCE`]).
@@ -547,8 +572,11 @@ pub(crate) struct Cluster {
     placing: placing::Placing,
     /// The lease timing (ttl, grace, safety, skew).
     pub(crate) lease_config: LeaseConfig,
-    /// How often the node lease is written ([`lease_every`]).
+    /// Between two tries of the node lease's first write ([`lease_every`]).
     lease_every: Duration,
+    /// When the node lease is renewed, and how long a renewal may take
+    /// ([`renewals`]).
+    renewals: wasmkeep_cluster::node_lease::Renewals,
     /// How long one node lease write may take ([`lease_attempt`]).
     pub(crate) lease_attempt: Duration,
     /// This node's lease validity, shared with every hold.
@@ -980,6 +1008,18 @@ impl Cluster {
             socket_sweep: config.socket_sweep,
             history_retention: config.history_retention,
             idle_compaction: config.idle_compaction,
+            lease_removal: config.lease_removal,
+            after_removal_wait: config.after_removal_wait.unwrap_or_else(|| {
+                Duration::from_millis(wasmkeep_cluster::node_lease::after_removal_wait_ms(
+                    &config.lease,
+                    wasmkeep_cluster::node_lease::UNRESOLVED_WAIT_MS,
+                ))
+            }),
+            lease_removal_every: config.lease_removal_every.unwrap_or_else(|| {
+                Duration::from_millis(wasmkeep_cluster::lease_removal::round_every_ms(
+                    &config.lease,
+                ))
+            }),
             idle_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::replica::IDLE_SNAPSHOTS_AT_ONCE,
             )),
@@ -1003,6 +1043,7 @@ impl Cluster {
             secrets_blocked: std::sync::atomic::AtomicBool::new(false),
             lease_config: config.lease,
             lease_every: lease_every(config.heartbeat, &config.lease),
+            renewals: renewals(config.heartbeat, &config.lease),
             lease_attempt: lease_attempt(&config.lease),
             validity: Arc::new(NodeValidity::new()),
             lapse_hook: std::sync::OnceLock::new(),
@@ -1058,6 +1099,9 @@ impl Cluster {
         tokio::spawn(listing_loop(Arc::downgrade(&cluster), config.heartbeat));
         tokio::spawn(join_read_loop(Arc::downgrade(&cluster), reads_wanted_rx));
         tokio::spawn(fence_loop(Arc::downgrade(&cluster), fences_due_rx));
+        tokio::spawn(lease_removal_task::lease_removal_loop(Arc::downgrade(
+            &cluster,
+        )));
         Ok(cluster)
     }
 

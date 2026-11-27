@@ -1,8 +1,9 @@
 //! Node leases and ownership records (ADR 0020) against a real S3 API
 //! (moto's S3 server; R2, OVHcloud and any S3-compatible store work): the
 //! conditional writes they rest on, one winner among concurrent acquires,
-//! a renewal whose reply was lost adopted from a read, and a fence that a
-//! renewal landing between its read and its write defeats.
+//! a renewal whose reply was lost adopted from a read, a fence that a
+//! renewal landing between its read and its write defeats, and the removal
+//! of released node leases by the live nodes.
 //!
 //! Skipped unless `WASMKEEP_TEST_S3_BUCKET` names a bucket; the endpoint and
 //! credentials come from the AWS_* environment variables, e.g.
@@ -501,4 +502,85 @@ async fn alarm_index_keys_never_nest_and_absent_deletes_succeed() {
             "exact key only"
         );
     }
+}
+
+/// The removal of released node leases (ADR 0020, amendment of
+/// 2026-11-27) on an S3 API: a listing's last-modified times (whole
+/// seconds on S3), the folders of `state/`, the record read and the mark
+/// written `If-Match` on an `ETag`. A released lease no record names is
+/// removed; one a record names stays; a live one stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn released_leases_are_removed_on_s3() {
+    use wasmkeep_cluster::app_format::floor::{self, Minor};
+    use wasmkeep_cluster::control::Keys as _;
+    use wasmkeep_cluster::lease_removal::{Remover, Settings};
+    let Some((store, prefix)) = s3("released_leases_are_removed_on_s3") else {
+        return;
+    };
+    let bucket = ObjectStoreBucket::new(store, format!("{prefix}/rm"));
+    let day = 24 * 60 * 60 * 1000;
+    // Later than the bucket's clock: what was just written lists as old
+    // enough to be read.
+    let now = Wall.now_ms() + 60_000;
+    let lease = |id: &str, state: &str, at: u64| {
+        format!(
+            "wasmkeep-node 3\n{state} i-{id}\n{at}\n{id}\nhttp://{id}\n0.10.0\nacme/shop\n\n\nserving\n\n\n"
+        )
+        .into_bytes()
+    };
+    floor::raise(
+        &bucket,
+        "formats/acme/shop/floor",
+        Minor { major: 0, minor: 9 },
+    )
+    .await
+    .unwrap();
+    bucket
+        .put_body("nodes/a", lease("a", "live", now))
+        .await
+        .unwrap();
+    for id in ["gone", "held"] {
+        bucket
+            .put_body(&format!("nodes/{id}"), lease(id, "released", now - 2 * day))
+            .await
+            .unwrap();
+    }
+    let record = OwnerRecord {
+        holder: Some(("held".into(), "i-held".into())),
+        generation: 2,
+        recorded: None,
+    };
+    bucket
+        .put_body("state/acme/shop/owners/c/x", record.encode())
+        .await
+        .unwrap();
+    let settings = Settings {
+        after_ms: day,
+        horizon_ms: 10_000,
+        config: LeaseConfig::default_safe(),
+        hold_back_ms: wasmkeep_cluster::lease_removal::HOLD_BACK_MS,
+    };
+    // Ahead of the wall clock as `now` is.
+    struct Ahead;
+    impl Clock for Ahead {
+        fn now_ms(&self) -> u64 {
+            Wall.now_ms() + 60_000
+        }
+    }
+    let round = Remover::new()
+        .round(
+            &bucket,
+            &Ahead,
+            "acme/shop",
+            &settings,
+            || tokio::time::sleep(Duration::from_secs(10)),
+            || true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(round.removed, ["gone"], "{round:?}");
+    assert_eq!(round.named, ["held"], "{round:?}");
+    assert_eq!(bucket.get("nodes/gone").await.unwrap(), None);
+    assert!(bucket.get("nodes/held").await.unwrap().is_some());
+    assert!(bucket.get("nodes/a").await.unwrap().is_some());
 }

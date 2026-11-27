@@ -108,8 +108,9 @@ status`, `cluster verify`, draining, moving and deleting) and
   until a process starts with that id (its start check waits, then it
   takes them back) or the node is fenced: `wasmkeep cluster fence <node>`
   writes a fence even with no object, and the actors are free 15 s
-  later. Node leases, ownership records and markers are never collected
-  on their own. `wasmkeep cluster forget <node>` removes a retired node's
+  later. Ownership records and markers are never collected on their
+  own; `released` node leases are, by the live nodes (below).
+  `wasmkeep cluster forget <node>` removes a retired node's
   heartbeat in the format from before node leases, or a `released` node
   lease (a node that stopped cleanly) that no ownership record of any app
   on the prefix still names, once either is older than 25 s; it refuses a
@@ -123,7 +124,8 @@ status`, `cluster verify`, draining, moving and deleting) and
   that id meanwhile makes that write fail, and the command leaves its
   lease alone. A process that starts while the mark is there writes
   nothing over it, waits for it to be gone and then starts as on a new
-  id; if the mark is still there 60 s later (the command stopped between
+  id, watching the absent key about 45 s (the bucket client's request
+  budget plus ttl and grace) before it creates its lease; if the mark is still there 60 s later (the command stopped between
   its two steps), the process does not start, reports `this node's lease
   is being removed by cluster forget`, and running the command again
   removes the mark; `cluster status` warns about a mark older than a
@@ -137,10 +139,24 @@ status`, `cluster verify`, draining, moving and deleting) and
   write lands in the moment between the second read and the delete loses
   that lease and exits (its next write finds the object gone), and its
   service manager starts it again: availability only, nothing is taken
-  from another node. Released leases left by earlier clusters on
-  a prefix cost nothing per heartbeat period (nodes read them only when
-  they list `nodes/`, every 30 s), so removing them is tidying, not a
-  fix.
+  from another node.
+- **Released node leases are removed by the live nodes**
+  ([ADR 0020](adr/0020-one-lease-per-node.md#amendment-of-2026-11-27-released-leases-removed-by-the-live-nodes)),
+  so a cluster whose nodes start under new ids does not pile them up.
+  The lowest-id live node of each app removes its app's `released`
+  leases a day after their release, the way `cluster forget` does after
+  the finalize: the mark, then its delete, and never a lease an
+  ownership record still names. Nothing is removed until the app's
+  upgrade to 0.9 is finalized and while a node of the app older than 0.9
+  is live. A mark a removal left behind (its node stopped between the
+  two steps) is deleted about 16 s after it was written, so a process
+  waiting on it starts. One round every 15 s, a listing of the keys of
+  `nodes/`; at most 16 leases per round. `serve --no-lease-removal` (or
+  `[process] lease-removal = false`) turns it off: set it alike on every
+  node, since a node with it off is still the one chosen if its id is
+  the lowest. Counted by `wasmkeep_node_lease_removals_total{outcome}`.
+  Each node's table of the newest lease bodies it read drops a node whose
+  lease has been gone for 15 s.
 
 ### When a node dies: what a caller sees
 
@@ -251,8 +267,8 @@ What the wait does not cover, with the defaults:
   for that node's actors are kept instead of sent, even over connections
   to it that still work. They are released when a heartbeat listing shows
   a lease write of that node more than 2 s (twice the allowed clock skew)
-  after the failure: about 2 to 8 s later, since a node writes its lease
-  every 3 s and this node reads the heartbeats every 3 s. They are then sent to the
+  after the failure: about 2 to 7 s later, since a node writes its lease
+  every 2 s and this node reads the heartbeats every 3 s. They are then sent to the
   owner as usual, and get its answer or the 503 they would have got at
   once. Nobody takes the actors. The node is then not suspected again for
   10 s; while the fault lasts, the next failed connection after that
@@ -551,6 +567,7 @@ curl -i -X POST localhost:8082/actor/counter/alice   # 2, forwarded to a
 | `--failover-wait-secs` | How long a `GET` or `HEAD` without a body, or a WebSocket upgrade, for an actor whose node died or is stopping is kept until another node took the actor over, instead of a 503 at once; default 25 (from the lease timing), 0 turns it off (see "When a node dies: what a caller sees") |
 | `--history-retention-secs` | How long old actor history stays in the bucket before garbage collection may delete it; default 3600, 0 allowed (see "History in the bucket") |
 | `--no-idle-compaction` | Never take a snapshot at the head when an actor hibernates, nor run the idle pass a retention window later ([ADR 0042](adr/0042-compacting-an-idle-actors-history.md), see "History in the bucket"); on by default; `[process] idle-compaction = false` in a node file says the same |
+| `--no-lease-removal` | Never remove released node leases (see "How it works"); by default the lowest-id live node of the app removes them a day after their release, once the app is finalized at 0.9; `[process] lease-removal = false` in a node file says the same |
 | `--secrets-key FILE` | With `--app`: the key the app's secrets are sealed with (`wasmkeep secrets new-key`); given twice during a key change (see "Secrets in the bucket") |
 | `--no-placement` | Never send a wake-up of an actor nobody holds to a lighter node, nor receive one ([ADR 0041](adr/0041-placement-at-wake-up.md)): the node keeps every actor it wakes and does not announce `place`. Placement is on by default; `[process] placement = false` in a node file says the same |
 | `--no-alarms` | Never fire an actor's alarms on this node and sweep none from the bucket's index; requests are still served and the alarms stay pending for a node without the flag. For a node on a restored copy (see [backup and restore](deploy/backup-and-restore.md)). The node logs once at start that alarms are off |

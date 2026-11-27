@@ -91,6 +91,7 @@ or the other way round. It checks names only; types, labels and meanings are kep
 | `wasmkeep_node_lease_writes_total` | counter | none | Node lease (heartbeat) writes that reached the bucket. |
 | `wasmkeep_node_lease_failures_total` | counter | none | Node lease writes that failed or timed out. |
 | `wasmkeep_lease_reads_behind_total` | counter | none | Node lease reads, made to judge an ownership record, older than a body this process read before: read again. |
+| `wasmkeep_node_lease_removals_total` | counter | `outcome` (`removed`, `ended`, `changed`, `unfinished`, `named`, `blocked`, `failed`) | What this node, as its app's remover, did with released node leases and marks a removal left behind, by outcome. |
 | `wasmkeep_lease_reads_stale_total` | counter | none | Ownership judgements refused because every node lease read was older than a body read before. |
 | `wasmkeep_lease_reads_unpinned_total` | counter | none | Newest node lease bodies replaced by an older one after older bodies were read for ttl plus grace with none confirming them. |
 | `wasmkeep_node_lease_write_milliseconds` | histogram | none | One node lease write, from its send to its answer. |

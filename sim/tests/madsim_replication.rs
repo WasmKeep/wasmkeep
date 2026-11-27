@@ -2190,8 +2190,12 @@ fn acknowledged_writes_survive_lease_write_cuts() {
 
 /// With lease cuts, a hold that keeps acting on its cell alone until its
 /// release is answered acknowledges writes the next owner, which took the
-/// record once the release landed, never restored: caught on a twentieth
-/// of the seeds at least (about a tenth: 202 of 2,000, 30 of 200).
+/// record once the release landed, never restored: caught on a fortieth
+/// of the seeds at least. About a tenth with renewals a third of the ttl
+/// after each send (202 of 2,000, 30 of 200); since renewals follow the
+/// last acknowledged write and a failed one is tried again soon (ADR 0020,
+/// amendment of 2026-11-27), fewer cuts end in a lapse: 109 of 2,000, 7 of
+/// 200.
 #[test]
 fn acting_until_a_release_after_a_lapse_is_answered_is_caught() {
     let rules = Rules {
@@ -2212,7 +2216,7 @@ fn acting_until_a_release_after_a_lapse_is_answered_is_caught() {
         seeds(),
         first
     );
-    let floor = (seeds() / 20).max(1);
+    let floor = (seeds() / 40).max(1);
     assert!(caught >= floor, "caught on {caught} seeds, want {floor}");
 }
 
