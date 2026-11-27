@@ -50,6 +50,7 @@
 - [Upgrade a cluster to 0.7.0](deploy/upgrading-to-0.7.md)
 - [Upgrade a cluster to 0.8.0](deploy/upgrading-to-0.8.md)
 - [Upgrade a cluster to 0.9.0](deploy/upgrading-to-0.9.md)
+- [Upgrade a cluster to 0.10.0](deploy/upgrading-to-0.10.md)
 - [An upgrade, a verify and a trace](deploy/operating.md)
 - [Monitoring](monitoring.md)
 - [Troubleshooting](troubleshooting.md)

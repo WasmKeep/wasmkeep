@@ -9,6 +9,10 @@ The text under a version's heading is its GitHub release text
 
 ## Unreleased
 
+Upgrading from 0.9.x, one node at a time or with every node stopped, then
+`wasmkeep cluster upgrade finalize`: see
+[upgrading to 0.10.0](docs/deploy/upgrading-to-0.10.md).
+
 ### Added
 
 - **Released node leases are removed without an operator**
@@ -74,7 +78,6 @@ The text under a version's heading is its GitHub release text
 - `cluster status` and `cluster upgrade status` overlap up to 32 reads per
   batch without waiting for slow earlier objects, keeping their output sorted.
   CLI app discovery lists tenants and apps without walking deployment history.
-
 - **Creating an actor no longer writes a per-actor lease marker once the
   app's upgrade floor is 0.10**
   ([ADR 0045](docs/adr/0045-the-generation-floor-of-a-restored-app.md)):
@@ -97,6 +100,14 @@ The text under a version's heading is its GitHub release text
   `paused (mixed versions)` during an upgrade) before draining the next
   node, at most two minutes
   ([draining a node](docs/cluster-operations.md#draining-a-node)).
+
+- The toolchain image installs `componentize-py` and `ziglang` from the
+  hashed lockfile (`scripts/requirements/languages.txt`, with
+  `--require-hashes --only-binary=:all:`) and checks the installed
+  versions against its pins, instead of an unhashed `pip install`.
+- Releases: `publish.yml` requires a signed annotated tag that GitHub
+  verifies, and `docs.yml` builds only from such a tag
+  ([releasing](docs/releasing.md)).
 
 ### Fixed
 
@@ -153,6 +164,10 @@ The text under a version's heading is its GitHub release text
   depends on luck.** Placement sent the wake-up to the lighter new peer
   every time; that peer is now asked to drain for the attempts, so the
   old node is the only target.
+
+- **A drain's and a move's closing mark ends at the release**, and the
+  node-lease simulation now covers operator moves, with a deterministic
+  case for an old node that receives an apart wake-up.
 
 ### Known limits
 

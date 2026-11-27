@@ -6,9 +6,15 @@ safely). Which way a cluster moves between two versions is what the
 upgrading page of the release you move to says
 ([0.4.0](deploy/upgrading-to-0.4.md), [0.5.0](deploy/upgrading-to-0.5.md),
 [0.6.0](deploy/upgrading-to-0.6.md), [0.7.0](deploy/upgrading-to-0.7.md),
-[0.8.0](deploy/upgrading-to-0.8.md), [0.9.0](deploy/upgrading-to-0.9.md)):
+[0.8.0](deploy/upgrading-to-0.8.md), [0.9.0](deploy/upgrading-to-0.9.md),
+[0.10.0](deploy/upgrading-to-0.10.md)):
 it is the rule for that release, and this page does not override it.
 
+- **From 0.9.x to 0.10.0: one node at a time, or stop every node**, then
+  `wasmkeep cluster upgrade finalize`. A big room's edges are
+  rebalanced by 0.10 once every node runs it. The steps, the generation
+  floor and the lease cleanup are in
+  [upgrading to 0.10.0](deploy/upgrading-to-0.10.md).
 - **From 0.8.1 to 0.9.0: stop every node, then start them all on
   0.9.0** (recommended), or one node at a time, which is supported and
   safe for data; then `wasmkeep cluster upgrade finalize`. Stopping is
