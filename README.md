@@ -287,7 +287,7 @@ All of it also builds as a site: `./scripts/docs-site.sh` (needs
 ## Status
 
 WasmKeep is young and **pre-alpha**: its releases so far, `0.1.0`,
-`0.2.0`, `0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0`, `0.8.1` and `0.9.0`, are pre-releases ([changelog](CHANGELOG.md)).
+`0.2.0`, `0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0`, `0.8.1`, `0.9.0` and `0.9.2`, are pre-releases ([changelog](CHANGELOG.md)).
 
 - **Works, and is tested**: everything in the status note at the top,
   each feature with tests that run before every merge, the node lease,

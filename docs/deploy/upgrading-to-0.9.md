@@ -57,7 +57,7 @@ so plan a short window.
    live, on 0.9.0.
 4. **Finalize** ([below](#finalize)). It comes after the start: until a
    node has run 0.9, every lease the nodes left names 0.8.1. With the
-   0.9.0 `wasmkeep` it needs a live node; from 0.9.1 it also works once
+   0.9.0 `wasmkeep` it needs a live node; from 0.9.2 it also works once
    those nodes are stopped again, their leases naming 0.9
    ([with no live node](#finalize)).
 
@@ -149,7 +149,7 @@ after raising the others. With `--yes`:
    of a stop (the machine may be cut off and still act). Run `wasmkeep
    cluster fence <id>` for such a node first; a fence counts 15 s after
    the node's last write. **With no live node of the app**, the 0.9.0
-   `wasmkeep` refuses it. From 0.9.1 it is accepted when every lease
+   `wasmkeep` refuses it. From 0.9.2 it is accepted when every lease
    of the app is `released` or `fenced` and names 0.9 or later, and no
    object under `nodes/` fails to decode; a lease that still says 0.8.1
    refuses it: start the app once on 0.9.0, or remove that lease with
