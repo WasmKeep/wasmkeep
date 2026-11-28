@@ -1250,3 +1250,93 @@ async fn a_node_gone_for_good_pauses_the_rebalance_only_for_the_away_bound() {
     );
     drop(nodes);
 }
+
+const MOVE_FAILED: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="failed"}"#;
+const ELSEWHERE: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="taken_elsewhere"}"#;
+const HOME_FAILED: &str =
+    r#"wasmkeep_placement_spread_total{tenant="default",app="default",outcome="home_failed"}"#;
+
+/// A rolling upgrade's step under a crowd (ADR 0040, section 14,
+/// amendment of 2026-11-28): edges whose home is a, each with clients
+/// connected through b and through c that reconnect at once; a drains, is
+/// stopped, its drain withdrawn while it is down, and it starts again.
+/// Once a serves, its edges go home with no take refused or failed (no
+/// target backed off or suspected), none woken on a third node in a
+/// move's gap (no move ends `taken_elsewhere`), every client connected
+/// again and closed with 1012 at most twice (the drain, the move home).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoined_home_takes_its_crowded_edges_at_the_first_try() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,wasmkeep_server::actor=debug")
+        .with_test_writer()
+        .try_init();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = three_with(&store, &dirs, None).await;
+    let mut edges: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let skip: Vec<&str> = edges.iter().map(String::as_str).collect();
+        let e = edge_on("a", &skip);
+        edges.push(e);
+    }
+    for e in &edges {
+        let r = send_reachable(
+            nodes[0].addr,
+            "POST",
+            &format!("/actor/edge/{e}/durable"),
+            "",
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "{}",
+            r.body
+        );
+    }
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut clients = crowd(nodes[1].addr, &edges, at_once, &connected, &stop_rx).await;
+    clients.extend(crowd(nodes[2].addr, &edges, at_once, &connected, &stop_rx).await);
+    let want = clients.len();
+    wait_connected(&connected, want, "at first").await;
+
+    drain(&store, "a").await;
+    wait_drain_line(&store, "a", "drained").await;
+    wait_connected(&connected, want, "after the drain").await;
+    stop_listening(nodes.remove(0)).await;
+    undrain(&store, "a").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (failed, elsewhere, home_failed) =
+        (metric(MOVE_FAILED), metric(ELSEWHERE), metric(HOME_FAILED));
+    // Back on a bucket whose history reads are slow, as a real one is: a
+    // restore takes a while, and the takes and relayed sockets that reach
+    // a at once queue behind it.
+    let slow = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
+    slow.delay_wal_get_ms.store(400, Ordering::SeqCst);
+    let seen_by_a: Arc<dyn ObjectStore> = slow;
+    let back = room_node("a", dirs[0].path(), &seen_by_a, |_| {}).await;
+    wait_drain_line(&store, "a", "serving").await;
+    all_home(&store, &edges, &["a", "b", "c"], Duration::from_secs(20)).await;
+    wait_connected(&connected, want, "after the moves home").await;
+    assert_eq!(
+        (
+            metric(MOVE_FAILED) - failed,
+            metric(ELSEWHERE) - elsewhere,
+            metric(HOME_FAILED) - home_failed
+        ),
+        (0, 0, 0),
+        "moves failed, moves taken elsewhere, cold takes failed"
+    );
+    stop_tx.send(true).unwrap();
+    for client in clients {
+        let closes = client.await.unwrap();
+        assert!(closes <= 2, "closed {closes} times with 1012");
+    }
+    drop((back, nodes));
+}

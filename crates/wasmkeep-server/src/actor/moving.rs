@@ -88,7 +88,9 @@ pub(super) enum MoveEnd {
     Elsewhere,
     /// Not done for a cause of this node's (a socket reopened or still
     /// closing, the release pending, the actor not held here any more, the
-    /// job past its wait): tried again later; the target is not to blame.
+    /// job past its wait), or the target answered `503` for the take's
+    /// whole time (alive, asking for a retry): tried again later; the
+    /// target is not to blame.
     Busy,
     /// Not done because the target refused the take or did not answer.
     Refused,
@@ -330,7 +332,10 @@ impl ActorService {
             }
             Taken::NoSuchActor => text_response(StatusCode::NOT_FOUND, "no such actor\n"),
             Taken::Refused(why) => {
-                tracing::debug!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(address), %why, "take refused");
+                // At info: the sender retries a `503` for the take's time,
+                // and why this node could not take is what an operator
+                // reading a slow move needs.
+                tracing::info!(app = %crate::logging::named(&self.inner.app_name), actor = %crate::logging::actor(address), %why, "take refused; the sender retries");
                 crate::cluster::unavailable("cannot take the actor now; retry\n")
             }
         }
@@ -609,6 +614,9 @@ pub(super) async fn move_parked(
             MoveEnd::Elsewhere
         }
         TakeAnswer::HeldBy(_) => MoveEnd::Busy,
+        // Alive and asking for a retry past the take's time: the room is
+        // backed off, the target not blamed.
+        TakeAnswer::Unavailable(_) => MoveEnd::Busy,
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => MoveEnd::Refused,
     };
     (end, closed)
@@ -758,7 +766,7 @@ pub(super) async fn move_resident(
     let done = match &answer {
         TakeAnswer::Held => true,
         TakeAnswer::HeldBy(holder) => holder.as_str() == target,
-        TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => false,
+        TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) | TakeAnswer::Unavailable(_) => false,
     };
     if !done {
         // Events stop going to the target: the next one claims the actor
@@ -781,6 +789,10 @@ pub(super) async fn move_resident(
         TakeAnswer::HeldBy(holder) => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %holder, %target, "move: another node took the actor first");
             return (MoveEnd::Elsewhere, closed);
+        }
+        TakeAnswer::Unavailable(_) => {
+            tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, ?answer, "move: the target asked to retry for the take's whole time; tried again later");
+            return (MoveEnd::Busy, closed);
         }
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, ?answer, "move: the target did not take the actor; tried again later");

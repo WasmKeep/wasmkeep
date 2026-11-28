@@ -262,7 +262,7 @@ impl ActorService {
         // Once, unless the upgrade is kept: then again from here each time
         // it asks for the actor.
         loop {
-            let route = self.inner.cold_route(&address).await;
+            let route = self.inner.upgrade_route(&address).await;
             let remote = match &route {
                 super::routing::Cold::Owner(owner) => Some(owner.clone()),
                 super::routing::Cold::Nobody | super::routing::Cold::Here => None,

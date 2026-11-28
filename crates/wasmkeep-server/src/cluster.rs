@@ -2072,6 +2072,53 @@ impl Cluster {
     /// arm its alarm. A signed node call (the signature covers the marker),
     /// sent only to nodes that advertise `take` on heartbeat line 11.
     pub(crate) async fn take(&self, peer: &str, address: &ActorAddress) -> TakeAnswer {
+        self.take_within(peer, address, TAKE_TIMEOUT).await
+    }
+
+    /// [`Self::take`] within `budget`: a `503` is a node alive that cannot
+    /// take the actor at this moment (a restore or an acquisition under
+    /// way, a signature made before it started), so the take is signed and
+    /// sent again after [`TAKE_RETRY_PAUSE`] until the budget ends, then
+    /// answered [`TakeAnswer::Unavailable`]. Decided on the status alone,
+    /// so a receiver of any version is retried alike. A take is safe to
+    /// send again: a node that took the actor answers `held`.
+    pub(crate) async fn take_within(
+        &self,
+        peer: &str,
+        address: &ActorAddress,
+        budget: Duration,
+    ) -> TakeAnswer {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut tries = 0u32;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.take_once(peer, address, left).await {
+                Err(why) => {
+                    tries += 1;
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if left <= TAKE_RETRY_PAUSE {
+                        tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, tries, %why, "take: the node asked to retry until the take's time ran out");
+                        return TakeAnswer::Unavailable(why);
+                    }
+                    tokio::time::sleep(TAKE_RETRY_PAUSE).await;
+                }
+                Ok(answer) => {
+                    if tries > 0 {
+                        tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, tries, ?answer, "take: answered after the node asked to retry");
+                    }
+                    return answer;
+                }
+            }
+        }
+    }
+
+    /// One take call, answered within `left`; `Err` with why for a `503`.
+    async fn take_once(
+        &self,
+        peer: &str,
+        address: &ActorAddress,
+        left: Duration,
+    ) -> Result<TakeAnswer, String> {
         let req = Request::builder()
             .method(hyper::Method::POST)
             .uri("/")
@@ -2082,12 +2129,12 @@ impl Cluster {
             ))));
         let mut req = match req {
             Ok(req) => req,
-            Err(e) => return TakeAnswer::Failed(e.to_string()),
+            Err(e) => return Ok(TakeAnswer::Failed(e.to_string())),
         };
         // A move is in no trace (it carries nothing); a take asked inside
         // a request's is its hop.
         let mut hop = crate::traces::hop("take", &self.node_id, peer, &mut req);
-        let response = match tokio::time::timeout(TAKE_TIMEOUT, async {
+        let response = match tokio::time::timeout(left, async {
             self.call_once(peer, address, &[], req)
                 .await
                 .map_err(|e| e.message(peer))
@@ -2095,11 +2142,15 @@ impl Cluster {
         .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(e)) => return TakeAnswer::Failed(e),
-            Err(_) => return TakeAnswer::Failed(format!("node {peer} did not answer in time")),
+            Ok(Err(e)) => return Ok(TakeAnswer::Failed(e)),
+            Err(_) => {
+                return Ok(TakeAnswer::Failed(format!(
+                    "node {peer} did not answer in time"
+                )));
+            }
         };
         hop.answered(Some(response.status()));
-        match response.status() {
+        Ok(match response.status() {
             StatusCode::OK => TakeAnswer::Held,
             StatusCode::CONFLICT => {
                 match response.headers().get(HOLDER).and_then(|v| v.to_str().ok()) {
@@ -2108,8 +2159,11 @@ impl Cluster {
                 }
             }
             StatusCode::NOT_FOUND => TakeAnswer::NoSuchActor,
+            StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(format!("node {peer} answered 503"));
+            }
             status => TakeAnswer::Failed(format!("node {peer} answered {status}")),
-        }
+        })
     }
 
     /// Whether `id` opens sockets the front hands over (ADR 0027): a live
