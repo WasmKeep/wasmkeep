@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The mixed-version check (a gate before tagging a release, docs/releasing.md):
 # three nodes on this machine, against moto as the tutorials and the S3
-# suites run it, start on a published release (OLD_VERSION, v0.9.0 by
+# suites run it, start on a published release (OLD_VERSION, v0.9.2 by
 # default), then move one node at a time to the binary built from this
 # checkout (drain, stop, swap, start, wait for ready and `cluster status`).
 # After each step it checks, through every node: the durable counter keeps
@@ -54,7 +54,7 @@
 #   the new side, started into a side app beside a live heartbeat two
 #   minor versions below, is never ready, names it and writes no lease;
 # - the finalize with no live node (ADR 0043, "Not settled" 10, from
-#   0.9.1): the side app's only node stopped on the old release refuses
+#   0.9.2): the side app's only node stopped on the old release refuses
 #   it, naming that node; stopped on the new one, it is accepted, and the
 #   old release then stops on that app's floor.
 #
@@ -93,7 +93,7 @@
 # or more than one minor version below the new side).
 #
 # Usage: scripts/mixed-version.sh [OLD_VERSION]
-#   OLD_VERSION (argument or variable, default v0.9.0): the release the
+#   OLD_VERSION (argument or variable, default v0.9.2): the release the
 #   nodes start on. A version without a SHA-256 pinned below is refused
 #   unless OLD_SHA256 gives the hash of its Linux x86_64 archive (from the
 #   release's SHA256SUMS).
@@ -121,8 +121,9 @@ declare -A PINNED_SHA256=(
   [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
   [v0.8.1]=88f7a35dd5e96306f5ef51c0987d9cf7d3f55b7601fb5e8fa8b43a77e6bdf6ac
   [v0.9.0]=b2a5b38c82f5ef3d6a59c26bd6460610c4dc684305b0a9ec73be3db294311240
+  [v0.9.2]=8305eae39a82ab08c5f17a5b237c7664d593ce78df2e618bdb4697a968b9e00d
 )
-OLD_VERSION=${1:-${OLD_VERSION:-v0.9.0}}
+OLD_VERSION=${1:-${OLD_VERSION:-v0.9.2}}
 [[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }
 old_short=${OLD_VERSION#v}
 OLD_ASSET=wasmkeep-$old_short-x86_64-unknown-linux-gnu.tar.gz
@@ -2052,7 +2053,7 @@ if [ $gated = 1 ]; then
   del_obj nodes/d
 
   # ---------------------------------------------------------------- the finalize with no live node
-  # ADR 0043, section 4 and "Not settled" 10 (from 0.9.1): with every
+  # ADR 0043, section 4 and "Not settled" 10 (from 0.9.2): with every
   # node of an app stopped, `finalize` is accepted only when every lease
   # the app's nodes left is released and names the new version or a
   # later one. The side app runs on node d of $old_short, then of the new

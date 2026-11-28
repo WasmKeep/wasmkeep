@@ -69,8 +69,8 @@ A gate before tagging any release. It runs on a workstation, alone
 in pull request CI or in `check.sh`:
 
 ```bash
-./scripts/mixed-version.sh            # from the previous release, v0.9.0 by default
-./scripts/mixed-version.sh v0.9.0     # or OLD_VERSION=v0.9.0
+./scripts/mixed-version.sh            # from the previous release, v0.9.2 by default
+./scripts/mixed-version.sh v0.9.2     # or OLD_VERSION=v0.9.2
 ```
 
 The old version must be 0.8.1 or later. It runs in one of two modes, by

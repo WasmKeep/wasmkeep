@@ -1,5 +1,5 @@
 //! The mixed-version check, `scripts/mixed-version.sh`, as an ignored test:
-//! three nodes of the previous published release (`OLD_VERSION`, v0.9.0 by
+//! three nodes of the previous published release (`OLD_VERSION`, v0.9.2 by
 //! default) moved one at a time to this checkout's binary, one moved back
 //! and up again; then, when this checkout is the next minor version, the
 //! gate of ADR 0043 (the format the new minor version brings, refused
