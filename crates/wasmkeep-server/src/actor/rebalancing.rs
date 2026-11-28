@@ -7,7 +7,8 @@
 //! the owner's side of a move (ADR 0017), started from memory: no move key
 //! is written or read. At most two at once, at most 500 sockets closed a
 //! period, per app on this node; paused while a node drains, a live node is
-//! not `serving`, or two minor versions run.
+//! not `serving`, a node of the app stopped or went quiet less than the
+//! away bound ago, or two minor versions run.
 //!
 //! While a move (this pass's, an operator's) or a drain's hand-over closes
 //! an actor's sockets, the actor is marked closing ([`State::mark_closing`]):
@@ -248,6 +249,8 @@ pub(super) fn tick(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, awaiting: 
 /// Decides, and starts the moves that may start now.
 fn kick(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, awaiting: &Awaiting) {
     let peers = cluster.rebalance_peers();
+    let gone = cluster.rebalance_away();
+    let away: Vec<(&str, Duration)> = gone.iter().map(|g| (g.node.as_str(), g.ago)).collect();
     let held = held_spread(inner, cluster);
     let keys: Vec<String> = held
         .iter()
@@ -286,6 +289,7 @@ fn kick(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, awaiting: &Awaiting) 
         on: cluster.rebalance_on(),
         draining: cluster.draining(),
         lease_valid: cluster.node_lease_valid(),
+        away: &away,
     };
     let budget = rebalance::Budget {
         in_flight: pass.in_flight.len(),

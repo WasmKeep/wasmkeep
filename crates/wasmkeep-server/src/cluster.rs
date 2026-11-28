@@ -621,6 +621,11 @@ pub(crate) struct Cluster {
     /// their instance never writes again, so rounds do not read them (the
     /// listings do).
     stopped_nodes: Mutex<std::collections::HashSet<String>>,
+    /// The nodes of this node's app whose node lease, as last read, is
+    /// listed but not live (released, fenced, or a stale heartbeat), with
+    /// the `written_at` of that write: the rebalance pass waits for them
+    /// (ADR 0040, section 14, amendment of 2026-11-28).
+    away_nodes: Mutex<Vec<(String, u64)>>,
     /// Node ids a signed call named that this node holds no live heartbeat
     /// of, for [`view::join_read_loop`].
     reads_wanted: tokio::sync::mpsc::UnboundedSender<String>,
@@ -1069,6 +1074,7 @@ impl Cluster {
             known_nodes: Mutex::new(Vec::new()),
             trust_ends: Mutex::new(HashMap::new()),
             stopped_nodes: Mutex::default(),
+            away_nodes: Mutex::default(),
             reads_wanted,
             heartbeat_read_attempt: heartbeat_read_attempt(config.heartbeat, &config.lease),
             slowest_read_ms: std::sync::atomic::AtomicU64::new(0),

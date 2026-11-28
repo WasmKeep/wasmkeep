@@ -1062,6 +1062,16 @@ impl Cluster {
             .map(|n| n.id.clone())
             .collect();
         let nodes = self.membership.live(judged.to_vec());
+        // Listed, of this app, but not live: stopped (released or fenced)
+        // or gone quiet. The rebalance waits for them a while; a key
+        // removed (`cluster forget`, the removal of released leases) is
+        // not listed, so it no longer counts.
+        *self.away_nodes.lock().unwrap_or_else(|p| p.into_inner()) = all
+            .iter()
+            .filter(|n| n.id != self.node_id && n.app == self.serves)
+            .filter(|n| !nodes.iter().any(|l| l.id == n.id))
+            .map(|n| (n.id.clone(), n.written_at_ms))
+            .collect();
         {
             let raw = |id: &str| all.iter().find(|n| n.id == id).map(|n| n.written_at_ms);
             *self.trust_ends.lock().unwrap_or_else(|p| p.into_inner()) = nodes
@@ -1525,6 +1535,16 @@ pub(crate) struct RebalancePeer {
     pub(crate) suspected: bool,
 }
 
+/// A node of this node's app that is listed but not live, as the
+/// rebalance pass reads it (ADR 0040, section 14, amendment of
+/// 2026-11-28): how long since the last write of its node lease, on the
+/// writer's clock.
+#[derive(Debug, Clone)]
+pub(crate) struct AwayNode {
+    pub(crate) node: String,
+    pub(crate) ago: Duration,
+}
+
 impl Cluster {
     /// Whether spread actors are moved home ([`ClusterConfig::rebalance`],
     /// off with placement).
@@ -1586,6 +1606,24 @@ impl Cluster {
             .map(|mut p| {
                 p.reachable = self.address_of(&p.node).is_some();
                 p
+            })
+            .collect()
+    }
+
+    /// The nodes of this node's app listed but not live: stopped, fenced,
+    /// or whose heartbeat went stale. The pass pauses while one of them
+    /// wrote its node lease less than [`wasmkeep_cluster::rebalance::Settings::away`]
+    /// ago: judged by that write's date, so a node that restarts reaches
+    /// the same answer as one that saw it stop.
+    pub(crate) fn rebalance_away(&self) -> Vec<AwayNode> {
+        let now = now_ms();
+        self.away_nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(node, written_at)| AwayNode {
+                node: node.clone(),
+                ago: Duration::from_millis(now.saturating_sub(*written_at)),
             })
             .collect()
     }

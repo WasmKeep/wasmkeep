@@ -22,8 +22,13 @@
 //!    sockets closed in a period than the budget plus one actor's.
 //!    Mutation: the budget removed.
 //! 4. Quiet: no move starts while, in the mover's view, a node drains or
-//!    is not serving, or two minor versions are live. Mutation: the pass
-//!    shown only the serving peers of its own version.
+//!    is not serving, a node stopped or died less than the away bound ago
+//!    (its drain request gone with it), or two minor versions are live.
+//!    Mutations: the pass shown only the serving peers of its own version;
+//!    the pass blind to stopped nodes (amendment of 2026-11-28). Now and
+//!    then a node stops for good when the faults end: convergence over the
+//!    nodes left, in a bound that includes the away bound, shows that the
+//!    pause ends.
 //! 5. Spread classes only: no actor of another class is moved. Mutation:
 //!    the pass fed every held actor.
 //! 7. A cold socket goes home: an actor nobody holds that a socket wakes is
@@ -54,6 +59,9 @@ const SETTLE: u64 = 9;
 const STAY: u64 = 60;
 /// A failed target is left out this long.
 const HORIZON: u64 = 10;
+/// How long a stopped or dead node still pauses every pass (the away
+/// bound, shortened): longer than most of the model's restarts.
+const AWAY: u64 = 30;
 /// Faults stop here; the cluster is then stable and quiet.
 const STABLE_AT: u64 = 300;
 const ACTORS: usize = 40;
@@ -83,12 +91,14 @@ enum Mutation {
     NoQuiet,
     AllClasses,
     NoTake,
+    NoAway,
 }
 
 /// One node as the others see it at one moment.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     state: State,
+    /// Since when it serves, or since when it is down.
     since: u64,
     minor: &'static str,
     reachable: bool,
@@ -133,6 +143,8 @@ struct World {
     flights: Vec<Flight>,
     mutation: Mutation,
     violations: Vec<(u8, String)>,
+    /// A node stopped at the end of the faults that never comes back.
+    gone: Option<usize>,
     /// Up to two seconds of lag, per observer and node.
     lag: Vec<Vec<usize>>,
 }
@@ -223,9 +235,24 @@ impl World {
             return;
         }
         let now = self.now;
-        let views: Vec<(usize, Seen)> = (0..self.nodes.len())
+        let all: Vec<(usize, Seen)> = (0..self.nodes.len())
             .filter(|&n| n != o)
             .map(|n| (n, self.view(o, n)))
+            .collect();
+        // Stopped or dead: listed, not live, each with how long ago.
+        let away: Vec<(&str, Duration)> = all
+            .iter()
+            .filter(|(_, s)| s.state == State::Down && self.mutation != Mutation::NoAway)
+            .map(|(n, s)| {
+                (
+                    Self::id(*n),
+                    Duration::from_secs(now.saturating_sub(s.since)),
+                )
+            })
+            .collect();
+        let views: Vec<(usize, Seen)> = all
+            .iter()
+            .copied()
             .filter(|(_, s)| s.state != State::Down)
             .collect();
         let shown: Vec<&(usize, Seen)> = views
@@ -293,6 +320,7 @@ impl World {
             } else {
                 2
             },
+            away: Duration::from_secs(AWAY),
         };
         let budget = Budget {
             in_flight,
@@ -308,6 +336,7 @@ impl World {
             on: true,
             draining: me.state == State::Draining,
             lease_valid: true,
+            away: &away,
         };
         let only: Vec<Held<'_>> = held.iter().map(|(_, h)| *h).collect();
         let verdict = rebalance::decide(local, &peers, &only, budget, settings);
@@ -323,7 +352,10 @@ impl World {
         let quiet = me.state == State::Serving
             && views
                 .iter()
-                .all(|(_, s)| s.state == State::Serving && s.minor == me.minor);
+                .all(|(_, s)| s.state == State::Serving && s.minor == me.minor)
+            && all
+                .iter()
+                .all(|(_, s)| s.state != State::Down || now - s.since >= AWAY);
         for (i, to) in starts {
             let a = &self.actors[i];
             if !quiet {
@@ -412,6 +444,7 @@ impl World {
             match node.seen.state {
                 State::Draining if now >= node.next_at => {
                     node.seen.state = State::Down;
+                    node.seen.since = now;
                     node.next_at = now + 5 + rng.below(15);
                 }
                 State::Down if now >= node.next_at => {
@@ -443,6 +476,7 @@ impl World {
             } else {
                 // A death: its records left naming it.
                 self.nodes[n].seen.state = State::Down;
+                self.nodes[n].seen.since = now;
                 self.nodes[n].next_at = now + 10 + rng.below(20);
                 for a in &mut self.actors {
                     if a.holder == Some(n) {
@@ -475,7 +509,14 @@ impl World {
     /// Faults end: every node serving, reachable, on the base version.
     fn stabilize(&mut self) {
         let now = self.now;
-        for n in &mut self.nodes {
+        for (i, n) in self.nodes.iter_mut().enumerate() {
+            if self.gone == Some(i) {
+                if n.seen.state != State::Down {
+                    n.seen.since = now;
+                }
+                n.seen.state = State::Down;
+                continue;
+            }
             if n.seen.state != State::Serving || n.seen.minor != BASE {
                 n.seen.since = now;
             }
@@ -484,16 +525,23 @@ impl World {
             n.seen.reachable = true;
         }
         for a in &mut self.actors {
-            if a.dead {
+            // A dead node's actors are free once it is fenced; the node
+            // stopped for good released its own.
+            if a.dead || (self.gone.is_some() && a.holder == self.gone) {
                 a.holder = None;
                 a.dead = false;
             }
         }
+        let gone = self.gone;
+        self.flights.retain(|f| Some(f.to) != gone);
     }
 
     /// Held spread actors away from their home over every node.
     fn away(&self) -> Vec<String> {
-        let all: Vec<&str> = NODES[..self.nodes.len()].to_vec();
+        let all: Vec<&str> = (0..self.nodes.len())
+            .filter(|n| self.gone != Some(*n))
+            .map(Self::id)
+            .collect();
         self.actors
             .iter()
             .filter(|a| a.spread && !a.dead)
@@ -518,7 +566,7 @@ impl World {
 /// its receiver's view arms none), and every misplaced
 /// actor moved two at a time per node, with a failure's horizon twice.
 fn bound() -> u64 {
-    SETTLE + STAY + (ACTORS as u64).div_ceil(2) * 2 + 2 * HORIZON + 2 * PERIOD
+    AWAY + SETTLE + STAY + (ACTORS as u64).div_ceil(2) * 2 + 2 * HORIZON + 2 * PERIOD
 }
 
 fn schedule(seed: u64, mutation: Mutation) -> Vec<(u8, String)> {
@@ -560,6 +608,7 @@ fn schedule(seed: u64, mutation: Mutation) -> Vec<(u8, String)> {
         flights: Vec::new(),
         mutation,
         violations: Vec::new(),
+        gone: rng.chance(30).then_some(count - 1),
         lag: vec![vec![0; count]; count],
     };
     w.snapshot();
@@ -663,6 +712,11 @@ fn a_pass_blind_to_drains_and_versions_fails_quiet() {
 #[test]
 fn feeding_every_class_fails_spread_only() {
     run(Mutation::AllClasses, &[1, 2, 3, 5], 5);
+}
+
+#[test]
+fn a_pass_blind_to_stopped_nodes_fails_quiet() {
+    run(Mutation::NoAway, &[1, 2, 3, 4], 4);
 }
 
 #[test]
