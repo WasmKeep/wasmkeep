@@ -225,9 +225,14 @@ no node drains, every live node serves and runs one minor version, and
 the home has served for three heartbeat periods and has room
 ([ADR 0040, section 14](../adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-26-edges-return-home)).
 
-- **Paused while two minor versions are live**, and while any node drains
-  or does not serve. `cluster status` shows each node's `AWAY` count and
-  each app's `REBALANCE`: `balanced`, `rebalancing`, or `paused` with why.
+- **Paused while two minor versions are live**, while any node drains
+  or does not serve, and for ten minutes after a node of the app stopped
+  or went quiet, so nothing moves while a node is down between the steps
+  above, drain withdrawn or not
+  ([amendment of 2026-11-28](../adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-28-no-move-while-a-node-may-come-back)).
+  A node removed for good with `wasmkeep cluster forget` stops counting
+  at once. `cluster status` shows each node's `AWAY` count and each app's
+  `REBALANCE`: `balanced`, `rebalancing`, or `paused` with why.
 - **Paced**: two moves in flight and 500 sockets closed per heartbeat
   period, per app on each node. The clients of a moved edge reconnect
   once more, and an upgrade for an edge being moved is answered `503` with

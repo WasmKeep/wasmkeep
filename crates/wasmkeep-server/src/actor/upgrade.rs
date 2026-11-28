@@ -171,9 +171,18 @@ impl ActorService {
                     }
                     answer => {
                         crate::metrics::placement_spread(app, "home_failed");
-                        if matches!(answer, crate::cluster::TakeAnswer::Failed(_)) {
-                            inner.rebalance.target_failed(&home, horizon);
-                            cluster.suspect(&home);
+                        match answer {
+                            crate::cluster::TakeAnswer::Failed(_) => {
+                                inner.rebalance.target_failed(&home, horizon);
+                                cluster.suspect(&home);
+                            }
+                            // Alive, asking for a retry: the next cold
+                            // edges do not wait on it, but it is not
+                            // suspected.
+                            crate::cluster::TakeAnswer::Unavailable(_) => {
+                                inner.rebalance.target_failed(&home, horizon);
+                            }
+                            _ => {}
                         }
                         tracing::debug!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %home, ?answer, "socket: its home did not take the spread actor; woken here");
                         None
@@ -262,7 +271,7 @@ impl ActorService {
         // Once, unless the upgrade is kept: then again from here each time
         // it asks for the actor.
         loop {
-            let route = self.inner.cold_route(&address).await;
+            let route = self.inner.upgrade_route(&address).await;
             let remote = match &route {
                 super::routing::Cold::Owner(owner) => Some(owner.clone()),
                 super::routing::Cold::Nobody | super::routing::Cold::Here => None,

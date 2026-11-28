@@ -4,7 +4,8 @@
 //! A spread actor's **home** is the rendezvous choice for its address over
 //! this node and the peers that serve its app ([`home`]). A node that holds
 //! one whose home is a peer moves it there, a few at a time, once the
-//! cluster is quiet (no node drains, every live node `serving`), runs one
+//! cluster is quiet (no node drains, every live node `serving`, no node
+//! of the app stopped a moment ago), runs one
 //! minor version, and the peer has been serving for a while and has room
 //! ([`decide`]). Every move raises the weight of the actor's node for that
 //! actor, so moves cannot cycle; an actor taken by a move stays a minute.
@@ -23,6 +24,13 @@ pub const STAY: Duration = Duration::from_secs(60);
 pub const IN_FLIGHT: usize = 2;
 /// Sockets a node's rebalance closes per heartbeat period: one full edge.
 pub const SOCKETS_PER_PERIOD: i64 = 500;
+/// How long a node of the app that stopped, or whose heartbeat went
+/// stale, still pauses every pass (ADR 0040, section 14, amendment of
+/// 2026-11-28): counted from the last write of its node lease (its
+/// release, or its last heartbeat). Longer than a restart's stop, install
+/// and start check; a node gone for good leaves its actors home over the
+/// nodes left, so the wait costs no reconnect.
+pub const AWAY: Duration = Duration::from_secs(600);
 
 /// The constants of the rule; tests shorten them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +41,8 @@ pub struct Settings {
     pub stay: Duration,
     /// [`IN_FLIGHT`] by default.
     pub in_flight: usize,
+    /// [`AWAY`] by default.
+    pub away: Duration,
 }
 
 impl Settings {
@@ -42,6 +52,7 @@ impl Settings {
             settle: period.saturating_mul(SETTLE_PERIODS),
             stay: STAY,
             in_flight: IN_FLIGHT,
+            away: AWAY,
         }
     }
 }
@@ -76,6 +87,11 @@ pub struct Local<'a> {
     pub draining: bool,
     /// Its node lease is valid now.
     pub lease_valid: bool,
+    /// The nodes of its app listed but not live (stopped, fenced, or a
+    /// stale heartbeat), each with how long since the last write of its
+    /// node lease. One written less than [`Settings::away`] ago pauses the
+    /// pass, drain request or not: it may be restarting.
+    pub away: &'a [(&'a str, Duration)],
 }
 
 /// A live peer of the same app, as this node's view shows it.
@@ -143,7 +159,9 @@ pub enum Pause {
     Off,
     /// This node or a peer is asked to drain.
     Draining,
-    /// A live peer is not `serving` (draining, stuck, or predates line 9).
+    /// A node of the app is not `serving`: a live peer that shows another
+    /// state (draining, stuck, or predates line 9), or one stopped or gone
+    /// quiet less than [`Settings::away`] ago.
     NotServing,
     /// A live peer runs another minor version, or a version unreadable.
     Versions,
@@ -248,7 +266,9 @@ pub fn decide<'a>(
         Some(Pause::Off)
     } else if local.draining || peers.iter().any(|p| p.drain_requested) {
         Some(Pause::Draining)
-    } else if peers.iter().any(|p| p.drain != Some(DrainState::Serving)) {
+    } else if peers.iter().any(|p| p.drain != Some(DrainState::Serving))
+        || local.away.iter().any(|(_, ago)| *ago < settings.away)
+    {
         Some(Pause::NotServing)
     } else if mine.is_none() || peers.iter().any(|p| minor(p.version) != mine) {
         Some(Pause::Versions)
@@ -322,6 +342,7 @@ mod tests {
             on: true,
             draining: false,
             lease_valid: true,
+            away: &[],
         }
     }
     fn room(sockets: u64, socket_room: u64, actor_room: u64) -> RoomLoad {
@@ -450,6 +471,31 @@ mod tests {
             run(&[b, peer("c")], &[held(e)]).paused,
             Some(Pause::Versions)
         );
+    }
+
+    #[test]
+    fn a_node_stopped_within_the_away_bound_pauses_every_node() {
+        let e = edge_of("b");
+        let away = settings().away;
+        let mut l = local();
+        // Stopped (released) a moment ago, its drain request withdrawn:
+        // it is not a live peer, yet it may be restarting.
+        let stopped = [("c", Duration::from_secs(2))];
+        l.away = &stopped;
+        let v = decide(l, &[peer("b")], &[held(e)], budget(), settings());
+        assert_eq!(v.paused, Some(Pause::NotServing));
+        assert_eq!(v.misplaced, 1, "counted while paused");
+        let just = [("c", away - Duration::from_millis(1))];
+        l.away = &just;
+        let v = decide(l, &[peer("b")], &[held(e)], budget(), settings());
+        assert_eq!(v.paused, Some(Pause::NotServing));
+        // Past the bound it no longer counts: a node gone for good does
+        // not stall the pass.
+        let gone = [("c", away)];
+        l.away = &gone;
+        let v = decide(l, &[peer("b")], &[held(e)], budget(), settings());
+        assert_eq!((v.paused, v.moves.len()), (None, 1));
+        assert!(AWAY >= Duration::from_secs(300), "longer than a restart");
     }
 
     #[test]

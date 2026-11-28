@@ -105,6 +105,12 @@ impl ServiceInner {
         if self.mailboxes.contains(address) || cluster.is_parked(address) {
             return Cold::Here;
         }
+        self.read_route(cluster, address).await
+    }
+
+    /// [`Self::cold_route`] past its local checks: the owner learned, or
+    /// one bounded read of the record. `Here` when the read fails.
+    async fn read_route(&self, cluster: &Cluster, address: &ActorAddress) -> Cold {
         if let Some(owner) = self.cached_owner(address) {
             return Cold::Owner(owner);
         }
@@ -117,6 +123,39 @@ impl ServiceInner {
             Ok(Ok(Route::Nobody)) => Cold::Nobody,
             _ => Cold::Here,
         }
+    }
+
+    /// [`Self::cold_route`] for a WebSocket upgrade. A spread actor's
+    /// mailbox here that holds no lease and is not parked (a stub another
+    /// upgrade's admission probe left, a request waiting) does not make it
+    /// this node's (ADR 0040, section 14, amendment of 2026-11-28): its
+    /// record is read, so an actor nobody holds is taken by its home first
+    /// as with no mailbox. Otherwise every socket that came after the first
+    /// would wake it here, in the gap of a move between other nodes. A
+    /// read that fails is `Here`, as before.
+    pub(super) async fn upgrade_route(&self, address: &ActorAddress) -> Cold {
+        let route = self.cold_route(address).await;
+        let Some(cluster) = self.cluster.as_ref() else {
+            return route;
+        };
+        // A move of it from this node is under way: the mailbox answers
+        // with the move's target (`Elsewhere`), so the socket follows the
+        // move, not the home in this node's view.
+        let moving = self
+            .moves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(address);
+        if route == Cold::Here
+            && !moving
+            && self.mailboxes.contains(address)
+            && self.goes_home(cluster, address)
+            && !cluster.holds_here(address)
+            && !cluster.is_parked(address)
+        {
+            return self.read_route(cluster, address).await;
+        }
+        route
     }
 
     /// Whether `address`'s class spreads and rebalancing is on: its node is

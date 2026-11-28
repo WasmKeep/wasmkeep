@@ -40,24 +40,34 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
   true`) has a home, the node its rendezvous choice names over the nodes
   that serve. A node holding one away from its home moves it there, with
   the move of ADR 0017 and without a move request, once no node drains,
-  every live node serves and runs one minor version, and the home has
-  served for three heartbeat periods and has room. At most two moves in
+  every live node serves and runs one minor version, no node of the app
+  stopped or went quiet less than ten minutes ago (a node being upgraded
+  is stopped with its drain withdrawn; `cluster forget` ends the wait at
+  once), and the home has served for three heartbeat periods and has
+  room ([amendment of 2026-11-28](docs/adr/0040-directory-broadcast-groups-and-the-reconnecting-room.md#amendment-2026-11-28-no-move-while-a-node-may-come-back)). At most two moves in
   flight and 500 sockets closed per heartbeat period, per app on each
   node; an actor moved off its home by a take (an operator's move) stays
   a minute. While a move closes an edge's sockets, an upgrade for it on
   that node is answered `503` with `Retry-After: 1`, so clients that
-  reconnect at once do not hold the move up. A rolling restart therefore ends with
+  reconnect at once do not hold the move up. A take answered `503` (a node
+  alive that cannot take the actor at that moment) is signed and sent
+  again for 2 s; one still answered `503` backs the node off for the
+  rebalance and cold sockets, but no longer makes it suspected. A rolling restart therefore ends with
   the edges where a cold start puts them, at the cost of one more
   reconnect for the clients of the restarted node's edges.
 - **A socket for an edge nobody holds wakes it at its home**: the home
   takes the edge first and the socket is relayed there; if that take is
-  refused or fails, the edge wakes where the socket landed, as before.
+  refused or fails, the edge wakes where the socket landed, as before. A
+  mailbox of the edge on the node the socket lands on that holds no lease
+  (left by another socket's check) no longer makes that node wake it: its
+  record is read, so an edge in a move's gap is not woken on a third node.
 - `serve --no-rebalance` and `rebalance = false` under `[process]` in a
   node file turn the rebalance off (it is off with placement). A 0.9
   `serve` refuses the node file key: remove it before going back.
 - `cluster status` shows each node's `AWAY` count (`misplaced` in
   `--json`) and each app's `REBALANCE`: `balanced`, `rebalancing` or
-  `paused` with why. The heartbeat's load line gains `misplaced=<n>`,
+  `paused` with why (`<id> stopped` for a node stopped within the ten
+  minutes). The heartbeat's load line gains `misplaced=<n>`,
   which older nodes and CLIs skip.
 - Metrics: `wasmkeep_rebalance_misplaced`, `wasmkeep_rebalance_moves_total{outcome}`,
   `wasmkeep_rebalance_sockets_closed_total`, `wasmkeep_rebalance_paused{reason}`,

@@ -140,6 +140,13 @@ async fn recorder() -> (String, Captured) {
 
 /// [`recorder`], answering every request with `status` (`404 Not Found`).
 async fn answering(status: &'static str) -> (String, Captured) {
+    answering_in_turn(vec![status]).await
+}
+
+/// [`answering`] with each status of `statuses` in turn, the last one for
+/// every request after.
+async fn answering_in_turn(statuses: Vec<&'static str>) -> (String, Captured) {
+    let statuses = Arc::new(statuses);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let captured = Captured::default();
@@ -150,6 +157,7 @@ async fn answering(status: &'static str) -> (String, Captured) {
                 return;
             };
             let into = into.clone();
+            let statuses = Arc::clone(&statuses);
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -179,7 +187,11 @@ async fn answering(status: &'static str) -> (String, Captured) {
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
-                into.0.lock().unwrap().push(buf);
+                let status = {
+                    let mut all = into.0.lock().unwrap();
+                    all.push(buf);
+                    statuses[(all.len() - 1).min(statuses.len() - 1)]
+                };
                 let answer = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
                 let _ = socket.write_all(answer.as_bytes()).await;
             });
@@ -348,6 +360,57 @@ async fn a_hello_sends_these_bytes() {
 /// (ADR 0043, section 6). Until 0.9 a 404 passed for the answer of a node
 /// of 0.4.1 and before, which knew no hello: no node this version runs
 /// beside is one, and a node of 0.8.1 answers 200 or 403.
+/// A take answered `503` is a node alive that cannot take the actor at
+/// that moment (ADR 0040, section 14, amendment of 2026-11-28): signed and
+/// sent again until it is answered, within the take's time; one answered
+/// `503` to the end is `Unavailable` (neither suspected nor backed off by
+/// the callers), not `Failed`. Any other refusal is not sent again.
+#[tokio::test]
+async fn a_take_answered_503_is_sent_again_within_its_time() {
+    let target = ActorAddress::new("t", "room", "a b").unwrap();
+    let (base, captured) = answering_in_turn(vec![
+        "503 Service Unavailable",
+        "503 Service Unavailable",
+        "200 OK",
+    ])
+    .await;
+    let me = sender(&base).await;
+    assert_eq!(me.take("owner", &target).await, TakeAnswer::Held);
+    let sent = captured.0.lock().unwrap().clone();
+    assert_eq!(sent.len(), 3, "sent until answered");
+    let macs: std::collections::HashSet<String> = sent
+        .iter()
+        .map(|raw| fields(header(&String::from_utf8_lossy(raw), INTERNAL)).3)
+        .collect();
+    assert_eq!(macs.len(), 3, "each try signed anew");
+
+    let (base, captured) = answering("503 Service Unavailable").await;
+    let me = sender(&base).await;
+    let started = std::time::Instant::now();
+    let answer = me
+        .take_within("owner", &target, Duration::from_millis(1_200))
+        .await;
+    assert!(matches!(answer, TakeAnswer::Unavailable(_)), "{answer:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(captured.0.lock().unwrap().len() >= 3);
+
+    // A try after a `503` that fails otherwise (no answer in time, an
+    // error) still says the node asked for a retry: not `Failed`.
+    let (base, _) =
+        answering_in_turn(vec!["503 Service Unavailable", "500 Internal Server Error"]).await;
+    let me = sender(&base).await;
+    let answer = me.take("owner", &target).await;
+    assert!(matches!(answer, TakeAnswer::Unavailable(_)), "{answer:?}");
+
+    let (base, captured) = answering("500 Internal Server Error").await;
+    let me = sender(&base).await;
+    assert!(matches!(
+        me.take("owner", &target).await,
+        TakeAnswer::Failed(_)
+    ));
+    assert_eq!(captured.0.lock().unwrap().len(), 1, "not sent again");
+}
+
 #[tokio::test]
 async fn a_hello_answered_404_is_not_taken() {
     for (status, fails) in [("200 OK", false), ("404 Not Found", true)] {

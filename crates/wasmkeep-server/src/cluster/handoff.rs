@@ -27,13 +27,27 @@ pub(crate) enum TakeAnswer {
     HeldBy(String),
     /// No such actor (never created, or a class the node does not serve).
     NoSuchActor,
-    /// Refused (draining, secrets blocked, another tenant), the bucket did
-    /// not answer, or the call failed.
+    /// Refused (another tenant), any other answer, or the call failed: no
+    /// answer in time, no connection.
     Failed(String),
+    /// The node answered `503` (draining, secrets blocked, an acquisition
+    /// or a restore that cannot finish now, a signature to make again) to
+    /// every try for [`TAKE_RETRY_FOR`]: it is alive and asks for a retry,
+    /// so it is not suspected; the rebalance and cold sockets back it off
+    /// (ADR 0040, section 14, amendment of 2026-11-28).
+    Unavailable(String),
 }
 
-/// How long a take may take (a restore can take a few seconds).
+/// How long a take may take (a restore can take a few seconds), its tries
+/// after a `503` included.
 pub(super) const TAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The pause before a take answered `503` is sent again.
+pub(super) const TAKE_RETRY_PAUSE: Duration = Duration::from_millis(250);
+/// How long a take answered `503` is sent again: a moment's refusal (a
+/// restore queued, a signature made before the start) passes within it,
+/// and a node that refuses for longer (draining, secrets blocked) costs
+/// its callers two seconds, not the take's ten.
+pub(super) const TAKE_RETRY_FOR: Duration = Duration::from_secs(2);
 
 /// The body of a take call.
 pub(crate) fn take_body(tenant: &str) -> String {

@@ -1116,3 +1116,291 @@ async fn an_operators_move_of_crowded_edges_whose_clients_reconnect_at_once() {
         drop((a, b, c));
     }
 }
+
+/// The first edge name whose home over `all` is `home` and over `rest`
+/// is `then`.
+fn edge_homed(all: &[&str], home: &str, rest: &[&str], then: &str) -> String {
+    (1..)
+        .map(|k| format!("lobby.e{k}"))
+        .find(|e| choice(e, all) == home && choice(e, rest) == then)
+        .unwrap()
+}
+
+/// Removes `id`'s drain request, as `cluster undrain` does.
+async fn undrain(store: &Arc<dyn ObjectStore>, id: &str) {
+    use object_store::ObjectStoreExt as _;
+    store
+        .delete(&object_store::path::Path::from(format!(
+            "control/drain/{id}"
+        )))
+        .await
+        .unwrap();
+    announce_intent(store).await;
+}
+
+/// Three room nodes, `settings` for the rebalance if given, every one
+/// serving.
+async fn three_with(
+    store: &Arc<dyn ObjectStore>,
+    dirs: &[tempfile::TempDir],
+    settings: Option<fn(Duration) -> wasmkeep_cluster::rebalance::Settings>,
+) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    for (id, dir) in ["a", "b", "c"].into_iter().zip(dirs) {
+        nodes.push(
+            room_node(id, dir.path(), store, |config| {
+                if let Some(settings) = settings {
+                    let cluster = config.cluster.as_mut().unwrap();
+                    cluster.rebalance_settings = Some(settings(cluster.heartbeat));
+                }
+            })
+            .await,
+        );
+    }
+    for id in ["a", "b", "c"] {
+        wait_drain_line(store, id, "serving").await;
+    }
+    settle().await;
+    nodes
+}
+
+/// Drains a, then wakes `edge` on b (a request from outside wakes it
+/// where it lands), stops a and withdraws its drain while it is down, as
+/// the upgrading page's step does.
+async fn edge_on_b_while_a_stops(store: &Arc<dyn ObjectStore>, nodes: &mut Vec<Node>, edge: &str) {
+    drain(store, "a").await;
+    wait_drain_line(store, "a", "drained").await;
+    let path = format!("/actor/edge/{edge}/durable");
+    let r = send_reachable(nodes[1].addr, "POST", &path, "").await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("b")),
+        "{}",
+        r.body
+    );
+    stop_listening(nodes.remove(0)).await;
+    undrain(store, "a").await;
+}
+
+/// A rolling upgrade's step, one node at a time (ADR 0040, section 14,
+/// amendment of 2026-11-28): drain, stop, withdraw the drain while the
+/// node is stopped, start. An edge woken on b while a drains, whose home
+/// over b and c is c, stays on b while a is stopped (a node of the app
+/// stopped within the away bound pauses every pass, drain request or
+/// not), and moves once, straight to a, when a serves again.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_moves_while_a_stopped_node_may_come_back() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = three_with(&store, &dirs, None).await;
+    let edge = edge_homed(&["a", "b", "c"], "a", &["b", "c"], "c");
+    let moved = metric(MOVED);
+    edge_on_b_while_a_stops(&store, &mut nodes, &edge).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        holder(&store, "edge", &edge).await.as_deref(),
+        Some("b"),
+        "moved while a node of the app was stopped"
+    );
+    assert_eq!(metric(MOVED), moved);
+
+    let back = room_node("a", dirs[0].path(), &store, |_| {}).await;
+    wait_drain_line(&store, "a", "serving").await;
+    all_home(
+        &store,
+        std::slice::from_ref(&edge),
+        &["a", "b", "c"],
+        Duration::from_secs(10),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(metric(MOVED), moved + 1, "moved once, to its home");
+    drop((back, nodes));
+}
+
+/// A node stopped for good pauses the rebalance only for the away bound
+/// (ADR 0040, section 14, amendment of 2026-11-28): past it, an edge away
+/// from its home over the nodes left moves there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_gone_for_good_pauses_the_rebalance_only_for_the_away_bound() {
+    const AWAY: Duration = Duration::from_secs(3);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = three_with(
+        &store,
+        &dirs,
+        Some(|period| wasmkeep_cluster::rebalance::Settings {
+            away: AWAY,
+            ..wasmkeep_cluster::rebalance::Settings::for_period(period)
+        }),
+    )
+    .await;
+    let edge = edge_homed(&["a", "b", "c"], "a", &["b", "c"], "c");
+    edge_on_b_while_a_stops(&store, &mut nodes, &edge).await;
+    let stopped = std::time::Instant::now();
+    let deadline = stopped + AWAY + Duration::from_secs(10);
+    while holder(&store, "edge", &edge).await.as_deref() != Some("c") {
+        assert!(std::time::Instant::now() < deadline, "never moved home");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        stopped.elapsed() >= AWAY - Duration::from_millis(500),
+        "moved within the away bound: {:?}",
+        stopped.elapsed()
+    );
+    drop(nodes);
+}
+
+const MOVE_FAILED: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="failed"}"#;
+const ELSEWHERE: &str =
+    r#"wasmkeep_rebalance_moves_total{tenant="default",app="default",outcome="taken_elsewhere"}"#;
+const HOME_FAILED: &str =
+    r#"wasmkeep_placement_spread_total{tenant="default",app="default",outcome="home_failed"}"#;
+
+/// A rolling upgrade's step under a crowd (ADR 0040, section 14,
+/// amendment of 2026-11-28): edges whose home is a, each with clients
+/// connected through b and through c that reconnect at once; a drains, is
+/// stopped, its drain withdrawn while it is down, and it starts again.
+/// Once a serves, its edges go home with no take refused or failed (no
+/// target backed off or suspected), none woken on a third node in a
+/// move's gap (no move ends `taken_elsewhere`), every client connected
+/// again and closed with 1012 at most twice (the drain, the move home).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoined_home_takes_its_crowded_edges_at_the_first_try() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,wasmkeep_server::actor=debug")
+        .with_test_writer()
+        .try_init();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = three_with(&store, &dirs, None).await;
+    let mut edges: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let skip: Vec<&str> = edges.iter().map(String::as_str).collect();
+        let e = edge_on("a", &skip);
+        edges.push(e);
+    }
+    for e in &edges {
+        let r = send_reachable(
+            nodes[0].addr,
+            "POST",
+            &format!("/actor/edge/{e}/durable"),
+            "",
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.node.as_deref()),
+            (200, Some("a")),
+            "{}",
+            r.body
+        );
+    }
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut clients = crowd(nodes[1].addr, &edges, at_once, &connected, &stop_rx).await;
+    clients.extend(crowd(nodes[2].addr, &edges, at_once, &connected, &stop_rx).await);
+    let want = clients.len();
+    wait_connected(&connected, want, "at first").await;
+
+    drain(&store, "a").await;
+    wait_drain_line(&store, "a", "drained").await;
+    wait_connected(&connected, want, "after the drain").await;
+    stop_listening(nodes.remove(0)).await;
+    undrain(&store, "a").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (failed, elsewhere, home_failed) =
+        (metric(MOVE_FAILED), metric(ELSEWHERE), metric(HOME_FAILED));
+    // Back on a bucket whose history reads are slow, as a real one is: a
+    // restore takes a while, and the takes and relayed sockets that reach
+    // a at once queue behind it.
+    let slow = Arc::new(Flaky::new(
+        Arc::clone(&store),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
+    slow.delay_wal_get_ms.store(400, Ordering::SeqCst);
+    let seen_by_a: Arc<dyn ObjectStore> = slow;
+    let back = room_node("a", dirs[0].path(), &seen_by_a, |_| {}).await;
+    wait_drain_line(&store, "a", "serving").await;
+    all_home(&store, &edges, &["a", "b", "c"], Duration::from_secs(20)).await;
+    wait_connected(&connected, want, "after the moves home").await;
+    assert_eq!(
+        (
+            metric(MOVE_FAILED) - failed,
+            metric(ELSEWHERE) - elsewhere,
+            metric(HOME_FAILED) - home_failed
+        ),
+        (0, 0, 0),
+        "moves failed, moves taken elsewhere, cold takes failed"
+    );
+    stop_tx.send(true).unwrap();
+    for client in clients {
+        let closes = client.await.unwrap();
+        assert!(closes <= 2, "closed {closes} times with 1012");
+    }
+    drop((back, nodes));
+}
+
+/// An operator's move of an edge to a node that is neither its node nor
+/// its home (ADR 0040, section 14, amendment of 2026-11-28), with clients
+/// connected through the moving node that reconnect at once: an upgrade
+/// that lands there during the move follows the move to its target, and
+/// does not ask the edge's home to take it. The edge ends on the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operators_move_off_home_is_not_raced_by_sockets_on_its_node() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // No rebalance move for the length of the test.
+    let nodes = three_with(
+        &store,
+        &dirs,
+        Some(|period| wasmkeep_cluster::rebalance::Settings {
+            settle: Duration::from_secs(600),
+            ..wasmkeep_cluster::rebalance::Settings::for_period(period)
+        }),
+    )
+    .await;
+    let edge = edge_on("a", &[]);
+    let r = send_reachable(
+        nodes[2].addr,
+        "POST",
+        &format!("/actor/edge/{edge}/durable"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("c")),
+        "{}",
+        r.body
+    );
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let edges = vec![edge.clone()];
+    let clients = crowd(nodes[2].addr, &edges, at_once, &connected, &stop_rx).await;
+    request_move_of(&store, "edge", &edge, "b").await;
+    let started = std::time::Instant::now();
+    loop {
+        let at = holder(&store, "edge", &edge).await;
+        if at.as_deref() == Some("b") {
+            break;
+        }
+        assert_ne!(
+            at.as_deref(),
+            Some("a"),
+            "taken by its home in the move's gap"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "not moved to b: on {at:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_connected(&connected, clients.len(), "after the move").await;
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("b"));
+    stop_tx.send(true).unwrap();
+    for client in clients {
+        client.await.unwrap();
+    }
+    drop(nodes);
+}
