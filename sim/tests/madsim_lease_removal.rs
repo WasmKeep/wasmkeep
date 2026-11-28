@@ -573,25 +573,39 @@ fn broken(o: &Outcome) -> Option<String> {
 fn released_leases_are_removed_and_no_lease_a_node_wrote_is_deleted() {
     let range = only_seed().map_or(0..seeds(), |s| s..s + 1);
     let (mut removed, mut ended, mut deaths, mut starts, mut stayed) = (0, 0, 0, 0, 0);
+    let mut removing = 0; // seeds that removed at least one lease
     for seed in range {
         let o = simulate(seed, Variant::Correct, Duration::from_secs(120));
         if let Some(why) = broken(&o) {
             panic!("seed {seed}: {why}: {o:?}");
         }
         removed += o.removed;
+        removing += u64::from(o.removed > 0);
         ended += o.ended;
         deaths += o.deaths;
         starts += o.starts;
         stayed += o.marks_stayed;
     }
     eprintln!(
-        "{} seeds: {starts} starts of a, {removed} leases removed, {deaths} removers died, \
+        "{} seeds: {starts} starts of a, {removed} leases removed (in {removing} seeds), {deaths} removers died, \
          {ended} marks ended, {stayed} starts that gave up on a mark",
         seeds()
     );
     if only_seed().is_none() {
         let floor = (seeds() / 10).max(1);
-        assert!(removed >= seeds(), "{removed} removals");
+        // A seed removes nothing when no pause of `a` outlasts what a
+        // removal waits for: a lease must be released for 7.2 s (the
+        // heartbeat horizon, ttl and grace) and a round that fails on a
+        // slow request (one in eight, against a 1 s timeout) backs off
+        // for longer each time in a row, while `a` starts again after a
+        // pause under 16 s and rewrites the lease. About two seeds in
+        // three remove something (a seed that does removes several, so
+        // the total is no measure of it); the floor is half of the seeds.
+        assert!(
+            removing * 2 >= seeds(),
+            "{removing} of {} seeds removed a lease ({removed} removals)",
+            seeds()
+        );
         assert!(deaths >= floor, "{deaths} removers died");
         assert!(ended >= floor, "{ended} marks ended");
     }
