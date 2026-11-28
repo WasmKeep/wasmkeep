@@ -267,7 +267,7 @@ pub(super) fn drain_asked(node: &str) -> String {
 /// `wasmkeep cluster fence` (ADR 0020, section 2).
 pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
     use wasmkeep_cluster::node_lease::{
-        CREATED_FENCE_AHEAD_MS, OPERATOR_FENCE_BOUND_MS, OperatorFence, operator_fence,
+        FenceCreate, OPERATOR_FENCE_BOUND_MS, OperatorFence, operator_fence,
     };
     wasmkeep_cluster::membership::validate_node_id(&args.node)
         .map_err(|e| anyhow::anyhow!("invalid node id {:?}: {e}", args.node))?;
@@ -278,21 +278,14 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
         .build()?;
     let lease = wasmkeep_server::LeaseConfig::default_safe();
     let key = format!("nodes/{}", args.node);
-    // Given up after its bound, so that a create still in flight lands
-    // before the date it carries (ADR 0020, amendment of 2026-11-28).
+    // A create is given up after its bound, so that one still in flight
+    // lands before the date it carries; a fence over the lease waits for
+    // the client (ADR 0020, amendment of 2026-11-28).
+    let create = FenceCreate::bounded(OPERATOR_FENCE_BOUND_MS, |ms| {
+        tokio::time::sleep(std::time::Duration::from_millis(ms))
+    });
     let mut outcome = rt
-        .block_on(async {
-            let give_up =
-                tokio::time::sleep(std::time::Duration::from_millis(OPERATOR_FENCE_BOUND_MS));
-            operator_fence(
-                &bucket,
-                &status::Wall,
-                &key,
-                CREATED_FENCE_AHEAD_MS,
-                give_up,
-            )
-            .await
-        })
+        .block_on(operator_fence(&bucket, &status::Wall, &key, create))
         .map_err(|e| {
             anyhow::anyhow!(
                 "fencing {}: {e:?} (a fence may have been written; run this command again)",

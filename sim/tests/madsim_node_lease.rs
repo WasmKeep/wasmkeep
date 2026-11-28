@@ -1200,9 +1200,13 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
                         // client's own timeout bounds the call, so it is not
                         // given up here.
                         let ahead = variant.fence_ahead_ms();
-                        let _ =
-                            operator_fence(&bucket, &clock, &key, ahead, std::future::pending())
-                                .await;
+                        let _ = operator_fence(
+                            &bucket,
+                            &clock,
+                            &key,
+                            wasmkeep_cluster::node_lease::FenceCreate::by_client(ahead),
+                        )
+                        .await;
                     }
                 }
             })

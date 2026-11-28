@@ -632,8 +632,9 @@ async fn a_fenced_nodes_actor_is_waited_for() {
         &bucket,
         &WallClock,
         "nodes/a",
-        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
-        std::future::pending(),
+        wasmkeep_cluster::node_lease::FenceCreate::by_client(
+            wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        ),
     )
     .await
     .unwrap();

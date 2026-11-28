@@ -1746,8 +1746,9 @@ mod tests {
                 &bucket,
                 &Wall,
                 "nodes/b",
-                wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
-                std::future::pending()
+                wasmkeep_cluster::node_lease::FenceCreate::by_client(
+                    wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS
+                )
             )),
             Ok(OperatorFence::Forgotten)
         );

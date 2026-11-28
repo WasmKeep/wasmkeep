@@ -1234,8 +1234,9 @@ pub enum OperatorFence {
     Forgotten,
 }
 
-/// How long [`operator_fence`] may take before it is given up, by default
-/// (ms): its caller's timer ([ADR 0020], amendment of 2026-11-28).
+/// How long the create of [`operator_fence`] may take before it is given
+/// up, by default (ms): its caller's timer ([ADR 0020], amendment of
+/// 2026-11-28).
 ///
 /// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 pub const OPERATOR_FENCE_BOUND_MS: u64 = 10_000;
@@ -1251,65 +1252,116 @@ pub const OPERATOR_FENCE_BOUND_MS: u64 = 10_000;
 /// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 pub const CREATED_FENCE_AHEAD_MS: u64 = OPERATOR_FENCE_BOUND_MS + UNRESOLVED_WAIT_MS;
 
+/// How [`operator_fence`] bounds and dates a fence it creates: the date
+/// ahead and the timer that gives the create up come together, so that a
+/// create lands, if at all, before its date.
+pub struct FenceCreate<F> {
+    bound_ms: Option<u64>,
+    ahead_ms: u64,
+    timer: F,
+}
+
+impl<F, T> FenceCreate<F>
+where
+    F: FnMut(u64) -> T,
+    T: std::future::Future<Output = ()>,
+{
+    /// The create given up `bound_ms` after it is sent, by `timer(bound_ms)`
+    /// (a sleep of that long), and dated that bound plus
+    /// [`UNRESOLVED_WAIT_MS`] ahead: [`CREATED_FENCE_AHEAD_MS`] with
+    /// [`OPERATOR_FENCE_BOUND_MS`].
+    pub fn bounded(bound_ms: u64, timer: F) -> Self {
+        Self {
+            bound_ms: Some(bound_ms),
+            ahead_ms: bound_ms.saturating_add(UNRESOLVED_WAIT_MS),
+            timer,
+        }
+    }
+}
+
+impl FenceCreate<fn(u64) -> std::future::Pending<()>> {
+    /// Not given up here: the bucket client bounds each create itself, and
+    /// `ahead_ms` covers that bound plus the time a create given up on may
+    /// still take to land (a simulated bucket's), or a fence is meant to be
+    /// dated when sent (a broken variant, or a fence over an object that is
+    /// there).
+    pub fn by_client(ahead_ms: u64) -> Self {
+        Self {
+            bound_ms: None,
+            ahead_ms,
+            timer: |_| std::future::pending(),
+        }
+    }
+}
+
+impl<F> std::fmt::Debug for FenceCreate<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FenceCreate")
+            .field("bound_ms", &self.bound_ms)
+            .field("ahead_ms", &self.ahead_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> FenceCreate<F> {
+    /// How far ahead of the operator's clock a created fence is dated (ms).
+    pub fn ahead_ms(&self) -> u64 {
+        self.ahead_ms
+    }
+}
+
 /// An operator's fence of the node lease at `key`, without the watch a peer
 /// needs (the time bound alone keeps it safe): over the current object,
 /// `If-Match` on the version read, keeping its `written_at` and fields; if
 /// the object is absent, created (`If-None-Match: *`) with no instance and
-/// `written_at` set to this clock plus `ahead_ms`. A failed condition reads
-/// again, a few times.
+/// `written_at` set to this clock plus `create`'s date ahead. A failed
+/// condition reads again, a few times.
 ///
-/// The whole call is given up when `give_up` ends, a timer the caller
-/// starts before the call. `ahead_ms` is at least as long as a create may
-/// take to land after it is sent: until it is given up (by `give_up`, or
-/// by the bucket client itself), plus the time a write given up on may
-/// still take to land. [`CREATED_FENCE_AHEAD_MS`] with a timer of
-/// [`OPERATOR_FENCE_BOUND_MS`] for `object_store`. A create then lands, if
-/// at all, before its date, whatever absence it lands over ([ADR 0020],
-/// amendment of 2026-11-28). The date is never moved back: a reader that
-/// read it may be served it again later.
+/// Only the create is bounded: its timer starts before the clock that
+/// dates it is read, and the date is ahead by at least that bound plus the
+/// time a write given up on may still take to land ([`FenceCreate`]). A
+/// create then lands, if at all, before its date, whatever absence it
+/// lands over ([ADR 0020], amendment of 2026-11-28). A fence over an object
+/// that is there waits for the bucket client as before. The date is never
+/// moved back: a reader that read it may be served it again later.
 ///
 /// # Errors
-/// A bucket error, or `Unavailable` once given up: a fence may have been
-/// created, and running the call again finds it (`NotLive`).
+/// A bucket error, or `Unavailable` once the create was given up: a fence
+/// may have been created, and running the call again finds it (`NotLive`).
 ///
 /// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
-pub async fn operator_fence<B: Bucket, C: Clock>(
+pub async fn operator_fence<B, C, F, T>(
     bucket: &B,
     clock: &C,
     key: &str,
-    ahead_ms: u64,
-    give_up: impl std::future::Future<Output = ()>,
-) -> Result<OperatorFence, BucketError> {
-    before(
-        operator_fence_unbounded(bucket, clock, key, ahead_ms),
-        give_up,
-    )
-    .await
-    .unwrap_or_else(|| {
-        Err(BucketError::Unavailable(
-            "the fence was given up; it may have been created".into(),
-        ))
-    })
-}
-
-async fn operator_fence_unbounded<B: Bucket, C: Clock>(
-    bucket: &B,
-    clock: &C,
-    key: &str,
-    ahead_ms: u64,
-) -> Result<OperatorFence, BucketError> {
+    mut create: FenceCreate<F>,
+) -> Result<OperatorFence, BucketError>
+where
+    B: Bucket,
+    C: Clock,
+    F: FnMut(u64) -> T,
+    T: std::future::Future<Output = ()>,
+{
     let mut last = BucketError::Conflict;
     for _ in 0..3 {
         let (written, outcome) = match bucket.get(key).await? {
             None => {
-                let at = clock.now_ms().saturating_add(ahead_ms);
+                let give_up = (create.timer)(create.bound_ms.unwrap_or(0));
+                let at = clock.now_ms().saturating_add(create.ahead_ms);
                 let fence = NodeLeaseObject {
                     state: NodeState::Fenced,
                     instance: None,
                     written_at_ms: at,
                 };
+                let created = before(bucket.create(key, fence.encode()), give_up)
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(BucketError::Unavailable(
+                            "the fence's create was given up; it may have landed".into(),
+                        ))
+                    });
                 (
-                    bucket.create(key, fence.encode()).await,
+                    created,
                     OperatorFence::Fenced {
                         written_at_ms: at,
                         instance: None,
@@ -2723,8 +2775,7 @@ mod tests {
                 &&mem,
                 &At(&t),
                 "nodes/a",
-                1_000,
-                std::future::pending()
+                FenceCreate::by_client(1_000)
             )),
             Ok(OperatorFence::Fenced {
                 written_at_ms: 5_000,
@@ -2745,8 +2796,7 @@ mod tests {
                 &&mem,
                 &At(&t),
                 "nodes/a",
-                1_000,
-                std::future::pending()
+                FenceCreate::by_client(1_000)
             )),
             Ok(OperatorFence::NotLive {
                 state: NodeState::Fenced,
@@ -2760,8 +2810,7 @@ mod tests {
                 &&mem,
                 &At(&t),
                 "nodes/b",
-                1_000,
-                std::future::pending()
+                FenceCreate::by_client(1_000)
             )),
             Ok(OperatorFence::Fenced {
                 written_at_ms: 10_000,
@@ -2792,8 +2841,7 @@ mod tests {
                 &&mem,
                 &At(&t),
                 "nodes/c",
-                1_000,
-                std::future::pending()
+                FenceCreate::by_client(1_000)
             )),
             Ok(OperatorFence::OldFormat)
         );
@@ -4116,8 +4164,7 @@ mod tests {
                 &&sent,
                 &At(&t),
                 "nodes/b",
-                CREATED_FENCE_AHEAD_MS,
-                std::future::pending()
+                FenceCreate::by_client(CREATED_FENCE_AHEAD_MS)
             )),
             Ok(OperatorFence::Fenced { created: true, .. })
         ));
@@ -4171,8 +4218,7 @@ mod tests {
             &&mem,
             &At(&t),
             "nodes/b",
-            CREATED_FENCE_AHEAD_MS,
-            std::future::pending(),
+            FenceCreate::by_client(CREATED_FENCE_AHEAD_MS),
         ))
         .unwrap();
         let ahead = run((&mem).get("nodes/b")).unwrap().unwrap().0;
@@ -4212,24 +4258,62 @@ mod tests {
         );
     }
 
-    /// `operator_fence` given up: `Unavailable`, and nothing sent.
+    /// A bucket whose creates never answer (a client still retrying),
+    /// over `Mem` otherwise.
+    struct ParkedCreates<'a>(&'a crate::lease::tests::Mem);
+
+    impl Bucket for ParkedCreates<'_> {
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, BucketError> {
+            self.0.get(key).await
+        }
+        async fn create(&self, _key: &str, _body: Vec<u8>) -> Result<Version, BucketError> {
+            std::future::pending().await
+        }
+        async fn replace(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+            expected: &Version,
+        ) -> Result<Version, BucketError> {
+            self.0.replace(key, body, expected).await
+        }
+    }
+
+    /// Only the create is bounded: a create still parked when its timer
+    /// fires is given up (`Unavailable`, the timer asked for the bound, and
+    /// nothing written after), while a fence over a live lease is not given
+    /// up by that timer.
     #[test]
-    fn an_operator_fence_given_up_is_unavailable() {
+    fn only_the_create_of_an_operator_fence_is_given_up() {
         use crate::lease::tests::{At, Mem, run};
         use std::cell::Cell;
         let mem = Mem::default();
         let t = Cell::new(100_000);
+        let asked = Cell::new(None);
+        let create = FenceCreate::bounded(OPERATOR_FENCE_BOUND_MS, |ms| {
+            asked.set(Some(ms));
+            std::future::ready(())
+        });
+        assert_eq!(create.ahead_ms(), CREATED_FENCE_AHEAD_MS);
+        let parked = ParkedCreates(&mem);
         assert!(matches!(
-            run(operator_fence(
-                &&mem,
-                &At(&t),
-                "nodes/b",
-                CREATED_FENCE_AHEAD_MS,
-                std::future::ready(())
-            )),
+            run(operator_fence(&parked, &At(&t), "nodes/b", create)),
             Err(BucketError::Unavailable(_))
         ));
+        assert_eq!(asked.get(), Some(OPERATOR_FENCE_BOUND_MS));
         assert_eq!(run((&mem).get("nodes/b")), Ok(None));
+        // Over a live lease: fenced, though the same timer fires at once.
+        let mut lease = NodeLease::new(&mem, At(&t), "nodes/a", "i1", cfg());
+        run(lease.start(None)).unwrap();
+        let create = FenceCreate::bounded(OPERATOR_FENCE_BOUND_MS, |_| std::future::ready(()));
+        assert_eq!(
+            run(operator_fence(&parked, &At(&t), "nodes/a", create)),
+            Ok(OperatorFence::Fenced {
+                written_at_ms: 100_000,
+                instance: Some("i1".into()),
+                created: false
+            })
+        );
     }
 
     /// b's clock steps back while it runs as i2, then b is fenced: the
@@ -4609,8 +4693,7 @@ mod tests {
                 &&mem,
                 &At(&t),
                 "nodes/a",
-                1_000,
-                std::future::pending()
+                FenceCreate::by_client(1_000)
             )),
             Ok(OperatorFence::Forgotten)
         );

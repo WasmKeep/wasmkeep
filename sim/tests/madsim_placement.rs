@@ -627,8 +627,7 @@ fn one_hop_one_holder_residents_stay_and_a_failed_node_returns() {
                 &bucket,
                 &clock,
                 &format!("nodes/{}", NAMES[dead]),
-                0,
-                std::future::pending(),
+                wasmkeep_cluster::node_lease::FenceCreate::by_client(0),
             )
             .await
             .unwrap();

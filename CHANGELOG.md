@@ -133,13 +133,13 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
   over a later absence (after a process of that id started over no object,
   took actors, and had its lease deleted out of band); its old date then
   freed that process's actors while its lease was valid. The command now
-  gives the fence up after 10 s and dates the fence it creates 40 s ahead
+  gives the create up after 10 s and dates the fence it creates 40 s ahead
   (that bound plus the 30 s a write given up on may still take to land),
   so a create lands before its date; the date is moved forward to the
   bucket's time if that is later, never back. Nodes of 0.9 read these
   fences by the same rule. A node's actors are free 40 s later after a
   fence over a missing object (55 s instead of 15 s at the defaults), and
-  a process restarting under that id waits about 44 s
+  a process restarting under that id waits about 42 s
   ([ADR 0020, amendment of 2026-11-28](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-28-a-created-fence-dated-ahead)).
 - **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
   its last check on a second runtime while the first still held the

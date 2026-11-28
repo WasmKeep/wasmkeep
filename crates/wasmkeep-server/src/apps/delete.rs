@@ -315,7 +315,7 @@ pub async fn fence_app_nodes(
 ) -> Result<u64, DeployError> {
     use wasmkeep_cluster::membership::NODES_PREFIX;
     use wasmkeep_cluster::node_lease::{
-        CREATED_FENCE_AHEAD_MS, NodeState, OPERATOR_FENCE_BOUND_MS, OperatorFence, operator_fence,
+        FenceCreate, NodeState, OPERATOR_FENCE_BOUND_MS, OperatorFence, operator_fence,
     };
     struct Wall;
     impl wasmkeep_cluster::lease::Clock for Wall {
@@ -340,11 +340,13 @@ pub async fn fence_app_nodes(
             continue;
         }
         let key = format!("{NODES_PREFIX}{}", node.id);
-        // Bounded, as `cluster fence` is (ADR 0020, amendment of
+        // A create bounded, as for `cluster fence` (ADR 0020, amendment of
         // 2026-11-28).
-        let give_up = tokio::time::sleep(std::time::Duration::from_millis(OPERATOR_FENCE_BOUND_MS));
+        let create = FenceCreate::bounded(OPERATOR_FENCE_BOUND_MS, |ms| {
+            tokio::time::sleep(std::time::Duration::from_millis(ms))
+        });
         if let OperatorFence::Fenced { written_at_ms, .. } =
-            operator_fence(&bucket, &Wall, &key, CREATED_FENCE_AHEAD_MS, give_up)
+            operator_fence(&bucket, &Wall, &key, create)
                 .await
                 .map_err(super::bucket)?
         {

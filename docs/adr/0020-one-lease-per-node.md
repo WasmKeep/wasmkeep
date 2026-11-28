@@ -77,8 +77,8 @@
   leaves room for another whole one. See "Amendment of 2026-11-27:
   released leases removed by the live nodes" at the end.
 - Amended 2026-11-28: a fence created over a missing object is dated
-  ahead. `operator_fence` is given up after its bound, and the fence it
-  creates is dated that bound plus the time a write given up on may still
+  ahead. The create of `operator_fence` is given up after its bound, and
+  the fence it creates is dated that bound plus the time a write given up on may still
   take to land after the operator's clock (40 s at the defaults), so a
   create that lands over a later absence frees nothing early (#303). No
   reader changes. A fence deleted before its date is a new, narrower
@@ -1972,11 +1972,14 @@ the command has exited.
 A fence `operator_fence` creates is dated so that it lands, if at all,
 before its date, whatever absence it lands over:
 
-- **Bounded.** The whole call is given up when a timer the caller starts
-  before it ends (`OPERATOR_FENCE_BOUND_MS`, 10 s, for `cluster fence`
-  and `app delete`): a create the bucket client is still retrying is
+- **Bounded.** The create is given up when a timer started right before
+  the clock that dates it is read ends (`OPERATOR_FENCE_BOUND_MS`, 10 s,
+  for `cluster fence` and `app delete`; `FenceCreate` pairs the timer
+  with the date ahead). A create the bucket client is still retrying is
   dropped then, and the command fails with an error that says a fence may
-  have been written and to run it again (which finds it, `NotLive`).
+  have been written and to run it again (which finds it, `NotLive`). A
+  fence over an object that is there (`If-Match`, keeping its date) is not
+  bounded: it waits for the client's retries, as before.
 - **Dated ahead.** Its `written_at` is the operator's clock, read right
   before the create is sent, plus at least as long as that create may take
   to land: the bound, plus as long as a write given up on may still take
@@ -1984,7 +1987,8 @@ before its date, whatever absence it lands over:
   acquire assumes). `CREATED_FENCE_AHEAD_MS`, 40 s at the defaults.
 - **Never moved back.** `cluster fence` still moves a created fence it
   leaves behind to the bucket's time plus a second and the skew when that
-  is later (an operator's clock more than 40 s behind), never earlier. Its
+  is later (an operator's clock more than 38 s behind the bucket's at the
+  defaults: 40 s less the second and the 1 s skew), never earlier. Its
   clock warnings judge the clock the fence was dated from, before the 40 s.
 
 This replaces section 2's "its `written_at` set to the operator's clock"
@@ -2044,10 +2048,12 @@ version's command.
   object: 55 s after the command instead of 15 s, at the defaults. A fence
   over an existing object keeps that object's `written_at`, unchanged.
 - A process restarting under that id over the fence waits until the
-  fence's date plus twice the skew on its clock (44 s after the command at
-  the defaults, instead of the check's own wait).
-- `cluster fence` fails after 10 s against a bucket that keeps answering
-  5xx, where it waited for the client's retries before.
+  fence's date plus twice the skew on its clock (42 s after the command at
+  the defaults: 40 s plus twice the 1 s skew, instead of the check's own
+  wait).
+- `cluster fence` over a missing object fails after 10 s against a bucket
+  that keeps answering 5xx, where it waited for the client's retries
+  before; over an existing object it still waits for them.
 
 ### What it does not close
 
@@ -2080,7 +2086,8 @@ version's command.
   and 127417). The seed is skipped there and checked to still fail. No
   date chosen by the writer alone avoids both cases. Ordering a fence
   that vanished needs its date bounded by about ttl plus grace less four
-  times the skew past its landing (7 s at the defaults), while #303 needs
+  times the skew past its landing (15 s less 4 s, 11 s at the defaults),
+  while #303 needs
   at least the bound plus 30 s. A start check that waits out the date of
   a created fence it read and that then vanished, or a reader that does
   not unpin onto a body older than one it refused, would narrow it. Both
@@ -2092,7 +2099,9 @@ version's command.
   (the deterministic case of #303: sent at 100 s, b started at 108 s, the
   create landing at 109 s; held at 115.5 s and until the fence's date plus
   ttl and grace, free after), `a_created_fence_is_never_moved_back` and
-  `an_operator_fence_given_up_is_unavailable`.
+  `only_the_create_of_an_operator_fence_is_given_up` (a create parked
+  past its timer is given up and nothing is written; a fence over a live
+  lease is not given up).
 - `tests/cluster/node_leases.rs`:
   `a_fence_over_a_deleted_heartbeat_frees_its_actors`, dated 1 s ahead
   at its scaled timings, frees after that date plus ttl and grace.

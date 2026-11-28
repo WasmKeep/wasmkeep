@@ -320,8 +320,7 @@ async fn a_fence_over_a_deleted_heartbeat_frees_its_actors() {
         &bucket,
         &WallClock,
         "nodes/a",
-        1_000,
-        std::future::pending(),
+        wasmkeep_cluster::node_lease::FenceCreate::by_client(1_000),
     )
     .await
     .unwrap();
@@ -587,8 +586,9 @@ async fn a_fenced_node_stops_serving_its_actors() {
         &bucket,
         &WallClock,
         "nodes/a",
-        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
-        std::future::pending(),
+        wasmkeep_cluster::node_lease::FenceCreate::by_client(
+            wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        ),
     )
     .await
     .unwrap();

@@ -1434,8 +1434,9 @@ async fn a_fenced_node_lease_counts_its_pending_writes_as_lost_lease() {
         &bucket,
         &WallClock,
         "nodes/a",
-        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
-        std::future::pending(),
+        wasmkeep_cluster::node_lease::FenceCreate::by_client(
+            wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        ),
     )
     .await
     .unwrap();
@@ -1479,8 +1480,9 @@ async fn a_stop_after_a_fenced_node_lease_counts_its_pending_writes_as_lost_leas
         &bucket,
         &WallClock,
         "nodes/a",
-        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
-        std::future::pending(),
+        wasmkeep_cluster::node_lease::FenceCreate::by_client(
+            wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        ),
     )
     .await
     .unwrap();
