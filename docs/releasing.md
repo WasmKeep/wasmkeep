@@ -92,23 +92,26 @@ A gate before tagging any release. It runs on a workstation, alone
 in pull request CI or in `check.sh`:
 
 ```bash
-./scripts/mixed-version.sh            # from the previous release, v0.8.1 by default
-./scripts/mixed-version.sh v0.8.1     # or OLD_VERSION=v0.8.1
+./scripts/mixed-version.sh            # from the previous release, v0.9.2 by default
+./scripts/mixed-version.sh v0.9.2     # or OLD_VERSION=v0.9.2
 ```
 
 The old version must be 0.8.1 or later. It runs in one of two modes, by
 the minor versions of the old release and of the checkout's build, and
 says which on its first line and in the report:
 
-- **The next minor version** (0.9.0 after v0.8.1): every phase below. It
-  is the proof of
+- **The next minor version** (0.10.0 after v0.9.x, as 0.9.0 after
+  v0.8.1): every phase below. It is the proof of
   [ADR 0043, section 8](adr/0043-rolling-upgrades.md#8-how-the-mixed-version-check-becomes-the-proof),
-  and the old release must be the last of its minor version.
+  and the old release must be the last of its minor version. A new side
+  two minor versions ahead is refused (exit 2): a cluster is upgraded one
+  minor version at a time.
 - **The same minor version** (a patch: 0.9.1 after v0.9.0): the upgrade
   under load, one node back and up again, the four paths at the end of
   this section and both CLIs on the mixed cluster. Nothing is gated
   between two patches, so the gate, the returning old node, the tracing
-  phase and the old CLI on a finalized cluster are left out.
+  phase, the old CLI on a finalized cluster and the side app are left
+  out.
 
 It starts three nodes of the old release (downloaded with `gh` and checked
 against its `SHA256SUMS` and a SHA-256 pinned in the script) on a local
@@ -125,20 +128,35 @@ for the next minor version, every phase counting in the exit status:
 
 - **Back and forward.** One node returns to the old release and goes up
   again, with the same checks, before anything is finalized.
-- **The gate.** A deploy of a `wasmkeep.toml` with `apart-from` and
-  `spread` (deploy manifest 8) is refused while a node of the old release
-  is live, and so is `cluster upgrade finalize`, which names that node.
-  With every node new the deploy is still refused, naming the floor. After
-  `cluster upgrade finalize` it is accepted, and a class kept apart from
-  another wakes on another node.
+- **The gate**, on the format the new minor version brings: deploy
+  manifest 8 (a `wasmkeep.toml` with `apart-from` and `spread`) after
+  v0.8.1, and `cluster markers clean` (the generation floor,
+  [ADR 0045](adr/0045-the-generation-floor-of-a-restored-app.md)) after
+  v0.9.x. It is refused while a node of the old release is live, and so
+  is `cluster upgrade finalize`, which names that node. With every node
+  new it is still refused, naming the floor. After `cluster upgrade
+  finalize` it is accepted. The deploy with the keys is accepted after
+  the finalize either way, and a class kept apart from another wakes on
+  another node.
+- **The generation floor** (from a new side of 0.10). Before the
+  finalize, an actor a new node creates has the marker 0.9 writes, and
+  the old node takes it over; after it, an actor created on a node that
+  served through the finalize has none, and after `cluster markers
+  clean` an actor whose marker was the only carrier of its generation
+  starts above it, with `cluster verify` counting no marker left.
+- **Released node leases removed** (from a new side of 0.10). Beside a
+  node of the old release, the lowest-id new node removes a lease
+  released two days before and keeps one released a minute before
+  ([ADR 0020, amendment of 2026-11-27](adr/0020-one-lease-per-node.md#amendment-of-2026-11-27-released-leases-removed-by-the-live-nodes)).
 - **The returning old node.** After the finalize, a node of the old
   release is started: it stops itself on the app's upgrade floor, which it
-  names. With the gated format written it is started again, and stops on
-  the manifest it cannot read (a node of 0.8.1 reads the current manifest
-  before the floor); so does a node of v0.8.0, which reads no floor
-  (`MIXED_VERSION_OLDER_VERSION`). Each must stop itself with that reason
-  in its log, answer no request and write no lease, and the counter goes
-  on through the others.
+  names. Once manifest 8 is current, a node that cannot read it stops on
+  that manifest: 0.8.1 started again after v0.8.1 (it reads the current
+  manifest before the floor), and the older release
+  (`MIXED_VERSION_OLDER_VERSION`): v0.8.0, which reads no floor, after
+  v0.8.1; v0.8.1, two minor versions below the new side, after v0.9.x.
+  Each must stop itself with that reason in its log, answer no request
+  and write no lease, and the counter goes on through the others.
 - **Tracing.** Two new nodes export to a collector the script runs
   (`scripts/mixed-version/otlp-sink.mjs`), with `--trace-sample 0`. A
   client's sampled `traceparent` forwarded by the node of the old release
@@ -153,7 +171,20 @@ for the next minor version, every phase counting in the exit status:
   holds a run with the app's floor (backup format 2) must be refused and
   add no run to it: nothing there is removed or rewritten, and at most
   the `started` record of the run it gave up is left, which the new CLI
-  reads past.
+  reads past. After v0.9.x every run already carries the floor, which
+  the old CLI reads: its run into that archive works, or is refused with
+  the floor's message and completes nothing, and the new CLI adds a run
+  after it.
+- **The skew check, with a started node**
+  ([ADR 0043, section 5](adr/0043-rolling-upgrades.md#5-the-skew-check)).
+  A fourth node, of the new side, is started into a side app beside a
+  live heartbeat written for it two minor versions below: it must never
+  be ready, name that node in its log and write no lease.
+- **The finalize with no live node** (ADR 0043, "Not settled" 10). The
+  side app's only node is stopped cleanly on the old release: `cluster
+  upgrade finalize` is refused, naming it. Stopped on the new version, it
+  is accepted, and a node of the old release started into the app then
+  stops on its floor. The node's lease is removed with `cluster forget`.
 
 **The new side's version.** Only a `wasmkeep` of the next minor version
 writes a gated format or finalizes, and a build of the checkout reports
@@ -164,12 +195,12 @@ uses the release build and overrides nothing.
 Before the bump, the next-minor phases can still be run:
 
 ```bash
-MIXED_VERSION_NEW_VERSION=0.9.0 ./scripts/mixed-version.sh
+MIXED_VERSION_NEW_VERSION=0.10.0 ./scripts/mixed-version.sh
 ```
 
 That builds the new side with the cargo feature `test-version` of
 `wasmkeep-cluster` and `WASMKEEP_TEST_VERSION` in the build's environment,
-read by its `build.rs` alone. The binary reports `0.9.0+test.<commit>`,
+read by its `build.rs` alone. The binary reports `0.10.0+test.<commit>`,
 warns at every `serve`, and is built into `target/mixed-version/build`,
 never `target/release`. No release build sets the feature, without it the
 variable is ignored, and nothing changes the version of a built binary;

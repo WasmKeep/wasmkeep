@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The mixed-version check (a gate before tagging a release, docs/releasing.md):
 # three nodes on this machine, against moto as the tutorials and the S3
-# suites run it, start on a published release (OLD_VERSION, v0.8.1 by
+# suites run it, start on a published release (OLD_VERSION, v0.9.2 by
 # default), then move one node at a time to the binary built from this
 # checkout (drain, stop, swap, start, wait for ready and `cluster status`).
 # After each step it checks, through every node: the durable counter keeps
@@ -15,17 +15,19 @@
 # From 0.9.0 it is the proof of ADR 0043 (section 8), and goes on:
 # - back and forward: one node returns to the old release and goes up
 #   again, with the same checks, before anything is finalized;
-# - the gate: a deploy that needs the new format (a wasmkeep.toml with
-#   `apart-from` and `spread`, deploy manifest 8) is refused while a node
-#   of the old release is live, and `cluster upgrade finalize` is refused
-#   naming that node; with every node new it is still refused, naming the
-#   floor; after `cluster upgrade finalize` it is accepted, and placement
-#   follows the keys;
+# - the gate, on the format the new minor version brings: deploy manifest
+#   8 (a wasmkeep.toml with `apart-from` and `spread`) beside v0.8.1, and
+#   `cluster markers clean` (the generation floor, ADR 0045) beside v0.9.x.
+#   It is refused while a node of the old release is live, and `cluster
+#   upgrade finalize` is refused naming that node; with every node new it
+#   is still refused, naming the floor; after `cluster upgrade finalize`
+#   it is accepted. The deploy with the keys is accepted after the
+#   finalize either way, and placement follows the keys;
 # - the returning old node: after the finalize a node of the old release
-#   started again stops itself on the upgrade floor, which it names; once
-#   the gated format is written it stops on the manifest it cannot read.
-#   Neither time does it answer a request, and the counter goes on
-#   through the others;
+#   started again stops itself on the upgrade floor, which it names. Once
+#   manifest 8 is current, a node that cannot read it (0.8.1, and 0.8.0
+#   or 0.8.1 as the older release below) stops on the manifest. None
+#   answers a request, and the counter goes on through the others;
 # - tracing (ADR 0044): two new nodes export to a collector this script
 #   runs, with --trace-sample 0. A client's `traceparent ...-01` forwarded
 #   by a node of the old release is not followed; through a new node that
@@ -41,56 +43,71 @@
 #   that served through the finalize creates an actor with no marker, and
 #   after `cluster markers clean` one above a removed marker's number,
 #   with `cluster verify` counting no marker left;
+# - released node leases removed (ADR 0020, amendment of 2026-11-27,
+#   from a new side of 0.10): beside a node of the old release, the
+#   lowest-id new node removes a lease released two days before, and
+#   keeps one released a minute before;
 # - CLI skew: the old CLI against the finalized cluster (`deploy`,
 #   `secrets set`, `cluster status`, `cluster drain`, `backup create`):
-#   each works and is read rightly, or is refused and changes nothing.
+#   each works and is read rightly, or is refused and changes nothing;
+# - the skew check (ADR 0043, section 5) with a started node: node d of
+#   the new side, started into a side app beside a live heartbeat two
+#   minor versions below, is never ready, names it and writes no lease;
+# - the finalize with no live node (ADR 0043, "Not settled" 10, from
+#   0.9.2): the side app's only node stopped on the old release refuses
+#   it, naming that node; stopped on the new one, it is accepted, and the
+#   old release then stops on that app's floor.
 #
 # Two modes, by the two binaries' minor versions:
-# - the next minor version (0.9 beside v0.8.1): everything above;
+# - the next minor version (0.10 beside v0.9.x): everything above. A new
+#   side two minor versions or more ahead is refused: a cluster is
+#   upgraded one minor version at a time;
 # - the same minor version (a patch release: 0.9.1 beside v0.9.0): the
 #   upgrade under load, the four paths below, one node back and up again,
 #   and both CLIs on the mixed cluster. Nothing is gated between two
 #   patches of one minor version, so the gate, the returning old node, the
-#   tracing phase and the old CLI on a finalized cluster are left out, and
-#   the nodes run without tracing.
+#   tracing phase, the old CLI on a finalized cluster and the side app are
+#   left out, and the nodes run without tracing.
 #
 # The new side's version. A gated format is written only by a `wasmkeep`
 # of the next minor version, and a build of this checkout reports the
 # workspace version, which the release's pull request bumps. Until then,
-# MIXED_VERSION_NEW_VERSION=0.9.0 builds the new side with the test-only
+# MIXED_VERSION_NEW_VERSION=0.10.0 builds the new side with the test-only
 # feature `test-version` of wasmkeep-cluster and WASMKEEP_TEST_VERSION
 # (see its build.rs), into its own target directory: it reports
-# `0.9.0+test.<commit>`. Without the variable the plain release build is
+# `0.10.0+test.<commit>`. Without the variable the plain release build is
 # used and nothing is overridden: the next-minor mode once the workspace
 # version is ahead of OLD_VERSION, the same-minor mode otherwise.
 #
 # Needs gh (signed in), cargo with wasm32-wasip2, node (with a global
-# WebSocket, 22 or later), curl, jq, and uv (for uvx) or moto_server. It
-# downloads the old release once into target/mixed-version/cache/ and checks
-# its SHA-256 against the release's SHA256SUMS and the value pinned below
-# (or given). Everything it writes stays under target/mixed-version/ (or
-# MIXED_VERSION_DIR); the run's data is removed at the end unless
-# MIXED_VERSION_KEEP=1. Nodes and moto are stopped by the PIDs this script
-# started, never by name.
+# WebSocket, 22 or later), curl (with --aws-sigv4), jq, and uv (for uvx)
+# or moto_server. It downloads the old release once into
+# target/mixed-version/cache/ and checks its SHA-256 against the release's
+# SHA256SUMS and the value pinned below (or given). Everything it writes
+# stays under target/mixed-version/ (or MIXED_VERSION_DIR); the run's data
+# is removed at the end unless MIXED_VERSION_KEEP=1. Nodes and moto are
+# stopped by the PIDs this script started, never by name.
 #
 # Exit status: 0 when every check passed, in every phase; 1 when
-# one failed; 2 when the old version cannot be used (no pinned SHA-256).
+# one failed; 2 when the old version cannot be used (no pinned SHA-256,
+# or more than one minor version below the new side).
 #
 # Usage: scripts/mixed-version.sh [OLD_VERSION]
-#   OLD_VERSION (argument or variable, default v0.8.1): the release the
+#   OLD_VERSION (argument or variable, default v0.9.2): the release the
 #   nodes start on. A version without a SHA-256 pinned below is refused
 #   unless OLD_SHA256 gives the hash of its Linux x86_64 archive (from the
 #   release's SHA256SUMS).
 #   MIXED_VERSION_NEW_VERSION (unset): the version the new side is built
 #   to report, X.Y.Z (the test-only override above). Unset: this
 #   checkout's own version.
-#   MIXED_VERSION_OLDER_VERSION (v0.8.0 when OLD_VERSION is v0.8.1, else
-#   none): a release from before the upgrade floor was read, started once
-#   after the gated deploy (next-minor mode): it must stop on the manifest.
-#   It needs a pinned SHA-256.
-#   MIXED_VERSION_PORT_BASE (default 18100): client ports BASE+1..3,
-#   cluster ports BASE+11..13, metrics BASE+21..23, moto BASE+50,
-#   BASE+60 for the env file probe and BASE+70 for the trace collector.
+#   MIXED_VERSION_OLDER_VERSION (v0.8.0 when OLD_VERSION is v0.8.1, v0.8.1
+#   when it is v0.9.x, else none): an older release, started once after
+#   the deploy of manifest 8 (next-minor mode): it must stop on the
+#   manifest. It needs a pinned SHA-256.
+#   MIXED_VERSION_PORT_BASE (default 18100): client ports BASE+1..4,
+#   cluster ports BASE+11..14, metrics BASE+21..24 (the fourth: node d,
+#   of the side app), moto BASE+50, BASE+60 for the env file probe and
+#   BASE+70 for the trace collector.
 #   MIXED_VERSION_IDLE_SECS (default 15): the nodes' --idle-timeout-secs,
 #   short so that a room and its pusher leave memory within a minute.
 set -euo pipefail
@@ -104,8 +121,9 @@ declare -A PINNED_SHA256=(
   [v0.8.0]=966f254da08c68b0ffc5d41018b61aebe188b078d2819a764e6935abaa0a5c0e
   [v0.8.1]=88f7a35dd5e96306f5ef51c0987d9cf7d3f55b7601fb5e8fa8b43a77e6bdf6ac
   [v0.9.0]=b2a5b38c82f5ef3d6a59c26bd6460610c4dc684305b0a9ec73be3db294311240
+  [v0.9.2]=8305eae39a82ab08c5f17a5b237c7664d593ce78df2e618bdb4697a968b9e00d
 )
-OLD_VERSION=${1:-${OLD_VERSION:-v0.8.1}}
+OLD_VERSION=${1:-${OLD_VERSION:-v0.9.2}}
 [[ $OLD_VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "OLD_VERSION '$OLD_VERSION' is not vX.Y.Z" >&2; exit 2; }
 old_short=${OLD_VERSION#v}
 OLD_ASSET=wasmkeep-$old_short-x86_64-unknown-linux-gnu.tar.gz
@@ -139,6 +157,9 @@ i=1
 for n in "${NODES[@]}"; do
   port[$n]=$((base + i)); cport[$n]=$((base + 10 + i)); mport[$n]=$((base + 20 + i)); i=$((i + 1))
 done
+# Node d serves a side app of its own (the skew check and the finalize
+# with no live node), never the test app.
+port[d]=$((base + 4)); cport[d]=$((base + 14)); mport[d]=$((base + 24))
 moto_port=$((base + 50))
 sink_port=$((base + 70))
 for p in "${port[@]}" "${cport[@]}" "${mport[@]}" "$moto_port" $((base + 60)) "$sink_port"; do
@@ -223,12 +244,39 @@ else
   mode="next minor version ($old_minor -> $new_minor): every phase"
 fi
 echo "mixed-version: $OLD_VERSION -> $new_label, $mode"
-# ADR 0045's lines, from a new side of 0.10 on.
+# Whether minor version A is B or later.
+minor_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
+# A rolling upgrade is one minor version (ADR 0043, section 5): a node
+# refuses to start beside a live node two minor versions away.
+if [ $gated = 1 ]; then
+  old_next=${old_minor%.*}.$(( ${old_minor#*.} + 1 ))
+  [ "$new_minor" = "$old_next" ] || {
+    echo "the new side is $new_minor, not the minor version after $old_minor ($old_next):" \
+      "a cluster is upgraded one minor version at a time" >&2; exit 2; }
+fi
+# What the upgrade gates (ADR 0043, section 2), by the minor version that
+# introduced it: deploy manifest 8 (`apart-from` and `spread`) from 0.9,
+# and the generation floor (ADR 0045: `cluster markers clean`, and no
+# per-actor marker for a new actor) from 0.10. A format the old release
+# already writes is not gated between the two: the gate phase checks the
+# one the new side brings.
+gate_manifest=0
 genfloor=0
-if [ $gated = 1 ] && [ "$(printf '%s\n0.10\n' "$new_minor" | sort -V | head -1)" = 0.10 ]; then genfloor=1; fi
-# A release from before the floor was read, for the returning node.
+if [ $gated = 1 ]; then
+  minor_ge "$old_minor" 0.9 || gate_manifest=1
+  ! minor_ge "$new_minor" 0.10 || genfloor=1
+fi
+# A release older than the old one, for the returning node: 0.8.0 (it
+# reads no floor) beside v0.8.1, 0.8.1 (two minor versions below the new
+# side) beside v0.9.x. Each stops on the manifest it cannot read once
+# manifest 8 is current.
 older_bin=""; older_short=""
-OLDER_VERSION=${MIXED_VERSION_OLDER_VERSION-$( [ "$OLD_VERSION" != v0.8.1 ] || echo v0.8.0 )}
+case $OLD_VERSION in
+  v0.8.1) older_default=v0.8.0 ;;
+  v0.9.*) older_default=v0.8.1 ;;
+  *) older_default="" ;;
+esac
+OLDER_VERSION=${MIXED_VERSION_OLDER_VERSION-$older_default}
 if [ $gated = 1 ] && [ -n "$OLDER_VERSION" ]; then
   [ -n "${PINNED_SHA256[$OLDER_VERSION]:-}" ] || {
     echo "no SHA-256 pinned for MIXED_VERSION_OLDER_VERSION $OLDER_VERSION" >&2; exit 2; }
@@ -284,7 +332,7 @@ moto_pid=; clients_pid=; small_pid=; probe_pid=; bg_pid=; sink_pid=
 cleanup() {
   local n
   for p in $probe_pid $bg_pid $clients_pid $small_pid $sink_pid; do kill "$p" 2>/dev/null || true; done
-  for n in "${NODES[@]}"; do
+  for n in "${NODES[@]}" d; do
     [ -z "${pid[$n]:-}" ] || kill -9 "${pid[$n]}" 2>/dev/null || true
   done
   # SIGTERM, which uvx passes on to moto (a SIGKILL would leave it running).
@@ -434,8 +482,18 @@ retries() { # the answers retried in this step, counted by status
   [ -s "$run/retries-$step.txt" ] || return 0
   note "retried: $(awk '{ print $7 }' "$run/retries-$step.txt" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')(first: $(head -1 "$run/retries-$step.txt" | cut -c1-160))"
 }
-# A bucket object as moto holds it (unsigned, as the buckets are made).
-s3obj() { curl -sf "http://127.0.0.1:$moto_port/mixed-version/$1" 2>/dev/null || true; }
+# A request for an object of the bucket, signed with the test credentials:
+# moto answers 403 to an unsigned read of an object a signed client wrote,
+# and stores an empty object for a body sent as a form (curl's default
+# type for --data-binary).
+s3() { # s3 KEY [curl args...]
+  local key=$1; shift
+  curl -sf --aws-sigv4 "aws:amz:$AWS_REGION:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+    -H 'Content-Type: application/octet-stream' \
+    "$@" "http://127.0.0.1:$moto_port/mixed-version/$key"
+}
+# A bucket object as moto holds it, or nothing.
+s3obj() { s3 "$1" 2>/dev/null || true; }
 # Test-actor NAME's per-actor marker, and its ownership record's generation.
 marker_of() { s3obj "state/$APP/leases/t/$1"; }
 owner_gen() { s3obj "state/$APP/owners/t/$1" | sed -n 3p; }
@@ -444,16 +502,31 @@ holder() { # holder CLASS/NAME: the node owning it, - for none, ? when unknown
     | jq -r '.[0].owner // "-"' 2>/dev/null || echo "?"
 }
 # Have node N hold test-actor NAME: an actor move, checked through the
-# answer header of a read.
+# answer header of a read. A read through N wakes an actor nobody holds
+# there, so a fresh actor is often N's before its move is acted on, and a
+# second move can follow within the same second. Nodes order the move
+# requests of one actor by the bucket's last-modified time, in whole
+# seconds on S3 and moto: of two written in one second the one whose
+# target sorts first is kept and the other deleted. So no move is
+# written when N already holds the actor, and none within 1.1 s of the
+# last one of that actor.
+declare -A moved_at # actor -> when its last move was written (ms)
 pin_actor() { # pin_actor NAME ID
-  local a=$1 n=$2 deadline=$((SECONDS + 40))
-  new actor move --app "$APP" --bucket "$BUCKET" "t/$a" --to "$n" >/dev/null 2>&1 || true
+  local a=$1 n=$2 deadline=$((SECONDS + 40)) wait_ms
+  if [ "$(holder "t/$a")" = "$n" ]; then
+    req GET "$n" "/actor/t/$a/fired"
+    [ "$RNODE" != "$n" ] || return 0
+  fi
+  wait_ms=$(( ${moved_at[$a]:-0} + 1100 - $(now_ms) ))
+  [ "$wait_ms" -le 0 ] || sleep "$(awk -v ms="$wait_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+  moved_at[$a]=$(now_ms)
+  new actor move --app "$APP" --bucket "$BUCKET" "t/$a" --to "$n" > "$run/move.txt" 2>&1 || true
   while [ $SECONDS -lt $deadline ]; do
     req GET "$n" "/actor/t/$a/fired"
     [ "$RNODE" = "$n" ] && return 0
     sleep 1
   done
-  fail "t/$a is not on $n after a move (answered by '${RNODE}', $RS)"
+  fail "t/$a is not on $n after a move (answered by '${RNODE}', $RS; held by $(holder "t/$a"); the move said: $(tr '\n' ' ' < "$run/move.txt" | cut -c1-300))"
   return 1
 }
 pin() { pin_actor "at-$1" "$1"; }
@@ -1101,6 +1174,26 @@ gated_refused() { # gated_refused NAME
     fail "a deploy with apart-from and spread on a cluster of $(versions): exit $RC, current '$before' -> '$after': $OUT"
   fi
 }
+# The per-actor lease markers `cluster verify` counts in the app.
+markers_left() {
+  (new cluster verify --bucket "$BUCKET" --app "$APP" --json 2>/dev/null || true) \
+    | jq -r '.apps[0].lease_markers' 2>/dev/null || true
+}
+# The gate of 0.10 (ADR 0045, section 4): `cluster markers clean`, which
+# must be refused, naming the floor and `cluster upgrade finalize`, and
+# remove no marker: its message in OUT.
+markers_refused() { # markers_refused NAME
+  local before after
+  before=$(markers_left)
+  run_cli "$1" new cluster markers clean --bucket "$BUCKET" --app "$APP" --yes
+  after=$(markers_left)
+  if [ "$RC" != 0 ] && [[ $before =~ ^[1-9][0-9]*$ ]] && [ "$after" = "$before" ] \
+    && [[ $OUT == *"upgrade floor is $old_minor"* ]] && [[ $OUT == *"cluster upgrade finalize"* ]]; then
+    pass "cluster markers clean is refused on a cluster of $(versions), naming the floor $old_minor and \`cluster upgrade finalize\`; $after markers left: $OUT"
+  else
+    fail "cluster markers clean on a cluster of $(versions): exit $RC, markers '$before' -> '$after' (want refused on the floor $old_minor, none removed): $OUT"
+  fi
+}
 # feed/NAME then fan/NAME, each woken by a request through node R: where
 # each ran, in FEED_ON and FAN_ON.
 pair_wake() { # pair_wake NAME R
@@ -1251,6 +1344,42 @@ old_node_returns() { # old_node_returns WHEN REASON (floor or manifest) [BINARY]
   start_node c "$new_bin"
   if wait_ready c 150; then pass "node c (new) ready $((SECONDS - t0))s after its start"; fi
   wait_state c serving 60 || true
+}
+
+# ---------------------------------------------------------------- node leases by hand
+# A node lease or heartbeat body (format 3) of node ID, as a node writes
+# it: STATE (live, released), its written_at in ms, VERSION and APP.
+lease_body() { # lease_body ID STATE WRITTEN_AT_MS VERSION APP
+  printf 'wasmkeep-node 3\n%s %s\n%s\n%s\nhttp://127.0.0.1:9\n%s\n%s\n\n\nserving\n\ntake\n' \
+    "$2" "$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')" "$3" "$1" "$4" "$5"
+}
+put_lease() { # put_lease ID STATE WRITTEN_AT_MS VERSION APP
+  lease_body "$@" | s3 "nodes/$1" -X PUT --data-binary @- >/dev/null
+}
+del_obj() { s3 "$1" -X DELETE >/dev/null || true; }
+now_ms() { date +%s%3N; }
+
+# ---------------------------------------------------------------- the side app
+# Node d serves SIDE_APP alone, on the ports above: the skew check of a
+# starting node, and the finalize with no live node, with real binaries.
+SIDE_APP=mv/side
+start_side() { # start_side BINARY
+  local b=$1
+  mkdir -p "$run/d/data" "$run/d/cache"; chmod 700 "$run/d" "$run/d/data" "$run/d/cache"
+  echo "=== $(date -u +%T) start $(label "$b") ($("$b" --version))" >> "$run/d.log"
+  "$b" serve --app "$SIDE_APP" --bucket "$BUCKET" --node-id d \
+    --data-dir "$run/d/data" --cache-dir "$run/d/cache" \
+    --listen "127.0.0.1:${port[d]}" --advertise "http://127.0.0.1:${port[d]}" \
+    --cluster-listen "127.0.0.1:${cport[d]}" --cluster-advertise "https://127.0.0.1:${cport[d]}" \
+    --metrics-listen "127.0.0.1:${mport[d]}" --idle-timeout-secs "$idle_secs" \
+    --env "t=$run/etc/t.env" --secrets-key "$run/etc/secrets.key" \
+    >> "$run/d.log" 2>&1 &
+  pid[d]=$!; bin[d]=$b
+}
+# The side app's upgrade, as `cluster upgrade status` reads it: "STATE|FLOOR IN FORCE".
+side_state() {
+  new cluster upgrade status --bucket "$BUCKET" --app "$SIDE_APP" --json 2>/dev/null \
+    | jq -r '.apps[0] | "\(.state)|\(.floor_in_force)"' 2>/dev/null
 }
 
 # ---------------------------------------------------------------- 0. all old
@@ -1447,6 +1576,40 @@ apart_sent c
 apart_refused c a
 check_placement
 
+if minor_ge "$new_minor" 0.10; then
+  # ADR 0020, amendment of 2026-11-27: the lowest-id live node of the app,
+  # a (new), removes a released node lease a day after its release, once
+  # the app is finalized at 0.9 (it was born there) and no live node is
+  # older than 0.9: here beside a node of $old_short. A lease released two
+  # days ago, of a node z that no record names, must go, with the steps
+  # of `cluster forget` (its mark, then its delete).
+  begin lease-removal
+  removed_before=$(metric a wasmkeep_node_lease_removals_total 'outcome="removed"')
+  put_lease z released $(( $(now_ms) - 2 * 86400000 )) "$old_label" "$APP" \
+    || fail "writing a released lease for z to moto failed"
+  # The control: y, released a minute ago, stays (removed by hand after).
+  put_lease y released $(( $(now_ms) - 60000 )) "$old_label" "$APP" \
+    || fail "writing a released lease for y to moto failed"
+  [[ $(s3obj nodes/y) == "wasmkeep-node 3"$'\n'"released "* ]] || fail "y's lease reads back as '$(s3obj nodes/y | head -2 | tr '\n' ' ')'"
+  deadline=$((SECONDS + 90)); gone=0
+  while [ $SECONDS -lt $deadline ]; do
+    [ -n "$(s3obj nodes/z)" ] || { gone=1; break; }
+    sleep 1
+  done
+  removed_after=$(metric a wasmkeep_node_lease_removals_total 'outcome="removed"')
+  if [ $gone = 1 ] && [ "$removed_after" -gt "$removed_before" ]; then
+    pass "a removed z's lease, released two days before, on a cluster of $(versions) (a's removals: $removed_before -> $removed_after)"
+  else
+    fail "z's released lease on a cluster of $(versions): $( [ $gone = 1 ] && echo gone || echo 'still there after 90 s'), a's removals $removed_before -> $removed_after; outcomes: $(curl -s "http://127.0.0.1:${mport[a]}/metrics" | grep '^wasmkeep_node_lease_removals_total' | tr '\n' ' ')"
+  fi
+  del_obj nodes/z
+  if [[ $(s3obj nodes/y) == "wasmkeep-node 3"$'\n'"released "* ]]; then pass "y's lease, released a minute before, is kept"
+  else fail "y's lease, released a minute before: '$(s3obj nodes/y | head -2 | tr '\n' ' ')'"; fi
+  del_obj nodes/y
+  note "a's lease removal: $(curl -s "http://127.0.0.1:${mport[a]}/metrics" | grep '^wasmkeep_node_lease_removals_total' | tr '\n' ' ')"
+  check_status
+fi
+
 if [ $gated = 1 ]; then
   # ---------------------------------------------------------------- the gate, one old node live
   # a and b new, c on the old release: nothing behind the floor is written.
@@ -1462,12 +1625,19 @@ if [ $gated = 1 ]; then
   note "the plan of the project file's first deploy: $(grep -v '^ *$' "$run/deploy-file-plain.txt" | head -12 | tr '\n' '|' | cut -c1-600)"
   sleep 8
   check_counter
-  gated_refused deploy-keys-mixed
   gate_names=""
-  case $OUT in *"c ($old_label"*) gate_names="the deploy's refusal" ;; esac
-  if [[ $OUT == *"needs every node at $new_minor"* ]] && [[ $OUT == *"upgrade floor is $old_minor"* ]]; then
-    pass "the refusal is the floor's: the format needs every node at $new_minor, and the floor is $old_minor"
-  else fail "the refusal is not the floor's (needs every node at $new_minor, upgrade floor is $old_minor): $OUT"; fi
+  if [ $gate_manifest = 1 ]; then
+    gated_refused deploy-keys-mixed
+    case $OUT in *"c ($old_label"*) gate_names="the deploy's refusal" ;; esac
+    if [[ $OUT == *"needs every node at $new_minor"* ]] && [[ $OUT == *"upgrade floor is $old_minor"* ]]; then
+      pass "the refusal is the floor's: the format needs every node at $new_minor, and the floor is $old_minor"
+    else fail "the refusal is not the floor's (needs every node at $new_minor, upgrade floor is $old_minor): $OUT"; fi
+  else
+    # Every actor created so far has its marker, beside a node that
+    # writes and reads them.
+    markers_refused markers-clean-mixed
+    case $OUT in *"c ($old_label"*) gate_names="the refusal of \`cluster markers clean\`" ;; esac
+  fi
   # What the refusal sends the operator to: refused too, naming the node.
   run_cli finalize-mixed new cluster upgrade finalize --bucket "$BUCKET" --app "$APP" --yes
   if [ "$RC" != 0 ] && [[ $OUT == *"c ($old_label"* ]]; then
@@ -1598,11 +1768,15 @@ if [ $gated = 1 ]; then
   up=$(upgrade_state)
   if [[ $up == "finalize pending|$old_minor|"* ]]; then pass "cluster upgrade status: finalize pending, floor $old_minor ($up)"
   else fail "cluster upgrade status with every node new: '$up' (want finalize pending, floor $old_minor)"; fi
-  gated_refused deploy-keys-unfinalized
-  if [[ $OUT == *"needs every node at $new_minor"* ]] && [[ $OUT == *"upgrade floor is $old_minor"* ]] \
-    && [[ $OUT == *"cluster upgrade finalize"* ]]; then
-    pass "with every node new the refusal names the floor ($old_minor) and \`cluster upgrade finalize\`"
-  else fail "with every node new the refusal does not name the floor $old_minor and finalize: $OUT"; fi
+  if [ $gate_manifest = 1 ]; then
+    gated_refused deploy-keys-unfinalized
+    if [[ $OUT == *"needs every node at $new_minor"* ]] && [[ $OUT == *"upgrade floor is $old_minor"* ]] \
+      && [[ $OUT == *"cluster upgrade finalize"* ]]; then
+      pass "with every node new the refusal names the floor ($old_minor) and \`cluster upgrade finalize\`"
+    else fail "with every node new the refusal does not name the floor $old_minor and finalize: $OUT"; fi
+  else
+    markers_refused markers-clean-unfinalized
+  fi
   # Without the keys a fan wakes beside its feed: the control of what the
   # keys change.
   beside=""
@@ -1641,7 +1815,7 @@ if [ $gated = 1 ]; then
     if pin_actor gf-after a && [ -z "$(marker_of gf-after)" ]; then pass "t/gf-after, created by a after the finalize, has no marker"
     else fail "t/gf-after, created after the finalize: marker '$(marker_of gf-after)'"; fi
     # A restore's marker, the only carrier of its actor's generation.
-    curl -sf -X PUT --data-binary $'wasmkeep-lease 2\n41\n' "http://127.0.0.1:$moto_port/mixed-version/state/$APP/leases/t/gf-seeded" >/dev/null \
+    s3 "state/$APP/leases/t/gf-seeded" -X PUT --data-binary $'wasmkeep-lease 2\n41\n' >/dev/null \
       || fail "writing a restore's marker for t/gf-seeded to moto failed"
     run_cli markers-clean new cluster markers clean --bucket "$BUCKET" --app "$APP" --yes
     if [ "$RC" = 0 ] && [ -z "$(marker_of gf-seeded)" ] && [ -z "$(marker_of gf-new)" ]; then pass "cluster markers clean (exit 0): $OUT"
@@ -1653,6 +1827,9 @@ if [ $gated = 1 ]; then
     else fail "t/gf-seeded after the cleanup: generation '$(owner_gen gf-seeded)', not above 41"; fi
     check_all
     retries
+  elif [ $genfloor = 1 ]; then
+    begin genfloor-after-finalize
+    fail "the generation floor's checks after the finalize were not run: the upgrade was not finalized"
   fi
 
   # The floor is raised and nothing behind it is written yet: a node of the
@@ -1663,8 +1840,11 @@ if [ $gated = 1 ]; then
   check_all
   retries
 
+  # Manifest 8 after the finalize: gated until now beside v0.8.1; beside
+  # v0.9.x a format of the floor already in force, deployed here on the
+  # finalized cluster so that the older release below meets it.
   phase=gate
-  begin gated-deploy
+  if [ $gate_manifest = 1 ]; then begin gated-deploy; else begin deploy-keys; fi
   gated=0
   before=$(current)
   run_cli deploy-keys new deploy --project "$run/project/keys" --bucket "$BUCKET" --yes
@@ -1692,12 +1872,17 @@ if [ $gated = 1 ]; then
 
   # ---------------------------------------------------------------- the returning old node, again
   # The gated format is written: the same, on a manifest it cannot read.
+  # A node of v0.9.x reads manifest 8, and was shown above to stop on the
+  # floor: nothing it cannot read is written by 0.10.
   phase=old-node
-  begin "returning-$old_short-format"
-  old_node_returns "after the gated deploy" manifest
-  check_all
-  retries
-  # ADR 0043, section 8, 4, second half: a release that reads no floor.
+  if [ $gate_manifest = 1 ]; then
+    begin "returning-$old_short-format"
+    old_node_returns "after the gated deploy" manifest
+    check_all
+    retries
+  fi
+  # ADR 0043, section 8, 4, second half: a release that reads no floor
+  # (0.8.0), or two minor versions below the new side (0.8.1).
   if [ -n "$older_bin" ]; then
     begin "returning-$older_short-format"
     old_node_returns "after the gated deploy" manifest "$older_bin"
@@ -1748,8 +1933,29 @@ if [ $gated = 1 ]; then
   # removed or rewritten, and what it leaves is at most the `started` record
   # of the run it gave up (0.8.1 writes it before it reads the last run's
   # format), which the new CLI reads past.
+  # From v0.9.x the app was born with a floor, so every run of both
+  # archives is of format 2 already, which the old CLI reads: its run into
+  # the new CLI's archive, now carrying the floor of the new minor
+  # version, works or is refused with the floor's message and completes
+  # nothing, and the new CLI adds a run after it.
   backup_by new new backup-new-finalized
-  if [ "$RC" = 0 ] && grep -q 'backup format 2' "$run/backup-new-finalized.txt"; then
+  if [ $gate_manifest = 0 ]; then
+    if [ "$RC" = 0 ]; then pass "new CLI backup create after the finalize: $(tail -n 1 "$run/backup-new-finalized.txt")"
+    else fail "new CLI backup create after the finalize: exit $RC: $OUT"; fi
+    archive_list new "$run/archive-new-before.txt"
+    backup_by old new backup-old-floor
+    archive_list new "$run/archive-new-after.txt"
+    archive_diff "$run/archive-new-before.txt" "$run/archive-new-after.txt"
+    if old_cli_refused "backup create (the new CLI's archive)" "$older_cli"; then
+      if [ "$GONE" = 0 ] && [ "$COMPLETED" = 0 ]; then pass "the refused backup completed no run in that archive and touched nothing there"
+      else fail "the refused backup left that archive with $GONE objects removed or rewritten, $COMPLETED \`complete\` or \`latest\`"; fi
+    elif [ "$RC" = 0 ] && [ "$COMPLETED" -gt 0 ]; then
+      pass "$old_short CLI backup create into the new CLI's archive, after a run carrying the floor $new_minor: $(tail -n 1 "$run/backup-old-floor.txt")"
+    else fail "$old_short CLI backup create into the new CLI's archive: exit $RC, $COMPLETED \`complete\` or \`latest\` written: $OUT"; fi
+    backup_by new new backup-new-after-old
+    if [ "$RC" = 0 ]; then pass "new CLI backup create into that archive after the $old_short CLI's run: $(tail -n 1 "$run/backup-new-after-old.txt")"
+    else fail "new CLI backup create into that archive after the $old_short CLI's run: exit $RC: $OUT"; fi
+  elif [ "$RC" = 0 ] && grep -q 'backup format 2' "$run/backup-new-finalized.txt"; then
     pass "new CLI backup create after the finalize: a run of backup format 2 in the archive of the mixed run"
     archive_list new "$run/archive-new-before.txt"
     backup_by old new backup-old-format2
@@ -1808,8 +2014,98 @@ if [ $gated = 1 ]; then
   check_room "after the $old_short CLI's commands"
   retries
 
+  # ---------------------------------------------------------------- the skew check, a started node
+  # ADR 0043, section 5: a node of minor version N refuses to start while
+  # a live node of its app runs a version outside N-1 to N+1, writes no
+  # lease, names that node and reports not ready. Node x's heartbeat, two
+  # minor versions below the new side, is written for the side app (and
+  # kept fresh) while node d (new) starts into it.
+  phase=skew
+  begin skew-two-minors
+  # The side app, deployed by the old CLI: a node waits for a first deploy
+  # before its start checks.
+  run_cli side-deploy old deploy --no-project --app "$SIDE_APP" --bucket "$BUCKET" --actor "t=$test_actor"
+  [ "$RC" = 0 ] || fail "$old_short CLI deploy of $SIDE_APP: exit $RC: $OUT"
+  skew_version=${new_minor%.*}.$(( ${new_minor#*.} - 2 )).0
+  ( while :; do put_lease x live "$(now_ms)" "$skew_version" "$SIDE_APP"; sleep 1; done ) &
+  bg_pid=$!
+  sleep 2
+  touch "$run/d.log"; log_from=$(( $(wc -l < "$run/d.log") + 1 ))
+  start_side "$new_bin"
+  t0=$SECONDS; answered=""
+  while [ $((SECONDS - t0)) -lt 40 ]; do
+    code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port[d]}/_wasmkeep/ready" || true)
+    [ "$code" != 200 ] || answered="ready@$((SECONDS - t0))s"
+    kill -0 "${pid[d]}" 2>/dev/null || break
+    sleep 0.5
+  done
+  said=$(tail -n +"$log_from" "$run/d.log" | grep -F "node \`x\` runs \`$skew_version\`" | head -1 | cut -c1-400)
+  if [ -z "$answered" ] && [ -n "$said" ]; then
+    pass "node d (new) beside a live node of $skew_version is never ready, and names it: $said"
+  else
+    fail "node d (new) beside a live node x of $skew_version: ${answered:-never ready}, $( [ -n "$said" ] && echo 'named x' || echo 'x not named'): $(tail -n +"$log_from" "$run/d.log" | tail -n 3 | tr '\n' ' ' | cut -c1-400)"
+  fi
+  if [ -z "$(s3obj nodes/d)" ]; then pass "node d wrote no lease"
+  else fail "node d wrote a lease beside x ($skew_version): $(s3obj nodes/d | head -3 | tr '\n' ' ')"; fi
+  if kill -0 "${pid[d]}" 2>/dev/null; then stop_node d; else wait "${pid[d]}" 2>/dev/null; pid[d]=; fi
+  kill "$bg_pid" 2>/dev/null; wait "$bg_pid" 2>/dev/null; bg_pid=
+  del_obj nodes/x
+  del_obj nodes/d
+
+  # ---------------------------------------------------------------- the finalize with no live node
+  # ADR 0043, section 4 and "Not settled" 10 (from 0.9.2): with every
+  # node of an app stopped, `finalize` is accepted only when every lease
+  # the app's nodes left is released and names the new version or a
+  # later one. The side app runs on node d of $old_short, then of the new
+  # version; each is stopped cleanly before the finalize.
+  phase=gate
+  begin finalize-no-live-node
+  side_ok=1
+  for b in "$old_bin" "$new_bin"; do
+    start_side "$b"
+    # Ready, and no actor woken: no ownership record names d, so that
+    # `cluster forget` may remove its lease at the end.
+    if wait_ready d 90; then pass "node d ($(label "$b")) ready on $SIDE_APP"
+    else side_ok=0; fi
+    stop_node d
+    [ "$(s3obj nodes/d | sed -n 2p | cut -d' ' -f1)" = released ] \
+      || fail "node d's lease after its stop: '$(s3obj nodes/d | head -2 | tr '\n' ' ')' (want released)"
+    if [ "$b" = "$old_bin" ]; then
+      # Released, of $old_short: refused, naming it and the way out.
+      run_cli side-finalize-old new cluster upgrade finalize --bucket "$BUCKET" --app "$SIDE_APP" --yes
+      if [ "$RC" != 0 ] && [[ $OUT == *"no node of this app is live"* ]] && [[ $OUT == *"d ($old_label)"* ]] \
+        && [[ $(side_state) == *"|$old_minor" ]]; then
+        pass "cluster upgrade finalize of $SIDE_APP with its only node stopped on $old_short is refused, naming it (exit $RC): $OUT"
+      else fail "cluster upgrade finalize of $SIDE_APP after a stop on $old_short: exit $RC, then '$(side_state)': $OUT"; fi
+    fi
+  done
+  run_cli side-finalize new cluster upgrade finalize --bucket "$BUCKET" --app "$SIDE_APP" --yes
+  if [ $side_ok = 1 ] && [ "$RC" = 0 ] && [[ $(side_state) == *"|$new_minor" ]]; then
+    pass "cluster upgrade finalize of $SIDE_APP with no node live, its node stopped on the new version (exit 0): $(side_state): $OUT"
+  else fail "cluster upgrade finalize of $SIDE_APP with no node live, after a stop on the new version: exit $RC, then '$(side_state)': $OUT"; fi
+  # Its node of $old_short now stops on the floor.
+  log_from=$(( $(wc -l < "$run/d.log") + 1 ))
+  start_side "$old_bin"; t0=$SECONDS; answered=""
+  while [ $((SECONDS - t0)) -lt 60 ] && kill -0 "${pid[d]}" 2>/dev/null; do
+    code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port[d]}/_wasmkeep/ready" || true)
+    [ "$code" != 200 ] || answered="ready@$((SECONDS - t0))s"
+    sleep 0.5
+  done
+  said=$(tail -n +"$log_from" "$run/d.log" | grep -E 'older than the floor|upgrade was finalized at' | head -1 | cut -c1-300)
+  if [ -z "$answered" ] && [ -n "$said" ] && ! kill -0 "${pid[d]}" 2>/dev/null; then
+    pass "node d ($old_short) started into the finalized $SIDE_APP stops itself on its floor: $said"
+  else fail "node d ($old_short) started into the finalized $SIDE_APP: ${answered:-never ready}, $(tail -n +"$log_from" "$run/d.log" | tail -n 3 | tr '\n' ' ' | cut -c1-300)"; fi
+  if kill -0 "${pid[d]}" 2>/dev/null; then stop_node d; else wait "${pid[d]}" 2>/dev/null; pid[d]=; fi
+  # Its lease goes, so that the cluster lists its three nodes again.
+  sleep 26
+  run_cli side-forget new cluster forget d --bucket "$BUCKET"
+  [ "$RC" = 0 ] || { fail "cluster forget d: exit $RC: $OUT"; del_obj nodes/d; }
+  check_status
+  check_counter
+
 fi
 
+phase=end
 begin end
 # Every alarm armed in the run, read again: still exactly one run each.
 late=0
