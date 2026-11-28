@@ -139,6 +139,22 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
   timeout another whole attempt still lands 2 s before the lease runs out
   ([ADR 0020, amendment of 2026-11-27](docs/adr/0020-one-lease-per-node.md#second-part-same-amendment-the-renewals-budget)).
   A node writes its lease every 2 s instead of every 3 s.
+- **A fence created by `wasmkeep cluster fence` that lands late no
+  longer frees a running node's actors**
+  ([#303](https://github.com/WasmKeep/wasmkeep/issues/303)). Over a
+  missing `nodes/<id>`, the fence was dated by the operator's clock before
+  its create was sent, and a create the bucket client retried could land
+  over a later absence (after a process of that id started over no object,
+  took actors, and had its lease deleted out of band); its old date then
+  freed that process's actors while its lease was valid. The command now
+  gives the create up after 10 s and dates the fence it creates 40 s ahead
+  (that bound plus the 30 s a write given up on may still take to land),
+  so a create lands before its date; the date is moved forward to the
+  bucket's time if that is later, never back. Nodes of 0.9 read these
+  fences by the same rule. A node's actors are free 40 s later after a
+  fence over a missing object (55 s instead of 15 s at the defaults), and
+  a process restarting under that id waits about 42 s
+  ([ADR 0020, amendment of 2026-11-28](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-28-a-created-fence-dated-ahead)).
 - **`wasmkeep actor move` no longer waits for a 30 s timeout.** It made
   its last check on a second runtime while the first still held the
   bucket's pooled connection, and that request waited for object_store's
@@ -185,6 +201,14 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
 
 ### Known limits
 
+- **A fence created over a missing lease and deleted before its date**
+  (out of band) can, under stale reads, give a node's actors two owners:
+  a reader keeps the deleted fence as the newest it read, the node's next
+  process starts over the absence with bodies dated before it, and once
+  the reader stops trusting that fence, a stale older body frees the
+  record. This is narrower than the #303 case it replaces: it needs the
+  fence deleted, a reader that read it, and stale reads
+  ([ADR 0020, amendment of 2026-11-28](docs/adr/0020-one-lease-per-node.md#amendment-of-2026-11-28-a-created-fence-dated-ahead)).
 - **An operator's move can end on a third node.** Between the owner's
   release and the target's take, an event landing on another node wakes
   the actor there (for a spread actor with rebalancing on, at its home;

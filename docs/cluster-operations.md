@@ -338,7 +338,8 @@ Two commands act on a node's lease, and both are described with the
 lease itself, under [How it works](cluster.md#how-it-works):
 
 - `wasmkeep cluster fence <node>` writes a fence over the lease of a node
-  that is gone or cut off, so that its actors are free 15 s later. It is
+  that is gone or cut off, so that its actors are free 15 s later (55 s
+  when its lease object is missing and the fence is created). It is
   also what `cluster upgrade finalize` asks for when an older node's
   lease is stale without a release.
 - `wasmkeep cluster forget <node>` removes the lease a node left when it

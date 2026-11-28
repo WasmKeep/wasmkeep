@@ -1742,7 +1742,14 @@ mod tests {
         assert!(report.to_text().contains(&format!("warning: {}", lines[0])));
         let bucket = ObjectStoreBucket::new(Arc::clone(&store), "");
         assert_eq!(
-            block_on(operator_fence(&bucket, &Wall, "nodes/b")),
+            block_on(operator_fence(
+                &bucket,
+                &Wall,
+                "nodes/b",
+                wasmkeep_cluster::node_lease::FenceCreate::by_client(
+                    wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS
+                )
+            )),
             Ok(OperatorFence::Forgotten)
         );
         let done = block_on(forget_on(&store, "", "b", NOW)).unwrap();

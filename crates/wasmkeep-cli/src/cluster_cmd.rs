@@ -266,7 +266,9 @@ pub(super) fn drain_asked(node: &str) -> String {
 
 /// `wasmkeep cluster fence` (ADR 0020, section 2).
 pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
-    use wasmkeep_cluster::node_lease::{OperatorFence, operator_fence};
+    use wasmkeep_cluster::node_lease::{
+        FenceCreate, OPERATOR_FENCE_BOUND_MS, OperatorFence, operator_fence,
+    };
     wasmkeep_cluster::membership::validate_node_id(&args.node)
         .map_err(|e| anyhow::anyhow!("invalid node id {:?}: {e}", args.node))?;
     let (store, prefix) = open_bucket(&args.bucket)?;
@@ -276,9 +278,20 @@ pub(super) fn cluster_fence(args: &NodeArgs) -> anyhow::Result<()> {
         .build()?;
     let lease = wasmkeep_server::LeaseConfig::default_safe();
     let key = format!("nodes/{}", args.node);
+    // A create is given up after its bound, so that one still in flight
+    // lands before the date it carries; a fence over the lease waits for
+    // the client (ADR 0020, amendment of 2026-11-28).
+    let create = FenceCreate::bounded(OPERATOR_FENCE_BOUND_MS, |ms| {
+        tokio::time::sleep(std::time::Duration::from_millis(ms))
+    });
     let mut outcome = rt
-        .block_on(operator_fence(&bucket, &status::Wall, &key))
-        .map_err(|e| anyhow::anyhow!("fencing {}: {e:?}", args.node))?;
+        .block_on(operator_fence(&bucket, &status::Wall, &key, create))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "fencing {}: {e:?} (a fence may have been written; run this command again)",
+                args.node
+            )
+        })?;
     if let Some(warning) = rt.block_on(date_by_bucket(&bucket, &key, &lease, &mut outcome))? {
         eprintln!("warning: {warning}");
     }
@@ -350,7 +363,9 @@ async fn date_by_bucket(
     outcome: &mut wasmkeep_cluster::node_lease::OperatorFence,
 ) -> anyhow::Result<Option<String>> {
     use wasmkeep_cluster::lease::Bucket as _;
-    use wasmkeep_cluster::node_lease::{NodeLeaseObject, NodeState, OperatorFence, created_fence};
+    use wasmkeep_cluster::node_lease::{
+        CREATED_FENCE_AHEAD_MS, NodeLeaseObject, NodeState, OperatorFence, created_fence,
+    };
     let (written_at_ms, created) = match outcome {
         OperatorFence::Fenced {
             written_at_ms,
@@ -383,27 +398,35 @@ async fn date_by_bucket(
         .ok_or_else(|| anyhow::anyhow!("the fence vanished right after it was read"))?;
     let bucket_ms = modified + 1_000 + lease.max_skew_ms();
     let mut warning = None;
-    if bucket_ms > *written_at_ms {
-        if created && bucket_ms - *written_at_ms > 1_000 + 2 * lease.max_skew_ms() {
+    // This run's create is dated ahead of this machine's clock on purpose
+    // (`CREATED_FENCE_AHEAD_MS`): the clock is judged by the time it read.
+    if created {
+        let read = written_at_ms.saturating_sub(CREATED_FENCE_AHEAD_MS);
+        if bucket_ms > read && bucket_ms - read > 1_000 + 2 * lease.max_skew_ms() {
             warning = Some(format!(
-                "this machine's clock is {:.1} s behind the bucket's; the fence uses the bucket's time",
-                (bucket_ms - *written_at_ms) as f64 / 1000.0
+                "this machine's clock is {:.1} s behind the bucket's; the fence is dated no \
+                 earlier than the bucket's time",
+                (bucket_ms - read) as f64 / 1000.0
+            ));
+        } else if read > bucket_ms {
+            // Dated further ahead: the node's next process writes its first
+            // lease body only once the fence is twice the skew old on its
+            // clock.
+            warning = Some(format!(
+                "this machine's clock is {:.1} s ahead of the bucket's; the node can start again \
+                 only once the fence's date has passed on its clock",
+                (read - modified) as f64 / 1000.0
             ));
         }
-        if wasmkeep_cluster::node_lease::raise_created_fence(bucket, key, bucket_ms)
+    }
+    // Moved forward only, never back: a reader that read the date may be
+    // served it again later.
+    if bucket_ms > *written_at_ms
+        && wasmkeep_cluster::node_lease::raise_created_fence(bucket, key, bucket_ms)
             .await
             .map_err(|e| anyhow::anyhow!("moving the fence to the bucket's time: {e:?}"))?
-        {
-            *written_at_ms = bucket_ms;
-        }
-    } else if created && *written_at_ms > bucket_ms {
-        // Dated ahead: the node's next process writes its first lease body
-        // only once the fence is twice the skew old on its clock.
-        warning = Some(format!(
-            "this machine's clock is {:.1} s ahead of the bucket's; the node can start again only \
-             once the fence's date has passed on its clock",
-            (*written_at_ms - modified) as f64 / 1000.0
-        ));
+    {
+        *written_at_ms = bucket_ms;
     }
     Ok(warning)
 }
