@@ -91,7 +91,8 @@ use wasmkeep_cluster::node_lease::{
 use wasmkeep_sim::check::{double_ownership, stop_process};
 use wasmkeep_sim::driver::{Claim, Env, SkewedClock};
 use wasmkeep_sim::node::{
-    Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, take_fences, take_old_epoch_acts,
+    Breaks, Held, LeaseNode, NodeBuckets, NodeSetup, UNRESOLVED_WAIT_MS, take_fences,
+    take_old_epoch_acts,
 };
 use wasmkeep_sim::rng::Rng;
 
@@ -197,6 +198,11 @@ enum Variant {
     /// The hot operator's stale reads, with a read that finds a lease
     /// absent leaving the unpin window running (the rule before).
     StaleAbsentKeepsWindow,
+    /// The hot operator's stale reads, with its created fences dated by
+    /// its clock when sent, not ahead (the rule before ADR 0020's
+    /// amendment of 2026-11-28): a create that lands late, over a later
+    /// absence, frees the records of a process that started meanwhile.
+    StaleFenceDatedNow,
     /// The correct rules, with rebalance moves and cold takes (ADR 0040,
     /// section 14).
     Moves,
@@ -239,6 +245,7 @@ impl Variant {
                 | Self::StaleHotOperator
                 | Self::StaleFenceByDate
                 | Self::StaleAbsentKeepsWindow
+                | Self::StaleFenceDatedNow
         )
     }
 
@@ -247,8 +254,25 @@ impl Variant {
     fn hot_operator(self) -> bool {
         matches!(
             self,
-            Self::StaleHotOperator | Self::StaleFenceByDate | Self::StaleAbsentKeepsWindow
+            Self::StaleHotOperator
+                | Self::StaleFenceByDate
+                | Self::StaleAbsentKeepsWindow
+                | Self::StaleFenceDatedNow
         )
+    }
+
+    /// How far ahead the operator dates a fence it creates: as long as a
+    /// create may take to land after its send (the client gives up after
+    /// `ATTEMPT_MS`, and the bucket applies a slow one up to 2.5 s after it
+    /// arrives; `UNRESOLVED_WAIT_MS` covers both). Not at all where the
+    /// variant needs a fence dated when sent: the broken one, and the
+    /// window of a created fence, which only such a fence (an older
+    /// command's) can fall inside.
+    fn fence_ahead_ms(self) -> u64 {
+        match self {
+            Self::StaleFenceDatedNow | Self::StaleFenceByDate => 0,
+            _ => UNRESOLVED_WAIT_MS,
+        }
     }
 
     fn read_fault(self) -> ReadFault {
@@ -1172,7 +1196,13 @@ fn simulate_with(seed: u64, variant: Variant, duration: Duration, scenario: bool
                             let _ = bucket.delete(&key).await;
                             shared_op.lock().unwrap().deletions += 1;
                         }
-                        let _ = operator_fence(&bucket, &clock, &key).await;
+                        // Dated ahead (`Variant::fence_ahead_ms`). The
+                        // client's own timeout bounds the call, so it is not
+                        // given up here.
+                        let ahead = variant.fence_ahead_ms();
+                        let _ =
+                            operator_fence(&bucket, &clock, &key, ahead, std::future::pending())
+                                .await;
                     }
                 }
             })
@@ -1640,8 +1670,14 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     let (mut acquired, mut deletions) = (0, 0);
     // `WASMKEEP_SIM_SEED` runs that one seed's checks alone (no floor).
     let only = only_seed();
-    for seed in only.map_or(0..seeds(), |s| s..s + 1) {
-        if OUT_OF_BAND_DELETE.contains(&seed) {
+    // The seeds that showed a created fence landing late first.
+    let all = KNOWN_LATE_FENCE.iter().copied().chain(0..seeds());
+    let run: Box<dyn Iterator<Item = u64>> = match only {
+        Some(s) => Box::new(s..s + 1),
+        None => Box::new(all),
+    };
+    for seed in run {
+        if FENCE_DELETED_BEFORE_ITS_DATE.contains(&seed) {
             continue;
         }
         let o = simulate(seed, Variant::StaleHotOperator, Duration::from_secs(30));
@@ -1666,25 +1702,48 @@ fn stale_lease_reads_with_a_hot_operator_never_free_a_held_record() {
     assert!(acquired >= floor, "{acquired} acquisitions after a fence");
 }
 
-/// Seeds where the hot operator reaches the limit ADR 0020 keeps for a
-/// live lease deleted out of band ("What it does not close", #303): the
-/// operator deletes a running process's live lease, and a fence it created
-/// earlier, whose create had timed out, lands after that delete with its
-/// old date and frees the record that process holds. Two owners with the
-/// correct rules; skipped by the run above, and checked to still fail
-/// below, so a fix of #303 shows here.
-const OUT_OF_BAND_DELETE: [u64; 2] = [87_854, 127_417];
+/// Seeds where the hot operator deletes a running process's live lease,
+/// and a fence it created earlier, whose create had timed out, lands after
+/// that delete (ADR 0020, amendment of 2026-11-28). Dated by the
+/// operator's clock when sent, it freed the record that process holds
+/// (two owners, #303); dated ahead, it frees nothing early.
+const KNOWN_LATE_FENCE: [u64; 2] = [87_854, 127_417];
 
-/// The known seeds of the out-of-band-delete limit still give two owners
-/// with the correct rules: the limit is documented, not closed.
+/// Seeds where the hot operator reaches the limit ADR 0020 keeps for a
+/// created fence deleted out of band before its date (amendment of
+/// 2026-11-28, "What it does not close"): a delete the bucket applied late
+/// removes a fence dated ahead that a reader holds as its newest; the node
+/// starts over the absence, its bodies dated before that fence, so older
+/// to that reader; once the reader's unpin window has passed on behind
+/// reads, a stale older fence replaces the newest and frees the record the
+/// node holds. Two owners with the correct rules; skipped above, and
+/// checked to still fail below. One seed in the first 130,000, where the
+/// fence dated when sent gave two (`KNOWN_LATE_FENCE`).
+const FENCE_DELETED_BEFORE_ITS_DATE: [u64; 1] = [62_397];
+
+/// The known seeds of the deleted-fence limit still give two owners with
+/// the correct rules: the limit is documented, not closed.
 #[test]
-fn the_out_of_band_delete_limit_is_reached_on_its_known_seeds() {
-    for seed in OUT_OF_BAND_DELETE {
+fn a_fence_deleted_before_its_date_is_reached_on_its_known_seeds() {
+    for seed in FENCE_DELETED_BEFORE_ITS_DATE {
         assert!(
             caught_by(seed, Variant::StaleHotOperator),
-            "seed {seed} no longer reaches the out-of-band-delete limit: drop it from the skips"
+            "seed {seed} no longer reaches the deleted-fence limit: drop it from the skips"
         );
     }
+}
+
+/// A created fence dated when sent, not ahead, under the hot operator's
+/// stale reads, is caught: on the seeds that showed it first, then on any
+/// seed below `WASMKEEP_SIM_SEEDS`.
+#[test]
+fn a_created_fence_dated_when_sent_is_caught() {
+    let caught = first_caught(Variant::StaleFenceDatedNow, &KNOWN_LATE_FENCE);
+    eprintln!("created fence dated when sent: caught by seed {caught:?}");
+    assert!(
+        caught.is_some(),
+        "a created fence dated when sent was never caught"
+    );
 }
 
 /// The first seed of `variant` with two owners or one generation for two
@@ -1738,7 +1797,7 @@ fn an_absent_read_keeping_the_window_is_caught() {
 }
 
 /// A seed where [`Variant::StaleAbsentKeepsWindow`] gives two owners.
-const KNOWN_ABSENT: u64 = 128_996;
+const KNOWN_ABSENT: u64 = 73_281;
 
 /// Whether `seed` under `variant` gives two owners or one generation for
 /// two holds.

@@ -271,8 +271,8 @@ async fn a_first_ownership_record_goes_above_every_generation_used() {
 
 /// ADR 0020, section 2: with the heartbeat object gone (deleted, the
 /// machine lost), `wasmkeep cluster fence` writes a fence at the operator's
-/// clock; the actors its node held are free ttl plus grace (1.2 s here)
-/// later.
+/// clock dated ahead (1 s here); the actors its node held are free ttl plus
+/// grace (1.2 s here) after that date.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fence_over_a_deleted_heartbeat_frees_its_actors() {
     use object_store::ObjectStoreExt as _;
@@ -315,9 +315,16 @@ async fn a_fence_over_a_deleted_heartbeat_frees_its_actors() {
 
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(&store), "");
     let fenced_at = std::time::Instant::now();
-    let fenced = wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
-        .await
-        .unwrap();
+    // Dated 1 s ahead (scaled down from `CREATED_FENCE_AHEAD_MS`).
+    let fenced = wasmkeep_cluster::node_lease::operator_fence(
+        &bucket,
+        &WallClock,
+        "nodes/a",
+        1_000,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             fenced,
@@ -339,8 +346,8 @@ async fn a_fence_over_a_deleted_heartbeat_frees_its_actors() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        fenced_at.elapsed() >= Duration::from_millis(1_100),
-        "freed before ttl plus grace: {:?}",
+        fenced_at.elapsed() >= Duration::from_millis(2_100),
+        "freed before its date plus ttl and grace: {:?}",
         fenced_at.elapsed()
     );
 }
@@ -576,9 +583,15 @@ async fn a_fenced_node_stops_serving_its_actors() {
     let key = object_store::path::Path::from("nodes/a");
     // As `wasmkeep cluster fence a` does.
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(&store), "");
-    let fenced = wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
-        .await
-        .unwrap();
+    let fenced = wasmkeep_cluster::node_lease::operator_fence(
+        &bucket,
+        &WallClock,
+        "nodes/a",
+        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(
             fenced,

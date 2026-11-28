@@ -280,9 +280,12 @@ for unknown names), `existing:NAME,...`, or `internal` (actors only).
   and the cluster secret (`cluster/secret`) if it may have been read.
   Deleting the heartbeat does not revoke cleanly: the node stops too, but
   its actors stay held until a fence or a new process with its id. With no
-  heartbeat object, the fence `cluster fence` creates is dated by the
-  bucket's own time for that write, never earlier than the operator's
-  clock (a clock running behind would free the actors too early). A peer stops being trusted
+  heartbeat object, the fence `cluster fence` creates is dated 40 s ahead
+  of the operator's clock, so that a create the bucket client retried and
+  that lands late cannot free the actors of a process started meanwhile,
+  and moved to the bucket's own time for that write if that is later (a
+  clock running behind would free the actors too early): the actors are
+  free about 55 s after the command. A peer stops being trusted
   once its heartbeat is fenced or released, deleted, names a new key, or
   expires (its ttl, three heartbeat periods, plus the
   allowed clock skew); a node that cannot list the heartbeats trusts each

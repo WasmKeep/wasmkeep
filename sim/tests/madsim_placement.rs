@@ -622,9 +622,16 @@ fn one_hop_one_holder_residents_stay_and_a_failed_node_returns() {
             });
             sleep(Duration::from_millis(1)).await;
             evidence.resident_nodes.remove(&99); // process failure ends acting
-            operator_fence(&bucket, &clock, &format!("nodes/{}", NAMES[dead]))
-                .await
-                .unwrap();
+            // Over the node's lease: kept as it is, so no date ahead.
+            operator_fence(
+                &bucket,
+                &clock,
+                &format!("nodes/{}", NAMES[dead]),
+                0,
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
             sleep(Duration::from_millis(10_001)).await;
             leases[1].renew().await.unwrap();
             let takeover = owners[1]

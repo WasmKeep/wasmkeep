@@ -76,6 +76,14 @@
   a quarter of `ttl - safety` apart and as long, so one that times out
   leaves room for another whole one. See "Amendment of 2026-11-27:
   released leases removed by the live nodes" at the end.
+- Amended 2026-11-28: a fence created over a missing object is dated
+  ahead. `operator_fence` is given up after its bound, and the fence it
+  creates is dated that bound plus the time a write given up on may still
+  take to land after the operator's clock (40 s at the defaults), so a
+  create that lands over a later absence frees nothing early (#303). No
+  reader changes. A fence deleted before its date is a new, narrower
+  limit under stale reads. See "Amendment of 2026-11-28: a created fence dated
+  ahead" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a hold of a batched actor ends only through a barrier, dropped at once (lapse, lost lease, failure) or flushed first (hibernation, park, drain, move, clean stop); a clean stop flushes within its limit and counts what it drops (this record's sections 3 and 4; that record's sections 6 and 10).
 - Date: 2026-11-07
 - Milestone: [M3](../../ROADMAP.md#m3-first-public-release)
@@ -342,11 +350,13 @@ current object (`If-Match` on the version it read, keeping its
 alone keeps it safe; the node exits at its next write, and its actors are
 free ttl plus grace after its last write. When `nodes/<id>` is absent
 (deleted by mistake, the machine gone), the command creates the fence with
-`If-None-Match: *`, its `written_at` set to the operator's clock and no
-instance: records naming that id are free ttl plus grace later, and a
-process still running under it fails its next write and exits (its last
-acknowledged write came before the object vanished, so before the fence's
-`written_at`, within the skew bound). `wasmkeep cluster forget <node>`
+`If-None-Match: *`, no instance, and (since the amendment of 2026-11-28)
+its `written_at` set to the operator's clock plus as long as the create
+may take to land, the command giving it up past that: records naming that
+id are free ttl plus grace after that date, and a process still running
+under it fails its next write and exits (its last acknowledged write came
+before the fence landed, so before the fence's `written_at`, within the
+skew bound, whatever absence the create landed over). `wasmkeep cluster forget <node>`
 deletes a retired old-format heartbeat once it is stale by the start
 guard's test; no record can name it, since a new node using that id would
 have replaced it. After an object was deleted
@@ -1352,6 +1362,9 @@ the record's, and frees it at once: two owners. The simulation found it
 - `cluster fence` dates by the bucket's time every created fence it leaves
   behind: one it created, and one it found already there (`NotLive`), as
   after a create whose reply was lost and whose retry found its own fence.
+  Since the amendment of 2026-11-28 the created fence is dated ahead of
+  the operator's clock, and the bucket's time only ever moves a date
+  forward, never back.
 - Why not ttl plus grace (this amendment's first form): every body written
   after a fence but dated less than the window after it makes a reader keep
   the fence as its newest, and the fence served again frees the record
@@ -1390,32 +1403,23 @@ stale reads, in a cluster that mixes 0.8.0 and this version:
 
 - Deleting a live node's lease out of band (a manual `s3 rm`, a lifecycle
   rule, a sync tool) is outside the guarantee. A created fence that lands
-  late shows why. `operator_fence` dates the fence before it sends the
-  create, and `If-None-Match: *` cannot tell one absence from another.
-  object_store (0.14.2) retries a conditional create after a 5xx for up to
-  180 s. So a create can land over a later absence: after the lease of a
-  process that started over no object and took actors was deleted. Its old
-  date then frees that process's records while its lease is still valid
-  (`node_lease::tests::a_created_fence_landing_late_is_not_closed`: dated
-  100 s, a node started at 108 s, its record taken at 115.5 s with its
-  lease valid until 116 s). `cluster fence` moving any created fence it
-  finds to the bucket's time narrows this to a create that lands after the
-  command has exited. The complete fix is
-  [#303](https://github.com/WasmKeep/wasmkeep/issues/303).
+  late showed why: dated before its create was sent, it could land over a
+  later absence and free a running process's records. The amendment of
+  2026-11-28 closes that for fences created by this version's
+  `operator_fence` (dated ahead); see there for what stays open.
 - Since the amendment of 2026-11-27 an in-band component can delete a
   lease too: the live nodes' removal of released leases, within its limit
   for a delete held by the network (a remover's delete of a mark, sent and
   then held past the mark's age). Composed with one more late write, that
   can give two owners: a held remover delete that removes a running
-  process's live lease, then a held create landing over the absence (a
-  fence created earlier with `operator_fence`, or the first create of an
-  earlier process of the same id), dated before that process's last
-  write, and a taker that reads it inside the victim's validity, before
-  its next renewal finds the lease gone. Each part needs a request held
-  for tens of seconds; the simulation reaches the second half with an
-  operator who deletes live leases (seeds 87854 and 127417 of
-  `madsim_node_lease`, skipped there and checked to still fail). The fix
-  is the same: [#303](https://github.com/WasmKeep/wasmkeep/issues/303).
+  process's live lease, then a held create landing over the absence,
+  dated before that process's last write, and a taker that reads it
+  inside the victim's validity, before its next renewal finds the lease
+  gone. Each part needs a request held for tens of seconds. Since the
+  amendment of 2026-11-28 a fence `operator_fence` created is dated past
+  its landing, so that create frees nothing early; the first create of an
+  earlier process of the same id, landing late, is still open (it names
+  another instance, which can free the victim's records at once).
 - The window tolerates exactly the configured skew. A predecessor whose
   clock ran ahead by more than the skew allowed can date a body past the
   window, and the rule is then the one before it (dates alone) for that
@@ -1947,4 +1951,167 @@ created earlier, whose create had timed out, lands after that delete with
 its old date and frees the record the running process holds. That is the
 limit this record keeps for a live lease deleted out of band ("What it
 does not close", #303), now reached by the simulation; the known seed of
-that variant is 128996, where the correct rules hold.
+that variant is 128996, where the correct rules hold. Since the amendment
+of 2026-11-28 both seeds hold with the correct rules.
+
+## Amendment of 2026-11-28: a created fence dated ahead
+
+`operator_fence` dated a fence it created over a missing `nodes/<id>` by
+the operator's clock, read before it sent the create. `If-None-Match: *`
+cannot tell one absence from another, and `object_store` (0.14.2) retries
+a conditional create after a 5xx for up to 180 s, so a create could land
+over a later absence: after a process of that id started over no object,
+took actors, and had its lease deleted out of band. The free rule then
+trusted the old date, and freed that process's records while its lease
+was valid (#303). `cluster fence` moving a created fence it finds to the
+bucket's time closed only the case it sees, not a create that lands after
+the command has exited.
+
+### The rule
+
+A fence `operator_fence` creates is dated so that it lands, if at all,
+before its date, whatever absence it lands over:
+
+- **Bounded.** The whole call is given up when a timer the caller starts
+  before it ends (`OPERATOR_FENCE_BOUND_MS`, 10 s, for `cluster fence`
+  and `app delete`): a create the bucket client is still retrying is
+  dropped then, and the command fails with an error that says a fence may
+  have been written and to run it again (which finds it, `NotLive`).
+- **Dated ahead.** Its `written_at` is the operator's clock, read right
+  before the create is sent, plus at least as long as that create may take
+  to land: the bound, plus as long as a write given up on may still take
+  to land (`UNRESOLVED_WAIT_MS`, 30 s, as the resolver of an unresolved
+  acquire assumes). `CREATED_FENCE_AHEAD_MS`, 40 s at the defaults.
+- **Never moved back.** `cluster fence` still moves a created fence it
+  leaves behind to the bucket's time plus a second and the skew when that
+  is later (an operator's clock more than 40 s behind), never earlier. Its
+  clock warnings judge the clock the fence was dated from, before the 40 s.
+
+This replaces section 2's "its `written_at` set to the operator's clock"
+and the first bullet of "What it does not close" for those fences. The
+free rule, the ordering of a created fence (`older_than`, its window of
+twice the skew), and the start check are unchanged.
+
+### Why it is safe
+
+A process whose records the fence frees made its last acknowledged write
+before the fence landed (any later write is conditioned on the version the
+fence replaced, or creates over no object, and fails). The fence landed
+before its date, so that write is dated before the fence's `written_at`
+within the skew bound, which is section 2's premise for the time bound:
+the process's validity ended at that write's `written_at + ttl - safety`
+on its own clock, before the reader frees at the fence's
+`written_at + ttl + grace` on its own. A create that lands at once is
+dated 40 s past its landing: safe, only later.
+
+Ordering, while the fence stays: every body written before the fence
+landed is dated before the fence, so older than it, as before (by 40 s
+more). A process starting over the fence writes its first body no earlier
+than the fence's date plus twice the skew (the start check already waits
+out a created fence's date), so its bodies are newer. A fence that is
+deleted before its date is the exception: see "What it does not close".
+
+### Why the date is never moved back
+
+Issue #303 proposed a second step: once the create is confirmed, move its
+date back to the bucket's time with `If-Match` on the created version, so
+the cost falls only on a create that was never confirmed. That is unsafe
+under stale reads, which the amendment on lease reads covers: two created
+fences are ordered by date alone, so a reader that read the fence dated
+ahead keeps it as its newest. Moved back, the fence lets the node's next
+process start up to 40 s earlier, and its bodies are dated before the
+fence the reader holds, so older to it; served the first version again
+once that date is ttl plus grace old, the reader frees the record that
+process holds while its lease is valid
+(`node_lease::tests::a_created_fence_is_never_moved_back`). Only a
+forward move is safe: it never lets a process start sooner than a reader
+expects.
+
+### Why not reader-side dates
+
+Readers judging a created fence by `max(written_at, last-modified + 1 s +
+skew)` would need `Bucket::get` to return the last-modified time, and
+nodes of 0.9 judge `written_at` alone: in a 0.10 cluster with 0.9 nodes
+(ADR 0043, N±1), a 0.9 reader would still free on the old date. Dating
+ahead is a writer change only. A 0.9 node reads the fence by the same
+rules (its `frees`, `older_than` and start check are those of this
+version), so it is covered as soon as the fence is written by this
+version's command.
+
+### Cost
+
+- A node's actors are free 40 s later after a fence over a missing
+  object: 55 s after the command instead of 15 s, at the defaults. A fence
+  over an existing object keeps that object's `written_at`, unchanged.
+- A process restarting under that id over the fence waits until the
+  fence's date plus twice the skew on its clock (44 s after the command at
+  the defaults, instead of the check's own wait).
+- `cluster fence` fails after 10 s against a bucket that keeps answering
+  5xx, where it waited for the client's retries before.
+
+### What it does not close
+
+- A fence created by an earlier version's command (0.9 or before) is
+  dated when sent, as before; run the command of this version.
+- A held create of a node's own first lease (`start` over no object),
+  landing over a later absence, names another instance and can free the
+  running process's records at once (the second bullet of "What it does
+  not close" above). Deleting a live lease out of band stays outside the
+  guarantee.
+- A write given up on that lands more than 30 s later, as everywhere
+  `UNRESOLVED_WAIT_MS` is assumed.
+- **A created fence deleted before its date** (out of band, or by a
+  delete held by the network and applied late), under stale reads. This
+  limit is new with the date ahead. A reader that read the fence keeps it
+  as its newest. The node then starts over the absence, and its start
+  check waits ttl plus grace from that absence, not until the fence's
+  date, so its bodies are dated before the fence and are older to that
+  reader. Once the reader's unpin window (ttl plus grace) has passed on
+  behind reads, the next older body replaces the newest held and is
+  judged as read. If that body is a stale one, for example an older
+  created fence that is ttl plus grace old, it frees the record the node
+  holds. Two owners. It needs an out-of-band delete of the fence, a reader
+  that read the fence before it went, and stale reads. #303 needed the
+  delete of a live lease alone, and two owners followed on a bucket that
+  never serves stale reads. Seed 62397 of `madsim_node_lease` reaches it
+  under the hot operator, whose deletes the simulated bucket sometimes
+  applies late. It is the one seed of the first 130,000 that gives two
+  owners with the correct rules; dated when sent, two seeds did (87854
+  and 127417). The seed is skipped there and checked to still fail. No
+  date chosen by the writer alone avoids both cases. Ordering a fence
+  that vanished needs its date bounded by about ttl plus grace less four
+  times the skew past its landing (7 s at the defaults), while #303 needs
+  at least the bound plus 30 s. A start check that waits out the date of
+  a created fence it read and that then vanished, or a reader that does
+  not unpin onto a body older than one it refused, would narrow it. Both
+  are node changes, and nodes of 0.9 would not have them.
+
+### Tests
+
+- `node_lease::tests::a_created_fence_landing_late_frees_nothing_early`
+  (the deterministic case of #303: sent at 100 s, b started at 108 s, the
+  create landing at 109 s; held at 115.5 s and until the fence's date plus
+  ttl and grace, free after), `a_created_fence_is_never_moved_back` and
+  `an_operator_fence_given_up_is_unavailable`.
+- `tests/cluster/node_leases.rs`:
+  `a_fence_over_a_deleted_heartbeat_frees_its_actors`, dated 1 s ahead
+  at its scaled timings, frees after that date plus ttl and grace.
+- `sim/tests/madsim_node_lease.rs`: the operator dates its created
+  fences ahead by the simulation's `UNRESOLVED_WAIT_MS` (3 s: its client
+  gives up after 300 ms and its bucket applies a slow request up to 2.5 s
+  after it arrives). Seeds 87854 and 127417, which gave two owners under
+  the hot operator, hold and are no longer skipped; they run first in
+  `stale_lease_reads_with_a_hot_operator_never_free_a_held_record`. The
+  broken variant `StaleFenceDatedNow` (the fence dated when sent) is
+  caught on 87854 (`a_created_fence_dated_when_sent_is_caught`).
+  `StaleFenceByDate` keeps fences dated when sent: the window of a created
+  fence matters only for one an older command wrote, since a body written
+  before a fence dated ahead is dated well before it (seed 7548 still
+  shows it). Dated ahead, the timings of `StaleAbsentKeepsWindow` moved:
+  128996 no longer shows it, and its known seed is now 73281, where the
+  correct rules hold (62397 shows it too, but fails with the correct
+  rules, as said above).
+- The same simulation over the first 130,000 seeds, the correct rules
+  under the hot operator: two seeds give two owners with fences dated
+  when sent (87854, 127417), one with fences dated ahead (62397, the
+  limit above: `a_fence_deleted_before_its_date_is_reached_on_its_known_seeds`).

@@ -1430,9 +1430,15 @@ async fn a_fenced_node_lease_counts_its_pending_writes_as_lost_lease() {
     // As `wasmkeep cluster fence a` does.
     let store: Arc<dyn ObjectStore> = p.flaky.clone();
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, "");
-    wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
-        .await
-        .unwrap();
+    wasmkeep_cluster::node_lease::operator_fence(
+        &bucket,
+        &WallClock,
+        "nodes/a",
+        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     let why = tokio::time::timeout(Duration::from_secs(5), p.a.service.node_id_lost())
         .await
         .expect("the fence was never noticed");
@@ -1469,9 +1475,15 @@ async fn a_stop_after_a_fenced_node_lease_counts_its_pending_writes_as_lost_leas
     .await;
     let store: Arc<dyn ObjectStore> = p.flaky.clone();
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(store, "");
-    wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
-        .await
-        .unwrap();
+    wasmkeep_cluster::node_lease::operator_fence(
+        &bucket,
+        &WallClock,
+        "nodes/a",
+        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(5), p.a.service.node_id_lost())
         .await
         .expect("the fence was never noticed");

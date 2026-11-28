@@ -1208,9 +1208,10 @@ pub enum OperatorFence {
     /// Fenced: the node's process stops at its next write, and records
     /// naming it are free once `written_at + ttl + grace` has passed on the
     /// reader's clock. `created` if there was no object (none written by
-    /// any process: `written_at` is the operator's clock).
+    /// any process: `written_at` is the operator's clock, dated ahead).
     Fenced {
-        /// The kept (or, if created, the operator's) `written_at`.
+        /// The kept (or, if created, the operator's, dated ahead)
+        /// `written_at`.
         written_at_ms: u64,
         /// The process the fence names, if any.
         instance: Option<String>,
@@ -1233,22 +1234,75 @@ pub enum OperatorFence {
     Forgotten,
 }
 
+/// How long [`operator_fence`] may take before it is given up, by default
+/// (ms): its caller's timer ([ADR 0020], amendment of 2026-11-28).
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+pub const OPERATOR_FENCE_BOUND_MS: u64 = 10_000;
+
+/// How far ahead of the operator's clock [`operator_fence`] dates a fence it
+/// creates, by default (ms): its bound ([`OPERATOR_FENCE_BOUND_MS`]) plus
+/// as long as a write the bucket client gave up on may still take to land
+/// ([`UNRESOLVED_WAIT_MS`]), 40 s. A create can land over a later absence
+/// than the one it was sent for (`If-None-Match: *` cannot tell them
+/// apart); dated this far ahead, it is dated after every body written
+/// before it lands ([ADR 0020], amendment of 2026-11-28).
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
+pub const CREATED_FENCE_AHEAD_MS: u64 = OPERATOR_FENCE_BOUND_MS + UNRESOLVED_WAIT_MS;
+
 /// An operator's fence of the node lease at `key`, without the watch a peer
 /// needs (the time bound alone keeps it safe): over the current object,
 /// `If-Match` on the version read, keeping its `written_at` and fields; if
-/// the object is absent, created (`If-None-Match: *`) with `written_at` set
-/// to this clock and no instance. A failed condition reads again, a few
-/// times.
+/// the object is absent, created (`If-None-Match: *`) with no instance and
+/// `written_at` set to this clock plus `ahead_ms`. A failed condition reads
+/// again, a few times.
+///
+/// The whole call is given up when `give_up` ends, a timer the caller
+/// starts before the call. `ahead_ms` is at least as long as a create may
+/// take to land after it is sent: until it is given up (by `give_up`, or
+/// by the bucket client itself), plus the time a write given up on may
+/// still take to land. [`CREATED_FENCE_AHEAD_MS`] with a timer of
+/// [`OPERATOR_FENCE_BOUND_MS`] for `object_store`. A create then lands, if
+/// at all, before its date, whatever absence it lands over ([ADR 0020],
+/// amendment of 2026-11-28). The date is never moved back: a reader that
+/// read it may be served it again later.
+///
+/// # Errors
+/// A bucket error, or `Unavailable` once given up: a fence may have been
+/// created, and running the call again finds it (`NotLive`).
+///
+/// [ADR 0020]: ../../../docs/adr/0020-one-lease-per-node.md
 pub async fn operator_fence<B: Bucket, C: Clock>(
     bucket: &B,
     clock: &C,
     key: &str,
+    ahead_ms: u64,
+    give_up: impl std::future::Future<Output = ()>,
+) -> Result<OperatorFence, BucketError> {
+    before(
+        operator_fence_unbounded(bucket, clock, key, ahead_ms),
+        give_up,
+    )
+    .await
+    .unwrap_or_else(|| {
+        Err(BucketError::Unavailable(
+            "the fence was given up; it may have been created".into(),
+        ))
+    })
+}
+
+async fn operator_fence_unbounded<B: Bucket, C: Clock>(
+    bucket: &B,
+    clock: &C,
+    key: &str,
+    ahead_ms: u64,
 ) -> Result<OperatorFence, BucketError> {
     let mut last = BucketError::Conflict;
     for _ in 0..3 {
         let (written, outcome) = match bucket.get(key).await? {
             None => {
-                let at = clock.now_ms();
+                let at = clock.now_ms().saturating_add(ahead_ms);
                 let fence = NodeLeaseObject {
                     state: NodeState::Fenced,
                     instance: None,
@@ -2665,7 +2719,13 @@ mod tests {
         run(lease.start(None)).unwrap();
         t.set(9_000);
         assert_eq!(
-            run(operator_fence(&&mem, &At(&t), "nodes/a")),
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/a",
+                1_000,
+                std::future::pending()
+            )),
             Ok(OperatorFence::Fenced {
                 written_at_ms: 5_000,
                 instance: Some("i1".into()),
@@ -2681,17 +2741,30 @@ mod tests {
         );
         // Again: already fenced, nothing written.
         assert_eq!(
-            run(operator_fence(&&mem, &At(&t), "nodes/a")),
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/a",
+                1_000,
+                std::future::pending()
+            )),
             Ok(OperatorFence::NotLive {
                 state: NodeState::Fenced,
                 written_at_ms: 5_000
             })
         );
-        // Absent: created at the operator's clock, naming no instance.
+        // Absent: created at the operator's clock dated ahead, naming no
+        // instance.
         assert_eq!(
-            run(operator_fence(&&mem, &At(&t), "nodes/b")),
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/b",
+                1_000,
+                std::future::pending()
+            )),
             Ok(OperatorFence::Fenced {
-                written_at_ms: 9_000,
+                written_at_ms: 10_000,
                 instance: None,
                 created: true
             })
@@ -2715,7 +2788,13 @@ mod tests {
         // An old format: refused.
         run((&mem).create("nodes/c", b"wasmkeep-node 2\nc\nhttp://c\n".to_vec())).unwrap();
         assert_eq!(
-            run(operator_fence(&&mem, &At(&t), "nodes/c")),
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/c",
+                1_000,
+                std::future::pending()
+            )),
             Ok(OperatorFence::OldFormat)
         );
     }
@@ -4016,61 +4095,141 @@ mod tests {
         }
     }
 
-    /// What a created fence cannot close (ADR 0020, "What it does not
-    /// close"): a lease deleted out of band while its node runs. An
-    /// operator's create, dated 100 s by `operator_fence` before it is
-    /// sent, is still in flight (a bucket retrying it after a 5xx) when b
-    /// starts at 108 s over no object and takes the actor. Then b's lease is
-    /// deleted, and the create lands: `If-None-Match: *` cannot tell that
-    /// absence from the one it was sent for. At 115.5 s the fence is ttl plus
-    /// grace old, and a takes the record while b's lease is valid until
-    /// 116 s. Dated by the bucket's time once it is seen (as `cluster fence`
-    /// does for a created fence it finds), the fence frees nothing then.
+    /// A created fence that lands late (ADR 0020, amendment of
+    /// 2026-11-28): the operator's create, sent at 100 s, is still in
+    /// flight (a bucket retrying it after a 5xx) when b starts at 108 s over
+    /// no object and takes the actor. Then b's lease is deleted out of band,
+    /// and the create lands at 109 s: `If-None-Match: *` cannot tell that
+    /// absence from the one it was sent for. `operator_fence` dated it
+    /// ahead by as long as its create may take to land, so at 115.5 s,
+    /// while b's lease is valid until 116 s, it frees nothing; the record
+    /// is free once that date is ttl plus grace old.
     #[test]
-    fn a_created_fence_landing_late_is_not_closed() {
+    fn a_created_fence_landing_late_frees_nothing_early() {
         use crate::lease::tests::{At, Mem, run};
         use std::cell::Cell;
-        let fence = NodeLeaseObject {
+        // The body the operator's create carries, as sent at 100 s.
+        let sent = Mem::default();
+        let t = Cell::new(100_000);
+        assert!(matches!(
+            run(operator_fence(
+                &&sent,
+                &At(&t),
+                "nodes/b",
+                CREATED_FENCE_AHEAD_MS,
+                std::future::pending()
+            )),
+            Ok(OperatorFence::Fenced { created: true, .. })
+        ));
+        let fence = run((&sent).get("nodes/b")).unwrap().unwrap().0;
+        let mem = Mem::default();
+        t.set(108_000);
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "ib", cfg());
+        run(lb.start(None)).unwrap();
+        let b = Owners::new(&mem, At(&t), "b", "ib", "nodes/", cfg());
+        let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        assert_eq!(hold.generation, 1);
+        // Deleted out of band; the create lands at 109 s.
+        t.set(109_000);
+        mem.overwrite("nodes/b", None);
+        mem.overwrite("nodes/b", Some(&fence));
+        t.set(115_500);
+        assert_eq!(lb.valid_until_ms(), Some(116_000));
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg());
+        let held = Err(AcquireError::Held {
+            node: "b".into(),
+            instance: "ib".into(),
+        });
+        assert_eq!(run(a.acquire("owners/x", || true, async || Ok(1))), held);
+        // Held until the fence's date is ttl plus grace old, free after.
+        let free = NodeLeaseObject::decode(&fence).unwrap().written_at_ms
+            + cfg().ttl_ms()
+            + cfg().grace_ms();
+        t.set(free);
+        assert_eq!(run(a.acquire("owners/x", || true, async || Ok(1))), held);
+        t.set(free + 1);
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(2)
+        );
+    }
+
+    /// Why a created fence's date is never moved back once it is dated
+    /// ahead (ADR 0020, amendment of 2026-11-28): a reads the fence dated
+    /// 140 s; were it then moved back to the bucket's time (101 s), b's
+    /// next process could start over it at 116.1 s and take the actor, and
+    /// a, served the first version again past 155 s, would free that
+    /// record while b's lease is valid. `raise_created_fence` only moves a
+    /// date forward.
+    #[test]
+    fn a_created_fence_is_never_moved_back() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_000);
+        run(operator_fence(
+            &&mem,
+            &At(&t),
+            "nodes/b",
+            CREATED_FENCE_AHEAD_MS,
+            std::future::pending(),
+        ))
+        .unwrap();
+        let ahead = run((&mem).get("nodes/b")).unwrap().unwrap().0;
+        assert_eq!(
+            NodeLeaseObject::decode(&ahead).unwrap().written_at_ms,
+            140_000
+        );
+        assert_eq!(
+            run(raise_created_fence(&&mem, "nodes/b", 101_000)),
+            Ok(false)
+        );
+        let reads = std::sync::Arc::new(NewestReads::new());
+        let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg()).with_reads(reads.clone());
+        reads.observe("b", &NodeLeaseObject::decode(&ahead).unwrap(), &cfg());
+        // Moved back by hand, as a settle to the bucket's time would.
+        let back = NodeLeaseObject {
             state: NodeState::Fenced,
             instance: None,
-            written_at_ms: 100_000,
+            written_at_ms: 101_000,
         };
-        for raised in [false, true] {
-            let mem = Mem::default();
-            let t = Cell::new(108_000);
-            let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "ib", cfg());
-            run(lb.start(None)).unwrap();
-            let b = Owners::new(&mem, At(&t), "b", "ib", "nodes/", cfg());
-            let hold = run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
-            assert_eq!(hold.generation, 1);
-            // Deleted out of band; the create lands at 109 s.
-            t.set(109_000);
-            mem.overwrite("nodes/b", None);
-            mem.overwrite("nodes/b", Some(&fence.encode()));
-            if raised {
-                // The bucket's time for that write, plus a second and the
-                // skew.
-                assert_eq!(
-                    run(raise_created_fence(&&mem, "nodes/b", 111_000)),
-                    Ok(true)
-                );
-            }
-            t.set(115_500);
-            assert_eq!(lb.valid_until_ms(), Some(116_000));
-            let a = Owners::new(&mem, At(&t), "a", "a1", "nodes/", cfg());
-            let got = run(a.acquire("owners/x", || true, async || Ok(1)));
-            if raised {
-                assert_eq!(
-                    got,
-                    Err(AcquireError::Held {
-                        node: "b".into(),
-                        instance: "ib".into()
-                    })
-                );
-            } else {
-                assert_eq!(got.map(|h| h.generation), Ok(2), "the limit");
-            }
-        }
+        mem.overwrite("nodes/b", Some(&back.encode()));
+        t.set(116_100);
+        let v = run((&mem).get("nodes/b")).unwrap().unwrap().1;
+        let mut lb = NodeLease::new(&mem, At(&t), "nodes/b", "i2", cfg());
+        run(lb.start(Some(&v))).unwrap();
+        let b = Owners::new(&mem, At(&t), "b", "i2", "nodes/", cfg());
+        run(b.acquire("owners/x", || true, async || Ok(1))).unwrap();
+        t.set(150_000);
+        run(lb.renew()).unwrap();
+        t.set(155_100);
+        assert!(lb.is_valid());
+        *mem.serve_stale.borrow_mut() = Some(("nodes/b".into(), ahead, 1));
+        assert_eq!(
+            run(a.acquire("owners/x", || true, async || Ok(1))).map(|h| h.generation),
+            Ok(2),
+            "moved back, the fence frees a running process's record"
+        );
+    }
+
+    /// `operator_fence` given up: `Unavailable`, and nothing sent.
+    #[test]
+    fn an_operator_fence_given_up_is_unavailable() {
+        use crate::lease::tests::{At, Mem, run};
+        use std::cell::Cell;
+        let mem = Mem::default();
+        let t = Cell::new(100_000);
+        assert!(matches!(
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/b",
+                CREATED_FENCE_AHEAD_MS,
+                std::future::ready(())
+            )),
+            Err(BucketError::Unavailable(_))
+        ));
+        assert_eq!(run((&mem).get("nodes/b")), Ok(None));
     }
 
     /// b's clock steps back while it runs as i2, then b is fenced: the
@@ -4446,7 +4605,13 @@ mod tests {
         );
         assert!(!new.is_valid());
         assert_eq!(
-            run(operator_fence(&&mem, &At(&t), "nodes/a")),
+            run(operator_fence(
+                &&mem,
+                &At(&t),
+                "nodes/a",
+                1_000,
+                std::future::pending()
+            )),
             Ok(OperatorFence::Forgotten)
         );
         assert_eq!(

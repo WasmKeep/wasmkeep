@@ -628,9 +628,15 @@ async fn a_fenced_nodes_actor_is_waited_for() {
     );
     // As `wasmkeep cluster fence a` does.
     let bucket = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(&d.shared), "");
-    wasmkeep_cluster::node_lease::operator_fence(&bucket, &WallClock, "nodes/a")
-        .await
-        .unwrap();
+    wasmkeep_cluster::node_lease::operator_fence(
+        &bucket,
+        &WallClock,
+        "nodes/a",
+        wasmkeep_cluster::node_lease::CREATED_FENCE_AHEAD_MS,
+        std::future::pending(),
+    )
+    .await
+    .unwrap();
     let last_write = d.a_last_wrote_ms().await;
     // b lists the fence.
     tokio::time::sleep(Duration::from_millis(300)).await;
