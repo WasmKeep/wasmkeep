@@ -1064,6 +1064,29 @@ binary, is not covered by a test. Phase 6 by the skew rule's tests over
 a heartbeat of `0.7.0` (`wasmkeep-cluster`, `upgrade/tests.rs`), not
 with a started node.
 
+**As built for 0.10** (2026-11-27, `v0.9.x` to `0.10`). Manifest 8 is a
+format of the floor every app of `v0.9.x` already has, so it is not
+gated between the two: the deploy with the keys runs after the finalize
+as a deploy, and placement is checked as before. The format `0.10`
+brings is the generation floor
+([ADR 0045](0045-the-generation-floor-of-a-restored-app.md)), and its
+writer is `cluster markers clean`: phase 3 checks that command, refused
+with a `0.9` node live and with every node new before the finalize
+(naming the floor and `cluster upgrade finalize`, no marker removed),
+then accepted after it. Phase 4 starts `0.9.0` after the finalize (it
+stops on the floor) and `0.8.1`, two minor versions below, after the
+deploy of manifest 8 (it stops on the manifest it cannot read); `0.9`
+reads every manifest `0.10` writes, so it is not started a second time.
+Phase 6 now has a started node: a `0.10` node started into a side app
+beside a live heartbeat of `0.8.0` written for it is never ready, names
+it and writes no lease. The finalize with no live node ("Not settled"
+10) runs on that side app: refused while its only lease names `0.9.0`,
+accepted once it names `0.10`. The removal of released node leases
+(ADR 0020, amendment of 2026-11-27) is checked beside a `0.9` node: a
+lease released two days before goes, one released a minute before
+stays. A new side two minor versions ahead of the old release is
+refused by the script itself.
+
 Where it runs: on a workstation before a tag. The nightly job on `main`
 is not built. Never on a pull request.
 

@@ -1,15 +1,16 @@
 //! The mixed-version check, `scripts/mixed-version.sh`, as an ignored test:
-//! three nodes of the previous published release (`OLD_VERSION`, v0.8.1 by
+//! three nodes of the previous published release (`OLD_VERSION`, v0.9.0 by
 //! default) moved one at a time to this checkout's binary, one moved back
 //! and up again; then, when this checkout is the next minor version, the
-//! gate of ADR 0043 (a deploy that needs manifest 8, refused until `cluster
-//! upgrade finalize`), nodes of older releases started after it, tracing
-//! across versions, and the old CLI on the finalized cluster. It downloads
-//! the release (gh), starts moto and takes about a quarter of an hour, so
+//! gate of ADR 0043 (the format the new minor version brings, refused
+//! until `cluster upgrade finalize`), nodes of older releases started after
+//! it, tracing across versions, the old CLI on the finalized cluster, the
+//! skew check and the finalize with no live node. It downloads the
+//! release (gh), starts moto and takes about a quarter of an hour, so
 //! it runs only when asked twice: with `--run-ignored only` and
 //! `WASMKEEP_MIXED_VERSION=1`.
 //!
-//! The script's variables pass through: `MIXED_VERSION_NEW_VERSION=0.9.0`
+//! The script's variables pass through: `MIXED_VERSION_NEW_VERSION=0.10.0`
 //! builds this checkout once more as that version (the test-only feature
 //! `test-version` of `wasmkeep-cluster`), into `target/mixed-version/build`,
 //! for the next-minor phases before the workspace version is bumped.
