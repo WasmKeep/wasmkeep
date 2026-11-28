@@ -99,7 +99,7 @@ case and go on.
 vanished, or is cut off) is refused: run `wasmkeep cluster fence <id>`
 first; a fence counts 15 s after the node's last write.
 
-`finalize` also works with every node of the app stopped (from 0.9.1;
+`finalize` also works with every node of the app stopped (from 0.9.2;
 0.9.0 refuses an app with no live node). It is then accepted only when
 every lease the app's nodes left is `released` or `fenced` and names the
 version of the `wasmkeep` that finalizes or a later one: those leases
