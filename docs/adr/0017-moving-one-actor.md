@@ -15,6 +15,9 @@
   changes, or every 60 s, not every period ([ADR 0014](0014-draining-a-node-and-moving-an-actor.md),
   amendment of 2026-11-14); see "Amendment of 2026-11-14" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a move of a batched actor flushes before it records the move and releases, so the 30 s deadline starts after the flush.
+- Amended 2026-11-28 (0.10.0): `actor move` deletes the actor's requests
+  to other targets before writing its own, so the later of two requests
+  within one second counts; see "Amendment of 2026-11-28" at the end.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 
@@ -285,3 +288,77 @@ the delete and forgets the request at once.
   together).
 - **Tests:** the move tests in `tests/cluster/draining.rs` write the
   marker as the CLI does (`request_move_of`).
+
+## Amendment of 2026-11-28: the later of two requests in one second
+
+Nodes keep one move request per actor, the newest by last-modified time
+(section "Moving a resident actor"). That time is the bucket's, in whole
+seconds on S3, so two requests for one actor written within one second
+tie, and a tie keeps the request listed first: the one whose target
+sorts first. Of two `actor move` commands run one after the other within
+a second, the later could be deleted unread.
+
+- **The writer replaces the earlier request.** `actor move`
+  (`control::write_move`) lists the actor's requests, deletes those to
+  other targets, writes its own, and lists them again. A node's listing
+  sees the earlier request, the later one, or neither for a moment, but
+  never both, so the later command counts whatever the seconds say. A
+  node that read the earlier request may still act on it until its next
+  listing, as before. The later request is usually carried out after it,
+  but not always: a node with that stale copy can take the actor once it
+  is released, and the later request's owner then finds it held
+  elsewhere (`MoveEnd::Elsewhere`) and deletes the request. That window
+  is small and was there before this change.
+- **"Never both" assumes one listing page read at one moment**, as S3
+  and the stores it was checked on list a prefix. If the moves are split
+  across listing pages (over 1,000 move keys) or the store's listings
+  are only eventually consistent, the guarantee falls back to the 0.9
+  tie rule plus the node's warning, and is never worse than that.
+- **Two writers at the same time** may still leave two requests side by
+  side. A writer whose second listing finds the other one deletes neither
+  (two writers each deleting the other's would leave none). It then lists
+  the actor's requests every half second for up to 15 s, a few heartbeat
+  periods, until one is left. It reports which target stands, or, if the
+  nodes have not decided by then, which one their rule keeps. It exits
+  with code 3: "written, the outcome decided by the nodes". The writer
+  whose key landed last always finds the other one, unless a node
+  already deleted it. The other writer may succeed and see its request
+  replaced, as if it had run first. Of two requests, one written after
+  the other in the bucket's order is never deleted for the earlier while
+  its writer is told it stands alone.
+- **Wait and check; do not rerun at once.** A node deletes the loser of a
+  tie by its key, from its own copy of a listing, on its next pass
+  (`moves_pass`, once a heartbeat period). The delete is unconditional.
+  A rerun written meanwhile to the loser's target can be deleted by that
+  pass, after the rerun has itself deleted the winner, and the actor then
+  moves to neither. Within the same second, the node that deleted the
+  loser also ignores an identical request until it expires (its record
+  of deleted requests matches on the time). So after exit code 3, wait a
+  few seconds and check where the actor is held before asking again.
+  Unique request ids in the key would remove this hazard, but they are a
+  layout change under ADR 0043 and are left for later.
+- **What a failure says.** An error before the write (the first listing
+  or a delete failed) means nothing was written, though an earlier
+  request may already be gone. A failed listing after the write
+  (`MoveWrite::Unverified`) means the request was written but not checked
+  against others. That is exit code 3 too.
+- **The nodes' rule is unchanged** (`control::newest_moves`, used by
+  `moves_pass`): newest first, and on a tie the request met first. Nodes
+  of 0.9 and 0.10 keep the same request, so a mixed cluster never deletes
+  both ([ADR 0043](0043-rolling-upgrades.md)). A node logs a warning when it
+  deletes a request tied with the one it kept.
+- **Compatibility.** The key, its empty body and the layout are those of
+  0.9: a node of 0.9 reads a request written by `actor move` of 0.10 as
+  before, and a node of 0.10 reads one of 0.9. A CLI of 0.9 still writes
+  its key beside an earlier one, so two of its commands within one second
+  can still lose the later; the CLI of 0.10 has the fix.
+- **Tests:**
+  - `control::tests`: two writes within one second keep the later; a tie
+    keeps the request met first; a concurrent write is reported with
+    both requests; a failed listing before or after the write.
+  - In `wasmkeep-cli`: `actor_move_replaces_the_actors_earlier_request`,
+    and `a_concurrent_move_says_which_request_stands`.
+  - `sim/tests/madsim_move_order.rs` checks that exactly one request is
+    left, the writers' predictions, and no silent drop. It catches the
+    writer of 0.9 and a writer that writes its key before deleting the
+    others.

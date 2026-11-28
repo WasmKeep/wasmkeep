@@ -9,13 +9,13 @@
 //! acquires, restores and arms the alarm from the database. An actor nobody
 //! holds is taken by the target itself.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::cluster::{HOLDER, LeaseReturn, TakeAnswer, parse_take};
-use wasmkeep_cluster::control::MoveIntent;
+use wasmkeep_cluster::control::{self, MoveIntent};
 
 /// How long a move may stay under way before it gives up.
 const MOVE_DEADLINE: Duration = Duration::from_secs(30);
@@ -382,25 +382,23 @@ pub(super) async fn moves_pass(
             awaiting.looking.store(false, Ordering::Release);
         });
     }
-    // One move per actor: the newest key counts, the others are deleted.
-    let mut newest: BTreeMap<(String, String), MoveIntent> = BTreeMap::new();
-    // Only this app's moves are listed (under its root, ADR 0022).
-    for intent in cluster.moves() {
-        let actor = (intent.class.clone(), intent.name.clone());
-        match newest.get(&actor) {
-            Some(kept) if kept.written_at_ms >= intent.written_at_ms => {
-                cluster.delete_move(&intent).await;
-            }
-            Some(kept) => {
-                cluster.delete_move(kept).await;
-                newest.insert(actor, intent);
-            }
-            None => {
-                newest.insert(actor, intent);
-            }
+    // One move per actor: the newest key counts, the others are deleted
+    // (on a tie, the one listed first, as older nodes keep it). Only this
+    // app's moves are listed (under its root, ADR 0022).
+    let (newest, superseded) = control::newest_moves(cluster.moves());
+    for intent in &superseded {
+        // Requests of one actor listed together within one second: written
+        // at the same time by two writers, or by a writer before 0.10.0
+        // (ADR 0017, amendment of 2026-11-28).
+        if newest.iter().any(|kept| {
+            kept.written_at_ms == intent.written_at_ms
+                && (&kept.class, &kept.name) == (&intent.class, &intent.name)
+        }) {
+            tracing::warn!(app = %crate::logging::named(&inner.app_name), dropped = %intent.target, "two move requests for one actor have the same time; the one whose key sorts first is kept");
         }
+        cluster.delete_move(intent).await;
     }
-    for intent in newest.into_values() {
+    for intent in newest {
         let key = intent.key();
         let token = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         {

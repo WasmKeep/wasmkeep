@@ -343,6 +343,118 @@ fn move_key(root: &StateRoot, class: &str, name: &str, target: &str) -> String {
     )
 }
 
+/// The move requests that count, one per actor (ADR 0017), and the others,
+/// to delete: the newest by last-modified time counts. On a tie the one
+/// met first is kept (a listing's order: its key sorts first), the rule
+/// of every node since 0.4.0, so nodes of different versions keep the
+/// same request and never delete both. The last-modified time is the
+/// bucket's, in whole seconds on S3, so two requests written within one
+/// second tie: [`write_move`] keeps them from being listed together.
+pub fn newest_moves(
+    moves: impl IntoIterator<Item = MoveIntent>,
+) -> (Vec<MoveIntent>, Vec<MoveIntent>) {
+    use std::collections::BTreeMap;
+    let mut newest: BTreeMap<(String, String, String, String), MoveIntent> = BTreeMap::new();
+    let mut superseded = Vec::new();
+    for intent in moves {
+        let actor = (
+            intent.tenant.clone(),
+            intent.app.clone(),
+            intent.class.clone(),
+            intent.name.clone(),
+        );
+        match newest.get_mut(&actor) {
+            Some(kept) if kept.written_at_ms >= intent.written_at_ms => superseded.push(intent),
+            Some(kept) => superseded.push(std::mem::replace(kept, intent)),
+            None => {
+                newest.insert(actor, intent);
+            }
+        }
+    }
+    (newest.into_values().collect(), superseded)
+}
+
+/// What [`write_move`] found once its request was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveWrite {
+    /// The request is the actor's only one.
+    Alone,
+    /// Requests for the same actor to other targets were listed beside it
+    /// after the write: another writer wrote one at the same time. Every
+    /// request of the actor that listing gave, this one included; the
+    /// nodes keep one ([`newest_moves`]) and delete the others, from their
+    /// own copy of a listing, within a few heartbeat periods.
+    Concurrent(Vec<MoveIntent>),
+    /// Written, but the listing after the write failed: whether another
+    /// request stands beside it is not known.
+    Unverified(BucketError),
+}
+
+/// Writes move request `key` (from [`checked_move_key`]) as the actor's
+/// only one (ADR 0017, amendment of 2026-11-28): the actor's requests to
+/// other targets are deleted first, then `key` is written, then the
+/// actor's requests are listed again. A later request replaces an earlier
+/// one by its writer, whatever their last-modified times: nodes order
+/// requests by the bucket's whole seconds, and of two listed together
+/// within one second they keep the one whose key sorts first. A request
+/// for another target found on the second listing was written meanwhile
+/// by another writer, and is reported, never deleted (each writer deleting
+/// the other's would drop both). An error means `key` was not written:
+/// the first listing or a delete failed, and an earlier request may be
+/// deleted already. A failed second listing is [`MoveWrite::Unverified`].
+pub async fn write_move<K: Keys>(keys: &K, key: &str) -> Result<MoveWrite, BucketError> {
+    for other in actor_moves(keys, key).await? {
+        if other.key() != key {
+            keys.delete(&other.key()).await?;
+        }
+    }
+    keys.put_empty(key).await?;
+    let listed = match actor_moves(keys, key).await {
+        Ok(listed) => listed,
+        Err(e) => return Ok(MoveWrite::Unverified(e)),
+    };
+    if listed.iter().all(|m| m.key() == key) {
+        return Ok(MoveWrite::Alone);
+    }
+    Ok(MoveWrite::Concurrent(listed))
+}
+
+/// The move requests listed for the actor of move request `key` (from
+/// [`checked_move_key`]), each with its last-modified time.
+pub async fn actor_moves<K: Keys>(keys: &K, key: &str) -> Result<Vec<MoveIntent>, BucketError> {
+    Ok(keys
+        .list_keys(&actor_moves_prefix(key))
+        .await?
+        .into_iter()
+        .filter(|(k, _)| move_of_same_actor(k, key))
+        .filter_map(|(k, modified)| {
+            k.strip_prefix(STATE_PREFIX)
+                .and_then(|rest| parse_move(rest, modified))
+        })
+        .collect())
+}
+
+/// `key`'s actor's move requests: the key without its target, with the
+/// trailing slash.
+fn actor_moves_prefix(key: &str) -> String {
+    key.rsplit_once('/')
+        .map_or_else(String::new, |(actor, _)| format!("{actor}/"))
+}
+
+/// Whether `other` is a move request for the same actor as `key`.
+fn move_of_same_actor(other: &str, key: &str) -> bool {
+    let parsed = |k: &str| {
+        k.strip_prefix(STATE_PREFIX)
+            .and_then(|rest| parse_move(rest, 0))
+    };
+    match (parsed(other), parsed(key)) {
+        (Some(a), Some(b)) => {
+            (a.tenant, a.app, a.class, a.name) == (b.tenant, b.app, b.class, b.name)
+        }
+        _ => false,
+    }
+}
+
 fn segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -733,6 +845,154 @@ mod tests {
         }
         let (a, b) = (new_request_id(), new_request_id());
         assert!(request_id(&a) && a.len() == 16 && a != b, "{a} {b}");
+    }
+
+    /// A bucket that keeps whole seconds as last-modified times, as S3
+    /// does; `then_put` is written right after the next put (another
+    /// writer's request landing at the same time); listings fail once
+    /// `lists_left` reaches zero (`None`: never).
+    #[derive(Default)]
+    struct Seconds {
+        now_ms: std::sync::Mutex<u64>,
+        keys: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+        then_put: std::sync::Mutex<Option<String>>,
+        lists_left: std::sync::Mutex<Option<u32>>,
+    }
+
+    impl Keys for Seconds {
+        async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>, BucketError> {
+            if let Some(left) = self.lists_left.lock().unwrap().as_mut() {
+                if *left == 0 {
+                    return Err(BucketError::Unavailable("listing refused".into()));
+                }
+                *left -= 1;
+            }
+            let keys = self.keys.lock().unwrap();
+            Ok(keys
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, m)| (k.clone(), *m))
+                .collect())
+        }
+        async fn put_empty(&self, key: &str) -> Result<(), BucketError> {
+            let at = *self.now_ms.lock().unwrap() / 1_000 * 1_000;
+            let mut keys = self.keys.lock().unwrap();
+            keys.insert(key.to_owned(), at);
+            if let Some(other) = self.then_put.lock().unwrap().take() {
+                keys.insert(other, at);
+            }
+            Ok(())
+        }
+        async fn put_body(&self, key: &str, _body: Vec<u8>) -> Result<(), BucketError> {
+            self.put_empty(key).await
+        }
+        async fn get_body(&self, _key: &str) -> Result<Option<Vec<u8>>, BucketError> {
+            Ok(None)
+        }
+        async fn delete(&self, key: &str) -> Result<(), BucketError> {
+            self.keys.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    impl Seconds {
+        /// The targets a node keeps of the listed requests (`moves_pass`).
+        fn kept(&self, now_ms: u64) -> Vec<String> {
+            let listed: Vec<(String, u64)> = self
+                .keys
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, m)| (k.clone(), *m))
+                .collect();
+            let (control, _) = parse(&listed, now_ms);
+            let (kept, _) = newest_moves(control.moves);
+            kept.into_iter().map(|m| m.target).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_later_of_two_moves_in_one_second_counts() {
+        let root = StateRoot::new("", "acme", "blog");
+        // Written in this order within one second: the later one's key
+        // sorts after the earlier one's, so a tie keeps the earlier.
+        let first = checked_move_key(&root, "room", "x", "node-a").unwrap();
+        let later = checked_move_key(&root, "room", "x", "node-b").unwrap();
+        let other_actor = checked_move_key(&root, "room", "xy", "node-a").unwrap();
+        let bucket = Seconds::default();
+        *bucket.now_ms.lock().unwrap() = 10_100;
+        assert_eq!(
+            write_move(&bucket, &other_actor).await,
+            Ok(MoveWrite::Alone)
+        );
+        assert_eq!(write_move(&bucket, &first).await, Ok(MoveWrite::Alone));
+        *bucket.now_ms.lock().unwrap() = 10_900;
+        assert_eq!(write_move(&bucket, &later).await, Ok(MoveWrite::Alone));
+        let mut kept = bucket.kept(11_000);
+        kept.sort();
+        assert_eq!(kept, ["node-a", "node-b"], "x to node-b, xy untouched");
+        assert!(bucket.keys.lock().unwrap().contains_key(&later));
+        assert!(!bucket.keys.lock().unwrap().contains_key(&first));
+        // The same target again: rewritten, nothing else deleted.
+        assert_eq!(write_move(&bucket, &later).await, Ok(MoveWrite::Alone));
+        assert!(bucket.keys.lock().unwrap().contains_key(&other_actor));
+    }
+
+    #[test]
+    fn a_tie_keeps_the_request_met_first_as_older_nodes_do() {
+        let root = StateRoot::new("", "acme", "blog");
+        let a = checked_move_key(&root, "room", "x", "node-a").unwrap();
+        let b = checked_move_key(&root, "room", "x", "node-b").unwrap();
+        let c = checked_move_key(&root, "room", "x", "node-c").unwrap();
+        let (control, _) = parse(&[(a, 2_000), (b, 2_000), (c, 1_000)], 3_000);
+        let (kept, superseded) = newest_moves(control.moves);
+        let kept: Vec<_> = kept.iter().map(|m| m.target.as_str()).collect();
+        assert_eq!(kept, ["node-a"]);
+        let mut gone: Vec<_> = superseded.iter().map(|m| m.target.as_str()).collect();
+        gone.sort_unstable();
+        assert_eq!(gone, ["node-b", "node-c"]);
+    }
+
+    #[tokio::test]
+    async fn a_move_written_beside_another_writers_is_reported() {
+        let root = StateRoot::new("", "acme", "blog");
+        let mine = checked_move_key(&root, "room", "x", "node-b").unwrap();
+        let theirs = checked_move_key(&root, "room", "x", "node-a").unwrap();
+        let bucket = Seconds::default();
+        *bucket.then_put.lock().unwrap() = Some(theirs.clone());
+        let Ok(MoveWrite::Concurrent(listed)) = write_move(&bucket, &mine).await else {
+            panic!("not reported");
+        };
+        // Both listed, with their times: the nodes keep the one whose key
+        // sorts first, theirs.
+        assert_eq!(listed.len(), 2);
+        let (kept, _) = newest_moves(listed);
+        assert_eq!(kept[0].key(), theirs);
+        // Neither is deleted by the writer: the nodes keep one.
+        let keys = bucket.keys.lock().unwrap();
+        assert!(keys.contains_key(&mine) && keys.contains_key(&theirs));
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_says_whether_the_move_was_written() {
+        let root = StateRoot::new("", "acme", "blog");
+        let earlier = checked_move_key(&root, "room", "x", "node-a").unwrap();
+        let key = checked_move_key(&root, "room", "x", "node-b").unwrap();
+        // The listing before the write fails: nothing written.
+        let bucket = Seconds::default();
+        *bucket.lists_left.lock().unwrap() = Some(0);
+        assert!(write_move(&bucket, &key).await.is_err());
+        assert!(bucket.keys.lock().unwrap().is_empty());
+        // The one after it fails: written, not checked.
+        let bucket = Seconds::default();
+        bucket.keys.lock().unwrap().insert(earlier.clone(), 0);
+        *bucket.lists_left.lock().unwrap() = Some(1);
+        assert!(matches!(
+            write_move(&bucket, &key).await,
+            Ok(MoveWrite::Unverified(_))
+        ));
+        let keys = bucket.keys.lock().unwrap();
+        assert!(keys.contains_key(&key) && !keys.contains_key(&earlier));
     }
 
     #[test]
