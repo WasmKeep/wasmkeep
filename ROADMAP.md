@@ -6,7 +6,7 @@ For what each release contained, see the [changelog](CHANGELOG.md); for
 the numbers behind every claim here, [benchmarks](docs/benchmarks.md).
 
 WasmKeep is **pre-alpha**. Its releases so far, `0.1.0`, `0.2.0`,
-`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0`, `0.8.1`, `0.9.0` and `0.9.1`, are pre-releases for trying it,
+`0.3.0`, `0.4.0`, `0.4.1`, `0.4.2`, `0.5.0`, `0.5.1`, `0.6.0`, `0.7.0`, `0.8.0`, `0.8.1`, `0.9.0` and `0.9.2`, are pre-releases for trying it,
 side projects and staging.
 
 ## Now

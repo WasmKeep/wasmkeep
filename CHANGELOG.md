@@ -7,12 +7,12 @@ command line; its notes say what changed and how to move.
 The text under a version's heading is its GitHub release text
 (`.github/workflows/release.yml` copies it).
 
-## 0.9.1
+## 0.9.2
 
 **0.9 settled: `cluster upgrade finalize` with every node stopped, and
 no format change.** After an upgrade done the recommended way, by
 stopping every node, 0.9.0 refused the finalize until a node was live
-again. Only the `wasmkeep` that runs `finalize` needs 0.9.1.
+again. Only the `wasmkeep` that runs `finalize` needs 0.9.2.
 
 ### Fixed
 
@@ -30,6 +30,13 @@ again. Only the `wasmkeep` that runs `finalize` needs 0.9.1.
   `--app`, every app that can be is raised, each refused app is named
   with its reason and what to do, and the command exits with 1. The dry
   run (no `--yes`) now gives the same answers.
+
+## 0.9.1
+
+Tagged, not released: no binaries, image or registry packages. The
+release workflow accepted CI on `main` only and this patch was cut on a
+release branch. 0.9.2 carries its changes. The Go module tag
+`sdks/go/v0.9.1` exists and has the same SDK code as 0.9.2.
 
 ## 0.9.0
 

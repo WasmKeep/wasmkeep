@@ -1469,7 +1469,7 @@ node-lease simulation was run again over the changed module.
     write and the second listing are those of a finalize with a live
     node; the second listing also reports an object that does not
     decode. It assumes the default lease timings for a fence. Shipped
-    in `0.9.1`.
+    in `0.9.2`.
 11. **An object under `nodes/` that does not decode** is never removed
     by a command: `cluster forget` reads only what it can decode (and
     its own mark, which is not such an object). It

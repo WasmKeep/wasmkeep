@@ -20,14 +20,14 @@ wasmkeep cluster status --bucket s3://wasmkeep-demo --json   # for scripts
 Cluster s3://wasmkeep-demo (live: heartbeat within 10.0s)
 
 NODE  LIVE  AGE    STATE    ACTORS  SOCKETS  EV/MIN  FRONT/MIN  FILL   VERSION  APP        ADDRESS        CLUSTER ADDRESS  TLS     WORDS
-a     yes   979ms  serving  12      3        840     310        1.2%   0.9.1    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head place
-b     yes   2.2s   serving  4       0        95      288        -      0.9.1    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
-c     no    14m    -        -       -        -       -          -      0.9.1    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
+a     yes   979ms  serving  12      3        840     310        1.2%   0.9.2    acme/shop  http://a:8080  https://a:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head place
+b     yes   2.2s   serving  4       0        95      288        -      0.9.2    acme/shop  http://b:8080  -                plain   take front handoff ends flush rate_limits restore actor-restore recorded-head
+c     no    14m    -        -       -        -       -          -      0.9.2    acme/shop  http://c:8080  https://c:7443   pinned  take front handoff ends flush rate_limits restore actor-restore recorded-head
 
 APP        DEPLOYED VERSION  SEQ  ACTORS  FRONT  FORMAT
 acme/shop  9cf4de9152d8dd29  1    16      yes    3
 
-2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.9.1
+2 of 3 nodes live; TLS: 1 with a cluster listener, 1 plain; version: 0.9.2
 warning: mixed plain and TLS nodes: b still plain while a use the cluster listener; give every node a cluster listener, then drop --cluster-plaintext accept (ADR 0011)
 ```
 
