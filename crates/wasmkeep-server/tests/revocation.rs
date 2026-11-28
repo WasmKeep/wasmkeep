@@ -94,6 +94,9 @@ struct Gate {
     /// Listings of `nodes/` refused while unset; reads of each node's
     /// object still answered (a store that throttles LIST).
     lists_nodes: AtomicBool,
+    /// While `lists` is off, whether by-key reads of the other nodes'
+    /// heartbeats still go through (this node's own stays cut).
+    reads_peers: AtomicBool,
 }
 
 impl Gate {
@@ -104,6 +107,7 @@ impl Gate {
             beats: AtomicBool::new(true),
             lists: AtomicBool::new(true),
             lists_nodes: AtomicBool::new(true),
+            reads_peers: AtomicBool::new(false),
         })
     }
 
@@ -163,7 +167,11 @@ impl ObjectStore for Gate {
     ) -> object_store::Result<object_store::GetResult> {
         // Between listings a node reads the heartbeats it knows one by
         // one (ADR 0020, amendment of 2026-11-14): cut with the listings.
-        if location.as_ref().starts_with("nodes/") && !self.lists.load(Ordering::SeqCst) {
+        let key = location.as_ref();
+        if key.starts_with("nodes/")
+            && !self.lists.load(Ordering::SeqCst)
+            && !(self.reads_peers.load(Ordering::SeqCst) && key != self.heartbeat)
+        {
             return Err(Self::refused("reading a heartbeat"));
         }
         self.inner.get_opts(location, options).await
@@ -484,6 +492,10 @@ async fn revoke(
             // not list the heartbeats (seeing another pin at its own
             // address, it would drop its own pools, and the kept-alive
             // connection this test checks on a's side would go unused).
+            // It still reads a's heartbeat by key, so it keeps trusting a
+            // throughout (the module's premise) instead of its claim on
+            // a's address lapsing a few hundred milliseconds later.
+            b.gate.reads_peers.store(true, Ordering::SeqCst);
             b.gate.lists.store(false, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(30)).await;
             let old = store.get(&key).await.unwrap().bytes().await.unwrap();
@@ -573,6 +585,13 @@ fn new_pin() -> String {
 
 /// The scenario every test runs: see the module docs.
 async fn a_stops_trusting_b(how: Revoke) {
+    // Shown only when a test fails: which side held a request that ran
+    // into the forwarding deadline (seen once on an arm64 runner: 504
+    // after 30 s where a refused handshake gives 503 within seconds).
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("wasmkeep_server=debug,hyper_util=trace")
+        .try_init();
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a = node("a", da.path(), &store).await;
@@ -679,11 +698,15 @@ async fn a_stops_trusting_b(how: Revoke) {
     );
     // ...and b's new handshakes with a are refused (b's own 503, as a
     // refused its certificate).
+    let asked = Instant::now();
     let r = send(b.addr, "GET", "/actor/t/on-a/fired").await;
     assert_eq!(
         (r.status, r.body.as_str()),
         (503, "the actor's node did not answer; retry"),
-        "a new handshake from b was not refused"
+        "a new handshake from b was not refused: answered after {:?}, {:?} after the event; {}",
+        asked.elapsed(),
+        since.elapsed(),
+        r.head
     );
     let handshake = since.elapsed();
 
