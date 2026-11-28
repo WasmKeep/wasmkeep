@@ -179,9 +179,13 @@ fn actor_move_refuses_an_unmigrated_tenant() {
     else {
         unreachable!()
     };
-    let e = super::actor_move_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into())))
-        .unwrap_err()
-        .to_string();
+    let e = super::actor_move_on(
+        &args,
+        || Ok((std::sync::Arc::clone(&store), "wk".into())),
+        SETTLE,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(e.contains("cluster migrate --bucket s3://b/wk"), "{e}");
     assert!(e.contains("0.8.1"), "{e}");
     let listed: Vec<_> = rt.block_on(async {
@@ -221,7 +225,12 @@ fn actor_move_replaces_the_actors_earlier_request() {
         else {
             unreachable!()
         };
-        super::actor_move_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into()))).unwrap();
+        super::actor_move_on(
+            &args,
+            || Ok((std::sync::Arc::clone(&store), "wk".into())),
+            SETTLE,
+        )
+        .unwrap();
     };
     mv("room/x", "node-a");
     mv("room/xy", "node-a");
@@ -246,6 +255,55 @@ fn actor_move_replaces_the_actors_earlier_request() {
             "wk/state/acme/shop/moves/room/7879/node-a",
         ]
     );
+}
+
+/// How the move tests wait for the nodes: briefly.
+const SETTLE: super::Settle = super::Settle {
+    poll: std::time::Duration::from_millis(20),
+    limit: std::time::Duration::from_millis(400),
+};
+
+/// Of two requests written at the same time, `actor move` waits for the
+/// nodes to keep one and says which (ADR 0017, amendment of 2026-11-28),
+/// or, past its wait, which one their rule keeps.
+#[test]
+fn a_concurrent_move_says_which_request_stands() {
+    use object_store::{ObjectStore, ObjectStoreExt as _, memory::InMemory, path::Path};
+    use wasmkeep_cluster::control;
+    let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+    let keys =
+        wasmkeep_cluster::object_store::ObjectStoreBucket::new(std::sync::Arc::clone(&store), "wk");
+    let root = wasmkeep_cluster::state_root::StateRoot::new("", "acme", "shop");
+    let mine = control::checked_move_key(&root, "room", "x", "node-b").unwrap();
+    let theirs = control::checked_move_key(&root, "room", "x", "node-a").unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for key in [&theirs, &mine] {
+            store
+                .put(&Path::from(format!("wk/{key}")), Vec::new().into())
+                .await
+                .unwrap();
+            // Distinct times: mine is the newer.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let listed = control::actor_moves(&keys, &mine).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        // Nobody decides: the rule's pick (here the newest, mine).
+        let said = super::settle_move(&keys, &mine, "node-b", listed.clone(), SETTLE).await;
+        assert!(said.contains("keep the one to node-b"), "{said}");
+        // A node deletes mine meanwhile.
+        let (store2, gone) = (std::sync::Arc::clone(&store), format!("wk/{mine}"));
+        let node = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            store2.delete(&Path::from(gone)).await.unwrap();
+        });
+        let said = super::settle_move(&keys, &mine, "node-b", listed, SETTLE).await;
+        node.await.unwrap();
+        assert!(
+            said.contains("kept the one to node-a, and dropped this one"),
+            "{said}"
+        );
+    });
 }
 
 fn delete_args(extra: &[&str]) -> super::DeleteArgs {

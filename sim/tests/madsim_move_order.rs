@@ -15,17 +15,21 @@
 //! request written after it in the bucket's order of writes (not their
 //! seconds): of two concurrent writers, the one whose key landed first
 //! may be told it stands alone and be replaced, as if it had run first.
-//! The runs must see writes within one second, and concurrent writes
-//! reported. Broken on purpose,
-//! each is caught on some seed: the writer before 0.10.0 (the key written
-//! alone, the earlier request left beside it), and a writer that writes
-//! its key before deleting the others (a node listing in between keeps
-//! the earlier on a tie).
+//! Exactly one request is left at the end; if both writers were told they
+//! stand alone, it is the one written last; and a writer told of the
+//! other request predicts it by the nodes' rule over its listing (what
+//! `actor move` reports when the nodes have not decided within its wait).
+//! Over 50 seeds or more, the runs must see writes within one second, a
+//! request deleted by a node, and concurrent writes reported. Broken on
+//! purpose, each is caught on some seed: the writer before 0.10.0 (the
+//! key written alone, the earlier request left beside it), and a writer
+//! that writes its key before deleting the others (a node listing in
+//! between keeps the earlier on a tie).
 //!
-//! Not modelled: the move itself (`madsim_drain` does), expiry, and the
-//! nodes' copy of the requests between listings (a node acts on a request
-//! it read until its next listing; the later request is carried out
-//! after it).
+//! Not modelled: the move itself (`madsim_drain` does), expiry, a writer
+//! running again after a concurrent write (a node's delete from an older
+//! listing can remove the new request), and the nodes' copy of the
+//! requests between listings.
 //!
 //! `RUSTFLAGS="--cfg madsim" cargo test -p wasmkeep-sim --test madsim_move_order --target-dir target/madsim`
 
@@ -37,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use madsim::time::{Instant, sleep};
-use wasmkeep_cluster::control::{self, Keys, MoveWrite};
+use wasmkeep_cluster::control::{self, Keys, MoveIntent, MoveWrite};
 use wasmkeep_cluster::lease::BucketError;
 use wasmkeep_cluster::state_root::StateRoot;
 
@@ -152,11 +156,11 @@ async fn write(bucket: &Bucket, key: &str, rule: Writer) -> MoveWrite {
             for other in others(bucket.list_keys(&actor).await.unwrap()) {
                 bucket.delete(&other).await.unwrap();
             }
-            let left = others(bucket.list_keys(&actor).await.unwrap());
-            if left.is_empty() {
+            let listed = control::actor_moves(bucket, key).await.unwrap();
+            if listed.iter().all(|m| m.key() == key) {
                 MoveWrite::Alone
             } else {
-                MoveWrite::Concurrent(left)
+                MoveWrite::Concurrent(listed)
             }
         }
     }
@@ -282,6 +286,33 @@ fn broken(o: &Outcome) -> Option<String> {
             o.left, o.keys[1]
         ));
     }
+    // The nodes keep exactly one, the same one.
+    if o.left.len() != 1 {
+        return Some(format!("{} requests left: {:?}", o.left.len(), o.left));
+    }
+    // Both writers told they stand alone: the one written last stands.
+    let last = o.keys.iter().max_by_key(|k| o.put_at.get(*k)).unwrap();
+    if o.written.iter().all(|(w, _)| *w == MoveWrite::Alone) && o.left[0] != *last {
+        return Some(format!(
+            "both writers told alone, yet {} stands, not {last}",
+            o.left[0]
+        ));
+    }
+    // A writer told of the other request predicts, by the nodes' rule over
+    // its listing, the one that stands (what `actor move` reports past its
+    // wait).
+    for (w, _) in &o.written {
+        if let MoveWrite::Concurrent(listed) = w {
+            let (kept, _) = control::newest_moves(listed.clone());
+            let predicted = kept.first().map(MoveIntent::key);
+            if predicted.as_ref() != o.left.first() {
+                return Some(format!(
+                    "a writer predicted {predicted:?}, yet {} stands",
+                    o.left[0]
+                ));
+            }
+        }
+    }
     None
 }
 
@@ -313,11 +344,15 @@ fn the_later_move_counts_and_none_is_dropped_in_silence() {
             .filter(|(w, _)| matches!(w, MoveWrite::Concurrent(_)))
             .count();
     }
-    assert!(
-        same_second > seeds / 2,
-        "few writes within one second ({same_second})"
-    );
+    // About three seeds in five write both within one second, one in
+    // five has a node delete a request, one in three reports a concurrent
+    // write: checked only over enough seeds to be stable.
     if seeds >= 50 {
+        assert!(
+            same_second * 5 > seeds * 2,
+            "few writes within one second ({same_second} of {seeds})"
+        );
+        assert!(ties_deleted > 0, "no request deleted by a node");
         assert!(reported > 0, "no concurrent write reported");
     }
     eprintln!(

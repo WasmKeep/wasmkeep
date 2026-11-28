@@ -466,11 +466,24 @@ gets a warning (the request is written; the owner keeps the actor), as
 does one that serves another app.
 
 A new request replaces the actor's earlier one to another target: the
-later `actor move` counts. Two run at the same time for one actor, to
-different targets, may both be written; the one that finds the other's
-request then fails, naming its target, since which one the nodes carry
-out is not known (the other may succeed, as if it had run first). Run it
-again to settle it.
+later `actor move` counts.
+
+Two commands run at the same time for one actor, to different targets,
+may both be written. The one that finds the other's request waits up to
+15 s for the nodes to keep one. It then says which target stands, or
+which one the nodes' rule keeps, and exits with code 3, meaning the
+request was written but the nodes decide the outcome. The other command
+may succeed, as if it had run first.
+
+Exit code 3 also means the request was written but the listing after
+the write failed, so it was not checked against other requests. After
+exit code 3, wait a few seconds and check where the actor is held
+before asking again. Do not rerun at once and do not retry it in a
+script: a node can still delete a request it listed beside the other
+one, including a new one to the same target.
+
+Any other error means the request was not written, although an earlier
+request for the actor may already be removed.
 
 Within a few seconds the actor's owner hands it to `node-c` (within a
 minute for a request written by a CLI of 0.4.1 or before, which does not

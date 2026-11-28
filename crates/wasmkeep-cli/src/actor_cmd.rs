@@ -93,8 +93,84 @@ pub(super) struct MoveArgs {
 }
 
 /// Writes the actor's move request (ADR 0017), under its app's root.
+/// A request written whose outcome the nodes decide exits with
+/// [`MOVE_UNDECIDED_EXIT`].
 pub(super) fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
-    actor_move_on(args, || open_bucket_unchecked(&args.bucket))
+    let settle = Settle {
+        poll: std::time::Duration::from_millis(500),
+        limit: std::time::Duration::from_secs(15),
+    };
+    match actor_move_on(args, || open_bucket_unchecked(&args.bucket), settle) {
+        Err(e) if e.downcast_ref::<MoveUndecided>().is_some() => {
+            eprintln!("Error: {e}");
+            std::process::exit(MOVE_UNDECIDED_EXIT);
+        }
+        done => done,
+    }
+}
+
+/// `actor move`'s exit code for a request written whose outcome the nodes
+/// decide (ADR 0017, amendment of 2026-11-28): another writer's request
+/// stood beside it, or the listing after the write failed. Not to be
+/// retried blindly.
+pub(super) const MOVE_UNDECIDED_EXIT: i32 = 3;
+
+/// What to say after a request whose outcome the nodes decide.
+const WAIT_AND_CHECK: &str = "Wait a few seconds and check where the actor is held before asking \
+     again: a node may still delete a request it listed beside another, a new one to the same \
+     target included";
+
+/// A move request written, whose outcome the nodes decide
+/// ([`MOVE_UNDECIDED_EXIT`]).
+#[derive(Debug)]
+pub(super) struct MoveUndecided(String);
+
+impl std::fmt::Display for MoveUndecided {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MoveUndecided {}
+
+/// How `actor move` waits for the nodes to keep one of two requests: a
+/// listing every `poll`, for at most `limit` (a few heartbeat periods).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Settle {
+    pub(super) poll: std::time::Duration,
+    pub(super) limit: std::time::Duration,
+}
+
+/// Lists the actor's requests until one is left, or `settle.limit`; what
+/// stands, in words. `listed` is what the listing after the write gave.
+pub(super) async fn settle_move(
+    keys: &wasmkeep_cluster::object_store::ObjectStoreBucket,
+    key: &str,
+    to: &str,
+    mut listed: Vec<wasmkeep_cluster::control::MoveIntent>,
+    settle: Settle,
+) -> String {
+    use wasmkeep_cluster::control;
+    let deadline = tokio::time::Instant::now() + settle.limit;
+    while listed.len() > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(settle.poll).await;
+        if let Ok(now) = control::actor_moves(keys, key).await {
+            listed = now;
+        }
+    }
+    match listed.as_slice() {
+        [] => "no request is left, so the nodes carried one out".to_owned(),
+        [one] if one.target == to => format!("they kept this one, to {to}"),
+        [one] => format!("they kept the one to {}, and dropped this one", one.target),
+        _ => {
+            let (kept, _) = control::newest_moves(listed);
+            let kept = kept.first().map_or("", |m| m.target.as_str());
+            format!(
+                "they have not yet, and by their rule keep the one to {kept} (the newest, or \
+                 on a tie the target that sorts first)"
+            )
+        }
+    }
 }
 
 /// [`actor_move`] on the bucket `open` gives (opened once the request is
@@ -106,6 +182,7 @@ pub(super) fn actor_move(args: &MoveArgs) -> anyhow::Result<()> {
 pub(super) fn actor_move_on(
     args: &MoveArgs,
     open: impl FnOnce() -> anyhow::Result<(std::sync::Arc<dyn object_store::ObjectStore>, String)>,
+    settle: Settle,
 ) -> anyhow::Result<()> {
     use wasmkeep_cluster::control::{self, Keys as _};
     let ((tenant, app), class, name) = move_target(&args.actor, args.app.as_ref())?;
@@ -154,14 +231,33 @@ pub(super) fn actor_move_on(
             return Err(e);
         }
         announce_intent_async(&keys).await;
-        match written? {
-            control::MoveWrite::Alone => anyhow::Ok(()),
-            control::MoveWrite::Concurrent(others) => anyhow::bail!(
-                "another move request for {tenant}/{class}/{name} was written at the same time \
-                 (to {}); the nodes carry out one of them, and which is not known. Run `actor \
-                 move` again to settle it",
-                others.join(", ")
-            ),
+        let actor = format!("{tenant}/{class}/{name}");
+        match written {
+            Err(e) => Err(anyhow::anyhow!(
+                "the move request was not written: {e}. An earlier request for {actor} to \
+                 another target may have been removed already"
+            )),
+            Ok(control::MoveWrite::Alone) => anyhow::Ok(()),
+            Ok(control::MoveWrite::Unverified(e)) => Err(MoveUndecided(format!(
+                "the move request for {actor} to {to} was written, but the listing after it \
+                 failed ({e}): whether another request stands beside it is not known. \
+                 {WAIT_AND_CHECK}"
+            ))
+            .into()),
+            Ok(control::MoveWrite::Concurrent(listed)) => {
+                let others: Vec<&str> = listed
+                    .iter()
+                    .filter(|m| m.key() != key)
+                    .map(|m| m.target.as_str())
+                    .collect();
+                let others = others.join(", ");
+                let outcome = settle_move(&keys, &key, to, listed, settle).await;
+                Err(MoveUndecided(format!(
+                    "another move request for {actor} was written at the same time (to \
+                     {others}), and the nodes decide which counts: {outcome}. {WAIT_AND_CHECK}"
+                ))
+                .into())
+            }
         }
     })?;
     println!(

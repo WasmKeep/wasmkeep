@@ -118,8 +118,12 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
   the later of two requests for one actor written within a second could
   be deleted unread. `actor move` now deletes the actor's requests to
   other targets before writing its own. Of two run at the same time for
-  one actor, the one that finds the other's request beside its own
-  fails, naming that target, since which one counts is not known. The key and the nodes' rule are unchanged: nodes of 0.9 read the
+  one actor, the one that finds the other's request beside its own waits
+  up to 15 s for the nodes to keep one and says which target stands; it
+  exits with code 3 ("written, the outcome decided by the nodes"), as
+  does a request written whose check failed. After it, wait and check
+  where the actor is held rather than running the command again at
+  once. The key and the nodes' rule are unchanged: nodes of 0.9 read the
   requests as before; a CLI of 0.9 keeps the old behaviour (#339).
 - **A single slow lease renewal no longer runs a node's lease out.**
   Renewals went a heartbeat period after the previous send, each allowed
