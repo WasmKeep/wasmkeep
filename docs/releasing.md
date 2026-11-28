@@ -1,7 +1,7 @@
 # Releasing
 
-For maintainers. A release is a signed tag on a commit of `main` that CI
-passed on; two workflows do the rest, and a person approves each step that
+For maintainers. A release is a signed tag on a commit of `main`, or of a
+release branch for a patch, that CI passed on; two workflows do the rest, and a person approves each step that
 cannot be undone.
 
 ## What a release is
@@ -43,7 +43,9 @@ registry.
    pushes the image and opens a **draft** release. A tag on a commit the
    full suite did not pass on fails here: run it on the commit, then the
    workflow again. Never move or delete a
-   tag: the module proxy and the registries keep what they saw.
+   tag: the module proxy and the registries keep what they saw. A tag
+   whose own `release.yml` or `publish.yml` cannot pass is left as it is,
+   and the next patch version is released instead (0.9.1 was).
 3. **Publish the draft.** Read it, then publish it. That starts
    `publish.yml`.
 4. **Approve the registries.** `publish.yml` first checks the release (the
@@ -59,6 +61,27 @@ registry.
    `go get github.com/wasmkeep/wasmkeep/sdks/go@v<version>` each give the
    new version, and each registry's page names this repository as the
    source.
+
+## A patch from a release branch
+
+When `main` already carries the next minor version, a patch is cut on a
+release branch instead:
+
+- Cut `release/X.Y` (or `release/X.Y.Z`) from the `vX.Y.0` tag. Both
+  workflows match that name: they accept a full CI run on `main` or on the
+  release branch of the tag's minor version, and no other branch.
+- Cherry-pick the fixes, then the prepare commit of step 1, on the branch.
+- Start the full suite on the commit to tag with
+  `gh workflow run ci.yml --ref release/X.Y`: a push to that branch starts
+  no CI at all.
+- Run the [mixed-version check](#the-mixed-version-check) on that commit,
+  then push both tags as in step 2.
+- The tag runs the branch's own copy of the workflows: backport a
+  workflow fix to the branch before tagging.
+- `docs.yml` publishes the patch's docs as the site, since the site shows
+  the latest release.
+- Afterwards, forward-port the release's `CHANGELOG.md` section and the
+  pin it adds to `scripts/mixed-version.sh` to `main`.
 
 ## The mixed-version check
 
@@ -222,6 +245,9 @@ settings matter.
 - **GitHub, the tags**: the ruleset that keeps `v*` and `sdks/go/v*` from
   being moved or deleted. With several maintainers, also restrict who may
   create them.
+- **GitHub, the release branches**: a ruleset on `release/**` that forbids
+  deleting and force-pushing them. A patch's tag is accepted on such a
+  branch, so it needs the same care as `main`.
 - **The names.** A registry can trust a workflow only for a package that
   exists, except PyPI. Reserve the crate and the npm package once, by
   hand, with a placeholder version `0.0.0` that says so in its

@@ -99,13 +99,22 @@ jobs:
         run: |
           draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
           [ "$draft" = false ] || { echo "::error::the release $TAG is still a draft"; exit 1; }
-          run=$(gh run list --workflow ci.yml --commit "$SHA" --branch main --event push \
-            --limit 1 --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"')
+          [[ $TAG =~ ^v([0-9]+\.[0-9]+)\.[0-9]+ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+          line=${BASH_REMATCH[1]}
+          # A commit of main has its push run; a patch cut on a release
+          # branch has the full run by hand that release.yml waited for.
+          run=$(gh run list --workflow ci.yml --commit "$SHA" --limit 50 \
+            --json event,status,conclusion,headBranch \
+            | jq -r --arg line "$line" '[.[] | select(
+                (.headBranch == "main" and .event == "push")
+                or (.event == "workflow_dispatch" and (.headBranch == "release/\($line)"
+                    or (.headBranch | startswith("release/\($line).")))))][0]
+                | "\(.status) \(.conclusion)"')
           read -r status conclusion <<<"$run"
           echo "CI on $SHA: $status $conclusion"
           case "$status $conclusion" in
             "completed success") ;;
-            "null null"|" ") echo "::error::no CI run on main for $SHA: is $TAG on a commit of main?"; exit 1 ;;
+            "null null"|" ") echo "::error::no CI run on main or release/$line for $SHA: is $TAG on a commit of one of them?"; exit 1 ;;
             completed*) echo "::error::CI concluded $conclusion on $SHA: run CI again on that commit, then this workflow"; exit 1 ;;
             *) echo "::error::CI is $status on $SHA: wait for it, then run this workflow again"; exit 1 ;;
           esac

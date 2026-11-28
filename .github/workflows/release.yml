@@ -3,7 +3,8 @@ name: release
 # A tag `vX.Y.Z` (equal to the workspace version, annotated and signed, with
 # a signature GitHub verifies) builds the release
 # binaries, signs them and opens a draft pre-release with them, once CI has
-# passed on the tagged commit (the `ci` job waits for it), its text
+# passed on the tagged commit, on main or on a release branch for a patch
+# (the `ci` job waits for it), its text
 # taken from the version's section of CHANGELOG.md; a maintainer reviews and
 # publishes it. Run by hand (workflow_dispatch) it builds and
 # signs the same files as a workflow artifact, with no release: a dry run.
@@ -88,7 +89,8 @@ env:
 
 jobs:
   # A release is built only from a commit CI has passed on. For a tag, this
-  # waits for the CI workflow's run on the tagged commit (its push to main)
+  # waits for a full CI run on the tagged commit, on main or on the release
+  # branch of the tag's minor version (a patch cut once main has moved on),
   # and fails unless it succeeded: run CI again, then this workflow again.
   # Anything else (a dry run, a pull request) passes at once.
   ci:
@@ -149,16 +151,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
           REF_TYPE: ${{ github.ref_type }}
           SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
         run: |
           [ "$REF_TYPE" = tag ] || { echo "not a tag: nothing to wait for"; exit 0; }
+          [[ $TAG =~ ^v([0-9]+\.[0-9]+)\.[0-9]+ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+          line=${BASH_REMATCH[1]}
           for _ in $(seq 160); do
-            # The latest full CI run on main for this commit: started by
-            # hand (workflow_dispatch) before tagging, or the nightly one.
+            # The latest full CI run for this commit on main, or on the
+            # release branch of the tag's minor version (release/X.Y or
+            # release/X.Y.Z, for a patch cut from a tag once main has moved
+            # on): started by hand (workflow_dispatch) before tagging, or
+            # the nightly one. A run on any other branch does not count.
             # Runs on push are the fast jobs only and do not count. A
             # re-run replaces its conclusion.
             read -r status conclusion < <(gh run list --workflow ci.yml --commit "$SHA" \
-              --branch main --limit 20 --json event,status,conclusion \
-              --jq '[.[] | select(.event == "workflow_dispatch" or .event == "schedule")][0] | "\(.status) \(.conclusion)"') || true
+              --limit 50 --json event,status,conclusion,headBranch \
+              | jq -r --arg line "$line" '[.[]
+                  | select(.event == "workflow_dispatch" or .event == "schedule")
+                  | select(.headBranch == "main" or .headBranch == "release/\($line)"
+                           or (.headBranch | startswith("release/\($line).")))][0]
+                  | "\(.status) \(.conclusion)"') || true
             echo "CI on $SHA: $status $conclusion"
             if [ "$status" = completed ]; then
               [ "$conclusion" = success ] && exit 0
@@ -167,7 +179,7 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::no finished full CI run on main for $SHA: run gh workflow run ci.yml --ref main on it before tagging"
+          echo "::error::no finished full CI run on main or release/$line for $SHA: run gh workflow run ci.yml --ref <that branch> on it before tagging"
           exit 1
 
   # The example components a release carries: the counter of the README's
