@@ -111,6 +111,16 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
 
 ### Fixed
 
+- **The later of two `actor move` requests within one second counts**
+  ([ADR 0017, amendment of 2026-11-28](docs/adr/0017-moving-one-actor.md#amendment-of-2026-11-28-the-later-of-two-requests-in-one-second)).
+  Nodes keep one request per actor by the bucket's last-modified time,
+  whole seconds on S3, and on a tie the one whose target sorts first, so
+  the later of two requests for one actor written within a second could
+  be deleted unread. `actor move` now deletes the actor's requests to
+  other targets before writing its own. Of two run at the same time for
+  one actor, the one that finds the other's request beside its own
+  fails, naming that target, since which one counts is not known. The key and the nodes' rule are unchanged: nodes of 0.9 read the
+  requests as before; a CLI of 0.9 keeps the old behaviour (#339).
 - **A single slow lease renewal no longer runs a node's lease out.**
   Renewals went a heartbeat period after the previous send, each allowed
   2.67 s, so after one that timed out the next could be answered after

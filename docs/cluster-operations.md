@@ -465,6 +465,13 @@ The target must be a live node: an id no live node has is refused without
 gets a warning (the request is written; the owner keeps the actor), as
 does one that serves another app.
 
+A new request replaces the actor's earlier one to another target: the
+later `actor move` counts. Two run at the same time for one actor, to
+different targets, may both be written; the one that finds the other's
+request then fails, naming its target, since which one the nodes carry
+out is not known (the other may succeed, as if it had run first). Run it
+again to settle it.
+
 Within a few seconds the actor's owner hands it to `node-c` (within a
 minute for a request written by a CLI of 0.4.1 or before, which does not
 rewrite `control/changed`;

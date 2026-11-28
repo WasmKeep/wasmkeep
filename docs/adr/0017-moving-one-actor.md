@@ -15,6 +15,9 @@
   changes, or every 60 s, not every period ([ADR 0014](0014-draining-a-node-and-moving-an-actor.md),
   amendment of 2026-11-14); see "Amendment of 2026-11-14" at the end.
 - Amended by [ADR 0034](0034-batched-plain-writes.md) (proposed 2026-11-15; if accepted): a move of a batched actor flushes before it records the move and releases, so the 30 s deadline starts after the flush.
+- Amended 2026-11-28 (0.10.0): `actor move` deletes the actor's requests
+  to other targets before writing its own, so the later of two requests
+  within one second counts; see "Amendment of 2026-11-28" at the end.
 - Date: 2026-11-05
 - Milestone: [M4](../../ROADMAP.md#m4-operating-a-cluster) (the part [ADR 0014](0014-draining-a-node-and-moving-an-actor.md) left open)
 
@@ -285,3 +288,46 @@ the delete and forgets the request at once.
   together).
 - **Tests:** the move tests in `tests/cluster/draining.rs` write the
   marker as the CLI does (`request_move_of`).
+
+## Amendment of 2026-11-28: the later of two requests in one second
+
+Nodes keep one move request per actor, the newest by last-modified time
+(section "Moving a resident actor"). That time is the bucket's, in whole
+seconds on S3, so two requests for one actor written within one second
+tie, and a tie keeps the request listed first: the one whose target
+sorts first. Of two `actor move` commands run one after the other within
+a second, the later could be deleted unread.
+
+- **The writer replaces the earlier request.** `actor move`
+  (`control::write_move`) lists the actor's requests, deletes those to
+  other targets, writes its own, and lists them again. Nodes list the
+  requests at one moment, so they see the earlier request or the later
+  one, or neither for a moment, never both: the later command counts,
+  whatever the seconds say. A node that read the earlier request may
+  still act on it until its next listing, as before; the later one is
+  carried out after it.
+- **Two writers at the same time** may still leave two requests side by
+  side. A writer whose second listing finds the other one fails, naming
+  its target, and deletes neither (two writers each deleting the other's
+  would leave none); the nodes keep one by the rule above, and running
+  the command again settles it. The writer whose key landed last always
+  finds the other one, unless a node already deleted it. The other
+  writer may succeed and see its request replaced, as if it had run
+  first: of two requests, one written after the other in the bucket's
+  order is never deleted for the earlier while its writer is told it
+  stands alone.
+- **The nodes' rule is unchanged** (`control::newest_moves`, used by
+  `moves_pass`): newest first, and on a tie the request met first. Nodes
+  of 0.9 and 0.10 keep the same request, so a mixed cluster never deletes
+  both ([ADR 0043](0043-rolling-upgrades.md)). A node logs a warning when it
+  deletes a request tied with the one it kept.
+- **Compatibility.** The key, its empty body and the layout are those of
+  0.9: a node of 0.9 reads a request written by `actor move` of 0.10 as
+  before, and a node of 0.10 reads one of 0.9. A CLI of 0.9 still writes
+  its key beside an earlier one, so two of its commands within one second
+  can still lose the later; the CLI of 0.10 has the fix.
+- **Tests:** `control::tests` (two writes within one second, the later
+  kept; a tie keeps the request met first; a concurrent write reported),
+  `actor_move_replaces_the_actors_earlier_request` in `wasmkeep-cli`, and
+  `sim/tests/madsim_move_order.rs`, which catches the writer of 0.9 and a
+  writer that writes its key before deleting the others.

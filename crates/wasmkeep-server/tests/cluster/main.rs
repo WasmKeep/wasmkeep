@@ -1890,7 +1890,6 @@ async fn request_move_of(
     name: &str,
     target: &str,
 ) -> object_store::path::Path {
-    use object_store::ObjectStoreExt as _;
     let key = wasmkeep_cluster::control::checked_move_key(
         &wasmkeep_cluster::state_root::StateRoot::new("", "default", "default"),
         class,
@@ -1898,10 +1897,12 @@ async fn request_move_of(
         target,
     )
     .unwrap();
-    let path = object_store::path::Path::from(key);
-    store.put(&path, Vec::new().into()).await.unwrap();
+    let keys = wasmkeep_cluster::object_store::ObjectStoreBucket::new(Arc::clone(store), "");
+    wasmkeep_cluster::control::write_move(&keys, &key)
+        .await
+        .unwrap();
     announce_intent(store).await;
-    path
+    object_store::path::Path::from(key)
 }
 
 /// Asks for actor `class/name` to be deleted (`wasmkeep actor delete`,

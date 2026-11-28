@@ -144,14 +144,25 @@ pub(super) fn actor_move_on(
                 }
             }
         }
-        keys.put_empty(&key).await?;
+        // Replaces the actor's requests to other targets: the nodes order
+        // requests by the bucket's whole seconds (ADR 0017, amendment of
+        // 2026-11-28).
+        let written = control::write_move(&keys, &key).await;
         // Deleted meanwhile (ADR 0028): the request is taken back.
         if let Err(e) = refuse_deleted_async(&store, &prefix, tenant, &app).await {
             let _ = keys.delete(&key).await;
             return Err(e);
         }
         announce_intent_async(&keys).await;
-        anyhow::Ok(())
+        match written? {
+            control::MoveWrite::Alone => anyhow::Ok(()),
+            control::MoveWrite::Concurrent(others) => anyhow::bail!(
+                "another move request for {tenant}/{class}/{name} was written at the same time \
+                 (to {}); the nodes carry out one of them, and which is not known. Run `actor \
+                 move` again to settle it",
+                others.join(", ")
+            ),
+        }
     })?;
     println!(
         "Asked the owner of {tenant}/{class}/{name} to move it to {} (expires in 5 minutes).",

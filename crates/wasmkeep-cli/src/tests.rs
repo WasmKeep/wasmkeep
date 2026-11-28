@@ -191,6 +191,63 @@ fn actor_move_refuses_an_unmigrated_tenant() {
     assert_eq!(listed.len(), 1, "{listed:?}");
 }
 
+/// `actor move` replaces the actor's request to another target (ADR 0017,
+/// amendment of 2026-11-28): the bucket orders requests by whole seconds,
+/// so two left side by side within one second could keep the earlier.
+#[test]
+fn actor_move_replaces_the_actors_earlier_request() {
+    use clap::Parser as _;
+    use object_store::{ObjectStore, memory::InMemory};
+    let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mv = |actor: &str, to: &str| {
+        let super::Cli {
+            command: super::Command::Actor(super::ActorCommand::Move(args)),
+            ..
+        } = super::Cli::try_parse_from([
+            "wasmkeep",
+            "actor",
+            "move",
+            "--app",
+            "acme/shop",
+            actor,
+            "--to",
+            to,
+            "--force",
+            "--bucket",
+            "s3://b/wk",
+        ])
+        .unwrap()
+        else {
+            unreachable!()
+        };
+        super::actor_move_on(&args, || Ok((std::sync::Arc::clone(&store), "wk".into()))).unwrap();
+    };
+    mv("room/x", "node-a");
+    mv("room/xy", "node-a");
+    mv("room/x", "node-b");
+    let mut listed: Vec<String> = rt.block_on(async {
+        use futures_util::TryStreamExt as _;
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.location.to_string())
+            .filter(|k| k.contains("/moves/"))
+            .collect()
+    });
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            "wk/state/acme/shop/moves/room/78/node-b",
+            "wk/state/acme/shop/moves/room/7879/node-a",
+        ]
+    );
+}
+
 fn delete_args(extra: &[&str]) -> super::DeleteArgs {
     use clap::Parser as _;
     let mut argv = vec![
