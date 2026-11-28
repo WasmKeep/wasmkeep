@@ -32,9 +32,9 @@ pub(crate) enum TakeAnswer {
     Failed(String),
     /// The node answered `503` (draining, secrets blocked, an acquisition
     /// or a restore that cannot finish now, a signature to make again) to
-    /// every try within the take's time: it is alive and asks for a retry,
-    /// so it is neither suspected nor backed off (ADR 0040, section 14,
-    /// amendment of 2026-11-28).
+    /// every try for [`TAKE_RETRY_FOR`]: it is alive and asks for a retry,
+    /// so it is not suspected; the rebalance and cold sockets back it off
+    /// (ADR 0040, section 14, amendment of 2026-11-28).
     Unavailable(String),
 }
 
@@ -43,6 +43,11 @@ pub(crate) enum TakeAnswer {
 pub(super) const TAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The pause before a take answered `503` is sent again.
 pub(super) const TAKE_RETRY_PAUSE: Duration = Duration::from_millis(250);
+/// How long a take answered `503` is sent again: a moment's refusal (a
+/// restore queued, a signature made before the start) passes within it,
+/// and a node that refuses for longer (draining, secrets blocked) costs
+/// its callers two seconds, not the take's ten.
+pub(super) const TAKE_RETRY_FOR: Duration = Duration::from_secs(2);
 
 /// The body of a take call.
 pub(crate) fn take_body(tenant: &str) -> String {

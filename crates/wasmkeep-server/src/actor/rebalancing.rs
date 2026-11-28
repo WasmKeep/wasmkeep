@@ -346,7 +346,7 @@ fn kick(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, awaiting: &Awaiting) 
                     MoveEnd::Moved | MoveEnd::Elsewhere => {
                         pass.backoff.remove(&address);
                     }
-                    MoveEnd::Busy => {
+                    MoveEnd::Busy | MoveEnd::Unavailable => {
                         let before = pass.backoff.get(&address).copied();
                         pass.backoff
                             .insert(address.clone(), Backoff::after(before, BACKOFF_MIN));
@@ -360,6 +360,10 @@ fn kick(inner: &Arc<ServiceInner>, cluster: &Arc<Cluster>, awaiting: &Awaiting) 
                     inner.rebalance.target_failed(&target, horizon);
                     cluster.suspect(&target);
                 }
+                // Alive, asking for a retry for the take's retries: backed
+                // off, so the next edges do not wait on it too, but not
+                // suspected (routing goes on sending it requests).
+                MoveEnd::Unavailable => inner.rebalance.target_failed(&target, horizon),
                 MoveEnd::Elsewhere | MoveEnd::Busy => {}
             }
             // Closed loop: the next move starts when one ends.
@@ -466,6 +470,7 @@ async fn move_home(
         MoveEnd::Elsewhere => "taken_elsewhere",
         MoveEnd::Busy => "busy",
         MoveEnd::Refused => "failed",
+        MoveEnd::Unavailable => "busy",
     };
     crate::metrics::rebalance_move(&inner.app_labels, outcome, closed);
     (end, closed)

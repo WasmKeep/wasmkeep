@@ -1152,9 +1152,9 @@ ends:
 - `failed`, the target refused the take or did not answer: the target is
   suspected and backed off, a heartbeat horizon doubling on each failure
   in a row up to 160 s, for moves and cold sockets alike. A take answered
-  `503` is not a refusal (amendment of 2026-11-28): it is sent again
-  within the take's 10 s, and one answered `503` to the end backs the
-  actor off as `busy`, the target not blamed.
+  `503` is not a failure (amendment of 2026-11-28): it is sent again for
+  2 s, and one answered `503` throughout backs the target off the same way
+  without suspecting it (counted `busy`).
 
 What a move closed is charged to the period's budget, not what it was
 expected to close.
@@ -1300,11 +1300,16 @@ bound:
   suspected it and backed it off, so the first take refused just after
   the home served made both peers leave it out for a heartbeat horizon
   or more. A take answered `503` is now signed and sent again every
-  250 ms within its 10 s, and one answered `503` to the end is
-  `unavailable`: the move backs the actor off as `busy`, a cold socket
-  wakes the actor where it landed, and nobody is suspected. The decision
-  reads the status alone, so a receiver of any version is retried the
-  same way. The receiver logs why it refused, at `info`. The reason of
+  250 ms for 2 s (every try within the take's 10 s from the first, none
+  sent with less than a second left), and one answered `503` throughout,
+  or whose try after a `503` fails another way, is `unavailable`: the
+  target is backed off as before, so the next edges do not wait on it,
+  but it is not suspected, so requests still go to it; the move backs the
+  actor off too (counted `busy`), and a cold socket wakes the actor where
+  it landed. A moment's refusal passes within the 2 s; a node that refuses
+  for longer (draining before the sender sees it, its secrets blocked)
+  costs each caller 2 s once, then its backoff. The decision reads the
+  status alone, so a receiver of any version is retried the same way. The receiver logs why it refused, at `info`. The reason of
   the refusal in that run was not recorded (it was logged at `debug`);
   a cluster test with a slow bucket did not reproduce it, so this
   amendment does not name it.
@@ -1316,14 +1321,18 @@ bound:
   edge on that node then acquired it there, in the gap between a move's
   release and its take on the home, and that node moved it again: the
   logs' "another node took the actor first". An upgrade for a spread
-  actor whose mailbox here holds no lease and is not parked now reads
-  the record, as with no mailbox: nobody holds it, so its home takes it
-  first (the take of the move and the cold socket's both reach the home,
-  which holds it after the first). A read that fails still means "try
-  here".
+  actor whose mailbox here holds no lease, is not parked and is not being
+  moved from this node now reads the record, as with no mailbox: nobody
+  holds it, so its home takes it first (the take of the move and the cold
+  socket's both reach the home, which holds it after the first). A move
+  from this node keeps the mailbox's answer, the move's target, so a
+  socket follows an operator's move off home. A read that fails still
+  means "try here". Only WebSocket upgrades read it: a plain request that
+  lands on such a mailbox is unchanged.
 
 A wake-up is still never refused: a socket waits for its home's answer
-within the take's 10 s, then wakes the actor where it landed.
+(at most the take's 10 s, its retries after a `503` at most 2 s), then
+wakes the actor where it landed.
 
 **Tests.** `rebalance::decide` (a node stopped within the bound pauses
 every node; at the bound it no longer counts);
@@ -1334,7 +1343,11 @@ then stops a node for good when the faults end, so convergence over the
 nodes left, within a bound that includes this one, shows the pause ends;
 `cluster/wire_tests.rs`: a take answered `503` twice is signed and sent
 again until it is held, one answered `503` throughout is `unavailable`
-within its budget, and a `500` is not sent again; `tests/cluster/spread.rs`:
+within its retries, one answered `503` then `500` is `unavailable`, and a
+`500` alone is `failed` and not sent again; an operator's move of an edge
+to a node that is not its home, with clients through the moving node,
+ends on its target (a guard: it passes without the move check too, as
+the gap is short on an in-memory bucket); `tests/cluster/spread.rs`:
 the upgrading page's step with the drain withdrawn while the node is
 down moves nothing until it serves, then moves the edge once, straight
 home; a node stopped for good pauses the pass for the bound only (shortened);

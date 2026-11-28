@@ -51,8 +51,8 @@ Upgrading from 0.9.x, one node at a time or with every node stopped, then
   that node is answered `503` with `Retry-After: 1`, so clients that
   reconnect at once do not hold the move up. A take answered `503` (a node
   alive that cannot take the actor at that moment) is signed and sent
-  again within the take's 10 s, and is never counted against the node: it
-  is neither suspected nor backed off. A rolling restart therefore ends with
+  again for 2 s; one still answered `503` backs the node off for the
+  rebalance and cold sockets, but no longer makes it suspected. A rolling restart therefore ends with
   the edges where a cold start puts them, at the cost of one more
   reconnect for the clients of the restarted node's edges.
 - **A socket for an edge nobody holds wakes it at its home**: the home

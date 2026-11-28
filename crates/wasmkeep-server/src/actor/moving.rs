@@ -88,12 +88,13 @@ pub(super) enum MoveEnd {
     Elsewhere,
     /// Not done for a cause of this node's (a socket reopened or still
     /// closing, the release pending, the actor not held here any more, the
-    /// job past its wait), or the target answered `503` for the take's
-    /// whole time (alive, asking for a retry): tried again later; the
-    /// target is not to blame.
+    /// job past its wait): tried again later; the target is not to blame.
     Busy,
     /// Not done because the target refused the take or did not answer.
     Refused,
+    /// Not done because the target answered `503` for the take's retries:
+    /// alive, asking for a retry. Backed off, not suspected.
+    Unavailable,
 }
 
 impl MoveEnd {
@@ -614,9 +615,7 @@ pub(super) async fn move_parked(
             MoveEnd::Elsewhere
         }
         TakeAnswer::HeldBy(_) => MoveEnd::Busy,
-        // Alive and asking for a retry past the take's time: the room is
-        // backed off, the target not blamed.
-        TakeAnswer::Unavailable(_) => MoveEnd::Busy,
+        TakeAnswer::Unavailable(_) => MoveEnd::Unavailable,
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => MoveEnd::Refused,
     };
     (end, closed)
@@ -792,7 +791,7 @@ pub(super) async fn move_resident(
         }
         TakeAnswer::Unavailable(_) => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, ?answer, "move: the target asked to retry for the take's whole time; tried again later");
-            return (MoveEnd::Busy, closed);
+            return (MoveEnd::Unavailable, closed);
         }
         TakeAnswer::NoSuchActor | TakeAnswer::Failed(_) => {
             tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %target, ?answer, "move: the target did not take the actor; tried again later");

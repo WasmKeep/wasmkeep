@@ -394,6 +394,14 @@ async fn a_take_answered_503_is_sent_again_within_its_time() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(captured.0.lock().unwrap().len() >= 3);
 
+    // A try after a `503` that fails otherwise (no answer in time, an
+    // error) still says the node asked for a retry: not `Failed`.
+    let (base, _) =
+        answering_in_turn(vec!["503 Service Unavailable", "500 Internal Server Error"]).await;
+    let me = sender(&base).await;
+    let answer = me.take("owner", &target).await;
+    assert!(matches!(answer, TakeAnswer::Unavailable(_)), "{answer:?}");
+
     let (base, captured) = answering("500 Internal Server Error").await;
     let me = sender(&base).await;
     assert!(matches!(

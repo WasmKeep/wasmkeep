@@ -138,7 +138,17 @@ impl ServiceInner {
         let Some(cluster) = self.cluster.as_ref() else {
             return route;
         };
+        // A move of it from this node is under way: the mailbox answers
+        // with the move's target (`Elsewhere`), so the socket follows the
+        // move, not the home in this node's view.
+        let moving = self
+            .moves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(address);
         if route == Cold::Here
+            && !moving
+            && self.mailboxes.contains(address)
             && self.goes_home(cluster, address)
             && !cluster.holds_here(address)
             && !cluster.is_parked(address)

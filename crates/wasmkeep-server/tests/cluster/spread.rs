@@ -1340,3 +1340,67 @@ async fn a_rejoined_home_takes_its_crowded_edges_at_the_first_try() {
     }
     drop((back, nodes));
 }
+
+/// An operator's move of an edge to a node that is neither its node nor
+/// its home (ADR 0040, section 14, amendment of 2026-11-28), with clients
+/// connected through the moving node that reconnect at once: an upgrade
+/// that lands there during the move follows the move to its target, and
+/// does not ask the edge's home to take it. The edge ends on the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operators_move_off_home_is_not_raced_by_sockets_on_its_node() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    // No rebalance move for the length of the test.
+    let nodes = three_with(
+        &store,
+        &dirs,
+        Some(|period| wasmkeep_cluster::rebalance::Settings {
+            settle: Duration::from_secs(600),
+            ..wasmkeep_cluster::rebalance::Settings::for_period(period)
+        }),
+    )
+    .await;
+    let edge = edge_on("a", &[]);
+    let r = send_reachable(
+        nodes[2].addr,
+        "POST",
+        &format!("/actor/edge/{edge}/durable"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.node.as_deref()),
+        (200, Some("c")),
+        "{}",
+        r.body
+    );
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let edges = vec![edge.clone()];
+    let clients = crowd(nodes[2].addr, &edges, at_once, &connected, &stop_rx).await;
+    request_move_of(&store, "edge", &edge, "b").await;
+    let started = std::time::Instant::now();
+    loop {
+        let at = holder(&store, "edge", &edge).await;
+        if at.as_deref() == Some("b") {
+            break;
+        }
+        assert_ne!(
+            at.as_deref(),
+            Some("a"),
+            "taken by its home in the move's gap"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "not moved to b: on {at:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_connected(&connected, clients.len(), "after the move").await;
+    assert_eq!(holder(&store, "edge", &edge).await.as_deref(), Some("b"));
+    stop_tx.send(true).unwrap();
+    for client in clients {
+        client.await.unwrap();
+    }
+    drop(nodes);
+}

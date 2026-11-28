@@ -2072,35 +2072,52 @@ impl Cluster {
     /// arm its alarm. A signed node call (the signature covers the marker),
     /// sent only to nodes that advertise `take` on heartbeat line 11.
     pub(crate) async fn take(&self, peer: &str, address: &ActorAddress) -> TakeAnswer {
-        self.take_within(peer, address, TAKE_TIMEOUT).await
+        self.take_within(peer, address, TAKE_RETRY_FOR).await
     }
 
-    /// [`Self::take`] within `budget`: a `503` is a node alive that cannot
-    /// take the actor at this moment (a restore or an acquisition under
-    /// way, a signature made before it started), so the take is signed and
-    /// sent again after [`TAKE_RETRY_PAUSE`] until the budget ends, then
-    /// answered [`TakeAnswer::Unavailable`]. Decided on the status alone,
-    /// so a receiver of any version is retried alike. A take is safe to
-    /// send again: a node that took the actor answers `held`.
+    /// [`Self::take`], retrying for `retry_for`: a `503` is a node alive
+    /// that cannot take the actor at this moment (a restore or an
+    /// acquisition under way, a signature made before it started), so the
+    /// take is signed and sent again after [`TAKE_RETRY_PAUSE`] while
+    /// `retry_for` lasts, then answered [`TakeAnswer::Unavailable`]. Every
+    /// try ends within the take's [`TAKE_TIMEOUT`] from the first; one sent
+    /// after a `503` that is not answered in time is `Unavailable` too, so
+    /// a node that asked for a retry is never suspected for it. Decided on
+    /// the status alone, so a receiver of any version is retried alike. A
+    /// take is safe to send again: a node that took the actor answers
+    /// `held`.
     pub(crate) async fn take_within(
         &self,
         peer: &str,
         address: &ActorAddress,
-        budget: Duration,
+        retry_for: Duration,
     ) -> TakeAnswer {
-        let deadline = tokio::time::Instant::now() + budget;
+        let started = tokio::time::Instant::now();
+        let deadline = started + TAKE_TIMEOUT;
+        let retries_end = started + retry_for.min(TAKE_TIMEOUT);
         let mut tries = 0u32;
+        let mut last = String::new();
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match self.take_once(peer, address, left).await {
                 Err(why) => {
                     tries += 1;
-                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if left <= TAKE_RETRY_PAUSE {
-                        tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, tries, %why, "take: the node asked to retry until the take's time ran out");
+                    let now = tokio::time::Instant::now();
+                    // No try sent with less than a second left: it could
+                    // only time out.
+                    if now + TAKE_RETRY_PAUSE > retries_end
+                        || deadline.saturating_duration_since(now)
+                            < TAKE_RETRY_PAUSE + Duration::from_secs(1)
+                    {
+                        tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, tries, %why, "take: the node asked to retry for the take's whole time");
                         return TakeAnswer::Unavailable(why);
                     }
+                    last = why;
                     tokio::time::sleep(TAKE_RETRY_PAUSE).await;
+                }
+                Ok(TakeAnswer::Failed(why)) if tries > 0 => {
+                    tracing::info!(app = %crate::logging::app(address), actor = %crate::logging::actor(address), %peer, tries, %why, "take: a try after the node asked to retry failed");
+                    return TakeAnswer::Unavailable(format!("{last}; then {why}"));
                 }
                 Ok(answer) => {
                     if tries > 0 {
