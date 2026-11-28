@@ -1100,8 +1100,9 @@ unless:
 
 1. placement and rebalancing are on;
 2. the cluster is quiet in this node's view: no node of the app is asked
-   to drain, and every live one shows `serving` (a drain shrinks the set,
-   so homes change for its length);
+   to drain, every live one shows `serving` (a drain shrinks the set, so
+   homes change for its length), and none of the app stopped or went quiet
+   less than ten minutes ago (amendment of 2026-11-28, below);
 3. every live node runs this node's minor version (patches of one minor
    do not pause it): during an upgrade a move toward a node about to be
    restarted is a wasted reconnect.
@@ -1150,7 +1151,10 @@ ends:
   off, 10 s doubling up to 160 s; the target is not blamed;
 - `failed`, the target refused the take or did not answer: the target is
   suspected and backed off, a heartbeat horizon doubling on each failure
-  in a row up to 160 s, for moves and cold sockets alike.
+  in a row up to 160 s, for moves and cold sockets alike. A take answered
+  `503` is not a refusal (amendment of 2026-11-28): it is sent again
+  within the take's 10 s, and one answered `503` to the end backs the
+  actor off as `busy`, the target not blamed.
 
 What a move closed is charged to the period's budget, not what it was
 expected to close.
@@ -1193,7 +1197,9 @@ to move: its edges woke at their homes over the smaller set. A dead
 node's edges are taken over where a request lands (a record naming a
 dead node is "try here", not "nobody"), and those not at home are moved
 once the cluster is quiet: their clients reconnect a second time. A node
-stuck not serving pauses the pass for as long as it shows.
+stuck not serving pauses the pass for as long as it shows; a node stopped,
+or dead, pauses it for ten minutes after its last write (amendment of
+2026-11-28).
 
 **Upgrades.** Nothing is gated, because nothing new is written: the take
 call and its body are frozen since 0.9 (ADR 0043, section 2), no header
@@ -1215,8 +1221,8 @@ off; to keep edges off a node, drain it.
 counted whether or not the pass may run, and left out by a node with
 rebalancing off; `cluster status` shows it per
 node (`AWAY`) and one word per app: `balanced` when every live node
-publishes 0, `rebalancing`, or `paused` with the node that drains or is
-not serving, or `mixed versions`. It is read from heartbeats, so it lags
+publishes 0, `rebalancing`, or `paused` with the node that drains, is not
+serving or stopped within the ten minutes, or `mixed versions`. It is read from heartbeats, so it lags
 a node that just started serving by up to two periods, and a drain
 intent by one. Metrics, by tenant and
 app: `wasmkeep_rebalance_misplaced`, `wasmkeep_rebalance_moves_total{outcome}`,
@@ -1251,6 +1257,93 @@ the cold socket's take among its events, and one holder at a time holds
 through them. Not tested here: a peer a minor version apart in a cluster
 test (the unit tests and the mixed-version check cover it), and what a
 move costs an edge at its socket cap.
+
+#### Amendment 2026-11-28: no move while a node may come back
+
+A rolling upgrade of three nodes under a big room, run as the upgrading
+page says (drain, stop, install, withdraw the drain, start, one node at a
+time), showed two faults once the last node served again: delivery was
+slow for minutes, though nothing was lost and the edges did end home.
+
+**1. Moves while a node was stopped.** Rule 2 read only the live peers. A
+stopped node's lease is `released`, so it is not live, and once the page's
+step had withdrawn its drain request nothing paused the pass: the other
+nodes moved edges to their homes over the two of them, and moved most
+again when the stopped node served. Now a node of the app that is listed
+under `nodes/` but not live (`released`, `fenced`, or a heartbeat past
+the horizon) pauses every pass (reason `not_serving`) until its last
+write of the node lease is **ten minutes** old (`rebalance::AWAY`). The
+bound:
+
+- It is longer than a restart's stop, install and start check, so a
+  node that is coming back is waited for. A node starting again writes a
+  `serving` heartbeat and is a live peer from then: the settle delay
+  applies to it as before.
+- It ends, so a node that is gone for good does not stall the pass: its
+  edges woke at their homes over the nodes left, and those taken over
+  elsewhere move once the ten minutes have passed. `cluster forget`, and
+  the removal of released leases (ADR 0020), delete the key, which then
+  no longer counts at all.
+- It is judged by the date of that write on the writer's clock (within
+  the allowed skew), not by when this node saw it stop, so a node that
+  restarts meanwhile reaches the same answer.
+
+`cluster status` shows the app `paused (<id> stopped)` meanwhile.
+
+**2. Edges raced once the node served.** Two causes, both fixed:
+
+- *A take answered `503` blamed the home.* A node answers a take `503`
+  when it cannot take the actor at that moment and asks for a retry: it
+  is draining, it cannot open the secrets, the acquisition or the
+  restore cannot finish now, or the call was signed before it started.
+  The mover and the cold socket's sender counted that as a failed target,
+  suspected it and backed it off, so the first take refused just after
+  the home served made both peers leave it out for a heartbeat horizon
+  or more. A take answered `503` is now signed and sent again every
+  250 ms within its 10 s, and one answered `503` to the end is
+  `unavailable`: the move backs the actor off as `busy`, a cold socket
+  wakes the actor where it landed, and nobody is suspected. The decision
+  reads the status alone, so a receiver of any version is retried the
+  same way. The receiver logs why it refused, at `info`. The reason of
+  the refusal in that run was not recorded (it was logged at `debug`);
+  a cluster test with a slow bucket did not reproduce it, so this
+  amendment does not name it.
+- *A stub woke the edge on a third node.* An upgrade for an actor whose
+  mailbox is on the node it lands on was routed "try here" without a
+  read: a mailbox means the actor is resident. But the first socket's
+  admission check leaves a mailbox while it asks the home to take the
+  actor, and a request waiting leaves one too. Every later socket for the
+  edge on that node then acquired it there, in the gap between a move's
+  release and its take on the home, and that node moved it again: the
+  logs' "another node took the actor first". An upgrade for a spread
+  actor whose mailbox here holds no lease and is not parked now reads
+  the record, as with no mailbox: nobody holds it, so its home takes it
+  first (the take of the move and the cold socket's both reach the home,
+  which holds it after the first). A read that fails still means "try
+  here".
+
+A wake-up is still never refused: a socket waits for its home's answer
+within the take's 10 s, then wakes the actor where it landed.
+
+**Tests.** `rebalance::decide` (a node stopped within the bound pauses
+every node; at the bound it no longer counts);
+`sim/tests/madsim_rebalance.rs` gives the pass the nodes that are down,
+with how long, adds to property 4 that no move starts while one went down
+less than the bound ago (mutation: the pass blind to them), and now and
+then stops a node for good when the faults end, so convergence over the
+nodes left, within a bound that includes this one, shows the pause ends;
+`cluster/wire_tests.rs`: a take answered `503` twice is signed and sent
+again until it is held, one answered `503` throughout is `unavailable`
+within its budget, and a `500` is not sent again; `tests/cluster/spread.rs`:
+the upgrading page's step with the drain withdrawn while the node is
+down moves nothing until it serves, then moves the edge once, straight
+home; a node stopped for good pauses the pass for the bound only (shortened);
+and a rejoin under clients that reconnect at once through both other
+nodes, the rejoined node on a slow bucket, ends with every edge home, no move
+or cold take failed, none ended `taken_elsewhere`, and each
+client closed at most twice (without the read of the record, moves ended
+`taken_elsewhere` and edges went back and forth between the other two
+nodes). `cluster status` shows the pause.
 
 ## Consequences
 

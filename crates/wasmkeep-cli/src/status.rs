@@ -581,7 +581,8 @@ impl Report {
     /// 14), from its live nodes' load lines: `balanced` when every one
     /// publishes `misplaced=0`, `rebalancing` while some do not, or
     /// `paused` with the reason a node's pass waits for (a node draining or
-    /// not serving, two minor versions live). `None` without a live node
+    /// not serving, one of the app stopped or gone quiet within the away
+    /// bound, two minor versions live). `None` without a live node
     /// publishing the count (a version before it). A node with
     /// rebalancing switched off counts as the others do: its heartbeat
     /// does not say so.
@@ -605,6 +606,16 @@ impl Report {
                 _ => format!("{} not serving", n.info.id),
             };
             return Some(("paused", Some(why)));
+        }
+        // Listed but not live, written within the away bound: the passes
+        // wait for it (ADR 0040, section 14, amendment of 2026-11-28).
+        let away = u64::try_from(wasmkeep_cluster::rebalance::AWAY.as_millis()).unwrap_or(u64::MAX);
+        if let Some(n) = self
+            .nodes
+            .iter()
+            .find(|n| !n.live && n.info.app == app && n.age_ms < away)
+        {
+            return Some(("paused", Some(format!("{} stopped", n.info.id))));
         }
         let minor = |n: &&Node| wasmkeep_cluster::rebalance::minor(&n.info.version);
         if nodes
@@ -1311,6 +1322,9 @@ mod tests {
                 beat_with(&store, id, NOW, false, app, away(n)).await;
             }
             beat(&store, "i", NOW, false, "acme/five").await;
+            // k serves acme/six; l, of the same app, stopped a minute ago.
+            beat_with(&store, "k", NOW, false, "acme/six", away(0)).await;
+            beat_with(&store, "l", NOW - 60_000, false, "acme/six", away(0)).await;
             // f drains; h runs another minor version.
             rewrite(
                 Arc::clone(&store),
@@ -1326,7 +1340,7 @@ mod tests {
                 "\n0.1.0\n",
             )
             .await;
-            for app in ["one", "two", "three", "four", "five"] {
+            for app in ["one", "two", "three", "four", "five", "six"] {
                 put(
                     &store,
                     &format!("demo/apps/acme/{app}/current"),
@@ -1360,6 +1374,7 @@ mod tests {
             (a["rebalance"].clone(), a["rebalance_paused"].clone())
         };
         assert_eq!(app("acme/one"), (json!("balanced"), Value::Null));
+        assert_eq!(app("acme/six"), (json!("paused"), json!("l stopped")));
         assert_eq!(app("acme/two"), (json!("rebalancing"), Value::Null));
         assert_eq!(app("acme/three"), (json!("paused"), json!("f drains")));
         assert_eq!(app("acme/four"), (json!("paused"), json!("mixed versions")));
